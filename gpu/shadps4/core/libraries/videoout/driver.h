@@ -98,6 +98,7 @@ public:
 private:
     struct Request {
         Vulkan::Frame* frame;
+        Vulkan::Frame* generated = nullptr; ///< bbport: frame generation, shown half a frame first
         VideoOutPort* port;
         s64 flip_arg;
         s32 index;

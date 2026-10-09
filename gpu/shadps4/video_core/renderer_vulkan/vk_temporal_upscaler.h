@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -23,6 +24,8 @@
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/renderer_vulkan/dlss/dlss.h"
 #include "video_core/texture_cache/image.h"
+
+struct FfxVkFsr3_3_1_6FrameGenerationContext;
 
 struct FfxVkPortableUpscaleContext;
 
@@ -126,6 +129,10 @@ public:
         u32 width, height;
     };
     bool DisplayOverride(VAddr address, Display& display);
+    /// bbport: FSR 3.1 frame generation (BB_FRAME_GEN=1, scaled FSR 3 presets). Records a
+    /// frame between the previous display frame and `display` (this one, finished): the scene
+    /// interpolated, the UI kept from `display`. False when there is none this frame.
+    bool RecordFrameGeneration(const Display& display, Display& generated);
     /// BB_PRESENT_DUMP_TRIGGER: whether this presented frame is to be saved (consumes the trigger).
     bool PresentDumpDue();
     /// Saves `image` (General layout, 4 bytes a pixel) as present_<w>x<h> in BB_DUMP_DIR.
@@ -251,6 +258,31 @@ private:
     std::mutex display_mutex;
     int present_dump_remaining = 0, present_dump_index = 0;
     std::unordered_map<VAddr, DisplayImage> displays;
+
+    /// bbport: frame generation (RecordFrameGeneration). RunScaled keeps this frame's upscaled
+    /// scene before the UI (hudless) and its depth; the presenter then records the rest.
+    static bool FrameGenerationOn();
+    void CaptureFrameGenerationInputs(vk::Image depth_image, u32 w, u32 h, u32 ow, u32 oh,
+                                      float frame_ms);
+    bool EnsureFrameGeneration(u32 w, u32 h, u32 ow, u32 oh);
+    void DestroyFrameGeneration();
+    FfxVkFsr3_3_1_6FrameGenerationContext* fg_context = nullptr;
+    std::mutex fg_mutex; ///< the context is used on the recording threads
+    VideoCore::UniqueImage fg_hudless, fg_color, fg_output, fg_depth;
+    vk::UniqueImageView fg_hudless_view, fg_color_view, fg_output_view;
+    std::unordered_map<VkImage, vk::UniqueImageView> fg_final_views;
+    vk::UniqueDescriptorSetLayout fg_capture_desc_layout, fg_compose_desc_layout;
+    vk::UniquePipelineLayout fg_capture_pipeline_layout, fg_compose_pipeline_layout;
+    vk::UniquePipeline fg_capture_pipeline, fg_compose_pipeline;
+    u32 fg_width = 0, fg_height = 0, fg_render_width = 0, fg_render_height = 0;
+    u32 fg_input_width = 0, fg_input_height = 0;
+    bool fg_inputs = false; ///< this frame's hudless scene and depth are captured
+    bool fg_reset = true;
+    bool fg_disabled = false;
+    std::atomic<bool> fg_failed{false};
+    u64 fg_frame_id = 0;
+    float fg_frame_ms = 16.6f, fg_near = 0.1f, fg_fov = 1.0f;
+    std::array<float, 2> fg_jitter{};
     FfxVkPortableUpscaleContext* context = nullptr;
     bool resources_ready = false; ///< images below match width/height/out size
     bool resources_fsr4 = false;  ///< made for FSR 4 (no FSR 3 context)

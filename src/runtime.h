@@ -10,7 +10,13 @@ extern __thread sigjmp_buf *runtime_fault_recover;
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
 #endif
+/* The guest's calling convention for host functions it calls. Elsewhere than x86-64 the guest CPU
+ * (guest_cpu.h) converts guest calls to the host's convention. */
+#if defined(__x86_64__)
 #define ABI __attribute__((sysv_abi))
+#else
+#define ABI
+#endif
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
 uintptr_t runtime_resolve(const char *name, int is_data);

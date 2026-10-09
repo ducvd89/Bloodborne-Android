@@ -114,7 +114,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
-    info.Deserialize(ar);
+    // bbport: e.g. an SRT walker for another host (x86-64 code on arm64): recompiled instead.
+    if (!info.Deserialize(ar)) {
+        return false;
+    }
 
     // Motion vertex shaders embed session-local buffer device addresses. They must be
     // recompiled for the current allocation, never loaded from a previous process.
@@ -497,9 +500,18 @@ bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
 void PersistentSrtInfo::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer srt{ar};
 
+    // bbport: no walker (one from the cache that this host could not use): stored without code.
+    const auto* code = static_cast<const u8*>(SrtWalkerCode(walker_func));
+    if (walker_func_size && !code) {
+        PersistentSrtInfo copy = *this;
+        copy.walker_func = {};
+        copy.walker_func_size = 0;
+        srt.Write(&copy, sizeof(copy));
+        return;
+    }
     srt.Write(this, sizeof(*this));
     if (walker_func_size) {
-        srt.Write(reinterpret_cast<void*>(walker_func), walker_func_size);
+        srt.Write(code, walker_func_size);
     }
 }
 
@@ -507,6 +519,8 @@ bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader srt{ar};
 
     srt.Read(this, sizeof(*this));
+    // bbport: the stored walker pointer belonged to the process that wrote the file.
+    walker_func = {};
 
     if (walker_func_size) {
         // bbport: the size is checked before the code is registered (it becomes executable):
@@ -514,6 +528,10 @@ bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar) {
         const auto code = ar.CurrPtr();
         ar.Advance(walker_func_size);
         walker_func = RegisterWalkerCode(code, walker_func_size);
+        if (!walker_func) {
+            walker_func_size = 0;
+            return false;
+        }
     }
 
     return true;

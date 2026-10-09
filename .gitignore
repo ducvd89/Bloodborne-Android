@@ -33,7 +33,7 @@ patches.json
 # Android/local setup and user-owned game data must stay outside source control.
 /.local-deps/
 /PKGs/
-/game/
+/game
 /build-local.sh
 /launch-local.sh
 /build-fsr411-local.sh

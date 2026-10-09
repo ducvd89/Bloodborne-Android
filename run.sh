@@ -143,8 +143,15 @@ if [[ ${MANGOHUD:-0} == 1 ]]; then
     elif grep -qs '"VK_LAYER_MANGOHUD' /usr/share/vulkan/implicit_layer.d/*.json \
             /etc/vulkan/implicit_layer.d/*.json \
             "${XDG_DATA_HOME:-$HOME/.local/share}"/vulkan/implicit_layer.d/*.json; then
-        # The system's own MangoHud (and its config) is used; the bundled one is skipped.
-        export VK_LOADER_LAYERS_DISABLE=${VK_LOADER_LAYERS_DISABLE:+$VK_LOADER_LAYERS_DISABLE,}VK_LAYER_MANGOHUD_overlay_64_x86_64
+        # The system's own MangoHud (and its config) is used; the bundled one is skipped. On
+        # aarch64 both layers have the same name and the loader keeps only one of them.
+        if [[ $(uname -m) == x86_64 ]]; then
+            export VK_LOADER_LAYERS_DISABLE=${VK_LOADER_LAYERS_DISABLE:+$VK_LOADER_LAYERS_DISABLE,}VK_LAYER_MANGOHUD_overlay_64_x86_64
+        fi
+    elif [[ -f mangohud/MangoHud.conf && -z ${MANGOHUD_CONFIG:-}${MANGOHUD_CONFIGFILE:-} \
+            && ! -e ${XDG_CONFIG_HOME:-$HOME/.config}/MangoHud/MangoHud.conf ]]; then
+        # The package's layout (GPU load/clock/temperature) unless the user has their own.
+        export MANGOHUD_CONFIGFILE=$PWD/mangohud/MangoHud.conf
     fi
 fi
 # Write tracking with userfaultfd write-protection instead of mprotect (no address-space write lock:

@@ -98,6 +98,8 @@ add_host_shader(taa_sharpen.comp taa_sharpen_ldr_comp LDR_OUTPUT=1)
 add_host_shader(fsr4_color.comp fsr4_decode_comp)
 add_host_shader(fsr4_color.comp fsr4_encode_comp ENCODE=1)
 add_host_shader(fsr4_reactive.comp fsr4_reactive_comp)
+add_host_shader(frame_gen.comp frame_gen_capture_comp CAPTURE=1)
+add_host_shader(frame_gen.comp frame_gen_compose_comp)
 add_host_shader(buffer_multi_copy.comp buffer_multi_copy_comp)
 add_host_shader(depth_resample.frag depth_resample_frag)
 add_host_shader(depth_resample.frag depth_stencil_resample_frag HAS_STENCIL=1)
@@ -155,7 +157,8 @@ target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-f
 target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
 target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
-target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan
+    ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 

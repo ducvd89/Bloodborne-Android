@@ -6,6 +6,7 @@
 #include "common/thread.h"
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_state.h"
+#include "bbport_guest_call.h"
 #include "core/libraries/kernel/process.h"
 
 #include <magic_enum/magic_enum.hpp>
@@ -92,7 +93,7 @@ void AvPlayerState::DefaultEventCallback(void* opaque, AvPlayerEvents event_id, 
     const auto callback = self->m_event_replacement.event_callback;
     const auto ptr = self->m_event_replacement.object_ptr;
     if (callback != nullptr) {
-        callback(ptr, event_id, 0, event_data);
+        GuestCall(callback, ptr, event_id, 0, event_data);
     }
 }
 

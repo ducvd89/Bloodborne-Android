@@ -54,6 +54,12 @@ class PackagedVulkanTests(unittest.TestCase):
                 self.assertEqual(self.env, before)
                 del self.env[key]
 
+    def test_host_mesa_override_falls_back_to_bundled_drivers(self):
+        self.env["VK_ICD_FILENAMES"] = str(self.icds / "freedreno_icd.aarch64.json")
+        self.assertIn("ignoring VK_ICD_FILENAMES", self.configure())
+        self.assertNotIn("VK_ICD_FILENAMES", self.env)
+        self.assertEqual(self.env["VK_DRIVER_FILES"], self.env["BB_BUNDLED_VK_DRIVER_FILES"])
+
     def test_host_nvidia_and_compiler_are_exposed_without_host_libc(self):
         driver = self.library("libGLX_nvidia.so.580.1")
         (self.libs / "libGLX_nvidia.so.0").symlink_to(driver.name)

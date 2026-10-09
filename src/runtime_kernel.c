@@ -3,6 +3,7 @@
  * use FreeBSD numbering; host errno values never reach the guest directly. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "guest_cpu.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +23,6 @@
 #include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/time.h>
-#include <x86intrin.h>
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define PAGE 16384
 
@@ -91,19 +91,9 @@ static ABI uint64_t process_time_counter(void) {
     return (uint64_t)(t.tv_sec-process_start.tv_sec)*1000000000+(uint64_t)(t.tv_nsec-process_start.tv_nsec);
 }
 static ABI uint64_t process_time_frequency(void) { return 1000000000; }
-static ABI uint64_t read_tsc(void) { return __rdtsc(); }
-static uint64_t tsc_hz;
-static ABI uint64_t tsc_frequency(void) {
-    if (!tsc_hz) {
-        struct timespec a,b,nap={0,20000000};
-        clock_gettime(CLOCK_MONOTONIC,&a); uint64_t t0=__rdtsc();
-        nanosleep(&nap,NULL);
-        clock_gettime(CLOCK_MONOTONIC,&b); uint64_t t1=__rdtsc();
-        uint64_t ns=(uint64_t)(b.tv_sec-a.tv_sec)*1000000000+(uint64_t)(b.tv_nsec-a.tv_nsec);
-        tsc_hz=(t1-t0)*1000000000/(ns ? ns : 1);
-    }
-    return tsc_hz;
-}
+/* The guest reads the same counter with RDTSC. */
+static ABI uint64_t read_tsc(void) { return guest_cpu_tsc(); }
+static ABI uint64_t tsc_frequency(void) { return guest_cpu_tsc_frequency(); }
 /* Shared with the GPU library so flip/label timestamps use the guest's clock. */
 uint64_t runtime_process_time_us(void) { return process_time(); }
 uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
@@ -234,7 +224,7 @@ static ABI int32_t thread_once(int32_t *once,void (ABI *routine)(void)) {
         int32_t state=__atomic_load_n(once,__ATOMIC_ACQUIRE);
         if (state==1) return 0;
         if (state==0 && __atomic_compare_exchange_n(once,&state,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
-            routine();
+            guest_cpu_call((uintptr_t)routine,0,NULL);
             __atomic_store_n(once,1,__ATOMIC_RELEASE);
             return 0;
         }
@@ -278,7 +268,8 @@ void runtime_thread_keys_cleanup(void) {
             void *value=key_values[i];
             if (!value || !keys[i].used || !keys[i].destructor) continue;
             key_values[i]=NULL; any=1;
-            keys[i].destructor(value);
+            const uint64_t argument=(uint64_t)(uintptr_t)value;
+            guest_cpu_call((uintptr_t)keys[i].destructor,1,&argument);
         }
         if (!any) break;
     }
@@ -332,6 +323,15 @@ void runtime_guest_call_sites(uint64_t out[3]);
 /* The first three return addresses into the game's code on this thread's stack (guest offsets). */
 static void guest_call_sites(uint64_t out[3]) {
     const uintptr_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
+#ifndef GUEST_CPU_NATIVE
+    /* The guest stack is not the host's: read from the guest call into the runtime. */
+    uint64_t stack[400]={0};
+    struct iovec local={stack,sizeof(stack)}, remote={(void *)guest_cpu_stack_pointer(),sizeof(stack)};
+    const ssize_t got=remote.iov_base ? process_vm_readv(getpid(),&local,1,&remote,1,0) : 0;
+    int found=0;
+    out[0]=out[1]=out[2]=0;
+    for (ssize_t i=0;i<got/8 && found<3;++i) if (stack[i]>=text_lo && stack[i]<text_hi) out[found++]=stack[i]-text_lo;
+#else
     static _Thread_local uintptr_t stack_hi;
     if (!stack_hi) {
         pthread_attr_t attr; void *base=NULL; size_t size=0;
@@ -342,6 +342,7 @@ static void guest_call_sites(uint64_t out[3]) {
     int found=0;
     out[0]=out[1]=out[2]=0;
     for (int i=0;i<400 && found<3 && (uintptr_t)(sp+i+1)<=stack_hi;++i) if (sp[i]>=text_lo && sp[i]<text_hi) out[found++]=sp[i]-text_lo;
+#endif
 }
 void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
@@ -397,14 +398,17 @@ static uint64_t sample_rips[1024], sample_callers[1024];
 static _Atomic uint64_t samples_total;
 static void sample_handler(int sig, siginfo_t *info, void *context) {
     (void)sig; (void)info;
-    const ucontext_t *uc=(const ucontext_t *)context;
-    uint64_t rip=(uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+    GuestRegs regs;
+    const int in_guest=guest_cpu_signal_regs(context,&regs);
+    uint64_t rip=in_guest==GUEST_CPU_IN_GUEST ? regs.rip : guest_cpu_host_pc(context);
     const uint64_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
     /* Host code: keyed with its guest caller, the first return address into the game on the stack. */
     uint64_t caller=0;
-    if (rip<text_lo || rip>=text_hi) {
+    if (in_guest==GUEST_CPU_IN_HOST_CALL) {
+        if (regs.rip>=text_lo && regs.rip<text_hi) caller=regs.rip-text_lo;
+    } else if (rip<text_lo || rip>=text_hi) {
         uint64_t stack[256]={0};
-        struct iovec local={stack,sizeof(stack)}, remote={(void *)uc->uc_mcontext.gregs[REG_RSP],sizeof(stack)};
+        struct iovec local={stack,sizeof(stack)}, remote={(void *)regs.gpr[GUEST_RSP],sizeof(stack)};
         const ssize_t got=process_vm_readv(getpid(),&local,1,&remote,1,0);
         for (ssize_t i=0;i<got/8;++i) if (stack[i]>=text_lo && stack[i]<text_hi) { caller=stack[i]-text_lo; break; }
     }

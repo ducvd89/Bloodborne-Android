@@ -9,7 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
-#include <x86intrin.h>
+#include "bbport_cpu.h"
 
 #include "common/thread.h"
 #include "common/types.h"
@@ -66,11 +66,11 @@ public:
         }
         const u64 target = posted.load(std::memory_order_relaxed);
         if (done.load(std::memory_order_acquire) != target) {
-            const u64 start = __rdtsc();
+            const u64 start = BbCpu::Cycles();
             while (done.load(std::memory_order_acquire) != target) {
-                __builtin_ia32_pause();
+                BbCpu::Pause();
             }
-            wait_cycles += __rdtsc() - start;
+            wait_cycles += BbCpu::Cycles() - start;
         }
         active = false;
     }
@@ -90,7 +90,7 @@ private:
             const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
             u64 now = posted.load(std::memory_order_acquire);
             for (u32 spins = 1; now == seen; ++spins) {
-                __builtin_ia32_pause();
+                BbCpu::Pause();
                 if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
                     sleeping.store(true, std::memory_order_seq_cst);
                     posted.wait(seen, std::memory_order_seq_cst);
@@ -102,9 +102,9 @@ private:
                 break;
             }
             seen = now;
-            const u64 start = __rdtsc();
+            const u64 start = BbCpu::Cycles();
             task(context);
-            task_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            task_cycles.fetch_add(BbCpu::Cycles() - start, std::memory_order_relaxed);
             done.store(seen, std::memory_order_release);
         }
     }

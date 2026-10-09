@@ -636,7 +636,8 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     info.Queue = instance.GetGraphicsQueue();
     info.DescriptorPoolSize = 16;
     info.MinImageCount = std::max(image_count, 2u);
-    info.ImageCount = std::max(image_count, 2u);
+    // bbport: two more, as the presenter (frame generation: two presents per game frame).
+    info.ImageCount = std::max(image_count, 2u) + 2;
     info.UseDynamicRendering = true;
     info.PipelineInfoMain.PipelineRenderingCreateInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,

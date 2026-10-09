@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: FSR 3.1 frame generation (vk_temporal_upscaler.cpp, BB_FRAME_GEN=1).
+// CAPTURE: the finished display frame (read through a UNORM view: its sRGB-encoded bits, in
+// RGBA order whatever the display format's order) into the RGBA8 frame generation input.
+// COMPOSE (in place on the generated frame): where the UI changed the frame (the finished frame
+// differs from the upscaled scene before the UI), the current frame's pixels are kept: the UI is
+// not interpolated along the scene's motion. Elsewhere the generated pixels stay.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef CAPTURE
+layout(binding = 0) uniform texture2D final_tex;
+layout(binding = 1, rgba8) uniform writeonly image2D result_img;
+#else
+layout(binding = 0, rgba8) uniform image2D generated_img;
+layout(binding = 1, rgba8) uniform readonly image2D hudless_img;
+layout(binding = 2, rgba8) uniform readonly image2D final_img;
+layout(push_constant) uniform Push {
+    float threshold;
+};
+#endif
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+#ifdef CAPTURE
+    if (any(greaterThanEqual(pixel, imageSize(result_img)))) {
+        return;
+    }
+    imageStore(result_img, pixel, texelFetch(final_tex, pixel, 0));
+#else
+    if (any(greaterThanEqual(pixel, imageSize(generated_img)))) {
+        return;
+    }
+    const vec4 final_color = imageLoad(final_img, pixel);
+    const vec4 scene = imageLoad(hudless_img, pixel);
+    if (any(greaterThan(abs(final_color.rgb - scene.rgb), vec3(threshold)))) {
+        imageStore(generated_img, pixel, vec4(final_color.rgb, 1.0));
+    }
+#endif
+}

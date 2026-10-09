@@ -101,6 +101,13 @@ public:
 
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
+    /// bbport: the frame generated for the frame PrepareFrame just returned (FSR 3.1 frame
+    /// generation), to be presented half a frame before it; null when there is none.
+    Frame* TakeGeneratedFrame() {
+        Frame* frame = generated_frame;
+        generated_frame = nullptr;
+        return frame;
+    }
 
 private:
     Frame* GetRenderFrame();
@@ -124,6 +131,7 @@ private:
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
     std::deque<u64> recent_frame_ticks; ///< bbport: BB_FRAMES_AHEAD bound (PrepareFrame)
+    Frame* generated_frame = nullptr; ///< bbport: TakeGeneratedFrame
     Scheduler present_scheduler;
     Scheduler flip_scheduler;
     Swapchain swapchain;

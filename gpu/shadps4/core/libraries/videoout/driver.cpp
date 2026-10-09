@@ -5,6 +5,7 @@
 #include <cmath>
 #include <vector>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <time.h>
 #include <sys/resource.h>
@@ -368,9 +369,29 @@ static void PrintMemory() {
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    // bbport: frame generation: the generated frame goes first and the real one half a flip
+    // interval later (the average of the last flips, so frames come at an even rate).
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point last_flip{};
+    static double interval_ms = 33.3;
+    const auto flip_time = Clock::now();
+    if (last_flip != Clock::time_point{}) {
+        const double ms = std::chrono::duration<double, std::milli>(flip_time - last_flip).count();
+        if (ms > 0.0 && ms < 200.0) {
+            interval_ms += (ms - interval_ms) * 0.2;
+        }
+    }
+    last_flip = flip_time;
+    const auto half = std::chrono::microseconds(s64(std::clamp(interval_ms, 8.0, 100.0) * 500.0));
     // Update HDR status before presenting, then present the frame (bbport: on the swap thread).
-    RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
+    RunPresenter([this, frame = req.frame, generated = req.generated, hdr = req.port->is_hdr,
+                  half] {
         presenter->SetHDR(hdr);
+        if (generated) {
+            const auto shown = Clock::now();
+            presenter->Present(generated);
+            std::this_thread::sleep_until(shown + half);
+        }
         presenter->Present(frame);
     });
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
@@ -781,11 +802,13 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
+    Vulkan::Frame* const generated = presenter->TakeGeneratedFrame();
 
     {
         std::scoped_lock lock{mutex};
         requests.push({
             .frame = frame,
+            .generated = generated,
             .port = port,
             .flip_arg = flip_arg,
             .index = index,

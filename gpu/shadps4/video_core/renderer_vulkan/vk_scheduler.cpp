@@ -14,6 +14,7 @@
 #include <functional>
 
 #include "bbport_copy.h"
+#include "bbport_cpu.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_toggles.h"
 #include "bbport_wait_trace.h"
@@ -673,7 +674,7 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
             for (u32 spins = 1; worker.queued.load(std::memory_order_acquire) == 0 &&
                                 ordered_queued.load(std::memory_order_acquire) == 0;
                  ++spins) {
-                __builtin_ia32_pause();
+                BbCpu::Pause();
                 // The clock is read every 256 pauses, not per iteration.
                 if (!(spins & 255) &&
                     (stoken.stop_requested() || std::chrono::steady_clock::now() >= spin_until)) {

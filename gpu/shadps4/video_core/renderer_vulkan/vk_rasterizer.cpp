@@ -1104,13 +1104,13 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         self.buffer_cache.NewPacket();
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
         if (BbSections::Enabled()) {
-            const u64 t0 = __rdtsc();
+            const u64 t0 = BbCpu::Cycles();
             task.task(self, data + sizeof(TaskPacket));
             void* fn = reinterpret_cast<void*>(task.task);
             for (std::size_t k = 0; k < TaskKinds; ++k) {
                 if (task_kinds[k] == fn || !task_kinds[k]) {
                     task_kinds[k] = fn;
-                    task_cycles[k] += __rdtsc() - t0;
+                    task_cycles[k] += BbCpu::Cycles() - t0;
                     ++task_counts[k];
                     break;
                 }
@@ -1256,13 +1256,13 @@ void Rasterizer::PrintPipeStats() {
     }
     static auto window = std::chrono::steady_clock::now();
     static u64 last_packets = 0, last_drains = 0, last_drain_cycles = 0, last_busy = 0;
-    static u64 last_tsc = __rdtsc();
+    static u64 last_tsc = BbCpu::Cycles();
     const auto now = std::chrono::steady_clock::now();
     const double seconds = std::chrono::duration<double>(now - window).count();
     if (seconds < 5.0) {
         return;
     }
-    const u64 tsc = __rdtsc();
+    const u64 tsc = BbCpu::Cycles();
     const double cycles = double(tsc - last_tsc);
     const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
     std::printf("Draw pipe: %.0f draws/s pipelined, %.0f drains/s that waited, stage A waited "

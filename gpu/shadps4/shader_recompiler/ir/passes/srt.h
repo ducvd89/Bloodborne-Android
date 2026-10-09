@@ -5,6 +5,7 @@
 
 #include <boost/container/set.hpp>
 #include <boost/container/small_vector.hpp>
+#include "common/arch.h"
 #include "common/types.h"
 
 namespace Serialization {
@@ -13,7 +14,29 @@ struct Archive;
 
 namespace Shader {
 
+#ifdef ARCH_X86_64
 using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*flat_dst*/);
+inline const void* SrtWalkerCode(PFN_SrtWalker walker) {
+    return reinterpret_cast<const void*>(walker);
+}
+#else
+/// Other hosts: the walker is a program for RunSrtProgram, not machine code.
+void RunSrtProgram(const u32* program, const u32* user_data, u32* flat_dst);
+struct SrtWalker {
+    const u32* program{};
+    void operator()(const u32* user_data, u32* flat_dst) const {
+        RunSrtProgram(program, user_data, flat_dst);
+    }
+    explicit operator bool() const {
+        return program != nullptr;
+    }
+};
+using PFN_SrtWalker = SrtWalker;
+inline const void* SrtWalkerCode(PFN_SrtWalker walker) {
+    return walker.program;
+}
+#endif
+/// The walker for code from SrtWalkerCode (the shader cache); empty if it is not usable here.
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 
 struct PersistentSrtInfo {

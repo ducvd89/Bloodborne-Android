@@ -1,11 +1,13 @@
 {
   "Config": {
     "TSOEnabled": "1",
-    "VectorTSOEnabled": "1",
-    "MemcpySetTSOEnabled": "1",
+    "VectorTSOEnabled": "0",
+    "MemcpySetTSOEnabled": "0",
     "HalfBarrierTSOEnabled": "1",
-    "X87ReducedPrecision": "0",
+    "X87ReducedPrecision": "1",
     "Multiblock": "1",
+    "DisableL2Cache": "0",
+    "DynamicL1Cache": "0",
     "DiskCache": "0"
   }
 }

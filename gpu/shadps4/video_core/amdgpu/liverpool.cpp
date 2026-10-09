@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <array>
 #include <time.h>
+#include "bbport_cpu.h"
 #include "bbport_threads.h"
 #include "bbport_ce_stats.h"
 #include "bbport_timeline.h"
@@ -169,7 +170,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 for (u32 spins = 1; !(num_commands || num_submits || submit_done) &&
                                     !stoken.stop_requested();
                      ++spins) {
-                    __builtin_ia32_pause();
+                    BbCpu::Pause();
                     if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
                         break;
                     }
