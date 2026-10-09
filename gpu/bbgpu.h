@@ -30,6 +30,10 @@ int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);
 int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int bbgpu_overlay_captures_input(void);
+/* Window-thread snapshot: mouse velocity in pixels/second, SDL button bitmask.
+ * Mouse input is zero while released, unfocused, in a text dialog or in the overlay. */
+typedef struct { float x, y; uint32_t buttons; int focused; } BbMouseState;
+void bbgpu_mouse_state(BbMouseState *state);
 /* Patches the loaded image before the game runs (image still writable): libGnm entry hooks. */
 void bbgpu_patch_image(unsigned char *image, uint64_t size);
 /* Number of symbols registered by the vendored libraries (diagnostics). */

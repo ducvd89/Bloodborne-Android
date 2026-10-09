@@ -29,6 +29,7 @@ public:
         vk::Image image;
         vk::ImageView view;
         u32 width, height;
+        vk::Format format = vk::Format::eR16G16B16A16Sfloat;
     };
     struct Frame {
         vk::CommandBuffer cmdbuf;

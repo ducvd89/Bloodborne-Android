@@ -327,6 +327,8 @@ public:
     }
 
     /// Returns the vendor ID of the physical device
+    bool IsDlssSupported() const { return dlss_supported; }
+
     u32 GetVendorID() const {
         return properties.vendorID;
     }
@@ -599,6 +601,7 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool compute_shader_derivatives{};
+    bool dlss_supported = false;
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool cooperative_matrix{};      // bbport: VK_KHR_cooperative_matrix (FSR 4.1.1 FP8 variant)
     bool shader_float8{};           // bbport: VK_EXT_shader_float8 with FP8 matrices (RDNA4)

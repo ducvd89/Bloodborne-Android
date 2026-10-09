@@ -30,3 +30,15 @@ patches.json
 /docs/ISSUE_ACTION_PLAN_*.md
 # AMD FidelityFX DLLs (FSR 4.1.1 is built from the user's own): never in the repository
 *.dll
+# Android/local setup and user-owned game data must stay outside source control.
+/.local-deps/
+/PKGs/
+/game/
+/build-local.sh
+/launch-local.sh
+/build-fsr411-local.sh
+/INSTALL-LOCAL.md
+*.apk
+*.wcp
+*.keystore
+*.jks

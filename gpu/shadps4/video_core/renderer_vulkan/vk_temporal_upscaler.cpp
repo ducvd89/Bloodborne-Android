@@ -180,6 +180,16 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
     BbSettings::ConfigureUpscalerSupport(instance.IsFsr4Int8Supported(),
                                          instance.IsFsr411Supported());
     fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
+    if (instance.IsDlssSupported()) {
+        dlss = std::make_unique<Dlss::Upscaler>(instance.GetInstance(), instance.GetPhysicalDevice(),
+            instance.GetDevice(), [this] { scheduler.WaitSubmittedWork(); });
+    }
+    BbSettings::Get().dlss_supported = dlss && dlss->Available();
+    if (BbSettings::Get().upscaler == BbSettings::UpscalerDlss && !BbSettings::Get().dlss_supported) {
+        std::printf("DLSS unavailable: %s; using FSR 3.1\n",
+            dlss ? dlss->Problem().c_str() : "SDK or NVIDIA Vulkan extensions missing");
+        BbSettings::Get().upscaler = BbSettings::UpscalerFsr3;
+    }
     // Available unless BB_UPSCALER=none; on/off and the parameters are the menu's settings.
     const char* env = std::getenv("BB_UPSCALER");
     enabled = !(env && std::strcmp(env, "none") == 0);
@@ -238,7 +248,7 @@ bool TemporalUpscaler::Active() const {
     // Toggle 1 << 24 switches it off at run time (A/B); history restarts after.
     return enabled && !failed &&
            (BbSettings::Get().upscaler == BbSettings::UpscalerFsr3 ||
-            BbSettings::IsFsr4(BbSettings::Get().upscaler) ||
+            BbSettings::IsExternalUpscaler(BbSettings::Get().upscaler) ||
             BbSettings::Get().upscaler == BbSettings::UpscalerTaa) &&
            !BbToggle::Disabled(1u << 24);
 }
@@ -359,7 +369,7 @@ bool TemporalUpscaler::OnFrameStart() {
         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
         scheduler.Finish();
         fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
-        if (BbSettings::IsFsr4(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
+        if (BbSettings::IsExternalUpscaler(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
     }
     if (applied_upscaler != upscaler) fsr4_failed = false; // retry after a menu change
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
@@ -418,7 +428,7 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
 }
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
-    const bool use_fsr4 = UseFsr4();
+    const bool use_fsr4 = UseExternalUpscaler();
     const bool use_taa = BbSettings::Get().upscaler == BbSettings::UpscalerTaa;
     if (use_taa && (w != ow || h != oh)) {
         std::printf("TAA: remove BB_RENDER_RES to use native-resolution TAA\n");
@@ -577,7 +587,8 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
         return true;
     }
     if (use_fsr4) {
-        std::printf("Upscaler: FSR 4 inputs %ux%u -> %ux%u\n", w, h, ow, oh);
+        std::printf("Upscaler: %s inputs %ux%u -> %ux%u\n",
+                    BbSettings::UpscalerName(BbSettings::Get().upscaler), w, h, ow, oh);
         return true;
     }
     FfxVkPortableMemoryUsage usage{};
@@ -1190,9 +1201,9 @@ void TemporalUpscaler::Run() {
     if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
         RecordTaa(cmdbuf, input_color_view, input_depth_view);
         dispatched = true;
-    } else if (UseFsr4()) {
-        dispatched = RecordFsr4(cmdbuf, {input_color, input_color_view, w, h},
-                                {input_depth, input_depth_view, w, h}, w, h, ow, oh, frame_ms);
+    } else if (UseExternalUpscaler()) {
+        dispatched = RecordExternalUpscaler(cmdbuf, {input_color, input_color_view, w, h, color.info.pixel_format},
+                                {input_depth, input_depth_view, w, h, depth_format}, w, h, ow, oh, frame_ms);
         if (dispatched && has_reactive) {
             RecordFsr4Reactive(cmdbuf, input_color_view, w, h, ow, oh);
         }
@@ -1752,7 +1763,7 @@ void TemporalUpscaler::RunScaled() {
     last_frame = now;
 
     // bbport: FSR 4 writes its HDR-format output, copied into the output-size UI image.
-    if (UseFsr4() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
+    if (UseExternalUpscaler() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
         const auto cmdbuf = scheduler.CommandBuffer(); // after the commands recorded above
         barrier(vk::Image(output_image), vk::ImageAspectFlagBits::eColor,
                 vk::ImageLayout::eUndefined, all, vk::AccessFlagBits2::eNone,
@@ -1773,12 +1784,12 @@ void TemporalUpscaler::RunScaled() {
                 vk::to_string(color.info.pixel_format).find("Srgb") != std::string::npos;
             fsr4_linear_frame = linear_env && fsr4_linear_image && !srgb_format &&
                                 !BbToggle::Disabled(BbToggle::Fsr4EncodedInput);
-            Fsr4Upscaler::Image input{color_image, color_view, source_width, source_height};
+            Fsr4Upscaler::Image input{color_image, color_view, source_width, source_height, color.info.pixel_format};
             {
                 static int reported = -1;
                 if (int(fsr4_linear_frame) != reported) {
                     reported = int(fsr4_linear_frame);
-                    std::printf("Upscaler: FSR 4 input %s (%s)\n",
+                    std::printf("Upscaler: external provider input %s (%s)\n",
                                 fsr4_linear_frame ? "decoded to linear light" : "as it is",
                                 vk::to_string(color.info.pixel_format).c_str());
                 }
@@ -1824,8 +1835,8 @@ void TemporalUpscaler::RunScaled() {
                 input = {vk::Image(fsr4_linear_image), *fsr4_linear_view, source_width,
                          source_height};
             }
-            ok4 = RecordFsr4(cmdbuf, input,
-                            {depth_image, depth_view, source_width, source_height}, w, h, ow,
+            ok4 = RecordExternalUpscaler(cmdbuf, input,
+                            {depth_image, depth_view, source_width, source_height, depth_format}, w, h, ow,
                             oh, frame_ms);
             if (ok4 && fsr4_linear_frame) {
                 const vk::MemoryBarrier2 upscaled{
@@ -2165,18 +2176,39 @@ void TemporalUpscaler::DumpPresented(vk::Image image, u32 width, u32 height, vk:
 
 namespace Vulkan {
 
-bool TemporalUpscaler::UseFsr4() const {
+bool TemporalUpscaler::UseExternalUpscaler() const {
     const int selected = BbSettings::Get().upscaler;
-    const bool supported = selected == BbSettings::UpscalerFsr411
+    const bool supported = selected == BbSettings::UpscalerDlss ? (dlss && dlss->Available())
+                             : selected == BbSettings::UpscalerFsr411
                                ? instance.IsFsr411Supported()
                                : instance.IsFsr4Int8Supported();
-    return BbSettings::IsFsr4(selected) && supported && !fsr4_failed;
+    return BbSettings::IsExternalUpscaler(selected) && supported && !fsr4_failed;
 }
 
-bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color,
+bool TemporalUpscaler::RecordExternalUpscaler(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color,
                                   Fsr4Upscaler::Image depth, u32 w, u32 h, u32 ow, u32 oh,
                                   float frame_ms) {
     const auto& settings = BbSettings::Get();
+    if (settings.upscaler == BbSettings::UpscalerDlss && dlss) {
+        const bool ok = dlss->Record({
+            .command = cmdbuf,
+            .color = {color.image, color.view, VkFormat(color.format), color.width, color.height},
+            .depth = {depth.image, depth.view, VkFormat(depth.format), depth.width, depth.height,
+                      VK_IMAGE_ASPECT_DEPTH_BIT},
+            .motion = {vk::Image(motion_image), *motion_view, VK_FORMAT_R16G16_SFLOAT, w, h},
+            .output = {vk::Image(output_image), *output_view, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh},
+            .width = w, .height = h, .preset = applied_preset,
+            .jitter_x = jitter[0], .jitter_y = jitter[1], .reset = reset,
+        });
+        scheduler.GetDynamicState().Invalidate();
+        if (!ok) {
+            std::printf("Upscaler: DLSS failed: %s; falling back to FSR 3.1\n", dlss->Problem().c_str());
+            BbSettings::Get().upscaler = BbSettings::UpscalerFsr3;
+            BbSettings::Get().dlss_supported = false;
+            reset = true;
+        }
+        return ok;
+    }
     // Same jitter convention as FSR 3; the menu (or toggle 1 << 26) flips it for tests.
     const float sign =
         BbToggle::Disabled(1u << 26) != settings.fsr4_invert_jitter.load() ? -1.0f : 1.0f;

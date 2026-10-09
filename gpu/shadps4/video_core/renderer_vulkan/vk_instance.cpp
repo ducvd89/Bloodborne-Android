@@ -273,6 +273,13 @@ bool Instance::CreateDevice() {
     ASSERT_MSG(robustness2_features.nullDescriptor,
                "Required Vulkan feature unavailable: nullDescriptor");
 
+    // Optional NGX Vulkan requirements. Buffer device address is already enabled via Vulkan 1.2.
+#ifdef BB_DLSS_SDK
+    if (GetVendorID() == 0x10de) {
+        dlss_supported = add_extension("VK_NVX_binary_import") &&
+                         add_extension("VK_NVX_image_view_handle");
+    }
+#endif
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);

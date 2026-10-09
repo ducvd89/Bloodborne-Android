@@ -1,4 +1,4 @@
-/* libScePad on SDL3 gamepads and the keyboard. SDL events are pumped by the window thread
+/* libScePad on SDL3 gamepads, keyboard and mouse. SDL events are pumped by the window thread
  * (gpu/shim/window.cpp); here state is only sampled.
  *
  * Keyboard layout (also with a gamepad connected: both drive the game):
@@ -16,6 +16,7 @@
 #include <time.h>
 #include <SDL3/SDL.h>
 #include <sys/stat.h>
+#include <math.h>
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
 #define ERR_INVALID_HANDLE ((int32_t)0x80920003)
@@ -142,7 +143,9 @@ static void report_guest_heap(void) {
  * a left-side click, touchpad_right), and on the keyboard the sticks: move_* (left), look_*
  * (right). Gamepad names as SDL's: a b x y back start leftstick rightstick leftshoulder
  * rightshoulder dpup dpdown dpleft dpright touchpad misc1 paddle1-4, plus lefttrigger and
- * righttrigger. The keyboard works next to a gamepad (the Steam Deck always has one): its buttons
+ * righttrigger. key.* also accepts Mouse Left/Right/Middle/X1/X2. Mouse camera capture is
+ * enabled by mouse_look=1; F10 releases it. mouse_sensitivity scales pixels/second into stick
+ * displacement; mouse_invert_y flips the vertical axis. The keyboard works next to a gamepad: its buttons
  * add to the gamepad's, a held move/look key moves the stick all the way. */
 enum {
     IN_CROSS, IN_CIRCLE, IN_SQUARE, IN_TRIANGLE, IN_L1, IN_R1, IN_L2, IN_R2, IN_L3, IN_R3,
@@ -161,9 +164,21 @@ static const uint32_t input_buttons[IN_COUNT]={
 };
 #define MAX_BIND 4
 enum { PAD_LEFT_TRIGGER=SDL_GAMEPAD_BUTTON_COUNT, PAD_RIGHT_TRIGGER }; /* triggers as buttons */
-typedef struct { int key_count, pad_count; SDL_Scancode keys[MAX_BIND]; int pad[MAX_BIND]; } Binding;
+typedef struct { int key_count, pad_count; SDL_Scancode keys[MAX_BIND]; int pad[MAX_BIND]; uint32_t mouse; } Binding;
 static Binding bindings[IN_COUNT];
 static int bindings_ready;
+static float mouse_sensitivity=0.10f;
+static int mouse_invert_y;
+
+static uint32_t mouse_button_from_name(const char *name) {
+    static const struct { const char *name; int button; } names[]={
+        {"Mouse Left",SDL_BUTTON_LEFT}, {"Mouse Right",SDL_BUTTON_RIGHT},
+        {"Mouse Middle",SDL_BUTTON_MIDDLE}, {"Mouse X1",SDL_BUTTON_X1}, {"Mouse X2",SDL_BUTTON_X2},
+    };
+    for (size_t i=0;i<sizeof(names)/sizeof(*names);++i)
+        if (!SDL_strcasecmp(name,names[i].name)) return SDL_BUTTON_MASK(names[i].button);
+    return 0;
+}
 
 static void bind_defaults(void) {
     static const struct { int input; SDL_Scancode key; } keys[]={
@@ -210,6 +225,12 @@ static void load_bindings(void) {
     if (!f) return;
     char line[512];
     while (fgets(line,sizeof line,f)) {
+        if (!strncmp(line,"mouse_sensitivity=",18)) {
+            float value=strtof(line+18,NULL);
+            if (isfinite(value) && value>0 && value<=10) mouse_sensitivity=value;
+            continue;
+        }
+        if (!strncmp(line,"mouse_invert_y=",15)) { mouse_invert_y=atoi(line+15)!=0; continue; }
         const int keyboard=!strncmp(line,"key.",4), pad=!strncmp(line,"pad.",4);
         char *eq=strchr(line,'=');
         if ((!keyboard && !pad) || !eq) continue;
@@ -218,12 +239,14 @@ static void load_bindings(void) {
         for (int i=0;i<IN_COUNT;++i) if (!strcmp(line+4,input_names[i])) input=i;
         if (input<0 || (pad && input>=IN_MOVE_UP)) { printf("Runtime: controls: unknown input %s\n",line); continue; }
         Binding *b=&bindings[input];
-        if (keyboard) b->key_count=0; else b->pad_count=0;
+        if (keyboard) { b->key_count=0; b->mouse=0; } else b->pad_count=0;
         for (char *name=strtok(eq+1,",\r\n"); name; name=strtok(NULL,",\r\n")) {
             while (*name==' ') ++name;
             for (char *end=name+strlen(name); end>name && end[-1]==' ';) *--end=0;
             if (!*name) continue;
             if (keyboard) {
+                const uint32_t mouse=mouse_button_from_name(name);
+                if (mouse) { b->mouse|=mouse; continue; }
                 const SDL_Scancode s=SDL_GetScancodeFromName(name);
                 if (s==SDL_SCANCODE_UNKNOWN) printf("Runtime: controls: unknown key \"%s\" for %s\n",name,line+4);
                 else if (b->key_count<MAX_BIND) b->keys[b->key_count++]=s;
@@ -236,7 +259,8 @@ static void load_bindings(void) {
     }
     fclose(f);
 }
-static int key_down(const bool *k, int input) {
+static int key_down(const bool *k, uint32_t mouse, int input) {
+    if (bindings[input].mouse & mouse) return 1;
     for (int i=0;i<bindings[input].key_count;++i) if (k[bindings[input].keys[i]]) return 1;
     return 0;
 }
@@ -257,17 +281,30 @@ static int pad_value(SDL_Gamepad *g, int input) {
 static uint8_t key_axis(uint8_t value, int negative, int positive) {
     return negative || positive ? (uint8_t)(128-(negative ? 128 : 0)+(positive ? 127 : 0)) : value;
 }
-static void apply_keyboard(PadData *d, const bool *k) {
+static void apply_keyboard(PadData *d, const bool *k, uint32_t mouse) {
     for (int i=IN_CROSS;i<=IN_RIGHT;++i)
-        if (i!=IN_TOUCHPAD && i!=IN_TOUCHPAD_RIGHT && key_down(k,i)) d->buttons|=input_buttons[i];
-    if (key_down(k,IN_TOUCHPAD)) touch_click(d,0);
-    if (key_down(k,IN_TOUCHPAD_RIGHT)) touch_click(d,1);
-    if (key_down(k,IN_L2)) d->l2=255;
-    if (key_down(k,IN_R2)) d->r2=255;
-    d->left_x=key_axis(d->left_x,key_down(k,IN_MOVE_LEFT),key_down(k,IN_MOVE_RIGHT));
-    d->left_y=key_axis(d->left_y,key_down(k,IN_MOVE_UP),key_down(k,IN_MOVE_DOWN));
-    d->right_x=key_axis(d->right_x,key_down(k,IN_LOOK_LEFT),key_down(k,IN_LOOK_RIGHT));
-    d->right_y=key_axis(d->right_y,key_down(k,IN_LOOK_UP),key_down(k,IN_LOOK_DOWN));
+        if (i!=IN_TOUCHPAD && i!=IN_TOUCHPAD_RIGHT && key_down(k,mouse,i)) d->buttons|=input_buttons[i];
+    if (key_down(k,mouse,IN_TOUCHPAD)) touch_click(d,0);
+    if (key_down(k,mouse,IN_TOUCHPAD_RIGHT)) touch_click(d,1);
+    if (key_down(k,mouse,IN_L2)) d->l2=255;
+    if (key_down(k,mouse,IN_R2)) d->r2=255;
+    d->left_x=key_axis(d->left_x,key_down(k,mouse,IN_MOVE_LEFT),key_down(k,mouse,IN_MOVE_RIGHT));
+    d->left_y=key_axis(d->left_y,key_down(k,mouse,IN_MOVE_UP),key_down(k,mouse,IN_MOVE_DOWN));
+    d->right_x=key_axis(d->right_x,key_down(k,mouse,IN_LOOK_LEFT),key_down(k,mouse,IN_LOOK_RIGHT));
+    d->right_y=key_axis(d->right_y,key_down(k,mouse,IN_LOOK_UP),key_down(k,mouse,IN_LOOK_DOWN));
+}
+
+/* Bloodborne still receives a right stick: lift nonzero movement past its dead zone,
+ * then scale velocity. Do not consume motion here: the game may read pad state many times. */
+static uint8_t mouse_axis(float speed) {
+    if (speed==0 || !isfinite(speed)) return 128;
+    float amount=24+(speed<0 ? -speed : speed)*mouse_sensitivity;
+    if (amount>127) amount=127;
+    return (uint8_t)(128+(speed<0 ? -(int)amount : (int)amount));
+}
+static void apply_mouse(PadData *d, const BbMouseState *mouse) {
+    if (mouse->x!=0) d->right_x=mouse_axis(mouse->x);
+    if (mouse->y!=0) d->right_y=mouse_axis(mouse_invert_y ? -mouse->y : mouse->y);
 }
 
 static void sample_host(PadData *d) {
@@ -280,6 +317,9 @@ static void sample_host(PadData *d) {
     SDL_Gamepad *g=current_gamepad();
     if (!bindings_ready) { load_bindings(); bindings_ready=1; }
     if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
+    BbMouseState mouse;
+    bbgpu_mouse_state(&mouse);
+    if (!mouse.focused) return;
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     if (g) {
         int touch_right=0;
@@ -307,15 +347,16 @@ static void sample_host(PadData *d) {
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
         if (touch_right) touch_click(d,1);
     }
-    if (k) apply_keyboard(d,k);
+    if (k) apply_keyboard(d,k,mouse.buttons);
+    apply_mouse(d,&mouse);
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
  * tokens, re-read when it changes: button names (cross circle square triangle l1 r1 l2 r2 l3 r3
  * options touchpad touchpad_left touchpad_right up down left right) are held while listed;
- * touchpad defaults to a left-side click; lx= ly= rx= ry= (0..255) override
+ * touchpad defaults to a left-side click; lx= ly= rx= ry= l2= r2= (0..255) override
  * the sticks. An empty file releases everything. */
-static struct { uint32_t buttons; int stick[4]; int touch_side; } injected={0,{-1,-1,-1,-1},-1};
+static struct { uint32_t buttons; int stick[4]; int touch_side; int triggers[2]; } injected={0,{-1,-1,-1,-1},-1,{-1,-1}};
 static int replay_armed;      /* 1 while a BB_PAD_REPLAY recording plays, 2 once it ended */
 static uint64_t replay_start; /* 0: (re)start at the next sample */
 static void read_inject(void) {
@@ -341,6 +382,7 @@ static void read_inject(void) {
     injected.buttons=0;
     injected.touch_side=-1;
     for (int i=0;i<4;++i) injected.stick[i]=-1;
+    injected.triggers[0]=injected.triggers[1]=-1;
     char token[64];
     while (fscanf(f,"%63s",token)==1) {
         if (!strcmp(token,"replay") && replay_armed!=1) { replay_armed=1; replay_start=0; } /* BB_PAD_REPLAY */
@@ -350,10 +392,14 @@ static void read_inject(void) {
         }
         for (size_t i=0;i<sizeof(names)/sizeof(*names);++i) if (!strcmp(token,names[i].name)) injected.buttons|=names[i].ps;
         for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }
+        for (int i=0;i<2;++i) if (!strncmp(token,i ? "r2=" : "l2=",3)) {
+            int v=atoi(token+3); injected.triggers[i]=v<0 ? 0 : v>255 ? 255 : v;
+        }
     }
     fclose(f);
-    printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n",injected.buttons,
-           injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3]);
+    if (!getenv("BB_PAD_QUIET"))
+        printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n",injected.buttons,
+               injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3]);
 }
 /* BB_PAD_RECORD=<file>: F9 starts and stops recording the pad state (gamepad or keyboard) with
  * the time since F9; BB_PAD_REPLAY=<file> plays such a recording back, started by the token
@@ -449,6 +495,14 @@ static void sample(PadData *d) {
     else if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
     if (injected.buttons & BTN_L2) d->l2=255;
     if (injected.buttons & BTN_R2) d->r2=255;
+    if (injected.triggers[0]>=0 && !(injected.buttons & BTN_L2)) {
+        d->l2=(uint8_t)injected.triggers[0];
+        if (d->l2>30) d->buttons|=BTN_L2;
+    }
+    if (injected.triggers[1]>=0 && !(injected.buttons & BTN_R2)) {
+        d->r2=(uint8_t)injected.triggers[1];
+        if (d->r2>30) d->buttons|=BTN_R2;
+    }
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
     touch_ids(d);

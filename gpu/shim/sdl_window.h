@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include "common/types.h"
+#include "mouse_input.h"
 
 struct SDL_Window;
 
@@ -34,6 +35,7 @@ public:
     void BeginTextInput(const std::string& initial, const std::string& prompt);
     /// 0 while typing, 1 confirmed (Enter), 2 cancelled (Escape); text is UTF-8.
     int PollTextInput(std::string& text);
+    BbMouseState GetMouseState();
 
 private:
     std::atomic<s32> width, height;
@@ -44,6 +46,10 @@ private:
     std::string text, text_prompt, base_title;
     void UpdateTextTitle();
     void UpdateCursor();
+    void UpdatePointer();
+    std::mutex mouse_mutex;
+    MouseInput mouse_input;
+    bool mouse_look{}, mouse_wanted{true}, mouse_relative{};
     u64 last_mouse_motion_ms{}; ///< SDL_GetTicks of the last mouse motion (UpdateCursor)
     bool cursor_hidden{};
     SDL_Window* window{};

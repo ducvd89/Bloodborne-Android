@@ -47,6 +47,12 @@ int main() {
     s.menu_y = -1.0f;
     BbSettings::Load();
     assert(s.menu_x == 0.625f && s.menu_y == 0.125f && s.upscaler == BbSettings::UpscalerFsr411);
+    s.upscaler = BbSettings::UpscalerDlss;
+    BbSettings::Save();
+    s.upscaler = BbSettings::UpscalerOff;
+    BbSettings::Load();
+    assert(s.upscaler == BbSettings::UpscalerDlss);
+    assert(Read(path).find("upscaler=dlss") != std::string::npos);
     unlink(path);
     std::puts("PASS: settings save keeps other keys, menu position");
 }

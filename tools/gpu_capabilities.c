@@ -102,7 +102,7 @@ static int read_input(const char *kind) {
     SDL_Window *window = NULL;
     SDL_Renderer *renderer = NULL;
     const char *prompt = want_key && want_pad ? "Press a key or a gamepad button"
-                         : want_key           ? "Press a key"
+                         : want_key           ? "Press a key or mouse button"
                                               : "Press a gamepad button";
     if (!SDL_CreateWindowAndRenderer("bbport", 520, 90, 0, &window, &renderer)) {
         fprintf(stderr, "read-input: %s\n", SDL_GetError());
@@ -137,6 +137,13 @@ static int read_input(const char *kind) {
                     done = 1;
                 } else if (want_key) {
                     printf("key %s\n", SDL_GetScancodeName(e.key.scancode));
+                    done = 1;
+                }
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                if (want_key && e.button.button>=SDL_BUTTON_LEFT && e.button.button<=SDL_BUTTON_X2) {
+                    static const char *names[]={"", "Mouse Left", "Mouse Middle", "Mouse Right", "Mouse X1", "Mouse X2"};
+                    printf("key %s\n", names[e.button.button]);
                     done = 1;
                 }
                 break;

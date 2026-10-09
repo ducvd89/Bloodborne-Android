@@ -41,6 +41,8 @@ elseif (BB_PGO STREQUAL "use")
 endif()
 
 find_package(Vulkan REQUIRED)
+# Optional local NVIDIA SDK; proprietary runtime remains outside the source tree.
+set(BB_DLSS_SDK "$ENV{BB_DLSS_SDK}" CACHE PATH "NVIDIA DLSS SDK directory")
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
 find_package(magic_enum REQUIRED)
@@ -125,6 +127,16 @@ add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
+if(BB_DLSS_SDK)
+    if(NOT EXISTS "${BB_DLSS_SDK}/lib/Linux_x86_64/libnvsdk_ngx.a")
+        message(FATAL_ERROR "BB_DLSS_SDK must point to the NVIDIA DLSS SDK")
+    endif()
+    target_include_directories(bbgpu PRIVATE "${BB_DLSS_SDK}/include")
+    target_compile_definitions(bbgpu PRIVATE BB_DLSS_SDK=1
+        BB_DLSS_RUNTIME="${BB_DLSS_SDK}/lib/Linux_x86_64/rel")
+    target_link_libraries(bbgpu PRIVATE "${BB_DLSS_SDK}/lib/Linux_x86_64/libnvsdk_ngx.a"
+        Vulkan::Vulkan ${CMAKE_DL_LIBS})
+endif()
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
@@ -193,3 +205,20 @@ add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
     shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp)
 target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
 target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)
+
+if(BB_DLSS_SDK)
+    add_executable(dlss-device-test EXCLUDE_FROM_ALL ../tests/test_dlss_device.cpp
+        ../tests/test_gpu_runtime_stubs.cpp)
+    target_include_directories(dlss-device-test PRIVATE shim shadps4)
+    target_compile_options(dlss-device-test PRIVATE -fPIC)
+    set_source_files_properties(../tests/test_dlss_device.cpp PROPERTIES
+        COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+    target_link_libraries(dlss-device-test PRIVATE bbgpu)
+    add_executable(dlss-vulkan-test EXCLUDE_FROM_ALL ../tests/test_dlss_vulkan.cpp
+        shadps4/video_core/renderer_vulkan/dlss/dlss.cpp)
+    target_include_directories(dlss-vulkan-test PRIVATE shadps4 "${BB_DLSS_SDK}/include")
+    target_compile_definitions(dlss-vulkan-test PRIVATE BB_DLSS_SDK=1
+        BB_DLSS_RUNTIME="${BB_DLSS_SDK}/lib/Linux_x86_64/rel")
+    target_link_libraries(dlss-vulkan-test PRIVATE "${BB_DLSS_SDK}/lib/Linux_x86_64/libnvsdk_ngx.a"
+        Vulkan::Vulkan ${CMAKE_DL_LIBS})
+endif()

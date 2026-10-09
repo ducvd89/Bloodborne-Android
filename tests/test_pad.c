@@ -4,7 +4,9 @@
 #include "../src/runtime_pad.c"
 
 static int capture;
+static BbMouseState host_mouse={.focused=1};
 int bbgpu_overlay_captures_input(void) { return capture; }
+void bbgpu_mouse_state(BbMouseState *state) { *state=host_mouse; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;
@@ -29,7 +31,9 @@ int main(void) {
     int config_fd=mkstemp(config);
     assert(config_fd>=0);
     const char controls[]="upscaler=fsr3\npad.cross=b\npad.circle=a\npad.r2=rightshoulder\n"
-                          "pad.r1=righttrigger\nkey.cross=X, Space\npad.bogus=a\n";
+                          "pad.r1=righttrigger\nkey.cross=X, Space\npad.bogus=a\n"
+                          "key.r1=Mouse Left, 3\nkey.r2=Mouse Right\nkey.r3=Mouse Middle\n"
+                          "key.l2=Mouse X1\nkey.circle=Mouse X2, Left Shift\nmouse_sensitivity=0.10\n";
     assert(write(config_fd,controls,sizeof(controls)-1)==(ssize_t)(sizeof(controls)-1));
     close(config_fd);
     setenv("BB_CONFIG",config,1);
@@ -48,6 +52,17 @@ int main(void) {
     assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].x==1440);
     inject(path,"");
     assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.touch_count==0);
+
+    /* Android bridge: partial analog triggers, clamping, digital buttons, then release. */
+    inject(path,"lx=0 ry=255 l2=127 r2=20");
+    assert(pad_read_state(1,&data)==0 && data.left_x==0 && data.right_y==255);
+    assert(data.l2==127 && data.r2==20 && data.buttons==BTN_L2);
+    inject(path,"l2=-10 r2=999");
+    assert(pad_read_state(1,&data)==0 && data.l2==0 && data.r2==255 && data.buttons==BTN_R2);
+    inject(path,"l2 l2=0");
+    assert(pad_read_state(1,&data)==0 && data.l2==255 && data.buttons==BTN_L2);
+    inject(path,"");
+    assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.l2==0 && data.r2==0);
 
     SDL_VirtualJoystickTouchpadDesc touch={.nfingers=2};
     SDL_VirtualJoystickDesc desc;
@@ -93,6 +108,36 @@ int main(void) {
     assert(data.buttons==(BTN_CROSS|BTN_R2|BTN_R1) && data.r2==255);
     assert(bindings[IN_CROSS].key_count==2 && bindings[IN_CROSS].keys[0]==SDL_SCANCODE_X &&
            bindings[IN_CROSS].keys[1]==SDL_SCANCODE_SPACE);
+    /* Release the controller; exercise mouse buttons, camera, repeated reads and focus. */
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_EAST,false));
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,false));
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,-32768));
+    SDL_UpdateJoysticks();
+    SDL_UpdateGamepads();
+    host_mouse=(BbMouseState){.buttons=SDL_BUTTON_LMASK|SDL_BUTTON_RMASK|SDL_BUTTON_MMASK|
+                                        SDL_BUTTON_X1MASK|SDL_BUTTON_X2MASK,
+                             .x=500,.y=-500,.focused=1};
+    assert(pad_read_state(1,&data)==0);
+    assert(data.buttons==(BTN_R1|BTN_R2|BTN_R3|BTN_L2|BTN_CIRCLE));
+    assert(data.l2==255 && data.r2==255 && data.right_x>128 && data.right_y<128);
+    PadData again;
+    assert(pad_read_state(1,&again)==0 && again.right_x==data.right_x && again.right_y==data.right_y);
+    mouse_invert_y=1;
+    assert(pad_read_state(1,&data)==0 && data.right_y>128);
+    mouse_invert_y=0;
+    host_mouse.x=1e9f; host_mouse.y=-1e9f;
+    assert(pad_read_state(1,&data)==0 && data.right_x==255 && data.right_y==1);
+    capture=1;
+    assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.right_x==128 && data.right_y==128);
+    capture=0;
+    host_mouse.focused=0;
+    assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.right_x==128 && data.right_y==128);
+    host_mouse=(BbMouseState){.focused=1};
+    assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.right_x==128 && data.right_y==128);
+    bool keys[SDL_SCANCODE_COUNT]={0};
+    keys[SDL_SCANCODE_W]=keys[SDL_SCANCODE_D]=keys[SDL_SCANCODE_SPACE]=true;
+    apply_keyboard(&data,keys,0);
+    assert(data.left_y==0 && data.left_x==255 && (data.buttons & BTN_CROSS));
     SDL_CloseJoystick(joystick);
     if (gamepad) SDL_CloseGamepad(gamepad);
     gamepad=NULL;
@@ -100,5 +145,5 @@ int main(void) {
     SDL_Quit();
     unlink(path);
     unlink(config);
-    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch coordinates, overlay capture, controls");
+    puts("PASS: pad ABI, touchpad, controller, keyboard/mouse bindings, camera, overlay and focus suppression");
 }

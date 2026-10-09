@@ -75,7 +75,7 @@ FSR411_BUILD_ERRORS = {
 
 # Choices: (label, value). The first entry is the default. Labels are translated when shown.
 UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("English", "en"), ("Português (Brasil)", "pt_BR")]
-UPSCALERS = [("FSR 4", "fsr4"), ("FSR 4.1.1", "fsr411"), ("FSR 3", "fsr3"),
+UPSCALERS = [("DLSS 4.5 (experimental)", "dlss"), ("FSR 4", "fsr4"), ("FSR 4.1.1", "fsr411"), ("FSR 3", "fsr3"),
              ("TAA (нативное сглаживание)", "taa"), ("Выключен", "off")]
 PRESETS = [("Native AA", 0), ("Quality (x1.5)", 1), ("Balanced (x1.7)", 2),
            ("Performance (x2)", 3), ("Ultra Performance (x3)", 4)]
@@ -151,6 +151,9 @@ INI_DEFAULTS = {
     "output_res": "1920x1080",
     "model_lod": "0",
     "live_resolution": "0",
+    "mouse_look": "0",
+    "mouse_sensitivity": "0.10",
+    "mouse_invert_y": "0",
     **{key: "1" if default else "0" for key, _, default in EFFECTS},
 }
 
@@ -559,7 +562,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         controls.add(self.gamepad_row)
         # Bindings: "Assign" waits for a key or button (bb-gpu-capabilities --read-input).
         self.control_rows = {}
-        for kind, title, icon in (("key", tr("Клавиатура"), "input-keyboard-symbolic"),
+        for kind, title, icon in (("key", "Keyboard and mouse", "input-keyboard-symbolic"),
                                   ("pad", tr("Геймпад"), "input-gaming-symbolic")):
             expander = Adw.ExpanderRow(title=title,
                                        subtitle=tr("Назначение кнопок; применяется при запуске игры"))
@@ -576,6 +579,18 @@ class LauncherWindow(Adw.ApplicationWindow):
                 self.control_rows[(kind, name)] = (row, default)
                 self.show_control(kind, name)
             controls.add(expander)
+        self.mouse_row = Adw.SwitchRow(title="Mouse camera",
+                                      subtitle="F10 releases/captures the mouse; applies on game restart",
+                                      active=self.ini.get("mouse_look") == "1")
+        controls.add(self.mouse_row)
+        self.mouse_sensitivity_row = Adw.SpinRow.new_with_range(0.01, 1.0, 0.01)
+        self.mouse_sensitivity_row.set_title("Mouse sensitivity")
+        self.mouse_sensitivity_row.set_digits(2)
+        self.mouse_sensitivity_row.set_value(float(self.ini.get("mouse_sensitivity", "0.10")))
+        controls.add(self.mouse_sensitivity_row)
+        self.mouse_invert_row = Adw.SwitchRow(title="Invert mouse Y",
+                                             active=self.ini.get("mouse_invert_y") == "1")
+        controls.add(self.mouse_invert_row)
         page.add(controls)
 
         upscaler = Adw.PreferencesGroup(
@@ -756,7 +771,9 @@ class LauncherWindow(Adw.ApplicationWindow):
 
     def update_upscaler_status(self):
         value = combo_value(self.upscaler_row)
-        if value == "fsr4":
+        if value == "dlss":
+            hint = "NVIDIA RTX: experimental Super Resolution, models M/L. No frame generation."
+        elif value == "fsr4":
             ok = (PORT_DIR / "fsr4_shaders").is_dir()
             hint = tr("Ассеты найдены") if ok else tr("Нет ассетов: tools/fetch_fsr4_assets.sh")
         elif value == "fsr411":
@@ -768,8 +785,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         else:
             hint = tr("Сглаживание в разрешении вывода без модели FSR") if value == "taa" else None
         self.preset_row.set_sensitive(value not in ("taa", "off"))
-        self.sharpen_row.set_sensitive(value != "off")
-        self.sharpness_row.set_sensitive(value != "off")
+        self.sharpen_row.set_sensitive(value not in ("off", "dlss"))
+        self.sharpness_row.set_sensitive(value not in ("off", "dlss"))
         self.upscaler_row.set_subtitle(hint or "")
 
     def game_problem(self, path):
@@ -910,6 +927,9 @@ class LauncherWindow(Adw.ApplicationWindow):
             "output_res": combo_value(self.output_row),
             "model_lod": combo_value(self.lod_row),
             "live_resolution": combo_value(self.live_row),
+            "mouse_look": "1" if self.mouse_row.get_active() else "0",
+            "mouse_sensitivity": f"{self.mouse_sensitivity_row.get_value():.2f}",
+            "mouse_invert_y": "1" if self.mouse_invert_row.get_active() else "0",
             **{key: "1" if row.get_active() else "0" for key, row in self.effect_rows.items()},
         })
         save_ini(self.ini, self.ini_lines)

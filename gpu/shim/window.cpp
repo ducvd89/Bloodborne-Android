@@ -1,6 +1,8 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <fstream>
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -10,6 +12,15 @@
 namespace Frontend {
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
+    // Optional host window size for small displays, independent of guest/UI resolution.
+    if (const char* size = std::getenv("BB_WINDOW_SIZE")) {
+        int w = 0, h = 0;
+        if (std::sscanf(size, "%dx%d", &w, &h) == 2 &&
+            w >= 320 && h >= 180 && w <= 16384 && h <= 16384) {
+            width_ = w;
+            height_ = h;
+        }
+    }
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
@@ -28,6 +39,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+    if (std::getenv("BB_WINDOW_SIZE")) {
+        // Xvfb has no window manager to focus a newly mapped Android game window.
+        SDL_RaiseWindow(window);
+    }
+    if (const char* config = std::getenv("BB_CONFIG")) {
+        std::ifstream file(config);
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.starts_with("mouse_look=")) mouse_look = std::atoi(line.c_str() + 11) != 0;
+        }
+    }
+    mouse_input.Reset(SDL_GetTicks(), false);
 
     const char* driver = SDL_GetCurrentVideoDriver();
     const SDL_PropertiesID wp = SDL_GetWindowProperties(window);
@@ -88,9 +111,20 @@ bool WindowSDL::PollEvents() {
         BbOverlay::UpdateTextInput(window);
     }
     SDL_Event event;
+    UpdatePointer();
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_EVENT_MOUSE_MOTION) {
             last_mouse_motion_ms = SDL_GetTicks();
+            if (mouse_relative) {
+                std::scoped_lock lock{mouse_mutex};
+                mouse_input.Add(event.motion.xrel, event.motion.yrel);
+            }
+        }
+        if (!text_active && !BbOverlay::CapturesInput() &&
+            event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F10) {
+            mouse_wanted = !mouse_wanted;
+            UpdatePointer();
+            continue;
         }
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
             std::scoped_lock lock{text_mutex};
@@ -128,16 +162,42 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
+    UpdatePointer();
     UpdateCursor();
     return is_open;
+}
+
+BbMouseState WindowSDL::GetMouseState() {
+    std::scoped_lock lock{mouse_mutex};
+    return mouse_input.State();
+}
+
+void WindowSDL::UpdatePointer() {
+    const bool focused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    const bool relative = mouse_look && mouse_wanted && focused && !text_active &&
+                          !BbOverlay::CapturesInput();
+    if (relative != mouse_relative) {
+        mouse_relative = relative && SDL_SetWindowRelativeMouseMode(window, true);
+        if (!relative) SDL_SetWindowRelativeMouseMode(window, false);
+        if (relative && !mouse_relative) {
+            LOG_ERROR(Frontend, "Mouse capture failed: {}", SDL_GetError());
+            mouse_wanted = false;
+        }
+        std::scoped_lock lock{mouse_mutex};
+        mouse_input.Reset(SDL_GetTicks(), focused);
+    }
+    std::scoped_lock lock{mouse_mutex};
+    if (mouse_relative) mouse_input.Update(SDL_GetTicks(), SDL_GetMouseState(nullptr, nullptr));
+    else mouse_input.Reset(SDL_GetTicks(), focused);
 }
 
 // Issue #3: the OS cursor over the game. Hidden in fullscreen, and in a window after 3 s without
 // moving the mouse; always shown while the settings menu is open.
 void WindowSDL::UpdateCursor() {
     const bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
-    const bool hide = !BbOverlay::MenuOpen() &&
-                      (fullscreen || SDL_GetTicks() - last_mouse_motion_ms > 3000);
+    const bool hide = !text_active && !BbOverlay::CapturesInput() &&
+                      (mouse_look ? mouse_relative :
+                       (fullscreen || SDL_GetTicks() - last_mouse_motion_ms > 3000));
     if (hide != cursor_hidden) {
         cursor_hidden = hide;
         hide ? SDL_HideCursor() : SDL_ShowCursor();
