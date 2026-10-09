@@ -16,6 +16,7 @@ export VK_DRIVER_FILES="$host/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json"
 export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
 export GLIBC_TUNABLES='glibc.cpu.hwcaps=-AVX2,-AVX,-AVX_Fast_Unaligned_Load,-AVX2_Usable,-AVX_Usable'
 export BB_CONFIG="$base/bbport.ini"
+[ -f "$BB_CONFIG" ] || cp "$base/bbport.default.ini" "$BB_CONFIG"
 if [ "${BB_ANDROID_INPUT:-0}" = 1 ]; then
     export BB_PAD_FILE="$base/android-pad.state" BB_PAD_QUIET=1
     # Text the game asks for (the character name): the app's touch keyboard.
@@ -112,6 +113,13 @@ case ${1:-game} in
         # The game folder chosen in the app (shared storage), else the bundle's own.
         game_dir=${BB_GAME_DIR:-$base/game}
         [ -f "$game_dir/eboot.bin" ] || { echo "Game missing: $game_dir"; exit 2; }
+        if [ -x "$host/usr/bin/python3.13" ]; then
+            PYTHONHOME="$host/usr" "$host/usr/bin/python3.13" \
+                "$base/scripts/prepare_game.py" "$game_dir" "$base/data"
+        elif [ ! -f "$base/data/boot-linked.bin" ]; then
+            echo 'Python runtime missing; cannot prepare the selected game files' >&2
+            exit 2
+        fi
         # The native ARM64 build (runtime and GPU native, the game's code in FEXCore) when it is
         # installed; BB_THOR_X86=1: the whole x86-64 loader under FEX instead.
         if [ -x "$base/arm64/bin/bb-probe" ] && [ "${BB_THOR_X86:-0}" != 1 ]; then

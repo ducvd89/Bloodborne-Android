@@ -1,5 +1,9 @@
 # AYN Thor Linux boot experiment
 
+These are historical development notes for the manual fexdroid-based prototype.
+For the self-contained `com.ducvd89.bloodborne` APK, use
+[Android release 0.1](ANDROID_RELEASE_0_1.md).
+
 Target: AYN Thor, Snapdragon 8 Gen 2 / Adreno 740, Android 13, 16 GB RAM,
 4 KiB pages. This uses the existing x86-64 Linux bbport under FEX; it is not
 a native ARM port. A small Bloodborne-only APK front end now starts the installed
@@ -163,10 +167,11 @@ menu checks. These tests establish menu navigation, confirm, and cancel;
 combat actions and camera movement in 3D gameplay remain unverified.
 
 The Linux prototype has also hit host-memory faults in some runs, including
-during a menu-navigation test. `fex-compatible.json` now selects strict scalar,
-vector, and memcpy TSO memory ordering and full x87 precision. This is a
-compatibility measure; a later run still crashed, so it does not resolve the
-instability.
+during a menu-navigation test. Strict TSO memory ordering and full x87 precision
+were tested, but a later run still crashed. `fex-compatible.json` retains its
+historical filename; it now selects FEX's Fast profile (TSO emulation off,
+reduced x87 precision) for maximum CPU speed. This can expose additional
+crashes or hangs in multithreaded code.
 Logs are retained in `out/thor-game-controller.log` and
 `out/thor-game-controller-compatible.log`.
 

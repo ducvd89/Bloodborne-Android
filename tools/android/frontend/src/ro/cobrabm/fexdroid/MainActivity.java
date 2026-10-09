@@ -52,8 +52,11 @@ public final class MainActivity extends Activity {
     private SurfaceView surface;
     private View scrim, handle;
     private LinearLayout drawer;
+    private LinearLayout drawerItems;
     private TextView status;
     private Button resume;
+    private Button controllerButton;
+    private TouchControllerOverlay controllerOverlay;
     private PadBridge pad;
     private AudioBridge audio;
     private volatile Process xvfb, game;
@@ -116,6 +119,10 @@ public final class MainActivity extends Activity {
         screen.addView(status,frame(-1,-1,Gravity.CENTER));
         status.setClickable(false);
 
+        controllerOverlay=new TouchControllerOverlay(this,pad);
+        controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
+        screen.addView(controllerOverlay,frame(-1,-1,Gravity.CENTER));
+
         handle=new View(this);
         GradientDrawable grip=new GradientDrawable(); grip.setColor(0x80c6ad76); grip.setCornerRadius(dp(4));
         handle.setBackground(grip); handle.setContentDescription("Open game menu");
@@ -127,16 +134,39 @@ public final class MainActivity extends Activity {
         screen.addView(scrim,frame(-1,-1,Gravity.FILL));
 
         drawer=new LinearLayout(this); drawer.setOrientation(LinearLayout.VERTICAL);
-        drawer.setPadding(dp(24),dp(18),dp(24),dp(16)); drawer.setBackgroundColor(0xff15171d);
+        drawer.setBackgroundColor(0xff15171d);
         drawer.setElevation(dp(16)); drawer.setVisibility(View.GONE);
+        drawerItems=new LinearLayout(this); drawerItems.setOrientation(LinearLayout.VERTICAL);
+        drawerItems.setPadding(dp(24),dp(18),dp(24),dp(16));
+        android.widget.ScrollView drawerScroll=new android.widget.ScrollView(this);
+        drawerScroll.setFillViewport(false);
+        drawerScroll.addView(drawerItems);
+        drawer.addView(drawerScroll,new LinearLayout.LayoutParams(-1,-1));
         TextView title=text("BLOODBORNE",25,0xffe8dfc9); title.setTypeface(Typeface.SERIF,Typeface.BOLD);
-        drawer.addView(title,new LinearLayout.LayoutParams(-1,dp(44)));
+        drawerItems.addView(title,new LinearLayout.LayoutParams(-1,dp(44)));
         TextView hint=text("Swipe left or press A to return",12,0xffa6a7ac);
-        drawer.addView(hint,new LinearLayout.LayoutParams(-1,dp(30)));
+        drawerItems.addView(hint,new LinearLayout.LayoutParams(-1,dp(30)));
         resume=menuButton("Resume game",() -> closeDrawer());
         menuButton("Graphics settings",() -> {
             closeDrawer();
             new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).show();
+        });
+        controllerButton=menuButton("On-screen controller: " + (controllerEnabled() ? "On" : "Off"),() -> {
+            boolean enabled=!controllerEnabled();
+            getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("controller_overlay",enabled).apply();
+            controllerOverlay.release();
+            controllerButton.setText("On-screen controller: " + (enabled ? "On" : "Off"));
+            closeDrawer();
+        });
+        menuButton("Edit on-screen controller",() -> {
+            getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("controller_overlay",true).apply();
+            controllerButton.setText("On-screen controller: On");
+            closeDrawer();
+            controllerOverlay.edit(null);
+        });
+        menuButton("Reset controller layout",() -> {
+            controllerOverlay.resetLayout();
+            closeDrawer();
         });
         menuButton("Game folder",() -> { closeDrawer(); askGameFolder(true); });
         menuButton("Restart game",() -> new AlertDialog.Builder(this)
@@ -146,7 +176,7 @@ public final class MainActivity extends Activity {
             .setTitle("Quit Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Quit",(dialog,which) -> finish()).show());
         TextView controls=text("B  Confirm     A  Cancel\nY  Item             X  Heal",13,0xffc6ad76);
-        controls.setPadding(0,dp(16),0,0); drawer.addView(controls);
+        controls.setPadding(0,dp(16),0,0); drawerItems.addView(controls);
         screen.addView(drawer,frame(dp(300),-1,Gravity.LEFT));
         setContentView(screen);
     }
@@ -161,12 +191,13 @@ public final class MainActivity extends Activity {
         b.setTextSize(16); b.setTextColor(0xffe8dfc9); b.setGravity(Gravity.LEFT|Gravity.CENTER_VERTICAL);
         b.setPadding(dp(14),0,dp(14),0); b.setOnClickListener(v -> action.run());
         LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(46)); lp.bottomMargin=dp(4);
-        drawer.addView(b,lp); return b;
+        drawerItems.addView(b,lp); return b;
     }
 
     private void openDrawer() {
         if (drawerOpen) return;
-        drawerOpen=true; pad.reset(); XInput.button(1,false);
+        drawerOpen=true; controllerOverlay.release(); pad.reset(); XInput.button(1,false);
+        controllerOverlay.setVisibility(View.GONE);
         handle.setVisibility(View.GONE);
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.setAlpha(0); scrim.setVisibility(View.VISIBLE); scrim.animate().alpha(1).setDuration(200).start();
@@ -176,6 +207,7 @@ public final class MainActivity extends Activity {
     private void closeDrawer() {
         if (!drawerOpen) return;
         drawerOpen=false; pad.reset();
+        controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.animate().alpha(0).setDuration(180).withEndAction(() -> scrim.setVisibility(View.GONE)).start();
         drawer.animate().translationX(-dp(300)).setDuration(200)
@@ -253,7 +285,15 @@ public final class MainActivity extends Activity {
         if (drawerOpen && e.isFromSource(android.view.InputDevice.SOURCE_JOYSTICK)) return true;
         return pad.motion(e) || super.dispatchGenericMotionEvent(e);
     }
-    @Override protected void onPause() { if (pad!=null) pad.reset(); if (audio!=null) audio.pause(); super.onPause(); }
+    private boolean controllerEnabled() {
+        return getSharedPreferences("bloodborne",MODE_PRIVATE).getBoolean("controller_overlay",false);
+    }
+    @Override protected void onPause() {
+        if (controllerOverlay!=null) controllerOverlay.release();
+        if (pad!=null) pad.reset();
+        if (audio!=null) audio.pause();
+        super.onPause();
+    }
     @Override protected void onResume() { super.onResume(); if (audio!=null) audio.resume(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
@@ -282,6 +322,7 @@ public final class MainActivity extends Activity {
     }
     private void startX(SurfaceHolder holder) {
         try {
+            RuntimeInstaller.ensure(this, new File(FILES), message -> main.post(() -> status.setText(message)));
             if (!new File(ROOT,"usr/bin/Xvfb").canExecute() || !new File(BASE,"run-thor.sh").isFile())
                 throw new java.io.IOException("The Bloodborne runtime is missing. Install the runtime bundle.");
             new File(FILES,"home/bbport").mkdirs();

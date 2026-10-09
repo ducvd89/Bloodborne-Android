@@ -11,9 +11,14 @@ if [[ -x $local_jdk/bin/javac ]]; then
     export JAVA_HOME="$local_jdk" PATH="$local_jdk/bin:$PATH"
 fi
 out="$PWD/out/thor/frontend"
-rm -rf "$out/classes" "$out/dex" "$out/res"
+rm -rf "$out/classes" "$out/dex" "$out/res" "$out/assets"
 mkdir -p "$out/classes" "$out/dex" "$out/res/drawable" "$out/assets"
 cp -r tools/android/frontend/res/. "$out/res/"
+if [[ -n ${BB_RUNTIME_ARCHIVE:-} ]]; then
+    cp "$BB_RUNTIME_ARCHIVE" "$out/assets/runtime.payload"
+    cp "${BB_RUNTIME_ARCHIVE%.tar.gz}.sha256" "$out/assets/runtime.sha256"
+    cp "${BB_RUNTIME_ARCHIVE%.tar.gz}.python-packages.txt" "$out/assets/python-packages.txt"
+fi
 # Use the user's own Bloodborne icon locally; game art is not committed to this repository.
 python3 - "$runtime_apk" "$out" <<'PY'
 import hashlib, sys, zipfile
@@ -22,6 +27,8 @@ from PIL import Image
 apk, out = Path(sys.argv[1]), Path(sys.argv[2])
 assert hashlib.file_digest(apk.open('rb'), 'sha256').hexdigest() == '2074fcee551dab0c6b0719c3f90f6389e517f194aaabacb5b0080bb2977ed847'
 icon = Path('game/CUSA03173/sce_sys/icon0.dds')
+if __import__('os').environ.get('BB_RUNTIME_ARCHIVE') and not icon.exists():
+    raise SystemExit('Release build needs the user-owned game icon at game/CUSA03173/sce_sys/icon0.dds')
 if icon.exists():
     (out/'res/drawable/icon.xml').unlink(missing_ok=True)
     Image.open(icon).save(out/'res/drawable/icon.png')
@@ -35,7 +42,7 @@ javac --release 8 -classpath "$android_jar" -d "$out/classes" "${sources[@]}"
 mapfile -t classes < <(rg --files "$out/classes" -g '*.class')
 "$build_tools/d8" --min-api 28 --lib "$android_jar" --output "$out/dex" "${classes[@]}"
 "$build_tools/aapt" package -f -M tools/android/frontend/AndroidManifest.xml \
-    -S "$out/res" -A "$out/assets" -I "$android_jar" -F "$out/unsigned.apk"
+    -S "$out/res" -A "$out/assets" -I "$android_jar" -0 payload -F "$out/unsigned.apk"
 python3 - "$out" <<'PY'
 import sys, zipfile
 from pathlib import Path
