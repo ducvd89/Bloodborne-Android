@@ -8,17 +8,6 @@ Title-menu navigation has been verified. A recent crash occurred on the `shadPS4
 
 The game still uses bbport's x86-64 Linux runtime and Vulkan renderer. FEX translates the CPU code on ARM64, and Linux/glibc Turnip supplies the native Vulkan driver. This is not a native ARM recompilation.
 
-## Android features
-
-- A Bloodborne-only Android front end: landscape fullscreen, no bottom navigation, and a drawer that slides in from the left edge.
-- Drawer controls for returning to the game, graphics settings, restarting, and quitting. No Steam, Dota 2, or CS launchers.
-- The app is named **Bloodborne**. Local builds use the icon from the user's own game dump when available; no game artwork is included here.
-- Nintendo-position controller mapping for the Thor: **B → Cross**, **A → Circle**, **Y → Square**, **X → Triangle**.
-- An Android gamepad-event bridge for launching without ADB input permissions, including analog sticks and triggers. Its runtime translation has unit coverage; full gameplay validation remains outstanding.
-- Scripts for staging the Linux runtime, fetching generic x86-64 libraries, deploying to the device, and running CPU/Vulkan/controller diagnostics.
-
-The APK front end and game display have been built and installed on the test Thor. Earlier ADB controller tests passed all physical controls, and all four D-pad directions plus confirm/cancel were verified inside the game's menus. The new drawer and direct-launch controller bridge still need broader device testing.
-
 ## Build and setup
 
 See [Android build, runtime setup, and limitations](docs/ANDROID_THOR.md).
