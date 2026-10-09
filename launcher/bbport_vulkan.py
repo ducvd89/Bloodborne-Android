@@ -19,6 +19,7 @@ MANIFEST_DIRS = (
 )
 LIBRARY_DIRS = (
     Path("/usr/lib/x86_64-linux-gnu"), Path("/lib/x86_64-linux-gnu"),
+    Path("/usr/lib/aarch64-linux-gnu"), Path("/lib/aarch64-linux-gnu"),
     Path("/usr/lib64"), Path("/lib64"), Path("/usr/lib"), Path("/lib"),
     Path("/run/opengl-driver/lib"),
 )
@@ -76,11 +77,24 @@ def host_nvidia(manifest_dirs, library_dirs):
     return None
 
 
+def host_mesa_override(value, manifest_dirs):
+    """An override naming only the distribution's own non-NVIDIA ICDs (some images export
+    VK_ICD_FILENAMES for their Mesa): those need the host's libraries and cannot load here."""
+    files = [Path(item) for item in value.split(":") if item]
+    return bool(files) and all(
+        any(path.parent == directory for directory in manifest_dirs)
+        and "nvidia" not in path.name.lower() for path in files)
+
+
 def configure(env, manifest_dirs=MANIFEST_DIRS, library_dirs=LIBRARY_DIRS):
     # Both overrides belong to the user; VK_DRIVER_FILES takes precedence over
     # VK_ICD_FILENAMES. In particular don't replace an explicit Lavapipe setup.
+    note = ""
+    for key in ("VK_DRIVER_FILES", "VK_ICD_FILENAMES"):
+        if env.get(key) and host_mesa_override(env[key], manifest_dirs):
+            note += f"Vulkan: ignoring {key}={env.pop(key)} (host Mesa driver)\n"
     if env.get("VK_DRIVER_FILES") or env.get("VK_ICD_FILENAMES"):
-        return "Vulkan: using explicit driver override"
+        return note + "Vulkan: using explicit driver override"
     bundled = env.get("BB_BUNDLED_VK_DRIVER_FILES", "")
     if env.get("VK_ADD_DRIVER_FILES"):
         bundled = env["VK_ADD_DRIVER_FILES"] + (":" + bundled if bundled else "")
@@ -91,7 +105,7 @@ def configure(env, manifest_dirs=MANIFEST_DIRS, library_dirs=LIBRARY_DIRS):
     if not found:
         if bundled:
             env["VK_DRIVER_FILES"] = bundled
-        return "Vulkan: bundled AMD/Intel drivers; no accessible NVIDIA ICD found"
+        return note + "Vulkan: bundled Mesa drivers; no accessible NVIDIA ICD found"
 
     data, driver = found
     # The driver version/path and mtime give each installed driver its own small
@@ -124,7 +138,7 @@ def configure(env, manifest_dirs=MANIFEST_DIRS, library_dirs=LIBRARY_DIRS):
     env["VK_DRIVER_FILES"] = str(manifest) + (":" + bundled if bundled else "")
     env["LD_LIBRARY_PATH"] = str(libraries) + (
         ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
-    return f"Vulkan: host NVIDIA driver {driver}; bundled AMD/Intel also available"
+    return note + f"Vulkan: host NVIDIA driver {driver}; bundled Mesa drivers also available"
 
 
 def main():

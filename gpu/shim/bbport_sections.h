@@ -7,7 +7,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
-#include <x86intrin.h>
+#include "bbport_cpu.h"
 
 namespace BbSections {
 enum Id : std::uint32_t {
@@ -56,10 +56,10 @@ inline bool Enabled() {
 inline thread_local bool recording_thread = false;
 
 struct Scope {
-    explicit Scope(Id id_) : id{id_}, start{Enabled() && recording_thread ? __rdtsc() : 0} {}
+    explicit Scope(Id id_) : id{id_}, start{Enabled() && recording_thread ? BbCpu::Cycles() : 0} {}
     ~Scope() {
         if (start) {
-            cycles[id].fetch_add(__rdtsc() - start, std::memory_order_relaxed);
+            cycles[id].fetch_add(BbCpu::Cycles() - start, std::memory_order_relaxed);
         }
     }
     Id id;

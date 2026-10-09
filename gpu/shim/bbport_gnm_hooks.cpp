@@ -513,6 +513,13 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
     const char* env = std::getenv("BB_GNM_CENSUS");
     const char* observe_env = std::getenv("BB_GNM_OBSERVE");
     observe = observe_env && observe_env[0] == '1';
+#if !defined(__x86_64__)
+    // The observing stubs call host functions from guest code: only possible on an x86-64 host.
+    if (observe) {
+        std::fprintf(stderr, "Gnm observe: BB_GNM_OBSERVE needs an x86-64 host, ignored\n");
+        observe = false;
+    }
+#endif
     if (!observe && (!env || env[0] != '1')) {
         return;
     }

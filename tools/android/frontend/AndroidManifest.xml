@@ -1,12 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="ro.cobrabm.fexdroid" android:versionCode="11301" android:versionName="Bloodborne Thor 1.0">
+    package="com.ducvd89.bloodborne" android:versionCode="2" android:versionName="0.1">
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="28" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The game folder in shared storage (targetSdk 28: file paths, as the Linux runtime reads them). -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <application android:label="Bloodborne" android:icon="@drawable/icon"
         android:theme="@style/GameTheme" android:debuggable="true"
-        android:allowBackup="false" android:extractNativeLibs="true" android:isGame="true">
-        <activity android:name=".MainActivity" android:exported="true"
+        android:allowBackup="false" android:extractNativeLibs="true" android:isGame="true"
+        android:requestLegacyExternalStorage="true">
+        <!-- Classes keep their package: the display and input bridges are bound to it (JNI names). -->
+        <activity android:name="ro.cobrabm.fexdroid.MainActivity" android:exported="true"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|density">
             <intent-filter>

@@ -30,7 +30,7 @@
 
 #include <mutex>
 #include <pthread.h>
-#include <x86intrin.h>
+#include "bbport_cpu.h"
 #include <vk_mem_alloc.h>
 
 extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
@@ -1110,7 +1110,8 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
         // counts as not done, which only takes the slower, always correct path; the GPU signal
         // thread refreshes the known tick on every fence anyway).
         thread_local u64 last_refresh = 0;
-        if (const u64 now = __rdtsc(); now - last_refresh > 800000) {
+        static const u64 refresh_cycles = BbCpu::MicrosToCycles(250);
+        if (const u64 now = BbCpu::Cycles(); now - last_refresh > refresh_cycles) {
             last_refresh = now;
             scheduler.GetWorkSemaphore()->Refresh();
         }

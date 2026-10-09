@@ -60,6 +60,16 @@ static int sdl_audio(void) {
         const char *mode=getenv("BB_AUDIO");
         sdl_ready = (!mode || strcmp(mode,"none")) && SDL_InitSubSystem(SDL_INIT_AUDIO);
         printf("Runtime: audio backend %s\n", sdl_ready ? SDL_GetCurrentAudioDriver() : "timer (silent)");
+        /* SDL's disk driver (the Android app plays its file, a FIFO): the first device opened sets
+         * the output format, so a fixed s16 stereo 48 kHz device is opened first and kept; the
+         * game's ports join it and SDL converts and mixes them into it. */
+        const char *driver=sdl_ready ? SDL_GetCurrentAudioDriver() : NULL;
+        if (driver && !strcmp(driver,"disk")) {
+            const SDL_AudioSpec spec={SDL_AUDIO_S16,2,48000};
+            if (!SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec))
+                fprintf(stderr,"Runtime: disk audio device failed (%s)\n",SDL_GetError());
+            else printf("Runtime: audio output s16 stereo 48 kHz to %s\n",getenv("SDL_AUDIO_DISK_OUTPUT_FILE") ? getenv("SDL_AUDIO_DISK_OUTPUT_FILE") : "sdlaudio.raw");
+        }
     }
     return sdl_ready;
 }

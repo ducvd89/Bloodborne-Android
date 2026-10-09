@@ -13,6 +13,7 @@
 #ifndef _WIN32
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 
 #define USER_ID 1
@@ -173,8 +174,7 @@ static ABI int32_t voice_info(uint32_t port,uint32_t *info) {
 typedef struct { const char *name; int initialized, status; } Dialog;
 static Dialog dialogs[]={{"CommonDialog",0,0},{"MsgDialog",0,0},{"SaveDataDialog",0,0},
                          {"NpProfileDialog",0,0},{"NpCommerceDialog",0,0},{"ImeDialog",0,0}};
-static int common_initialized;
-static ABI int32_t common_init(void) { common_initialized=1; return 0; }
+static ABI int32_t common_init(void) { return 0; }
 static int32_t dialog_init(int i) {
     if (dialogs[i].initialized) return (int32_t)0x80B80004;
     dialogs[i].initialized=1; dialogs[i].status=1; return 0;
@@ -230,6 +230,44 @@ static void utf8_to_utf16(const char *in, uint16_t *out, uint32_t max) {
     }
     out[n<max ? n : max]=0;
 }
+/* BB_IME_FILE (the Android frontend): the dialog is shown by the app with the touch keyboard. The
+ * request file holds the maximum length (UTF-16 units), the title and the current text, a line
+ * each; the app answers in <BB_IME_FILE>.result: "ok" or "cancel", then the text. Both files are
+ * written whole under another name and renamed, so neither side reads half a file. */
+static const char *ime_bridge(void) {
+    const char *path=getenv("BB_IME_FILE");
+    return path && *path ? path : NULL;
+}
+static void one_line(char *text) { for (char *p=text; *p; ++p) if (*p=='\n' || *p=='\r') *p=' '; }
+static int ime_bridge_request(const char *path, const char *initial, const char *title, uint32_t max_length) {
+    char result[600], temporary[600];
+    snprintf(result,sizeof(result),"%s.result",path);
+    snprintf(temporary,sizeof(temporary),"%s.tmp",path);
+    unlink(result); /* an answer to an earlier, abandoned dialog */
+    char first[512], prompt[256];
+    snprintf(first,sizeof(first),"%s",initial); snprintf(prompt,sizeof(prompt),"%s",title);
+    one_line(first); one_line(prompt);
+    FILE *f=fopen(temporary,"w");
+    if (!f) return 0;
+    fprintf(f,"%u\n%s\n%s\n",max_length,prompt,first);
+    if (fclose(f) || rename(temporary,path)) { unlink(temporary); return 0; }
+    return 1;
+}
+/* 0: no answer yet; 1: confirmed (text set); 2: cancelled. */
+static int ime_bridge_poll(const char *path, char *text, size_t size) {
+    char result[600];
+    snprintf(result,sizeof(result),"%s.result",path);
+    FILE *f=fopen(result,"r");
+    if (!f) return 0;
+    char status[16]="";
+    text[0]=0;
+    if (!fgets(status,sizeof(status),f)) status[0]=0;
+    if (!fgets(text,(int)size,f)) text[0]=0;
+    fclose(f);
+    unlink(result);
+    text[strcspn(text,"\r\n")]=0;
+    return strncmp(status,"ok",2) ? 2 : 1;
+}
 static void ime_complete(int end_status, const char *text) {
     if (!end_status && ime.buffer && ime.max_length) utf8_to_utf16(text,ime.buffer,ime.max_length);
     ime.end_status=end_status; ime.finished=1; ime.running=0;
@@ -246,6 +284,10 @@ static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
     utf16_to_utf8(param->title,128,prompt,sizeof(prompt));
     const char *preset=getenv("BB_IME_TEXT");
     if (preset) { ime_complete(0,preset); return 0; }
+    if (ime_bridge() && ime_bridge_request(ime_bridge(),initial,prompt[0] ? prompt : "Text",param->max_length)) {
+        printf("Runtime: ImeDialog opened: the app shows the touch keyboard\n");
+        return 0;
+    }
     if (!bbgpu_text_input_begin(initial,prompt[0] ? prompt : "Text")) {
         const char *name=getenv("BB_USER_NAME");
         ime_complete(0,name ? name : initial[0] ? initial : "Hunter");
@@ -255,7 +297,8 @@ static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
 static ABI int32_t ime_status(void) {
     if (ime.running) {
         char text[512];
-        int state=bbgpu_text_input_poll(text,sizeof(text));
+        int state=ime_bridge() ? ime_bridge_poll(ime_bridge(),text,sizeof(text))
+                               : bbgpu_text_input_poll(text,sizeof(text));
         if (state) ime_complete(state==1 ? 0 : 1,text);
     }
     return ime.running ? 1 : ime.finished ? 2 : 0; /* Running / Finished / None */

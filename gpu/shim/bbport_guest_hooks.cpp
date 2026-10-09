@@ -2,6 +2,7 @@
 #include "bbport_guest_hooks.h"
 #include "bbport_heap_sites.h"
 #include "bbport_toggles.h"
+#include "../../src/guest_cpu.h"
 
 #include <array>
 #include <atomic>
@@ -39,7 +40,11 @@ constexpr unsigned char HeapAllocReturnCode[3] = {0x48, 0x89, 0xc3};
 /// BB_FRAME_STATS: the range allocator's collector (0x26aa860, `push rbp`; rdi the allocator): its
 /// live range count [+0xc8] and byte count [+0xd0] are noted for the frame stats.
 constexpr u64 CollectorEntry = 0x26aa860;
+#ifdef GUEST_CPU_NATIVE
 constexpr unsigned char CollectorEntryCode[1] = {0x55};
+#else
+constexpr unsigned char CollectorEntryCode[4] = {0x55, 0x48, 0x89, 0xe5}; // push rbp; mov rbp, rsp
+#endif
 
 /// BB_HEAP_SITES=1: the game's deferred object release (0xbb5f10) skips the destruction when the
 /// registry check (0xbf0790) fails: `js 0xbb5fc7` there, its result counted (eax).
@@ -67,17 +72,19 @@ void* LoaderCopy(void* dst, const void* src, std::size_t size) {
 }
 struct sigaction previous_action {};
 
-void OnTrap(int sig, siginfo_t* info, void* context) {
-    auto* g = static_cast<ucontext_t*>(context)->uc_mcontext.gregs;
-    const u64 rip = u64(g[REG_RIP]) - 1; // past the int3
+/// One hook, at regs.rip (the hooked instruction): returns false when no hook is there. The
+/// instructions the patch replaced are carried out here; regs.rip is where the game resumes.
+bool Handle(GuestRegs& r) {
+    u64* const g = r.gpr;
+    const u64 rip = r.rip;
     if (rip == ImageBase + ReleaseCheck) {
-        const auto result = static_cast<std::int32_t>(g[REG_RAX] & 0xffffffff);
+        const auto result = static_cast<std::int32_t>(g[GUEST_RAX] & 0xffffffff);
         BbHeapSites::NoteReleaseCheck(std::uint32_t(result));
-        g[REG_RIP] = greg_t(ImageBase + (result < 0 ? 0xbb5fc7 : ReleaseCheck + 2));
-        return;
+        r.rip = ImageBase + (result < 0 ? 0xbb5fc7 : ReleaseCheck + 2);
+        return true;
     }
     if (rip == ImageBase + CollectorEntry) {
-        const u64 allocator = u64(g[REG_RDI]);
+        const u64 allocator = g[GUEST_RDI];
         for (std::size_t i = 0; i < BbStats::range_allocators.size(); ++i) {
             u64 expected = 0;
             if (BbStats::range_allocators[i].load(std::memory_order_relaxed) == allocator ||
@@ -89,26 +96,30 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
                 break;
             }
         }
-        g[REG_RSP] -= 8; // push rbp
-        *reinterpret_cast<u64*>(g[REG_RSP]) = u64(g[REG_RBP]);
-        g[REG_RIP] = greg_t(ImageBase + CollectorEntry + 1);
-        return;
+        g[GUEST_RSP] -= 8; // push rbp
+        *reinterpret_cast<u64*>(g[GUEST_RSP]) = g[GUEST_RBP];
+        r.rip = ImageBase + CollectorEntry + 1;
+        if (sizeof(CollectorEntryCode) > 1) {
+            g[GUEST_RBP] = g[GUEST_RSP]; // mov rbp, rsp
+            r.rip = ImageBase + CollectorEntry + sizeof(CollectorEntryCode);
+        }
+        return true;
     }
     for (const u64 site : HeapAllocReturns) {
         if (rip != ImageBase + site) {
             continue;
         }
-        const u64 address = u64(g[REG_RAX]);
-        const u64 size = *reinterpret_cast<const u64*>(u64(g[REG_RBP]) - 0x50);
+        const u64 address = g[GUEST_RAX];
+        const u64 size = *reinterpret_cast<const u64*>(g[GUEST_RBP] - 0x50);
         if (address != 0 && size != 0 && size < (u64(1) << 32)) {
             on_range_allocated(address, size);
         }
-        g[REG_RBX] = g[REG_RAX];
-        g[REG_RIP] = greg_t(ImageBase + site + sizeof(HeapAllocReturnCode));
-        return;
+        g[GUEST_RBX] = g[GUEST_RAX];
+        r.rip = ImageBase + site + sizeof(HeapAllocReturnCode);
+        return true;
     }
     if (rip == ImageBase + AllocReturn) {
-        if (const u64 node = u64(g[REG_RAX])) {
+        if (const u64 node = g[GUEST_RAX]) {
             const u64 start = *reinterpret_cast<const u64*>(node + 8);
             const u64 next = *reinterpret_cast<const u64*>(node + 0x18);
             const u64 end = next ? *reinterpret_cast<const u64*>(next + 8) : start;
@@ -116,9 +127,9 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
                 on_range_allocated(start, end - start);
             }
         }
-        g[REG_RSP] += 0x18;
-        g[REG_RIP] = greg_t(ImageBase + AllocReturn + sizeof(AllocReturnCode));
-        return;
+        g[GUEST_RSP] += 0x18;
+        r.rip = ImageBase + AllocReturn + sizeof(AllocReturnCode);
+        return true;
     }
     for (std::size_t i = 0; i < MemcpySites.size(); ++i) {
         const auto& site = MemcpySites[i];
@@ -126,11 +137,40 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
             continue;
         }
         hits[i].fetch_add(1, std::memory_order_relaxed);
+#ifdef GUEST_CPU_NATIVE
         // The call, to LoaderCopy instead of the game's memcpy: push the return address, jump.
-        const u64 ret = ImageBase + site.offset + 5;
-        g[REG_RSP] -= 8;
-        *reinterpret_cast<u64*>(g[REG_RSP]) = ret;
-        g[REG_RIP] = greg_t(reinterpret_cast<u64>(&LoaderCopy));
+        g[GUEST_RSP] -= 8;
+        *reinterpret_cast<u64*>(g[GUEST_RSP]) = ImageBase + site.offset + 5;
+        r.rip = reinterpret_cast<u64>(&LoaderCopy);
+#else
+        // The guest CPU cannot jump to host code: the call's work is done here.
+        g[GUEST_RAX] = reinterpret_cast<u64>(
+            LoaderCopy(reinterpret_cast<void*>(g[GUEST_RDI]), reinterpret_cast<const void*>(g[GUEST_RSI]),
+                       std::size_t(g[GUEST_RDX])));
+        r.rip = ImageBase + site.offset + 5;
+#endif
+        return true;
+    }
+    return false;
+}
+
+#ifdef GUEST_CPU_NATIVE
+constexpr int GregOrder[GUEST_GPRS] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP,
+                                       REG_RSI, REG_RDI, REG_R8,  REG_R9,  REG_R10, REG_R11,
+                                       REG_R12, REG_R13, REG_R14, REG_R15};
+
+void OnTrap(int sig, siginfo_t* info, void* context) {
+    auto* g = static_cast<ucontext_t*>(context)->uc_mcontext.gregs;
+    GuestRegs regs;
+    for (int i = 0; i < GUEST_GPRS; ++i) {
+        regs.gpr[i] = u64(g[GregOrder[i]]);
+    }
+    regs.rip = u64(g[REG_RIP]) - 1; // past the int3
+    if (Handle(regs)) {
+        for (int i = 0; i < GUEST_GPRS; ++i) {
+            g[GregOrder[i]] = greg_t(regs.gpr[i]);
+        }
+        g[REG_RIP] = greg_t(regs.rip);
         return;
     }
     if (previous_action.sa_flags & SA_SIGINFO) {
@@ -146,6 +186,14 @@ void OnTrap(int sig, siginfo_t* info, void* context) {
     signal(SIGTRAP, SIG_DFL);
     raise(SIGTRAP);
 }
+#else
+void OnHook(GuestRegs* regs) {
+    if (!Handle(*regs)) {
+        std::fprintf(stderr, "STOP: guest hook without a handler at %#llx\n", (unsigned long long)regs->rip);
+        std::abort();
+    }
+}
+#endif
 
 bool Patch(u64 address, const unsigned char* expected, std::size_t size) {
     unsigned char bytes[16]{};
@@ -154,6 +202,9 @@ bool Patch(u64 address, const unsigned char* expected, std::size_t size) {
         std::memcmp(bytes, expected, size) != 0) {
         return false;
     }
+#ifndef GUEST_CPU_NATIVE
+    return guest_cpu_hook(address, size, OnHook) != 0;
+#endif
     const long page_size = sysconf(_SC_PAGESIZE);
     void* page = reinterpret_cast<void*>(address & ~u64(page_size - 1));
     const std::size_t span = (address + size) - reinterpret_cast<u64>(page);
@@ -172,11 +223,13 @@ void Install(RangeCallback on_gpu_range_allocated) {
     if (installed.exchange(true)) {
         return;
     }
+#ifdef GUEST_CPU_NATIVE
     struct sigaction action {};
     action.sa_sigaction = OnTrap;
     action.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&action.sa_mask);
     sigaction(SIGTRAP, &action, &previous_action);
+#endif
     int patched = 0;
     for (const auto& site : MemcpySites) {
         patched += Patch(ImageBase + site.offset, site.code, sizeof(site.code));

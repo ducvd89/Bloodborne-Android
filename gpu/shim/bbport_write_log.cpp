@@ -7,9 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ucontext.h>
+#include "../../src/guest_cpu.h"
 #include <unistd.h>
-#include <x86intrin.h>
+#include "bbport_cpu.h"
 
 namespace BbWriteLog {
 namespace {
@@ -58,7 +58,7 @@ void Note(std::uint64_t address, const void* data, std::uint64_t size, Source so
 
 void Record(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
     static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
-    Entry e{address, size, 0, __rdtsc(), source, tid};
+    Entry e{address, size, 0, BbCpu::Cycles(), source, tid};
     std::memcpy(&e.first, data, size < 8 ? size : 8);
     Push(ring, head, e);
     // Only small writes are scanned: scanning downloads of megabytes delays them enough to hide
@@ -85,7 +85,7 @@ void DumpRange(std::uint64_t address, std::uint64_t size) {
     }
     const char* sources[] = {"backing",      "WriteData",           "fence",
                              "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)", "DmaData"};
-    const std::uint64_t now = __rdtsc(), n = head.load();
+    const std::uint64_t now = BbCpu::Cycles(), n = head.load();
     int shown = 0;
     for (std::uint64_t i = n; i-- > (n > Size ? n - Size : 0) && shown < 64;) {
         const Entry& e = ring[i % Size];
@@ -105,23 +105,22 @@ void DumpRange(std::uint64_t address, std::uint64_t size) {
 
 extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     using namespace BbWriteLog;
-    const auto* uc = static_cast<const ucontext_t*>(ucontext);
-    const auto* g = uc->uc_mcontext.gregs;
-    BbFreeCheck::DumpAtFault(std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_R14]));
+    GuestRegs guest{};
+    guest_cpu_signal_regs(ucontext, &guest);
+    const std::uint64_t* g = guest.gpr;
+    BbFreeCheck::DumpAtFault(g[GUEST_RAX], g[GUEST_R14]);
     if (Mode() == 0) {
         return;
     }
-    const std::uint64_t regs[] = {std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_RBX]),
-                                  std::uint64_t(g[REG_RCX]), std::uint64_t(g[REG_RDX]),
-                                  std::uint64_t(g[REG_RSI]), std::uint64_t(g[REG_RDI]),
-                                  std::uint64_t(g[REG_R14]), std::uint64_t(g[REG_R15])};
+    const std::uint64_t regs[] = {g[GUEST_RAX], g[GUEST_RBX], g[GUEST_RCX], g[GUEST_RDX],
+                                  g[GUEST_RSI], g[GUEST_RDI], g[GUEST_R14], g[GUEST_R15]};
     const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15"};
     for (int i = 0; i < 8; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);
     }
     const char* sources[] = {"backing",      "WriteData",           "fence",
                              "EOP (decoded)", "WriteData (decoded)", "EOS (decoded)", "DmaData"};
-    const std::uint64_t now = __rdtsc();
+    const std::uint64_t now = BbCpu::Cycles();
     const auto print = [&](const Entry& e, const char* what) {
         std::fprintf(stderr,
                      "Write log: %s %s %#llx +%llu first %#llx tid %u, %.3f s before the fault\n",

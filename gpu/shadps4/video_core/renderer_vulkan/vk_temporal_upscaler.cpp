@@ -17,6 +17,7 @@
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "ffx_vk_portable.h"
+#include "ffx_vk_fsr3_3_1_5_bridge.h"
 #include "video_core/host_shaders/upscale_merge_comp.h"
 #include "video_core/host_shaders/upscale_reactive_comp.h"
 #include "video_core/host_shaders/taa_comp.h"
@@ -25,6 +26,8 @@
 #include "video_core/host_shaders/fsr4_decode_comp.h"
 #include "video_core/host_shaders/fsr4_encode_comp.h"
 #include "video_core/host_shaders/fsr4_reactive_comp.h"
+#include "video_core/host_shaders/frame_gen_capture_comp.h"
+#include "video_core/host_shaders/frame_gen_compose_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -237,6 +240,7 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
 }
 
 TemporalUpscaler::~TemporalUpscaler() {
+    DestroyFrameGeneration();
     if (resources_ready) scheduler.Finish();
     if (context) {
         scheduler.Finish();
@@ -471,6 +475,14 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     create_info.flags = hdr ? FFX_VK_PORTABLE_CONTEXT_HDR_COLOR_INPUT |
                                   FFX_VK_PORTABLE_CONTEXT_AUTO_EXPOSURE
                             : 0;
+    // bbport: BB_FSR_DEBUG=1: FSR's own checks report through its message callback.
+    static const bool fsr_debug = [] {
+        const char* env = std::getenv("BB_FSR_DEBUG");
+        return env && env[0] == '1';
+    }();
+    if (fsr_debug) {
+        create_info.flags |= FFX_VK_PORTABLE_CONTEXT_DEBUG_CHECKING;
+    }
     create_info.maxRenderSize = {w, h};
     create_info.maxOutputSize = {ow, oh};
     // FSR 4 has its own model context (vk_fsr4); the images below are shared.
@@ -479,9 +491,10 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
             PrintIssues("create info", issues);
             return false;
         }
-        if (ffxVkPortableUpscaleContextCreate(&device_info, &create_info, &context) !=
-            FFX_VK_PORTABLE_OK) {
-            std::printf("Upscaler: FSR 3 context creation failed\n");
+        if (const auto result = ffxVkPortableUpscaleContextCreate(&device_info, &create_info, &context);
+            result != FFX_VK_PORTABLE_OK) {
+            std::printf("Upscaler: FSR 3 context creation failed (%d, render %ux%u, output %ux%u, %s)\n",
+                        int(result), w, h, ow, oh, hdr ? "HDR scene color" : "tonemapped");
             context = nullptr;
             return false;
         }
@@ -1998,6 +2011,9 @@ void TemporalUpscaler::RunScaled() {
         reset = false;
         dispatched_last_frame = true;
         ExtraSharpen(vk::Image(ui_image), true, ow, oh);
+        if (FrameGenerationOn()) {
+            CaptureFrameGenerationInputs(depth_image, w, h, ow, oh, frame_ms);
+        }
     }
     barrier(vk::Image(ui_image), vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral, all,
             rw, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eColorAttachmentOutput,
@@ -2251,6 +2267,403 @@ bool TemporalUpscaler::RecordExternalUpscaler(vk::CommandBuffer cmdbuf, Fsr4Upsc
         reset = true;
     }
     return ok;
+}
+
+} // namespace Vulkan
+
+namespace Vulkan {
+
+// bbport: FSR 3.1 frame generation (docs/upscaler.md). On by BB_FRAME_GEN=1 (the Thor's
+// settings: frame_generation); used with the scaled FSR 3 presets only.
+bool TemporalUpscaler::FrameGenerationOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_FRAME_GEN");
+        return env && env[0] == '1';
+    }();
+    return on && BbSettings::Get().upscaler == BbSettings::UpscalerFsr3;
+}
+
+void TemporalUpscaler::DestroyFrameGeneration() {
+    if (!fg_context && !fg_output) {
+        return;
+    }
+    scheduler.Finish();
+    std::scoped_lock lock{fg_mutex};
+    if (fg_context) {
+        ffxVkFsr3_3_1_6FrameGenerationContextDestroy(fg_context);
+        fg_context = nullptr;
+    }
+    fg_final_views.clear();
+    fg_hudless_view.reset();
+    fg_color_view.reset();
+    fg_output_view.reset();
+    fg_hudless = VideoCore::UniqueImage{};
+    fg_color = VideoCore::UniqueImage{};
+    fg_output = VideoCore::UniqueImage{};
+    fg_depth = VideoCore::UniqueImage{};
+    fg_width = fg_height = fg_render_width = fg_render_height = 0;
+    fg_reset = true;
+}
+
+bool TemporalUpscaler::EnsureFrameGeneration(u32 w, u32 h, u32 ow, u32 oh) {
+    if (fg_context && fg_width == ow && fg_height == oh && fg_render_width == w &&
+        fg_render_height == h) {
+        return true;
+    }
+    DestroyFrameGeneration();
+    const auto device = instance.GetDevice();
+    const auto allocator = instance.GetAllocator();
+    const FfxVkFsr3_3_1_6FrameGenerationCreateInfo create{
+        .physicalDevice = instance.GetPhysicalDevice(),
+        .device = device,
+        .maxRenderWidth = w,
+        .maxRenderHeight = h,
+        .displayWidth = ow,
+        .displayHeight = oh,
+        .colorFormat = VK_FORMAT_R8G8B8A8_UNORM,
+    };
+    if (const auto result = ffxVkFsr3_3_1_6FrameGenerationContextCreate(&create, &fg_context);
+        result != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+        std::printf("Frame generation: context creation failed (%d); off\n", int(result));
+        fg_context = nullptr;
+        return false;
+    }
+    const auto make = [&](VideoCore::UniqueImage& image, vk::Format format, u32 width, u32 height,
+                          vk::ImageUsageFlags usage, vk::ImageCreateFlags flags = {}) {
+        image = VideoCore::UniqueImage(device, allocator);
+        image.Create(vk::ImageCreateInfo{
+            .flags = flags,
+            .imageType = vk::ImageType::e2D,
+            .format = format,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = usage,
+            .initialLayout = vk::ImageLayout::eUndefined,
+        });
+    };
+    const auto view = [&](const VideoCore::UniqueImage& image, vk::Format format) {
+        return Check(device.createImageViewUnique({
+            .image = vk::Image(image),
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+    };
+    using Usage = vk::ImageUsageFlagBits;
+    make(fg_hudless, vk::Format::eR8G8B8A8Unorm, ow, oh,
+         Usage::eStorage | Usage::eSampled | Usage::eTransferDst);
+    make(fg_color, vk::Format::eR8G8B8A8Unorm, ow, oh, Usage::eStorage | Usage::eSampled);
+    // Presented through an sRGB or UNORM view as the game's display buffer is (presenter).
+    make(fg_output, vk::Format::eR8G8B8A8Unorm, ow, oh, Usage::eStorage | Usage::eSampled,
+         vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage);
+    make(fg_depth, vk::Format::eR32Sfloat, w, h, Usage::eSampled | Usage::eTransferDst);
+    fg_hudless_view = view(fg_hudless, vk::Format::eR8G8B8A8Unorm);
+    fg_color_view = view(fg_color, vk::Format::eR8G8B8A8Unorm);
+    fg_output_view = view(fg_output, vk::Format::eR8G8B8A8Unorm);
+
+    if (!fg_capture_pipeline) {
+        const auto layout = [&](std::initializer_list<vk::DescriptorType> types, u32 push_size,
+                                vk::UniqueDescriptorSetLayout& set_layout,
+                                vk::UniquePipelineLayout& pipeline_layout) {
+            std::vector<vk::DescriptorSetLayoutBinding> bindings;
+            for (const auto type : types) {
+                bindings.push_back({.binding = u32(bindings.size()), .descriptorType = type,
+                                    .descriptorCount = 1,
+                                    .stageFlags = vk::ShaderStageFlagBits::eCompute});
+            }
+            set_layout = Check(device.createDescriptorSetLayoutUnique({
+                .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+                .bindingCount = u32(bindings.size()),
+                .pBindings = bindings.data()}));
+            const vk::PushConstantRange push{vk::ShaderStageFlagBits::eCompute, 0, push_size};
+            pipeline_layout = Check(device.createPipelineLayoutUnique({
+                .setLayoutCount = 1, .pSetLayouts = &*set_layout,
+                .pushConstantRangeCount = 1, .pPushConstantRanges = &push}));
+        };
+        const auto compute = [&](const auto& code, vk::PipelineLayout pipeline_layout) {
+            const auto module = CompileSPV(code, device);
+            auto pipeline = Check(device.createComputePipelineUnique(
+                {}, vk::ComputePipelineCreateInfo{
+                        .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                                  .module = module,
+                                  .pName = "main"},
+                        .layout = pipeline_layout,
+                    }));
+            device.destroyShaderModule(module);
+            return pipeline;
+        };
+        layout({vk::DescriptorType::eSampledImage, vk::DescriptorType::eStorageImage}, sizeof(u32),
+               fg_capture_desc_layout, fg_capture_pipeline_layout);
+        fg_capture_pipeline = compute(FRAME_GEN_CAPTURE_COMP, *fg_capture_pipeline_layout);
+        layout({vk::DescriptorType::eStorageImage, vk::DescriptorType::eStorageImage,
+                vk::DescriptorType::eStorageImage},
+               sizeof(float), fg_compose_desc_layout, fg_compose_pipeline_layout);
+        fg_compose_pipeline = compute(FRAME_GEN_COMPOSE_COMP, *fg_compose_pipeline_layout);
+    }
+    fg_width = ow;
+    fg_height = oh;
+    fg_render_width = w;
+    fg_render_height = h;
+    fg_reset = true;
+    FfxVkFsr3_3_1_6FrameGenerationMemoryUsage usage{};
+    ffxVkFsr3_3_1_6FrameGenerationContextGetMemoryUsage(fg_context, &usage);
+    std::printf("Frame generation: FSR 3.1 %ux%u -> %ux%u, %.1f MB\n", w, h, ow, oh,
+                double(usage.totalUsageInBytes) / (1 << 20));
+    return true;
+}
+
+void TemporalUpscaler::CaptureFrameGenerationInputs(vk::Image depth_image, u32 w, u32 h, u32 ow,
+                                                    u32 oh, float frame_ms) {
+    if (fg_disabled || fg_failed.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (!EnsureFrameGeneration(w, h, ow, oh)) {
+        fg_disabled = true;
+        return;
+    }
+    fg_frame_ms = frame_ms;
+    fg_near = camera_motion.Near();
+    fg_fov = camera_motion.VerticalFov();
+    fg_jitter = jitter;
+    fg_input_width = w;
+    fg_input_height = h;
+    // The upscaled scene before the UI, and the depth: copies, as both images are written
+    // again before the presenter records the generated frame.
+    scheduler.Record([ui = vk::Image(ui_image), hudless = vk::Image(fg_hudless), depth_image,
+                      depth = vk::Image(fg_depth), w, h, ow, oh](vk::CommandBuffer cmd) {
+        const auto all = vk::PipelineStageFlagBits2::eAllCommands;
+        const std::array<vk::ImageMemoryBarrier2, 4> before{{
+            {.srcStageMask = all, .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+             .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+             .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+             .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+             .image = ui, .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
+            {.srcStageMask = all, .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+             .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+             .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+             .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eGeneral,
+             .image = depth_image,
+             .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}},
+            {.srcStageMask = all, .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+             .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+             .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+             .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eGeneral,
+             .image = hudless, .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
+            {.srcStageMask = all, .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+             .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+             .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+             .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eGeneral,
+             .image = depth, .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
+        }};
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = u32(before.size()),
+                              .pImageMemoryBarriers = before.data()});
+        cmd.copyImage(ui, vk::ImageLayout::eGeneral, hudless, vk::ImageLayout::eGeneral,
+                      vk::ImageCopy{.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                    .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                    .extent = {ow, oh, 1}});
+        cmd.copyImage(depth_image, vk::ImageLayout::eGeneral, depth, vk::ImageLayout::eGeneral,
+                      vk::ImageCopy{.srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+                                    .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                    .extent = {w, h, 1}});
+        const vk::MemoryBarrier2 after{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = all,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite};
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &after});
+    });
+    fg_inputs = true;
+}
+
+namespace {
+/// The UNORM format of an 8-bit display buffer format (its encoded bits), or eUndefined.
+vk::Format UnormOf(vk::Format format) {
+    switch (format) {
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eR8G8B8A8Unorm:
+        return vk::Format::eR8G8B8A8Unorm;
+    case vk::Format::eB8G8R8A8Srgb:
+    case vk::Format::eB8G8R8A8Unorm:
+        return vk::Format::eB8G8R8A8Unorm;
+    case vk::Format::eA8B8G8R8SrgbPack32:
+    case vk::Format::eA8B8G8R8UnormPack32:
+        return vk::Format::eA8B8G8R8UnormPack32;
+    default:
+        return vk::Format::eUndefined;
+    }
+}
+} // namespace
+
+bool TemporalUpscaler::RecordFrameGeneration(const Display& display, Display& generated) {
+    if (!fg_inputs || !fg_context) {
+        return false;
+    }
+    fg_inputs = false;
+    if (fg_failed.load(std::memory_order_relaxed)) {
+        std::printf("Frame generation: a dispatch failed; off\n");
+        DestroyFrameGeneration();
+        fg_disabled = true;
+        return false;
+    }
+    const vk::Format unorm = UnormOf(display.format);
+    if (unorm == vk::Format::eUndefined || display.width != fg_width ||
+        display.height != fg_height) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::printf("Frame generation: display %ux%u format %s not supported\n", display.width,
+                        display.height, vk::to_string(display.format).c_str());
+        }
+        return false;
+    }
+    auto& final_view = fg_final_views[VkImage(display.image)];
+    if (!final_view) {
+        final_view = Check(instance.GetDevice().createImageViewUnique({
+            .image = display.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = unorm,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+    }
+    FfxVkFsr3_3_1_6FrameGenerationPrepareInfo prepare{};
+    prepare.color = {VkImage(vk::Image(fg_color)), VK_FORMAT_R8G8B8A8_UNORM, fg_width, fg_height,
+                     VK_IMAGE_LAYOUT_GENERAL,
+                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+    prepare.depth = {VkImage(vk::Image(fg_depth)), VK_FORMAT_R32_SFLOAT, fg_render_width,
+                     fg_render_height, VK_IMAGE_LAYOUT_GENERAL,
+                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    prepare.motionVectors = {VkImage(vk::Image(motion_image)), VK_FORMAT_R16G16_SFLOAT,
+                             fg_render_width, fg_render_height, VK_IMAGE_LAYOUT_GENERAL,
+                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+    prepare.renderWidth = fg_input_width;
+    prepare.renderHeight = fg_input_height;
+    const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+    prepare.jitterOffsetX = sign * fg_jitter[0];
+    prepare.jitterOffsetY = sign * fg_jitter[1];
+    prepare.motionVectorScaleX = 1.0f;
+    prepare.motionVectorScaleY = 1.0f;
+    prepare.frameTimeMilliseconds = fg_frame_ms;
+    prepare.minLuminance = 0.0f;
+    prepare.maxLuminance = 1.0f;
+    prepare.transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB;
+    prepare.cameraNear = fg_near > 0.0f ? fg_near : 0.1f;
+    prepare.cameraFar = 3000.0f;
+    prepare.viewSpaceToMeters = 1.0f;
+    prepare.cameraVerticalFovRadians = fg_fov > 0.0f ? fg_fov : 1.0f;
+    prepare.frameId = ++fg_frame_id;
+    prepare.reset = fg_reset ? VK_TRUE : VK_FALSE;
+
+    FfxVkFsr3_3_1_6FrameGenerationDispatchInfo dispatch{};
+    dispatch.color = prepare.color;
+    dispatch.output = {VkImage(vk::Image(fg_output)), VK_FORMAT_R8G8B8A8_UNORM, fg_width,
+                       fg_height, VK_IMAGE_LAYOUT_GENERAL,
+                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+    dispatch.displayWidth = fg_width;
+    dispatch.displayHeight = fg_height;
+    dispatch.frameTimeMilliseconds = fg_frame_ms;
+    dispatch.cameraNear = prepare.cameraNear;
+    dispatch.cameraFar = prepare.cameraFar;
+    dispatch.viewSpaceToMeters = 1.0f;
+    dispatch.cameraVerticalFovRadians = prepare.cameraVerticalFovRadians;
+    dispatch.minLuminance = 0.0f;
+    dispatch.maxLuminance = 1.0f;
+    dispatch.transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB;
+    dispatch.frameId = prepare.frameId;
+    dispatch.reset = prepare.reset;
+    fg_reset = false;
+
+    scheduler.EndRendering();
+    scheduler.Record([this, ctx = fg_context, prepare, dispatch, final = *final_view,
+                      color = *fg_color_view, output = *fg_output_view, hudless = *fg_hudless_view,
+                      output_image = vk::Image(fg_output), color_image = vk::Image(fg_color),
+                      w = fg_width, h = fg_height](vk::CommandBuffer cmd) mutable {
+        const auto all = vk::PipelineStageFlagBits2::eAllCommands;
+        const auto everything = vk::MemoryBarrier2{
+            .srcStageMask = all, .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = all,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite};
+        // The previous generated frame was presented (read): this one replaces it.
+        const std::array<vk::ImageMemoryBarrier2, 2> start{{
+            {.srcStageMask = all, .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+             .dstStageMask = all, .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+             .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eGeneral,
+             .image = output_image, .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
+            {.srcStageMask = all, .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
+             .dstStageMask = all, .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+             .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eGeneral,
+             .image = color_image, .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}},
+        }};
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &everything,
+                              .imageMemoryBarrierCount = u32(start.size()),
+                              .pImageMemoryBarriers = start.data()});
+        // The finished frame (UI included) is frame generation's input.
+        {
+            const vk::DescriptorImageInfo src{.imageView = final, .imageLayout = vk::ImageLayout::eGeneral};
+            const vk::DescriptorImageInfo dst{.imageView = color, .imageLayout = vk::ImageLayout::eGeneral};
+            const std::array<vk::WriteDescriptorSet, 2> writes{{
+                {.dstBinding = 0, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eSampledImage, .pImageInfo = &src},
+                {.dstBinding = 1, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &dst},
+            }};
+            const u32 unused = 0;
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *fg_capture_pipeline);
+            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fg_capture_pipeline_layout,
+                                     0, writes);
+            cmd.pushConstants(*fg_capture_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(unused), &unused);
+            cmd.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        }
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &everything});
+        {
+            std::scoped_lock lock{fg_mutex};
+            prepare.commandBuffer = cmd;
+            dispatch.commandBuffer = cmd;
+            if (ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(ctx, &prepare) !=
+                    FFX_VK_FSR3_3_1_6_FRAMEGEN_OK ||
+                ffxVkFsr3_3_1_6FrameGenerationContextRecordDispatch(ctx, &dispatch) !=
+                    FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+                fg_failed.store(true, std::memory_order_relaxed);
+            }
+        }
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &everything});
+        // The UI (where it changed the frame) from the current frame, over the generated one.
+        {
+            const vk::DescriptorImageInfo gen{.imageView = output, .imageLayout = vk::ImageLayout::eGeneral};
+            const vk::DescriptorImageInfo scene{.imageView = hudless, .imageLayout = vk::ImageLayout::eGeneral};
+            const vk::DescriptorImageInfo fin{.imageView = color, .imageLayout = vk::ImageLayout::eGeneral};
+            const std::array<vk::WriteDescriptorSet, 3> writes{{
+                {.dstBinding = 0, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &gen},
+                {.dstBinding = 1, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &scene},
+                {.dstBinding = 2, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &fin},
+            }};
+            static const float threshold = [] {
+                const char* env = std::getenv("BB_FRAME_GEN_UI_THRESHOLD");
+                return env ? float(std::atof(env)) : 24.0f / 255.0f;
+            }();
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *fg_compose_pipeline);
+            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fg_compose_pipeline_layout,
+                                     0, writes);
+            cmd.pushConstants(*fg_compose_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(threshold), &threshold);
+            cmd.dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        }
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &everything});
+    });
+    scheduler.DeferOperation([this, ctx = fg_context, id = prepare.frameId] {
+        std::scoped_lock lock{fg_mutex};
+        if (ctx == fg_context) {
+            ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(ctx, id);
+        }
+    });
+    generated = {vk::Image(fg_output), vk::Format::eR8G8B8A8Unorm, fg_width, fg_height};
+    return true;
 }
 
 } // namespace Vulkan

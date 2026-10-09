@@ -10,6 +10,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.InputFilter;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -19,7 +20,9 @@ import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -30,31 +33,45 @@ import java.io.PrintWriter;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /** Bloodborne-only Android player. Keeps the game surface alive beneath its sliding drawer. */
 public final class MainActivity extends Activity {
-    private static final String FILES="/data/data/ro.cobrabm.fexdroid/files";
-    private static final String ROOT=FILES+"/rootfs", BASE=FILES+"/bbport";
+    /** The app's files (by package: com.ducvd89.bloodborne), its Linux rootfs and the bbport runtime.
+     *  The rootfs programs name its absolute path (their interpreter), set when it was installed. */
+    private String FILES, ROOT, BASE;
+    /** The game (CUSA03173, with eboot.bin) in shared storage, chosen by the player. */
+    private String gameDir;
+    private static final int REQUEST_FOLDER=1, REQUEST_STORAGE=2;
+    private SurfaceHolder pendingHolder;
     private final Handler main=new Handler(Looper.getMainLooper());
     private final ExecutorService worker=Executors.newSingleThreadExecutor();
     private FrameLayout screen;
     private SurfaceView surface;
     private View scrim, handle;
     private LinearLayout drawer;
+    private LinearLayout drawerItems;
     private TextView status;
     private Button resume;
+    private Button controllerButton;
+    private TouchControllerOverlay controllerOverlay;
     private PadBridge pad;
+    private AudioBridge audio;
     private volatile Process xvfb, game;
     private volatile int shmid=-1;
     private volatile boolean destroyed;
     private boolean drawerOpen, displayOnly, startingX, hadError, swipeConsumed;
     private float touchX, touchY;
-    private boolean edgeGesture;
+    private boolean edgeGesture, imeOpen, imePolling;
+    private final AtomicBoolean imeAnswered=new AtomicBoolean();
 
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        FILES="/data/data/"+getPackageName()+"/files";
+        ROOT=FILES+"/rootfs"; BASE=FILES+"/bbport";
+        gameDir=getSharedPreferences("bloodborne",MODE_PRIVATE).getString("game_dir",null);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (Build.VERSION.SDK_INT>=28) {
             WindowManager.LayoutParams attrs=getWindow().getAttributes();
@@ -63,6 +80,7 @@ public final class MainActivity extends Activity {
         }
         displayOnly="x".equals(getIntent().getStringExtra("action"));
         pad=new PadBridge(new File(BASE,"android-pad.state"));
+        audio=new AudioBridge(new File(BASE,"audio.fifo")); audio.start();
         buildScreen();
         immersive();
     }
@@ -82,6 +100,7 @@ public final class MainActivity extends Activity {
         surface.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override public void surfaceCreated(SurfaceHolder h) {
                 if (shmid>=0) attach(h);
+                else if (!hasGame()) { pendingHolder=h; askGameFolder(false); }
                 else if (!startingX) { startingX=true; worker.execute(() -> startX(h)); }
             }
             @Override public void surfaceChanged(SurfaceHolder h,int format,int w,int height) {}
@@ -100,6 +119,10 @@ public final class MainActivity extends Activity {
         screen.addView(status,frame(-1,-1,Gravity.CENTER));
         status.setClickable(false);
 
+        controllerOverlay=new TouchControllerOverlay(this,pad);
+        controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
+        screen.addView(controllerOverlay,frame(-1,-1,Gravity.CENTER));
+
         handle=new View(this);
         GradientDrawable grip=new GradientDrawable(); grip.setColor(0x80c6ad76); grip.setCornerRadius(dp(4));
         handle.setBackground(grip); handle.setContentDescription("Open game menu");
@@ -111,30 +134,56 @@ public final class MainActivity extends Activity {
         screen.addView(scrim,frame(-1,-1,Gravity.FILL));
 
         drawer=new LinearLayout(this); drawer.setOrientation(LinearLayout.VERTICAL);
-        drawer.setPadding(dp(24),dp(18),dp(24),dp(16)); drawer.setBackgroundColor(0xff15171d);
+        drawer.setBackgroundColor(0xff15171d);
         drawer.setElevation(dp(16)); drawer.setVisibility(View.GONE);
+        drawerItems=new LinearLayout(this); drawerItems.setOrientation(LinearLayout.VERTICAL);
+        drawerItems.setPadding(dp(24),dp(18),dp(24),dp(16));
+        android.widget.ScrollView drawerScroll=new android.widget.ScrollView(this);
+        drawerScroll.setFillViewport(false);
+        drawerScroll.addView(drawerItems);
+        drawer.addView(drawerScroll,new LinearLayout.LayoutParams(-1,-1));
         TextView title=text("BLOODBORNE",25,0xffe8dfc9); title.setTypeface(Typeface.SERIF,Typeface.BOLD);
-        drawer.addView(title,new LinearLayout.LayoutParams(-1,dp(44)));
+        drawerItems.addView(title,new LinearLayout.LayoutParams(-1,dp(44)));
         TextView hint=text("Swipe left or press A to return",12,0xffa6a7ac);
-        drawer.addView(hint,new LinearLayout.LayoutParams(-1,dp(30)));
+        drawerItems.addView(hint,new LinearLayout.LayoutParams(-1,dp(30)));
         resume=menuButton("Resume game",() -> closeDrawer());
         menuButton("Graphics settings",() -> {
             closeDrawer();
-            if (shmid>=0) { XInput.key(118,true); main.postDelayed(() -> XInput.key(118,false),100); }
+            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).show();
         });
+        controllerButton=menuButton("On-screen controller: " + (controllerEnabled() ? "On" : "Off"),() -> {
+            boolean enabled=!controllerEnabled();
+            getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("controller_overlay",enabled).apply();
+            controllerOverlay.release();
+            controllerButton.setText("On-screen controller: " + (enabled ? "On" : "Off"));
+            closeDrawer();
+        });
+        menuButton("Edit on-screen controller",() -> {
+            getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("controller_overlay",true).apply();
+            controllerButton.setText("On-screen controller: On");
+            closeDrawer();
+            controllerOverlay.edit(null);
+        });
+        menuButton("Reset controller layout",() -> {
+            controllerOverlay.resetLayout();
+            closeDrawer();
+        });
+        menuButton("Game folder",() -> { closeDrawer(); askGameFolder(true); });
         menuButton("Restart game",() -> new AlertDialog.Builder(this)
             .setTitle("Restart Bloodborne?").setMessage("Any unsaved progress will be lost.")
-            .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> {
-                closeDrawer(); status.setText("Restarting Bloodborne…"); status.setVisibility(View.VISIBLE);
-                worker.execute(() -> { stopGame(); startGame(); });
-            }).show());
+            .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> restartGame()).show());
         menuButton("Quit game",() -> new AlertDialog.Builder(this)
             .setTitle("Quit Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Quit",(dialog,which) -> finish()).show());
         TextView controls=text("B  Confirm     A  Cancel\nY  Item             X  Heal",13,0xffc6ad76);
-        controls.setPadding(0,dp(16),0,0); drawer.addView(controls);
+        controls.setPadding(0,dp(16),0,0); drawerItems.addView(controls);
         screen.addView(drawer,frame(dp(300),-1,Gravity.LEFT));
         setContentView(screen);
+    }
+
+    private void restartGame() {
+        closeDrawer(); status.setText("Restarting Bloodborne…"); status.setVisibility(View.VISIBLE);
+        worker.execute(() -> { stopGame(); startGame(); });
     }
 
     private Button menuButton(String title,Runnable action) {
@@ -142,12 +191,13 @@ public final class MainActivity extends Activity {
         b.setTextSize(16); b.setTextColor(0xffe8dfc9); b.setGravity(Gravity.LEFT|Gravity.CENTER_VERTICAL);
         b.setPadding(dp(14),0,dp(14),0); b.setOnClickListener(v -> action.run());
         LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(46)); lp.bottomMargin=dp(4);
-        drawer.addView(b,lp); return b;
+        drawerItems.addView(b,lp); return b;
     }
 
     private void openDrawer() {
         if (drawerOpen) return;
-        drawerOpen=true; pad.reset(); XInput.button(1,false);
+        drawerOpen=true; controllerOverlay.release(); pad.reset(); XInput.button(1,false);
+        controllerOverlay.setVisibility(View.GONE);
         handle.setVisibility(View.GONE);
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.setAlpha(0); scrim.setVisibility(View.VISIBLE); scrim.animate().alpha(1).setDuration(200).start();
@@ -157,6 +207,7 @@ public final class MainActivity extends Activity {
     private void closeDrawer() {
         if (!drawerOpen) return;
         drawerOpen=false; pad.reset();
+        controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.animate().alpha(0).setDuration(180).withEndAction(() -> scrim.setVisibility(View.GONE)).start();
         drawer.animate().translationX(-dp(300)).setDuration(200)
@@ -234,7 +285,16 @@ public final class MainActivity extends Activity {
         if (drawerOpen && e.isFromSource(android.view.InputDevice.SOURCE_JOYSTICK)) return true;
         return pad.motion(e) || super.dispatchGenericMotionEvent(e);
     }
-    @Override protected void onPause() { if (pad!=null) pad.reset(); super.onPause(); }
+    private boolean controllerEnabled() {
+        return getSharedPreferences("bloodborne",MODE_PRIVATE).getBoolean("controller_overlay",false);
+    }
+    @Override protected void onPause() {
+        if (controllerOverlay!=null) controllerOverlay.release();
+        if (pad!=null) pad.reset();
+        if (audio!=null) audio.pause();
+        super.onPause();
+    }
+    @Override protected void onResume() { super.onResume(); if (audio!=null) audio.resume(); }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         // Deterministic UI checks over ADB, using the same handlers as the actual controls.
@@ -250,14 +310,21 @@ public final class MainActivity extends Activity {
         env.put("HOME",FILES+"/home/bbport"); env.put("LANG","C.UTF-8");
         env.put("TMPDIR",ROOT+"/tmp"); env.put("XDG_RUNTIME_DIR",ROOT+"/tmp");
         env.put("FXD_FILES",FILES); env.put("FXD_ROOT",ROOT); env.put("BB_ANDROID_INPUT","1");
+        // The rootfs's loader was built for the original fexdroid path: its libraries by name here.
+        env.put("LD_LIBRARY_PATH",ROOT+"/usr/lib/aarch64-linux-gnu:"+ROOT+"/usr/lib");
+        // Its libc emulates SysV shared memory through fxshmd (started below), whose built-in path
+        // is also fexdroid's: the socket by name.
+        env.put("FXD_SHM_SOCKET",ROOT+"/tmp/.fxshm/sock");
+        if (gameDir!=null) env.put("BB_GAME_DIR",gameDir);
         if (args[0].endsWith("/Xvfb")) env.put("LD_PRELOAD",ROOT+"/usr/lib/fexdroid/libfxpath.so");
         env.put("LIBGL_DRIVERS_PATH",ROOT+"/usr/lib/aarch64-linux-gnu/dri");
         return b.start();
     }
     private void startX(SurfaceHolder holder) {
         try {
-            if (!new File(ROOT,"usr/bin/Xvfb").canExecute() || !new File(BASE,"game/eboot.bin").isFile())
-                throw new java.io.IOException("Bloodborne files are missing. Restore the installed game bundle.");
+            RuntimeInstaller.ensure(this, new File(FILES), message -> main.post(() -> status.setText(message)));
+            if (!new File(ROOT,"usr/bin/Xvfb").canExecute() || !new File(BASE,"run-thor.sh").isFile())
+                throw new java.io.IOException("The Bloodborne runtime is missing. Install the runtime bundle.");
             new File(FILES,"home/bbport").mkdirs();
             try (PrintWriter passwd=new PrintWriter(new File(ROOT,"etc/passwd"));
                  PrintWriter group=new PrintWriter(new File(ROOT,"etc/group"))) {
@@ -267,6 +334,9 @@ public final class MainActivity extends Activity {
                 group.println("root:x:0:"); group.println("user:x:"+uid+":");
             }
             new File(ROOT,"tmp/.X0-lock").delete(); new File(ROOT,"tmp/.X11-unix/X0").delete();
+            // The shared memory daemon (Xvfb's frame, the display bridge): forks itself and stays.
+            Process shmd=process(ROOT+"/usr/libexec/fxshmd","--dir",ROOT+"/tmp/.fxshm");
+            shmd.waitFor();
             xvfb=process(ROOT+"/usr/bin/Xvfb",":0","-screen","0","1280x720x24",
                 "-shmem","-ac","-nolisten","tcp","-pn");
             Pattern ready=Pattern.compile("screen 0 shmid (\\d+)");
@@ -297,15 +367,134 @@ public final class MainActivity extends Activity {
         XInput.connect(0);
         if (!displayOnly && game==null) worker.execute(() -> startGame());
         pollFrames();
+        if (!imePolling) { imePolling=true; pollIme(); }
     }
+    // ---- Game folder: the extracted game (CUSA03173) in shared storage ----
+    private static boolean isGame(File dir) { return dir!=null && new File(dir,"eboot.bin").isFile(); }
+    private boolean hasGame() {
+        if (Build.VERSION.SDK_INT>=23 && checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                !=android.content.pm.PackageManager.PERMISSION_GRANTED) return false;
+        return gameDir!=null && isGame(new File(gameDir));
+    }
+    /** Explains, asks for storage access when needed, then opens the folder picker. */
+    private void askGameFolder(boolean change) {
+        if (Build.VERSION.SDK_INT>=23 && checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                !=android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{android.Manifest.permission.READ_EXTERNAL_STORAGE,
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE},REQUEST_STORAGE);
+            return;
+        }
+        status.setText(change ? "Choose the Bloodborne game folder." :
+            "Choose your Bloodborne game folder (CUSA03173, the folder with eboot.bin).");
+        status.setVisibility(View.VISIBLE);
+        new AlertDialog.Builder(this).setTitle("Bloodborne game folder")
+            .setMessage("Select the extracted game folder (CUSA03173, which contains eboot.bin) or the folder "
+                +"that holds it, in your phone's storage."+(gameDir!=null ? "\n\nCurrent: "+gameDir : ""))
+            .setPositiveButton("Choose folder",(d,w) -> {
+                Intent pick=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                try { startActivityForResult(pick,REQUEST_FOLDER); }
+                catch (Exception ex) { error("No folder picker: "+ex); }
+            })
+            .setNegativeButton(change ? "Cancel" : "Quit",(d,w) -> { if (!change) finish(); })
+            .setCancelable(change).show();
+    }
+    @Override public void onRequestPermissionsResult(int code,String[] permissions,int[] results) {
+        super.onRequestPermissionsResult(code,permissions,results);
+        if (code!=REQUEST_STORAGE) return;
+        if (results.length>0 && results[0]==android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            if (hasGame()) startPending(); else askGameFolder(false);
+        } else error("Bloodborne needs storage access to read the game folder.");
+    }
+    @Override protected void onActivityResult(int code,int result,Intent data) {
+        super.onActivityResult(code,result,data);
+        if (code!=REQUEST_FOLDER) return;
+        if (result!=RESULT_OK || data==null || data.getData()==null) { if (!hasGame()) askGameFolder(false); return; }
+        File dir=folderOf(data.getData());
+        if (dir!=null && !isGame(dir) && isGame(new File(dir,"CUSA03173"))) dir=new File(dir,"CUSA03173");
+        if (!isGame(dir)) {
+            new AlertDialog.Builder(this).setTitle("Not a Bloodborne folder")
+                .setMessage((dir==null ? "That location" : dir.getPath())+" has no eboot.bin.")
+                .setPositiveButton("Choose again",(d,w) -> askGameFolder(gameDir!=null)).show();
+            return;
+        }
+        boolean changed=gameDir!=null && !gameDir.equals(dir.getPath());
+        gameDir=dir.getPath();
+        getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putString("game_dir",gameDir).apply();
+        status.setText("Starting Bloodborne…");
+        if (changed && game!=null) restartGame(); else startPending();
+    }
+    /** A storage folder of the picker (tree document "primary:Path" or "XXXX-XXXX:Path") as a path. */
+    private static File folderOf(android.net.Uri tree) {
+        try {
+            String id=android.provider.DocumentsContract.getTreeDocumentId(tree);
+            int colon=id.indexOf(':');
+            String volume=colon<0 ? id : id.substring(0,colon), path=colon<0 ? "" : id.substring(colon+1);
+            File base="primary".equalsIgnoreCase(volume) ? android.os.Environment.getExternalStorageDirectory()
+                                                         : new File("/storage/"+volume);
+            return path.isEmpty() ? base : new File(base,path);
+        } catch (Exception ex) { return null; }
+    }
+    private void startPending() {
+        SurfaceHolder h=pendingHolder!=null ? pendingHolder : surface.getHolder();
+        pendingHolder=null;
+        if (h.getSurface()!=null && h.getSurface().isValid() && !startingX && shmid<0) {
+            startingX=true; worker.execute(() -> startX(h));
+        }
+    }
+
     private void pollFrames() {
         if (destroyed) return;
         if (!hadError && DisplayBridge.directFrames()>0) status.setVisibility(View.GONE);
         main.postDelayed(this::pollFrames,1000);
     }
+
+    /** The game's text dialog (the character name, BB_IME_FILE in run-thor.sh): shown here with the
+     *  touch keyboard. The request holds the maximum length, the title and the current text. */
+    private void pollIme() {
+        if (destroyed) return;
+        File request=new File(BASE,"ime.request");
+        if (!imeOpen && request.isFile()) {
+            try (BufferedReader r=new BufferedReader(new InputStreamReader(new java.io.FileInputStream(request),"UTF-8"))) {
+                int max=Integer.parseInt(r.readLine().trim());
+                String title=r.readLine(), initial=r.readLine();
+                request.delete();
+                showIme(Math.max(1,max),title==null ? "" : title,initial==null ? "" : initial);
+            } catch (Exception ex) { android.util.Log.e("Bloodborne","text request: "+ex); request.delete(); }
+        }
+        main.postDelayed(this::pollIme,250);
+    }
+    private void showIme(int max,String title,String initial) {
+        imeOpen=true; imeAnswered.set(false); pad.reset(); closeDrawer();
+        EditText field=new EditText(this);
+        field.setSingleLine(true); field.setText(initial); field.setSelection(field.getText().length());
+        field.setFilters(new InputFilter[]{new InputFilter.LengthFilter(max)});
+        field.setImeOptions(EditorInfo.IME_ACTION_DONE | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+        FrameLayout box=new FrameLayout(this); box.setPadding(dp(20),dp(8),dp(20),0); box.addView(field);
+        AlertDialog dialog=new AlertDialog.Builder(this).setTitle(title.isEmpty() ? "Enter text" : title)
+            .setView(box)
+            .setPositiveButton("OK",(d,w) -> answerIme(true,field.getText().toString()))
+            .setNegativeButton("Cancel",(d,w) -> answerIme(false,""))
+            .setOnCancelListener(d -> answerIme(false,"")).create();
+        field.setOnEditorActionListener((v,action,event) -> {
+            if (action!=EditorInfo.IME_ACTION_DONE) return false;
+            dialog.dismiss(); answerIme(true,field.getText().toString()); return true;
+        });
+        dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+        dialog.setOnDismissListener(d -> { imeOpen=false; immersive(); surface.requestFocus(); });
+        dialog.show(); field.requestFocus();
+    }
+    private void answerIme(boolean ok,String value) {
+        if (!imeAnswered.compareAndSet(false,true)) return;
+        File temporary=new File(BASE,"ime.request.result.tmp"), result=new File(BASE,"ime.request.result");
+        try (java.io.Writer w=new java.io.OutputStreamWriter(new java.io.FileOutputStream(temporary),"UTF-8")) {
+            w.write((ok ? "ok" : "cancel")+"\n"+value.replace('\n',' ')+"\n");
+        } catch (Exception ex) { android.util.Log.e("Bloodborne","text answer: "+ex); return; }
+        if (!temporary.renameTo(result)) android.util.Log.e("Bloodborne","text answer: rename failed");
+    }
     private void startGame() {
         if (destroyed) return;
         hadError=false;
+        new File(BASE,"ime.request").delete(); new File(BASE,"ime.request.result").delete();
         try {
             Process launched=process(ROOT+"/bin/sh",BASE+"/run-thor.sh","game"); game=launched;
             Thread log=new Thread(() -> {
@@ -328,7 +517,7 @@ public final class MainActivity extends Activity {
         if (p!=null) { p.destroyForcibly(); try { p.waitFor(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
     @Override protected void onDestroy() {
-        destroyed=true; pad.reset(); main.removeCallbacksAndMessages(null);
+        destroyed=true; pad.reset(); audio.stop(); main.removeCallbacksAndMessages(null);
         DisplayBridge.stop(); stopGame(); if (xvfb!=null) xvfb.destroyForcibly();
         worker.shutdownNow(); super.onDestroy();
     }

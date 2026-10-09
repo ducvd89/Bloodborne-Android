@@ -4,6 +4,7 @@
  * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "guest_cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,6 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
-#include <asm/prctl.h>
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
 #define STACK_MARGIN (256*1024)
@@ -39,6 +39,8 @@ typedef struct GuestThread {
     void *argument, *result;
     ThreadAttr attr;
     char name[32];
+    unsigned char *guest_stack; /* separate from the host stack when the guest CPU is not the host's */
+    size_t guest_stack_size;
     int detached, finished, joined, host_owned;
     jmp_buf exit_jump;
     struct GuestThread *next;
@@ -57,9 +59,6 @@ void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;
 }
 static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1); }
-static void set_gs(void *base) {
-    if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
-}
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
     uint64_t offset=tls_offset();
@@ -74,7 +73,7 @@ static void attach(GuestThread *t) {
     tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
     t->tls_block=block; t->tcb=tcb;
-    set_gs(tcb);
+    guest_cpu_set_gs(tcb);
     current=t;
 }
 static GuestThread *new_thread(void) {
@@ -221,8 +220,12 @@ static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     set_host_name(t->name);
-    if (!setjmp(t->exit_jump)) t->result=t->entry(t->argument);
+    if (t->guest_stack) guest_cpu_thread_stack(t->guest_stack+t->guest_stack_size,t->guest_stack_size);
+    const uint64_t argument=(uint64_t)(uintptr_t)t->argument;
+    if (!setjmp(t->exit_jump)) t->result=(void *)(uintptr_t)guest_cpu_call((uintptr_t)t->entry,1,&argument);
+    else guest_cpu_abandon();
     runtime_thread_keys_cleanup();
+    guest_cpu_thread_end();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
     return t->result;
 }
@@ -243,6 +246,11 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
     if (stack_memory) pthread_attr_setstack(&host,stack_memory,stack_bytes);
     else pthread_attr_setstacksize(&host,stack_bytes);
+#ifndef GUEST_CPU_NATIVE
+    t->guest_stack=runtime_low_map((size_t)stack,PROT_READ|PROT_WRITE);
+    if (!t->guest_stack) { fputs("STOP: cannot allocate a guest thread stack\n",stderr); exit(21); }
+    t->guest_stack_size=(size_t)stack;
+#endif
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
     *out=t;

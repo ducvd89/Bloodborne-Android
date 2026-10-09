@@ -136,8 +136,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
-    present_frames.resize(num_images);
-    for (u32 i = 0; i < num_images; i++) {
+    // bbport: two more with frame generation (a generated and a real frame per flip).
+    const u32 frame_count = num_images + 2;
+    present_frames.resize(frame_count);
+    for (u32 i = 0; i < frame_count; i++) {
         Frame& frame = present_frames[i];
         frame.id = i;
         auto fence = Check<"create present done fence">(
@@ -323,6 +325,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // bbport: scaled upscaler presets: the output-size display buffer drawn by the port.
     TemporalUpscaler::Display display{};
     const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);
+    // bbport: FSR 3.1 frame generation: a frame between the last one and this, recorded first.
+    TemporalUpscaler::Display generated{};
+    const bool has_generated =
+        upscaled && rasterizer->GetUpscaler().RecordFrameGeneration(display, generated);
     VideoCore::ImageId image_id{};
     if (!upscaled) {
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
@@ -401,52 +407,87 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
 
-    // Numbered here, in command order; marked where the commands are recorded.
-    const u32 stream = draw_scheduler.CrumbStream();
-    const bool crumbs = Breadcrumbs::Enabled();
-    const u32 fsr_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter FSR"}) : 0;
-    const u32 pp_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter post process"}) : 0;
-    draw_scheduler.Record([this, frame, image_view, image_size, frame_subresources, stream,
-                           fsr_crumb, pp_crumb, fsr = fsr_settings,
-                           pp = pp_settings](vk::CommandBuffer cmdbuf) {
-        // Frames of different submissions may be recorded on two threads at once.
-        std::scoped_lock lock{passes_mutex};
-        const auto pre_barrier = vk::ImageMemoryBarrier2{
-            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
-            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
-            .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-            .image = frame->image,
-            .subresourceRange{frame_subresources},
-        };
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .imageMemoryBarrierCount = 1,
-            .pImageMemoryBarriers = &pre_barrier,
+    // bbport: the passes into a presentation frame, flushed (the generated frame, then this one).
+    const auto render_frame = [&](Frame* frame, vk::ImageView image_view, vk::Extent2D image_size) {
+        // Numbered here, in command order; marked where the commands are recorded.
+        const u32 stream = draw_scheduler.CrumbStream();
+        const bool crumbs = Breadcrumbs::Enabled();
+        const u32 fsr_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter FSR"}) : 0;
+        const u32 pp_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter post process"}) : 0;
+        draw_scheduler.Record([this, frame, image_view, image_size, frame_subresources, stream,
+                               fsr_crumb, pp_crumb, fsr = fsr_settings,
+                               pp = pp_settings](vk::CommandBuffer cmdbuf) {
+            // Frames of different submissions may be recorded on two threads at once.
+            std::scoped_lock lock{passes_mutex};
+            const auto pre_barrier = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = frame->image,
+                .subresourceRange{frame_subresources},
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &pre_barrier,
+            });
+            if (fsr_crumb) {
+                Breadcrumbs::Mark(cmdbuf, stream, fsr_crumb, false);
+            }
+            const vk::ImageView input = fsr_pass.Render(cmdbuf, image_view, image_size,
+                                                        {frame->width, frame->height}, fsr,
+                                                        frame->is_hdr);
+            if (fsr_crumb) {
+                Breadcrumbs::Mark(cmdbuf, stream, fsr_crumb, true);
+                Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, false);
+            }
+            pp_pass.Render(cmdbuf, input, image_size, *frame, pp);
+            if (pp_crumb) {
+                Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, true);
+            }
         });
-        if (fsr_crumb) {
-            Breadcrumbs::Mark(cmdbuf, stream, fsr_crumb, false);
-        }
-        const vk::ImageView input = fsr_pass.Render(cmdbuf, image_view, image_size,
-                                                    {frame->width, frame->height}, fsr,
-                                                    frame->is_hdr);
-        if (fsr_crumb) {
-            Breadcrumbs::Mark(cmdbuf, stream, fsr_crumb, true);
-            Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, false);
-        }
-        pp_pass.Render(cmdbuf, input, image_size, *frame, pp);
-        if (pp_crumb) {
-            Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, true);
-        }
-    });
 
-    // Flush frame creation commands.
-    BbStats::frame_number.fetch_add(1, std::memory_order_relaxed); // bbport: game frames shown
-    frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
-    frame->ready_tick = draw_scheduler.CurrentTick();
-    SubmitInfo info{};
-    draw_scheduler.Flush(info);
+        // Flush frame creation commands.
+        BbStats::frame_number.fetch_add(1, std::memory_order_relaxed); // bbport: game frames shown
+        frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
+        frame->ready_tick = draw_scheduler.CurrentTick();
+        SubmitInfo info{};
+        draw_scheduler.Flush(info);
+    };
+    if (has_generated) {
+        Frame* gen = GetRenderFrame();
+        draw_scheduler.EndRendering();
+        // The game's display buffer view: sRGB when it is, the generated frame's bits likewise.
+        const bool srgb = vk::to_string(view_info.format).find("Srgb") != std::string::npos;
+        const auto device = instance.GetDevice();
+        const vk::ImageView gen_view = Check(device.createImageView({
+            .image = generated.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = srgb ? vk::Format::eR8G8B8A8Srgb : vk::Format::eR8G8B8A8Unorm,
+            .components = {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
+                           vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eOne},
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+        draw_scheduler.DeferOperation([device, gen_view] { device.destroyImageView(gen_view); });
+        draw_scheduler.Record([image = generated.image](vk::CommandBuffer cmdbuf) {
+            const vk::ImageMemoryBarrier2 to_read{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .image = image,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+            };
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+        });
+        render_frame(gen, gen_view, {generated.width, generated.height});
+        generated_frame = gen;
+    }
+    render_frame(frame, image_view, image_size);
     BbTimeline::Note(BbTimeline::PipeTask, 5, frame->ready_tick);
 
     // bbport: the GPU command thread runs at most BB_FRAMES_AHEAD (default 1) guest frames
