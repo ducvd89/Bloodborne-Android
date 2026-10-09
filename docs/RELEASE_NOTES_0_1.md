@@ -6,4 +6,4 @@ The left-side menu can show or hide a PlayStation-style touch controller with fa
 
 Install the APK, grant storage access, and select your own extracted **CUSA03173 v1.09** folder containing `eboot.bin`. Allow about 1 GB free beyond the game dump for the runtime and generated image. FSR 4 is disabled on this device.
 
-This is an experimental release. Menus boot, but gameplay can crash; other Android devices are untested. See [installation details](https://github.com/ducvd89/Bloodborne-Android/blob/android-0.1/docs/ANDROID_RELEASE_0_1.md).
+The game is running on the AYN Thor's Snapdragon 8 Gen 2 at a reported 20–35 FPS during gameplay. Performance varies by scene and settings; other Android devices are untested. See [installation details](https://github.com/ducvd89/Bloodborne-Android/blob/android-0.1/docs/ANDROID_RELEASE_0_1.md).

@@ -1,7 +1,8 @@
 # Android release 0.1
 
 **Target:** AYN Thor (Snapdragon 8 Gen 2, Adreno 740, Android 13, 16 GB RAM).
-Gameplay is experimental and can crash. Other devices are untested.
+The game is running at a reported 20–35 FPS during gameplay on that device.
+Performance and stability on other devices are untested.
 
 ## Install and play
 
@@ -62,7 +63,8 @@ runtime before installation. The signing key remains outside the repository.
 - Python prepared the selected CUSA03173 dump on the phone. Its resulting
   `boot-linked.bin` SHA-256 matched the existing known-good image.
 - The native FEXCore guest CPU and Vulkan renderer started with the bundled
-  runtime. Long gameplay stability is not established.
+  runtime. Gameplay on the test Snapdragon 8 Gen 2 device is reported at
+  20–35 FPS; this is not a controlled benchmark.
 - The touch controller toggle and on-screen rendering were checked over the
   running game. Face button, D-pad, analog stick, and trigger events reached
   the gamepad bridge and cleared on release. Moving Cross changed its active
