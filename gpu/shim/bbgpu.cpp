@@ -1,8 +1,10 @@
 #include "bbport_write_log.h"
+#include "bbport_game_menu.h"
 #include "bbport_gnm_hooks.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
+#include "game_profile.h"
 #include "bbport_copy.h"
 #include <sys/resource.h>
 #include "bbport_free_check.h"
@@ -188,6 +190,9 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
         CopySparseSerial(source + offset, dest + offset, std::min(Chunk, size - offset));
     });
 }
+void MemoryManager::ReadBacking(VAddr address, void* data, u64 size) {
+    runtime_memory_read_backing(address, data, size);
+}
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     BbWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, BbWriteLog::Backing);
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
@@ -259,6 +264,8 @@ static void StartProfileWriter() {
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
+    // What the translator knows about this game (games/), before anything asks for it.
+    Game::Select(config->serial);
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();
 #endif
@@ -329,6 +336,7 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
 
 extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
     BbGnmHooks::PatchImage(image, size);
+    BbGameMenu::PatchImage(image, size);
 }
 
 extern "C" unsigned bbgpu_symbol_count(void) {

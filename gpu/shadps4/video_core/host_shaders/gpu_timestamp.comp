@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: one GPU clock value of the command processor (an end-of-pipe timestamp, COPY_DATA from
+// the GPU clock; vk_timestamps.cpp). A Vulkan timestamp (device ticks) becomes the PS4's GPU
+// clock, 100 MHz, in the host clock's time line: base + (ticks - base ticks) * ratio, the ratio a
+// 8.24 fixed-point number (Vulkan's tick period over 10 ns); written into the game's memory
+// through its device address. 64-bit values are (low, high) dword pairs.
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) writeonly buffer Target {
+    uvec2 value;
+};
+
+layout(std430, binding = 0) readonly buffer Results { uvec2 results[]; };
+
+layout(push_constant) uniform Push {
+    uvec2 address;    // where the value goes
+    uvec2 base_ticks; // device ticks at the calibration
+    uvec2 base_clock; // PS4 GPU clock (100 MHz) at the calibration
+    uvec2 mask;       // the timestamps' valid bits
+    uint ratio;       // 8.24 fixed point: PS4 clock ticks per device tick
+    uint slot;        // the timestamp's result
+} push;
+
+uvec2 Add(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+uvec2 Sub(uvec2 a, uvec2 b) {
+    uint borrow;
+    const uint low = usubBorrow(a.x, b.x, borrow);
+    return uvec2(low, a.y - b.y - borrow);
+}
+
+void main() {
+    const uvec2 ticks = Sub(results[push.slot], push.base_ticks) & push.mask;
+    // (ticks * ratio) >> 24 over 96 bits: low * ratio + (high * ratio << 32).
+    uint low_msb, low_lsb, high_msb, high_lsb, carry;
+    umulExtended(ticks.x, push.ratio, low_msb, low_lsb);
+    umulExtended(ticks.y, push.ratio, high_msb, high_lsb);
+    const uint word1 = uaddCarry(low_msb, high_lsb, carry);
+    const uint word2 = high_msb + carry;
+    const uvec2 scaled = uvec2((low_lsb >> 24) | (word1 << 8), (word1 >> 24) | (word2 << 8));
+    Target(push.address).value = Add(push.base_clock, scaled);
+}

@@ -72,7 +72,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma || VertexMotion()) {
+    if (info.uses_dma || info.uses_paged_buffers || VertexMotion()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -883,6 +883,15 @@ void EmitContext::DefineBuffers() {
 
         // Define aliases depending on the shader usage.
         auto& spv_buffer = buffers.emplace_back(binding.buffer++, desc.buffer_type);
+        // bbport BB_LAYER_MEMORY: its descriptor holds the page table record (read as U32).
+        spv_buffer.paged = desc.buffer_type == BufferType::Guest &&
+                           IsPagedBuffer(profile.paged_buffers, buf_sharp);
+        if (spv_buffer.paged) {
+            spv_buffer.Alias(PointerType::U32) =
+                DefineBuffer(false, false, 2, desc.buffer_type, U32[1]);
+            ++binding.unified;
+            continue;
+        }
         if (True(desc.used_types & IR::Type::U64)) {
             spv_buffer.Alias(PointerType::U64) =
                 DefineBuffer(desc.is_written, is_coherent, 3, desc.buffer_type, U64);
@@ -1316,6 +1325,55 @@ void EmitContext::DefineFunctions() {
         LOG_DEBUG(Render_Recompiler, "Shader {:#x} uses dynamic ReadConst", info.pgm_hash);
         read_const_dynamic = DefineReadConst(true);
     }
+}
+
+
+Id EmitContext::PhysicalPointer(Id pointee) {
+    auto [it, added] = physical_pointer_types.try_emplace(pointee.value);
+    if (added) {
+        it->second = TypePointer(spv::StorageClass::PhysicalStorageBuffer, pointee);
+    }
+    return it->second;
+}
+
+EmitContext::PagedAccess EmitContext::PagedPointer(const BufferDefinition& buffer, Id byte_offset,
+                                                   u32 access_bytes, Id pointee, bool guest_write) {
+    // The record: {guest address lo, hi, size, write-through, trash address lo, hi,
+    //              guest page-table start (entries), reserved}.
+    const auto [record, record_pointer] = buffer.Alias(PointerType::U32);
+    const auto word = [&](u32 i) {
+        return OpLoad(U32[1], OpAccessChain(record_pointer, record, u32_zero_value, ConstU32(i)));
+    };
+    const auto wide = [&](Id lo, Id hi) {
+        return OpBitwiseOr(U64, OpUConvert(U64, lo),
+                           OpShiftLeftLogical(U64, OpUConvert(U64, hi), ConstU32(32U)));
+    };
+    const Id base = wide(word(0), word(1));
+    const Id size = word(2);
+    const Id trash = wide(word(4), word(5));
+    // Within the buffer: offset < size and offset + access <= size (PS4 range checking: reads
+    // outside give zero, writes outside are dropped).
+    // Subtraction avoids accepting a wrapped offset + access_bytes at the 4 GiB boundary.
+    Id in_range = OpLogicalAnd(
+        U1[1], OpULessThanEqual(U1[1], ConstU32(access_bytes), size),
+        OpULessThanEqual(U1[1], byte_offset, OpISub(U32[1], size, ConstU32(access_bytes))));
+    if (guest_write) {
+        in_range = OpLogicalAnd(U1[1], in_range, OpINotEqual(U1[1], word(3), u32_zero_value));
+    }
+    const Id address = OpIAdd(U64, base, OpUConvert(U64, byte_offset));
+    const u32 shift = profile.sparse_page_shift;
+    const Id page =
+        OpUConvert(U32[1], OpShiftRightLogical(U64, address, Constant(U64, u64{shift})));
+    const auto [table, table_pointer] = buffers[bda_pagetable_index].Alias(PointerType::U64);
+    const Id table_index = guest_write ? OpIAdd(U32[1], page, word(6)) : page;
+    // Reject the access before indexing too: a wrapped/out-of-range offset can address a page
+    // beyond the table, even though the final pointer would select trash.
+    const Id safe_index = OpSelect(U32[1], in_range, table_index, u32_zero_value);
+    const Id entry = OpLoad(U64, OpAccessChain(table_pointer, table, u32_zero_value, safe_index));
+    const Id guard = OpLogicalAnd(U1[1], in_range, OpINotEqual(U1[1], entry, u64_zero_value));
+    const Id in_page = OpBitwiseAnd(U64, address, Constant(U64, (u64{1} << shift) - 1));
+    const Id target = OpSelect(U64, guard, OpIAdd(U64, entry, in_page), trash);
+    return {OpConvertUToPtr(PhysicalPointer(pointee), target), guard};
 }
 
 } // namespace Shader::Backend::SPIRV

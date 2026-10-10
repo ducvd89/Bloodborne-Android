@@ -5,6 +5,8 @@
 /* The settings menu of the GPU library restarts through probe.c, which tests do not link. */
 void runtime_restart(void) { abort(); }
 #include <assert.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -202,6 +204,71 @@ static void direct_memory(void) {
     assert(*(uint64_t *)x==0); /* released allocation does not leak previous data */
     assert(release(a,length)==0); /* release also unmaps owned mapping */
 }
+/* Write traps (runtime_memory_trap): a page stays read-only while any reason holds it, the game's
+ * own mprotect keeps them, and a new mapping starts without them. */
+void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int on);
+unsigned runtime_memory_trap_reasons(uintptr_t address);
+static sigjmp_buf trap_jump;
+static void trap_fault(int sig) { (void)sig; siglongjmp(trap_jump,1); }
+static int write_faults(volatile unsigned char *p) {
+    struct sigaction action={0}, old;
+    action.sa_handler=trap_fault;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSEGV,&action,&old);
+    int faulted=0;
+    if (sigsetjmp(trap_jump,1)) faulted=1;
+    else *p=0x5a;
+    sigaction(SIGSEGV,&old,NULL);
+    return faulted;
+}
+static int read_faults(volatile unsigned char *p) {
+    struct sigaction action={0}, old;
+    action.sa_handler=trap_fault;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSEGV,&action,&old);
+    int faulted=0;
+    if (sigsetjmp(trap_jump,1)) faulted=1;
+    else (void)*p;
+    sigaction(SIGSEGV,&old,NULL);
+    return faulted;
+}
+typedef int32_t (ABI *Protect)(const void *, uint64_t, int);
+static void write_traps(void) {
+    Allocate alloc=GET(Allocate,"rTXw65xmLIA#p#J");
+    Map map=GET(Map,"L-Q3LEjIbgA#p#J");
+    Unmap unmap=GET(Unmap,"cQke9UuBQOk#p#J");
+    Release release=GET(Release,"MBuItvba6z8#p#J");
+    Protect protect=GET(Protect,"vSMAm3cxYTY#p#J");
+    const uint64_t pool=536870912, length=16384;
+    int64_t a=-1;
+    void *x=NULL;
+    assert(alloc(0,pool,length,0,0,&a)==0 && map(&x,length,3,0,a,0)==0);
+    unsigned char *p=x;
+    const uintptr_t page=(uintptr_t)p;
+    runtime_memory_trap(page,4096,1,1);
+    runtime_memory_trap(page,4096,2,1);
+    assert(runtime_memory_trap_reasons(page)==3 && runtime_memory_trap_reasons(page+4096)==0);
+    assert(write_faults(p) && !write_faults(p+4096));
+    runtime_memory_trap(page,4096,1,0); /* one owner lifts its trap: the other's holds */
+    assert(runtime_memory_trap_reasons(page)==2 && write_faults(p));
+    assert(protect(x,length,3)==0 && write_faults(p)); /* the game's mprotect keeps it */
+    runtime_memory_trap(page,4096,2,0);
+    assert(runtime_memory_trap_reasons(page)==0 && !write_faults(p) && p[0]==0x5a);
+    runtime_memory_trap(page,4096,2,1);
+    runtime_memory_trap(page,4096,16,1); /* from 16 up reads fault too */
+    assert(read_faults(p) && write_faults(p) && !read_faults(p+4096));
+    assert(protect(x,length,3)==0 && read_faults(p));
+    runtime_memory_trap(page,4096,16,0); /* back to the write trap left */
+    assert(!read_faults(p) && write_faults(p));
+    runtime_memory_trap(page,4096,2,0);
+    assert(!write_faults(p));
+    runtime_memory_trap(page,length,2,1);
+    assert(unmap(x,length)==0 && runtime_memory_trap_reasons(page)==0); /* gone with the mapping */
+    x=NULL;
+    assert(map(&x,length,3,0,a,0)==0 && !write_faults(x));
+    assert(unmap(x,length)==0 && release(a,length)==0);
+    puts("PASS: write and read traps by reason, kept across mprotect, forgotten on unmap");
+}
 static void memory_primitives(void) {
     typedef void *(ABI *Set)(void *,int,size_t);
     typedef void *(ABI *Copy)(void *,const void *,size_t);
@@ -350,7 +417,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-lifecycle")) { rw_lifecycle(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
-    libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
+    libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); write_traps(); memory_primitives();
     rw_lifecycle(); rw_concurrency(); rw_timeouts();
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;

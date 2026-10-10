@@ -4,15 +4,24 @@
 Other versions start and then fail inside the game's code (the base game 1.00 faults at guest
 offset 0x20348b8): hooks and patches use the addresses of this one executable. The check compares
 the loaded executable image, whose hash is the same whatever tool dumped it (the SELF headers
-around it differ). BB_SKIP_GAME_CHECK=1 skips it.
+around it differ). The shaders must also unpack: an extraction tool that leaves
+parts of compressed sectors stale (LibOrbisPkg PkgTool on .NET 6 or newer, issue #81) makes the
+game hang while it loads them, with no error. BB_SKIP_GAME_CHECK=1 skips both.
+
+Run as a script, it checks every .dcx file of a game folder: game_check.py GAME_DIR
 """
 import hashlib
 import os
+import struct
+import sys
+import zlib
 from pathlib import Path
 
 SUPPORTED_TITLE = 'CUSA03173'
 SUPPORTED_VERSION = '01.09'
 SUPPORTED_IMAGE = '071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444c0a'
+# The game loads these first; a broken extraction damages most files, these among them.
+CHECKED_FOLDER = 'dvdroot_ps4/shader'
 
 
 def image_sha256(game):
@@ -26,10 +35,30 @@ def image_sha256(game):
     return hashlib.sha256(image).hexdigest()
 
 
+def dcx_broken(path):
+    """True when a DFLT .dcx file does not unpack to its stated size or fails zlib's checksum.
+    Other compressions are not checked."""
+    data = Path(path).read_bytes()
+    if data[:4] != b'DCX\0' or data[0x18:0x1C] != b'DCS\0' or data[0x28:0x2C] != b'DFLT':
+        return False
+    size, packed = struct.unpack_from('>II', data, 0x1C)
+    try:
+        return len(zlib.decompress(data[0x4C:0x4C + packed])) != size
+    except zlib.error:
+        return True
+
+
+def broken_files(game, folder=CHECKED_FOLDER):
+    """The .dcx files under the game's folder that do not unpack (paths relative to the game)."""
+    root = Path(game)
+    return [str(f.relative_to(root)) for f in sorted((root / folder).rglob('*.dcx')) if dcx_broken(f)]
+
+
 def problem(game, image_hash=None):
     """None for the supported game, else (kind, title, version): kind is 'missing_update' (base
     game or an older update), 'wrong_eboot' (param.sfo says 1.09, eboot.bin is another version),
-    'other_title' (another edition or region) or 'unreadable'."""
+    'other_title' (another edition or region), 'unreadable' or 'damaged_files' (the right game,
+    but its shaders do not unpack: a broken extraction)."""
     if os.environ.get('BB_SKIP_GAME_CHECK') == '1':
         return None
     from prepare import sfo
@@ -40,7 +69,7 @@ def problem(game, image_hash=None):
     title, version = info.get('TITLE_ID', '?'), info.get('APP_VER', '?')
     try:
         if (image_hash or image_sha256(game)) == SUPPORTED_IMAGE:
-            return None
+            return ('damaged_files', title, version) if broken_files(game) else None
     except (OSError, ValueError, IndexError, StopIteration, KeyError):
         return 'unreadable', title, version
     if title != SUPPORTED_TITLE:
@@ -63,4 +92,31 @@ def explain(kind, title, version):
                        'for now; other editions and regions have a different executable.',
         'unreadable': f'{found} eboot.bin could not be read as a decrypted PS4 executable: dump '
                       'the game and the 1.09 update again.',
+        'damaged_files': f'{found} The game files are damaged: the shaders in {CHECKED_FOLDER} do '
+                         'not unpack, and the game would hang while loading them. The extraction '
+                         'tool left parts of compressed sectors stale (LibOrbisPkg PkgTool on '
+                         '.NET 6 or newer, issue #81): extract the game and the 1.09 update again '
+                         'with a fixed tool. scripts/game_check.py GAME_DIR checks every file.',
     }[kind]
+
+
+def main(argv):
+    """game_check.py GAME_DIR: every .dcx file of the game, those that do not unpack listed."""
+    if len(argv) != 2:
+        print('Usage: game_check.py GAME_DIR', file=sys.stderr)
+        return 2
+    game = Path(argv[1])
+    files = sorted((game / 'dvdroot_ps4').rglob('*.dcx'))
+    broken = []
+    for number, path in enumerate(files, 1):
+        if dcx_broken(path):
+            broken.append(path)
+            print(f'damaged: {path.relative_to(game)}')
+        if number % 1000 == 0:
+            print(f'{number} of {len(files)} checked', file=sys.stderr)
+    print(f'{len(broken)} of {len(files)} .dcx files do not unpack')
+    return 1 if broken else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

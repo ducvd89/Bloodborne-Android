@@ -22,7 +22,9 @@ Port of Bloodborne (PS4, **CUSA03173 v1.09**). The runtime and renderer run nati
 
 ## Features
 
-- **Lossless Scaling frame generation** (2×, 3×, 4×) — new in 0.4.0. Sign in with Steam in the app and it downloads `Lossless.dll` from your own copy of Lossless Scaling
+- **Cheats** — new in 0.5.0: infinite health and infinite blood vials/items, switched on and off while you play
+- **Game settings** in the app's menu: skip the online/offline screen (straight to the main menu), skip intros, free camera, debug menu
+- **Lossless Scaling frame generation** (2×, 3×, 4×). Sign in with Steam in the app and it downloads `Lossless.dll` from your own copy of Lossless Scaling
 - **FSR 3.1** upscaling and **FSR 3.1 frame generation**
 - **On-screen PlayStation controller** with an editable layout; physical controllers work too
 - **Two Vulkan drivers in one APK**, picked automatically for your GPU
@@ -51,12 +53,23 @@ On ColorOS / OxygenOS (Oppo, OnePlus) a "Security warning" about a malicious app
 
 Swipe in from the left edge (or press Back) to open the menu. Its sections:
 
-- **Game:** resume or restart the game.
+- **Game:** resume, Game settings, Cheats, restart.
 - **Graphics:** graphics settings (upscaler, render size, FPS limit, effects) and Lossless Scaling.
 - **Controls:** turn the on-screen controller on or off, edit its layout, reset it.
 - **Storage:** choose the game folder, quit.
 
 Each entry shows its current setting underneath.
+
+## Game settings and cheats
+
+**Game settings** are patches to the game, applied when it starts (Apply restarts it): skip the online/offline screen (on by default; there is no PSN here), skip the startup intros, the free camera (Cross + L3) and the game's debug menu (needs its font files).
+
+**Cheats** switch at once, while you play:
+
+- **Infinite health:** your HP refills to full every frame.
+- **Infinite blood vials and items:** using a blood vial, bullet or other item leaves its count as it was. Items you move to storage or give away stay in your inventory too.
+
+They are code hooks for Bloodborne 1.09 (the same places as Shiningami's GoldHEN cheats for CUSA03173), always in place and switched by flags the game process reads from the app.
 
 ## Lossless Scaling frame generation
 
@@ -93,6 +106,6 @@ Build inputs (SDK, rootfs, signing key, game icon) are listed in [docs/ANDROID_R
 
 ## Credits
 
-[bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) (Linux port), [shadPS4](https://github.com/shadps4-emu/shadPS4), [ARM_bloodborne_pc](https://github.com/MaSieS4Fun/ARM_bloodborne_pc), [FEX](https://github.com/FEX-Emu/FEX), [fexdroid](https://github.com/cobrabm12/fexdroid), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), [mesa-unified turnip/gen8](https://github.com/whitebelyash/mesa-unified), [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk), [JavaSteam](https://github.com/Longi94/JavaSteam), and [GameNative](https://github.com/utkarshdalal/GameNative) for showing LSFG on Android.
+[bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) (Linux port), [shadPS4](https://github.com/shadps4-emu/shadPS4), [ARM_bloodborne_pc](https://github.com/MaSieS4Fun/ARM_bloodborne_pc), [FEX](https://github.com/FEX-Emu/FEX), [fexdroid](https://github.com/cobrabm12/fexdroid), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), [mesa-unified turnip/gen8](https://github.com/whitebelyash/mesa-unified), [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk), [GoldHEN cheats](https://github.com/GoldHEN/GoldHEN_Cheat_Repository) (Shiningami), [JavaSteam](https://github.com/Longi94/JavaSteam), and [GameNative](https://github.com/utkarshdalal/GameNative) for showing LSFG on Android.
 
 Licensed under [GPL-2.0](LICENSE); third-party notices in [THIRD_PARTY_LICENSES.txt](tools/android/frontend/THIRD_PARTY_LICENSES.txt). Not affiliated with Sony Interactive Entertainment, FromSoftware, Valve or the developers of Lossless Scaling.

@@ -47,8 +47,8 @@ index c30f7cf..eb42c16 100644
  
  // ── pipeline creation ─────────────────────────────────────────────────────────
  
-+/* bbport: BB_FSR4_STATS=1 (the device must enable pipelineExecutableInfo) prints the
-+ * driver's statistics of each pass: registers, spills, instruction counts. */
++/* bbport: BB_FSR4_STATS=1 prints the driver's per-pass statistics (registers, spills,
++ * instruction counts) when the executable-statistics extension is enabled. */
 +static void printPipelineStats(FfxFsr4VkContext* c, uint32_t passIdx, VkPipeline pipeline)
 +{
 +    PFN_vkGetPipelineExecutableStatisticsKHR getStats =
@@ -80,14 +80,24 @@ index c30f7cf..eb42c16 100644
  static VkResult mkPipeline(FfxFsr4VkContext* c, uint32_t passIdx, VkPipe* out)
  {
      if (!c || !out || passIdx >= FFX_FSR4_VK_PASS_COUNT)
-@@ -709,7 +750,11 @@ static VkResult mkPipeline(FfxFsr4VkContext* c, uint32_t passIdx, VkPipe* out)
+@@ -709,7 +750,21 @@ static VkResult mkPipeline(FfxFsr4VkContext* c, uint32_t passIdx, VkPipe* out)
      cpci.stage.pName=blob->entryPoint ? blob->entryPoint : "main";
      cpci.layout=out->layout;
  
 +    const char* statsEnv = getenv("BB_FSR4_STATS");
-+    const int stats = statsEnv && statsEnv[0] == '1';
++    const PFN_vkGetPipelineExecutableStatisticsKHR getStats =
++        (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(
++            c->dev, "vkGetPipelineExecutableStatisticsKHR");
++    const int stats = statsEnv && statsEnv[0] == '1' && getStats;
 +    if (stats) cpci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
      r = vkCreateComputePipelines(c->dev, VK_NULL_HANDLE, 1, &cpci, c->alloc, &out->pipeline);
++    if (r != VK_SUCCESS && stats) {
++        /* bbport: the capture flag needs VK_EXT_pipeline_executable_statistics enabled on
++         * the device; without it creation can fail and take FSR4 down with it. Retry
++         * without the flag so the diagnostic never breaks the upscaler. */
++        cpci.flags &= ~(VkPipelineCreateFlags)VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
++        r = vkCreateComputePipelines(c->dev, VK_NULL_HANDLE, 1, &cpci, c->alloc, &out->pipeline);
++    }
 +    if (stats && r == VK_SUCCESS) printPipelineStats(c, passIdx, out->pipeline);
      vkDestroyShaderModule(c->dev, sm, c->alloc);
      if (r) {

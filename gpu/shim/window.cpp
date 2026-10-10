@@ -1,4 +1,5 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -10,6 +11,50 @@
 #include "bbport_overlay.h"
 
 namespace Frontend {
+
+namespace {
+
+// Issue #69: the monitor the window (and fullscreen) goes to. BB_DISPLAY: its number in SDL's
+// order (1, 2, ...; bb-gpu-capabilities --displays lists them) or a part of its name; without it
+// SDL's primary display. The monitors are logged so a report says which one was taken.
+SDL_DisplayID ChooseDisplay() {
+    const SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+    const char* wanted = std::getenv("BB_DISPLAY");
+    int count = 0;
+    SDL_DisplayID* ids = SDL_GetDisplays(&count);
+    SDL_DisplayID chosen = 0;
+    if (wanted && *wanted) {
+        char* end = nullptr;
+        const long number = std::strtol(wanted, &end, 10);
+        if (end && *end == '\0') {
+            if (number >= 1 && number <= count) {
+                chosen = ids[number - 1];
+            }
+        } else {
+            for (int i = 0; i < count && !chosen; ++i) {
+                const char* name = SDL_GetDisplayName(ids[i]);
+                if (name && strcasestr(name, wanted)) {
+                    chosen = ids[i];
+                }
+            }
+        }
+    }
+    const SDL_DisplayID display = chosen ? chosen : primary;
+    for (int i = 0; i < count; ++i) {
+        const char* name = SDL_GetDisplayName(ids[i]);
+        const SDL_DisplayMode* mode = SDL_GetDesktopDisplayMode(ids[i]);
+        std::printf("Display %d: %s %dx%d%s%s\n", i + 1, name ? name : "?", mode ? mode->w : 0,
+                    mode ? mode->h : 0, ids[i] == primary ? " (primary)" : "",
+                    ids[i] == display ? " <- the game's (BB_DISPLAY)" : "");
+    }
+    if (wanted && *wanted && !chosen) {
+        std::printf("Display: BB_DISPLAY=%s matches none, the primary one is used\n", wanted);
+    }
+    SDL_free(ids);
+    return display;
+}
+
+} // namespace
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
     // Optional host window size for small displays, independent of guest/UI resolution.
@@ -32,8 +77,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    const SDL_DisplayID display = ChooseDisplay();
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED_DISPLAY(display));
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);

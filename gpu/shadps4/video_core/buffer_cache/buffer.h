@@ -54,6 +54,14 @@ inline bool WriteTracking() {
 /// well, so writes into them that nothing announced show up as write faults (their sites).
 bool WriteVerify();
 
+/// bbport BB_CONSTANTS_IN_PLACE=1 (with BB_GUEST_IN_PLACE): small read-only buffers (constants) are
+/// read by the GPU where the game wrote them, when the draw executes, like everything else in
+/// place, instead of being copied when the draw is decoded (constant ring) or recorded (stream
+/// buffer). The copies kept a draw's values from command writes the CPU performed at decode time;
+/// in place those writes are GPU commands in stream order. Experiment bit 1 of BB_TOGGLE_FILE
+/// inverts it for an A/B while the game runs.
+bool ConstantsInPlace();
+
 /// Hints and requirements for the backing memory type of a commit
 enum class MemoryType : u8 {
     DeviceLocal,  ///< Requests device local buffer.

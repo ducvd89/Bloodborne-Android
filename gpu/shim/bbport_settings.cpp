@@ -177,6 +177,19 @@ void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
     }
 }
 
+void ConfigureDlssSupport(bool available, const char* problem) {
+    auto& v = Get();
+    v.dlss_supported = available;
+    static std::string kept;
+    kept = problem ? problem : "";
+    v.dlss_problem = available || kept.empty() ? nullptr : kept.c_str();
+    if (v.upscaler == UpscalerDlss && !available) {
+        std::printf("Upscaler: DLSS unavailable (%s); falling back to FSR 3.1\n",
+                    kept.empty() ? "the DLSS bridge or NVIDIA's DLSS library is missing" : kept.c_str());
+        v.upscaler = UpscalerFsr3;
+    }
+}
+
 bool FixedRenderSession() {
     const char* size = std::getenv("BB_RENDER_RES");
     return size && size[0];

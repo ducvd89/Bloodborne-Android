@@ -18,8 +18,10 @@ class PackagedVulkanTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.icds = self.root / "icds"
         self.libs = self.root / "host-libs"
+        self.egl = self.root / "egl_vendor.d"
         self.icds.mkdir()
         self.libs.mkdir()
+        self.egl.mkdir()
         self.env = {"BB_DATA_DIR": str(self.root / "data"),
                     "BB_BUNDLED_VK_DRIVER_FILES": "/bundled/radeon.json:/bundled/intel.json",
                     "LD_LIBRARY_PATH": "/bundled/lib"}
@@ -37,7 +39,7 @@ class PackagedVulkanTests(unittest.TestCase):
         return path
 
     def configure(self):
-        return vulkan.configure(self.env, (self.icds,), (self.libs,))
+        return vulkan.configure(self.env, (self.icds,), (self.libs,), (self.egl,))
 
     def test_amd_intel_keep_bundled_drivers(self):
         self.configure()
@@ -82,6 +84,35 @@ class PackagedVulkanTests(unittest.TestCase):
         self.configure()
         self.assertEqual(self.env, before)
 
+    def nvidia_host(self):
+        driver = self.library("libGLX_nvidia.so.580.1")
+        (self.libs / "libGLX_nvidia.so.0").symlink_to(driver.name)
+        self.manifest()
+
+    def test_nvidia_gets_the_host_egl_vendors_nvidia_first(self):
+        # #107: the package's glvnd saw no host EGL vendor; NVIDIA's ICD gave no vkCreateInstance.
+        self.nvidia_host()
+        for name in ("50_mesa.json", "10_nvidia.json"):
+            (self.egl / name).write_text("{}")
+        self.configure()
+        self.assertEqual(self.env["__EGL_VENDOR_LIBRARY_FILENAMES"],
+                         f"{self.egl / '10_nvidia.json'}:{self.egl / '50_mesa.json'}")
+
+    def test_egl_vendors_left_alone_without_nvidia_or_when_set(self):
+        (self.egl / "10_nvidia.json").write_text("{}")
+        self.configure() # no NVIDIA ICD: AMD/Intel keep the package's EGL
+        self.assertNotIn("__EGL_VENDOR_LIBRARY_FILENAMES", self.env)
+        self.nvidia_host()
+        for env in ({"__EGL_VENDOR_LIBRARY_FILENAMES": "/user/vendor.json"}, {"BB_NVIDIA_EGL": "0"}):
+            with self.subTest(env=env):
+                self.env.pop("__EGL_VENDOR_LIBRARY_FILENAMES", None)
+                self.env.pop("VK_DRIVER_FILES", None)
+                self.env.update(env)
+                self.configure()
+                self.assertEqual(self.env.get("__EGL_VENDOR_LIBRARY_FILENAMES"),
+                                 env.get("__EGL_VENDOR_LIBRARY_FILENAMES"))
+                self.env.pop("BB_NVIDIA_EGL", None)
+
     def test_absolute_and_relative_icd_paths(self):
         driver = self.library("libGLX_nvidia.so.0")
         for name in (str(driver), "../host-libs/" + driver.name):
@@ -110,20 +141,34 @@ class PackagedVulkanTests(unittest.TestCase):
         vulkan.configure(self.env, (self.icds,), ())
         self.assertIn("nvidia_icd.json", self.env["VK_DRIVER_FILES"])
 
-    def drm_card(self, name, vendor):
-        device = self.root / "drm" / name / "device"
-        device.mkdir(parents=True)
-        (device / "vendor").write_text(vendor + "\n")
+    def test_nvidia_report_names_libraries_searched_and_not_loaded(self):
+        # Issue #107: the driver loads but gives no vkCreateInstance; the report says what the
+        # dynamic linker looked for inside the package and did not load.
+        driver = self.library("libGLX_nvidia.so.615.1")
+        self.library("libnvidia-glcore.so.615.1")
+        self.manifest(str(driver))
+        self.configure()
+        cache = Path(self.env["LD_LIBRARY_PATH"].split(":")[0])
+        trace = "\n".join([
+            "   101:\tfind library=libGLdispatch.so.0 [0]; searching",
+            "   101:\tcalling init: /bundled/lib/libGLdispatch.so.0",
+            "   101:\tfind library=libnvidia-glcore.so.615.1 [0]; searching",
+            f"   101:\tcalling init: {cache}/libnvidia-glcore.so.615.1",
+            "   101:\tfind library=libnvidia-gpucomp.so.615.1 [0]; searching",
+            "   101:\tfind library=libm.so.6 [0]; searching",
+        ])
+        calls = []
 
-    def test_new_memory_model_offered_with_an_amd_gpu(self):
-        self.drm_card("card0", "0x8086")
-        self.drm_card("card1", "0x1002")
-        self.assertIs(vulkan.amd_gpu(self.root / "drm"), True)
+        def run(args, **kwargs):
+            calls.append(kwargs["env"].get("LD_DEBUG"))
+            return type("Result", (), {"stderr": trace})()
 
-    def test_new_memory_model_not_offered_without_an_amd_gpu(self):
-        self.drm_card("card0", "0x10de")
-        self.assertIs(vulkan.amd_gpu(self.root / "drm"), False)
+        lines = vulkan.nvidia_report(self.env, "vulkaninfo", run)
+        self.assertEqual(calls, ["libs"])
+        self.assertTrue(any(line.strip().startswith("libnvidia-glcore.so.615.1 ->") for line in lines))
+        self.assertIn("Dynamic linker: 3 NVIDIA/glvnd libraries searched, not loaded: "
+                      "libnvidia-gpucomp.so.615.1", lines)
 
-    def test_unknown_gpu_leaves_the_choice_to_the_game(self):
-        (self.root / "drm").mkdir()
-        self.assertIsNone(vulkan.amd_gpu(self.root / "drm"))
+    def test_nvidia_report_is_empty_without_the_host_driver(self):
+        self.configure()
+        self.assertEqual(vulkan.nvidia_report(self.env, "vulkaninfo", None), [])

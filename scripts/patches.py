@@ -55,6 +55,15 @@ def intel_cpu(cpuinfo='/proc/cpuinfo'):
         return False
 
 
+# The title's PLAY ONLINE / PLAY OFFLINE dialog: the port has no PSN, the game goes straight to the
+# main menu offline. On by default (the launcher's switch); BB_SKIP_NETWORK_CHOICE=0 shows it.
+SKIP_NETWORK_CHOICE='Skip Online/Offline Choice'
+
+
+def skip_network_choice(env=os.environ):
+    return env.get('BB_SKIP_NETWORK_CHOICE','1')!='0'
+
+
 def intel_tonemap_fix(env=os.environ, cpuinfo='/proc/cpuinfo'):
     forced=env.get('BB_INTEL_TONEMAP_FIX')
     return forced=='1' if forced in ('0','1') else intel_cpu(cpuinfo)
@@ -63,18 +72,63 @@ def intel_tonemap_fix(env=os.environ, cpuinfo='/proc/cpuinfo'):
 MODEL_LOD={'-2':'Model LOD -2 (Highest)','1':'Model LOD 1 (Lower)','2':'Model LOD 2 (Lowest)'}
 
 
+DEBUG_MENU='Restore Debug Menu (READ NOTES)'
+# What the patched game reads for the debug menu (BB_FILE_TRACE=1), under dvdroot_ps4. The game asks
+# for lower-case names; the PS4's file system and the port's runtime ignore case.
+DEBUG_MENU_FONTS=('adhoc/font/DbgFont14h.ccm','adhoc/font/DbgFont14h.tpf')
+DEBUG_MENU_SHADERS=('adhoc/FontShader/debugFont_vs.vpo','adhoc/FontShader/debugFont_ps.ppo')
+
+
+def find_ignoring_case(root, relative):
+    """`root`/`relative`, each component matched ignoring case; None when absent."""
+    path=Path(root)
+    for part in relative.split('/'):
+        exact=path/part
+        if exact.exists():
+            path=exact
+            continue
+        try:
+            matches=[e for e in path.iterdir() if e.name.casefold()==part.casefold()]
+        except OSError:
+            return None
+        if not matches:
+            return None
+        path=matches[0]
+    return path
+
+
+def debug_menu_problem(game):
+    """Why the debug menu patch cannot work with this game folder, or None."""
+    dvdroot=Path(game)/'dvdroot_ps4'
+    missing=[]
+    for relative in DEBUG_MENU_FONTS:
+        found=find_ignoring_case(dvdroot,relative)
+        if not found or not found.is_file() or found.stat().st_size==0:
+            missing.append(relative)
+    if not missing:
+        return None
+    hint=''
+    if all(find_ignoring_case(dvdroot,'font/'+r.rsplit('/',1)[1]) for r in missing):
+        hint=' (they are in dvdroot_ps4/font: the game reads them from dvdroot_ps4/adhoc/font)'
+    return ('the debug menu needs the font files from https://www.nexusmods.com/bloodborne/mods/253 '
+            f'in dvdroot_ps4 of the game folder or of a mod: missing {", ".join(missing)}{hint}')
+
+
 def validate_patch_requirements(names, game):
+    """The patches to apply: raises for conflicts; drops the debug menu (with a message) when its
+    font files are missing, as the game crashes opening the menu without them."""
     if 'Restore Debug Camera' in names and 'Enemy Control' in names:
         raise ValueError('Restore Debug Camera conflicts with Enemy Control; enable only one')
-    if 'Restore Debug Menu (READ NOTES)' in names:
-        font = game / 'dvdroot_ps4/font'
-        missing = [name for name in ('DbgFont14h.ccm', 'DbgFont14h.tpf')
-                   if not (font / name).is_file() or (font / name).stat().st_size == 0]
-        if missing:
-            raise ValueError('Debug menu needs non-empty font files in '
-                             f'{font}: {", ".join(missing)}. Install the fonts from '
-                             'https://www.nexusmods.com/bloodborne/mods/253 first; '
-                             'or disable debug_menu in bbport.ini')
+    if DEBUG_MENU in names:
+        problem=debug_menu_problem(game)
+        if problem:
+            print(f'Patches: debug menu off: {problem}',file=sys.stderr)
+            return [n for n in names if n!=DEBUG_MENU]
+        absent=[r for r in DEBUG_MENU_SHADERS if not find_ignoring_case(Path(game)/'dvdroot_ps4',r)]
+        if absent:
+            print(f'Patches: debug menu: {", ".join(absent)} not found (the mod\'s font shaders); '
+                  'the menu may not draw',file=sys.stderr)
+    return names
 
 
 def effect_patches(settings):
@@ -95,7 +149,7 @@ UI_HEIGHT=0x0235855D-EBOOT_BASE
 def read_settings(path):
     settings={}
     if path.exists():
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding='utf-8').splitlines():
             key,sep,value=line.partition('=')
             if sep and not line.startswith('#'): settings[key.strip()]=value.strip()
     return settings
@@ -231,7 +285,7 @@ def external_selection(found, config):
     each file's isEnabled."""
     settings={}
     if config and Path(config).is_file():
-        settings=json.loads(Path(config).read_text())
+        settings=json.loads(Path(config).read_text(encoding='utf-8'))
     enabled,disabled=set(settings.get('enabled',[])),set(settings.get('disabled',[]))
     return [(key,path,meta) for key,path,meta in found
             if key in enabled or (key not in disabled and meta.get('isEnabled','false').lower()=='true')]
@@ -291,7 +345,9 @@ def main():
     names+=[n for n in effect_patches(read_settings(a.settings)) if n not in names]
     if intel_tonemap_fix() and INTEL_TONEMAP not in names:
         names.append(INTEL_TONEMAP)
-    validate_patch_requirements(names,a.game_dir)
+    if skip_network_choice() and SKIP_NETWORK_CHOICE not in names:
+        names.append(SKIP_NETWORK_CHOICE)
+    names=validate_patch_requirements(names,a.game_dir)
     segments=eboot_segments((a.out/'eboot.elf').read_bytes())
     writes=compile_patches(a.xml,names,a.app_version,segments)
     size=render_size(read_settings(a.settings),a.render_res) if a.render_res else None

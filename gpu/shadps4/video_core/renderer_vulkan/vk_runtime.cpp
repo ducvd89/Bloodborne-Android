@@ -216,7 +216,7 @@ void Runtime::UpdateBuffer(const VideoCore::Buffer* dst, u64 offset, std::span<c
             cmdbuf.updateBuffer(handle, to, bytes.size_bytes(), bytes.data());
         });
     }
-    AccessBuffer(dst, offset, data.size(), vk::PipelineStageFlagBits2::eCopy,
+    AccessBuffer(dst, offset, data.size(), vk::PipelineStageFlagBits2::eClear,
                  vk::AccessFlagBits2::eTransferWrite);
 }
 
@@ -231,7 +231,7 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
         cmdbuf.updateBuffer(handle, offset, sizeof(value), &value);
     });
 
-    AccessBuffer(dst, offset, sizeof(value), vk::PipelineStageFlagBits2::eCopy,
+    AccessBuffer(dst, offset, sizeof(value), vk::PipelineStageFlagBits2::eClear,
                  vk::AccessFlagBits2::eTransferWrite);
 }
 
@@ -807,6 +807,9 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
         .range_start = offset,
         .range_end = offset + size - 1,
     };
+    if (global_write) {
+        return true; // bbport: a paged write may have touched it (AccessGlobal)
+    }
     bool has_access = barrier_tracker.FindRange(range, Access::Write);
     if (check_read_access && !has_access) {
         has_access |= barrier_tracker.FindRange(range, Access::Read);
@@ -870,6 +873,14 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
 
+void Runtime::AccessGlobal(vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    memory_barrier.srcStageMask |= src_stage;
+    if (src_access & vk::AccessFlagBits2::eShaderWrite) {
+        memory_barrier.srcAccessMask |= vk::AccessFlagBits2::eShaderWrite;
+        global_write = true;
+    }
+}
+
 void Runtime::FlushBarriers() {
     BeforeImageAccess();
     vk::DependencyInfo dep_info{};
@@ -905,6 +916,7 @@ void Runtime::FlushBarriers() {
 
     image_barriers.clear();
     barrier_tracker.Clear();
+    global_write = false;
     ++access_epoch;
 }
 

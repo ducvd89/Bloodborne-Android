@@ -55,7 +55,7 @@ public final class MainActivity extends Activity {
     private LinearLayout drawerItems;
     private TextView status;
     private View resume;
-    private LinearLayout graphicsItem, losslessItem, steamItem, controllerItem, folderItem;
+    private LinearLayout gameSettingsItem, cheatsItem, graphicsItem, losslessItem, steamItem, controllerItem, folderItem;
     private TouchControllerOverlay controllerOverlay;
     private PadBridge pad;
     private AudioBridge audio;
@@ -172,6 +172,14 @@ public final class MainActivity extends Activity {
 
         section("Game");
         resume=menuItem("ic_play","Resume game",null,() -> closeDrawer());
+        gameSettingsItem=menuItem("ic_settings","Game settings","",() -> {
+            closeDrawer();
+            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showGame();
+        });
+        cheatsItem=menuItem("ic_cheats","Cheats","",() -> {
+            closeDrawer();
+            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showCheats();
+        });
         menuItem("ic_refresh","Restart game","Unsaved progress is lost",() -> new AlertDialog.Builder(this)
             .setTitle("Restart Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> restartGame()).show());
@@ -286,6 +294,16 @@ public final class MainActivity extends Activity {
     }
     /** The rows' second lines: the current settings, read when the drawer opens. */
     private void refreshDrawer() {
+        java.util.List<String> game=new java.util.ArrayList<>();
+        if (!"0".equals(setting("skip_network_choice"))) game.add("Offline start");
+        if ("1".equals(setting("skip_intro"))) game.add("no intros");
+        if ("1".equals(setting("debug_camera"))) game.add("free camera");
+        if ("1".equals(setting("debug_menu"))) game.add("debug menu");
+        setDetail(gameSettingsItem,game.isEmpty() ? "Online/offline screen shown" : String.join(" · ",game));
+        java.util.List<String> cheats=new java.util.ArrayList<>();
+        if ("1".equals(setting("cheat_health"))) cheats.add("infinite health");
+        if ("1".equals(setting("cheat_items"))) cheats.add("infinite items");
+        setDetail(cheatsItem,cheats.isEmpty() ? "Off" : String.join(" · ",cheats));
         String upscaler="off".equals(setting("upscaler")) ? "No upscaling" : "FSR 3.1";
         String limit=setting("fps_limit");
         setDetail(graphicsItem,upscaler+" · "+("0".equals(limit) ? "no FPS limit"
@@ -648,7 +666,11 @@ public final class MainActivity extends Activity {
                     String line; while ((line=r.readLine())!=null) { out.println(line); out.flush(); }
                     int code=launched.waitFor();
                     if (game==launched) { game=null; error("Game stopped ("+code+"). Open the menu to restart."); }
-                } catch (Exception ex) { if (!destroyed) error(ex.toString()); }
+                } catch (Exception ex) {
+                    // A restart (settings, cheats) kills this process on purpose: its reader is
+                    // interrupted then, after the next game started. Only the current game's errors show.
+                    if (!destroyed && game==launched) error(ex.toString());
+                }
             },"Bloodborne-log"); log.setDaemon(true); log.start();
         } catch (Exception ex) { error(ex.toString()); }
     }

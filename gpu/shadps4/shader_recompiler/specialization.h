@@ -29,11 +29,13 @@ struct BufferSpecialization {
     u32 num_format : 4;
     u32 index_stride : 2;
     u32 element_size : 2;
+    u32 paged : 1; ///< bbport BB_LAYER_MEMORY: through the page table (IsPagedBuffer)
     AmdGpu::CompMapping dst_select{};
     AmdGpu::NumberConversion num_conversion{};
 
     bool operator==(const BufferSpecialization& other) const {
         return stride == other.stride && is_formatted == other.is_formatted &&
+               paged == other.paged &&
                swizzle_enable == other.swizzle_enable &&
                (!is_formatted ||
                 (data_format == other.data_format && num_format == other.num_format &&
@@ -115,8 +117,9 @@ struct StageSpecialization {
         }
         u32 binding{};
         ForEachSharp(binding, buffers, info->buffers,
-                     [](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+                     [&profile_](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                          spec.stride = sharp.GetStride();
+                         spec.paged = IsPagedBuffer(profile_.paged_buffers, sharp);
                          spec.is_formatted = desc.is_formatted;
                          spec.swizzle_enable = sharp.swizzle_enable;
                          if (spec.is_formatted) {

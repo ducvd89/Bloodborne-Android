@@ -48,6 +48,18 @@ if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
     grep -v '^\[' out/gpu-build.log | tail -40 >&2
     echo 'GPU library build failed (full log: out/gpu-build.log)' >&2; exit 1
 fi
+# Optional DLSS (NVIDIA RTX): DLSS_SDK_ROOT=<github.com/NVIDIA/DLSS checkout> builds the bridge
+# (gpu/dlss_bridge, the only code using NVIDIA's SDK) and puts it next to bb-probe with NVIDIA's
+# libnvidia-ngx-dlss.so. Without them the DLSS upscaler is listed as unavailable.
+if [[ -n ${DLSS_SDK_ROOT:-} ]]; then
+    cmake -S gpu/dlss_bridge -B out/dlss-bridge -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DDLSS_SDK_ROOT="$DLSS_SDK_ROOT" >/dev/null
+    ninja -C out/dlss-bridge >/dev/null
+    rm -f out/libnvidia-ngx-dlss.so.*
+    cp out/dlss-bridge/libbbport_dlss.so "$DLSS_SDK_ROOT"/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.* out/
+    cp "$DLSS_SDK_ROOT/LICENSE.txt" out/NVIDIA-DLSS-LICENSE.txt
+    echo "DLSS bridge: out/libbbport_dlss.so"
+fi
 # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
 gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
 # Hosts other than x86-64: the game's code runs in FEXCore's JIT, linked into out/fex/libbbcpu.so

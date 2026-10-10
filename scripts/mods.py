@@ -9,8 +9,9 @@ import shutil
 import sys
 import tempfile
 
-# Top-level folders of the game's dvdroot_ps4: a mod made of these is a dvdroot_ps4 itself.
-GAME_FOLDERS = {'action', 'chr', 'event', 'facegen', 'font', 'map', 'menu', 'movie', 'msg', 'mtd',
+# Top-level folders of the game's dvdroot_ps4: a mod made of these is a dvdroot_ps4 itself (adhoc:
+# the debug menu's fonts, which the retail game does not ship).
+GAME_FOLDERS = {'action', 'adhoc', 'chr', 'event', 'facegen', 'font', 'map', 'menu', 'movie', 'msg', 'mtd',
                 'obj', 'other', 'param', 'paramdef', 'parts', 'remo', 'script', 'sfx', 'shader',
                 'sound'}
 
@@ -62,7 +63,7 @@ def selected(root, config):
     available = discover(root)
     if not config or not Path(config).is_file():
         return available
-    settings = json.loads(Path(config).read_text())
+    settings = json.loads(Path(config).read_text(encoding='utf-8'))
     disabled_names = settings.get('disabled', [])
     if not isinstance(disabled_names, list) or not all(isinstance(n, str) for n in disabled_names):
         raise ValueError('Disabled mods must be a list of folder names')

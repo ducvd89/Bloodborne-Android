@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
 
 import game_check
 
@@ -25,9 +26,27 @@ def unpack(fmt, data, offset):
     return struct.unpack(fmt, span(data, offset, struct.calcsize(fmt)))
 
 
+def parse_elf(data):
+    """A plain ELF (some dumpers write the executable without the SELF wrapper)."""
+    header = unpack('<16sHHIQQQIHHHHHH', data, 0)
+    if header[0][:7] != b'\x7fELF\x02\x01\x01' or header[2] != 62:
+        raise ValueError("expected little-endian x86-64 ELF")
+    if header[9] != 56 or not 0 < header[10] < 256:
+        raise ValueError("unsupported program headers")
+    ph = [dict(zip(('type', 'flags', 'offset', 'vaddr', 'paddr', 'filesz', 'memsz', 'align'),
+                   unpack('<IIQQQQQQ', data, header[5] + i * 56)))
+          for i in range(header[10])]
+    end = max(header[5] + header[10] * 56, max(p['offset'] + p['filesz'] for p in ph))
+    if end > 512 * 1024 * 1024:
+        raise ValueError("probe image exceeds 512 MiB limit")
+    return bytearray(span(data, 0, end)), header, ph, [], []
+
+
 def parse_self(data):
+    if span(data, 0, 4) == b'\x7fELF':
+        return parse_elf(data)
     if span(data, 0, 4) != b'O\x15=\x1d':
-        raise ValueError("expected PS4 SELF")
+        raise ValueError("expected PS4 SELF or ELF (eboot.bin is neither: an encrypted or damaged dump?)")
     count, = unpack('<H', data, 24)
     base = 32 + count * 32
     header = unpack('<16sHHIQQQIHHHHHH', data, base)
@@ -246,10 +265,11 @@ def prepare(game, out):
                   bundled_modules=sorted(p.name for p in (game / 'sce_module').iterdir()),
                   resources=dict(resources), resource_bytes=total_bytes,
                   status='Prepared only; execution and Vulkan are tested separately.')
-    (out / 'analysis.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
+    (out / 'analysis.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(f"{report['sfo'].get('TITLE')} | entry={header[4]:#x} | image={size:,} bytes")
     print(f"{len(names)} imported symbols; {sum(counts.values()):,} relocations; {len(report['needed'])} required modules")
-    print(f"Unavailable non-loadable metadata headers: {missing}; not a byte-exact ELF reconstruction")
+    if missing:
+        print(f"Unavailable non-loadable metadata headers: {missing}; not a byte-exact ELF reconstruction")
     print(f"Output: {out.resolve()}")
     print(f"libc _init_env verified RET: {libc_evidence['init_env_is_ret']}")
 
@@ -259,6 +279,9 @@ if __name__ == '__main__':
     parser.add_argument('game', type=Path)
     parser.add_argument('--out', type=Path, default=Path(__file__).resolve().parent.parent / 'out')
     args = parser.parse_args()
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(errors='replace')  # the title has a ™; consoles in GBK etc.
     try:
         prepare(args.game, args.out)
     except GameCheckError as error:

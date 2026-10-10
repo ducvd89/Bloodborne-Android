@@ -58,6 +58,10 @@ fi
 export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
 [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
+# The GPU's check of indirect dispatch counts (upstream 0.5, vk_indirect_guard.h) is off: on the
+# Thor's Adreno 740 the game hung in an indirect dispatch with it (device lost after ~3 minutes of
+# play), not without it nor in 0.4. BB_INDIRECT_GUARD=1 in thor-local.sh turns it on.
+export BB_INDIRECT_GUARD=${BB_INDIRECT_GUARD:-0}
 # Lossless Scaling frame generation (lsfg_multiplier 2-4): the lsfg-vk 1.0 layer with our Turnip
 # patches (bbport/arm64/lsfg, build_lsfg.sh) and Lossless.dll from the player's own Lossless
 # Scaling (Steam), next to the game folder or in bbport/. It replaces FSR 3.1 frame generation.
@@ -200,6 +204,17 @@ case ${1:-game} in
                 [ -f "$parts/$key=$value.bin" ] && set -- "$@" --patches "$parts/$key=$value.bin"
             done
             [ "$fps_limit" != 30 ] && set -- "$@" --patches "$parts/fps=uncap.bin"
+            # No PSN here: the title screen goes straight to the main menu offline.
+            [ "$(setting skip_network_choice)" != 0 ] && [ -f "$parts/skip_network_choice=1.bin" ] &&
+                set -- "$@" --patches "$parts/skip_network_choice=1.bin"
+            # Cheats (the app's Cheats menu): their hooks are always in, switched live by the flags
+            # BB_CHEATS_FILE holds (the app rewrites it; here its start, from bbport.ini).
+            if [ -f "$parts/cheats.bin" ]; then
+                set -- "$@" --patches "$parts/cheats.bin"
+                export BB_CHEATS_FILE="$base/cheats.state"
+                printf '%s%s\n' "$([ "$(setting cheat_health)" = 1 ] && echo 1 || echo 0)" \
+                    "$([ "$(setting cheat_items)" = 1 ] && echo 1 || echo 0)" > "$BB_CHEATS_FILE"
+            fi
         else
             set -- "$@" "$base/data/boot-linked.bin" --patches "$base/data/patches.bin"
         fi

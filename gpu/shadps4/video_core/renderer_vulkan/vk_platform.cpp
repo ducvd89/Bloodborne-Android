@@ -22,6 +22,7 @@
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -192,9 +193,9 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
         break;
     }
 
-    if (window_type != Frontend::WindowSystemType::Headless) {
-        extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-    }
+    // The headless renderer creates the same logical device with VK_KHR_swapchain enabled;
+    // its instance dependency is required even when no surface is created by a GPU test.
+    extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
 
     if (EmulatorSettings.IsHdrAllowed()) {
         extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
@@ -286,7 +287,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                VK_VERSION_MAJOR(available_version), VK_VERSION_MINOR(available_version));
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
-    const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    // bbport: DLSS (optional bridge library) needs its own instance extensions.
+    if (Dlss* dlss = Dlss::Get()) {
+        dlss->AppendInstanceExtensions(extensions);
+    }
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",

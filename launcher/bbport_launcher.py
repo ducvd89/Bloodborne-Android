@@ -5,7 +5,8 @@
 Picks the game folder, edits the port's settings (bbport.ini: upscaler, preset, ...) and the
 start-up tweaks passed as environment variables to run.sh, starts and stops the game and shows
 its output. Launcher settings live in ~/.config/bbport-launcher/settings.json.
-Russian, English and Brazilian Portuguese (bbport_i18n: the Russian text is the key).
+Russian, English, Brazilian Portuguese and Simplified Chinese (bbport_i18n: the Russian
+text is the key).
 """
 
 import json
@@ -14,10 +15,10 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from bbport_assets import fsr411_problem
 from bbport_i18n import language, set_language, tr
-from bbport_vulkan import amd_gpu
 
 import gi
 
@@ -36,14 +37,14 @@ DATA_DIR = Path(os.environ.get("BB_DATA_DIR", PORT_DIR))
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "bbport-launcher"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MAX_LOG_LINES = 5000
-# The new memory and translation model runs on AMD GPUs only for now (None: unknown).
-AMD_GPU = amd_gpu()
-PC_MODEL_SUBTITLE = ("Эксперимент, только видеокарты AMD. Видеокарта работает с памятью игры "
-                     "напрямую, как в игре для ПК, а команды графики переводятся, а не "
-                     "эмулируются; возможны ошибки. Выключено — старая модель памяти, как в 0.3, "
-                     "со всеми исправлениями")
-PC_MODEL_NO_AMD = ("Только для видеокарт AMD, а на этом компьютере её нет. Используется старая "
-                   "модель памяти, как в 0.3, со всеми исправлениями")
+# The memory model (run.sh: BB_PC_MODEL): "auto" leaves it to the GPU (the new one on AMD, the
+# 0.3 one elsewhere), or either by hand. The new one goes through the layer's memory module on
+# every GPU (no sparse binding of the game's memory; BB_LAYER_MEMORY=0: AMD's sparse arena).
+PC_MODEL_SUBTITLE = ("Новая: видеокарта работает с памятью игры напрямую, как в игре для ПК, а команды "
+                     "графики переводятся, а не эмулируются. Старая — модель памяти 0.3 со всеми "
+                     "исправлениями. Если драйвер не проходит проверку при запуске — старая")
+MEMORY_MODELS = [("Авто: новая на AMD, старая на других", "auto"), ("Новая", "new"),
+                 ("Старая (как в 0.3)", "old")]
 # FSR 4.1.1 assets built from the user's AMD DLL (tools/fsr4cap, also in the package).
 FSR4CAP_DIR = PORT_DIR / "tools" / "fsr4cap"
 sys.path.insert(0, str(FSR4CAP_DIR))
@@ -74,8 +75,10 @@ FSR411_BUILD_ERRORS = {
 }
 
 # Choices: (label, value). The first entry is the default. Labels are translated when shown.
-UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("English", "en"), ("Português (Brasil)", "pt_BR")]
-UPSCALERS = [("DLSS 4.5 (experimental)", "dlss"), ("FSR 4", "fsr4"), ("FSR 4.1.1", "fsr411"), ("FSR 3", "fsr3"),
+UI_LANGUAGES = [("Как в системе", ""), ("Русский", "ru"), ("English", "en"), ("Português (Brasil)", "pt_BR"),
+                ("简体中文", "zh_CN")]
+UPSCALERS = [("FSR 4", "fsr4"), ("FSR 4.1.1", "fsr411"), ("FSR 3", "fsr3"),
+             ("DLSS (NVIDIA RTX)", "dlss"),
              ("TAA (нативное сглаживание)", "taa"), ("Выключен", "off")]
 PRESETS = [("Native AA", 0), ("Quality (x1.5)", 1), ("Balanced (x1.7)", 2),
            ("Performance (x2)", 3), ("Ultra Performance (x3)", 4)]
@@ -124,6 +127,8 @@ DEFAULTS = {
     "present_mode": "Mailbox",
     "gamepad": "",
     "gamepad_name": "",
+    "display": "",
+    "skip_network_choice": True,
     "fps_mode": "uncap",
     "fps_limit": 0,
     "draw_pipe": "",
@@ -133,7 +138,7 @@ DEFAULTS = {
     "frame_stats": False,
     "save_log": False,
     "crash_diag": False,
-    "pc_model": False,
+    "memory_model": "auto",
     "as_0_3": False,
     "gpu_profile": False,
     "vk_validation": False,
@@ -161,7 +166,7 @@ INI_DEFAULTS = {
 def load_settings():
     settings = dict(DEFAULTS)
     try:
-        settings.update(json.loads(CONFIG_FILE.read_text()))
+        settings.update(json.loads(CONFIG_FILE.read_text(encoding='utf-8')))
     except (OSError, ValueError):
         pass
     return settings
@@ -169,7 +174,7 @@ def load_settings():
 
 def save_settings(settings):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(settings, indent=2, ensure_ascii=False))
+    CONFIG_FILE.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def ini_path():
@@ -180,7 +185,7 @@ def load_ini():
     values = dict(INI_DEFAULTS)
     lines = []
     try:
-        lines = ini_path().read_text().splitlines()
+        lines = ini_path().read_text(encoding='utf-8').splitlines()
     except OSError:
         pass
     for line in lines:
@@ -209,7 +214,7 @@ def save_ini(values, lines):
     for key, value in values.items():
         if key not in written and value is not None:
             out.append(f"{key}={value}")
-    ini_path().write_text("\n".join(out) + "\n")
+    ini_path().write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
 def patches_dir(settings):
@@ -259,6 +264,9 @@ def game_environment(s):
     env["BB_PRESENT_MODE"] = s["present_mode"]
     if s.get("gamepad"):
         env["BB_GAMEPAD"] = s["gamepad"]
+    if s.get("display"):
+        env["BB_DISPLAY"] = s["display"]
+    env["BB_SKIP_NETWORK_CHOICE"] = "1" if s.get("skip_network_choice", True) else "0"
     if s["hdr"]:
         env["BB_HDR"] = "1"
     env["BB_FPS"] = s["fps_mode"]
@@ -276,10 +284,13 @@ def game_environment(s):
         env["BB_FRAME_STATS"] = "1"
     if s.get("save_log"):
         env["BB_SAVE_LOG"] = "1"
-    # The new memory and translation model (experimental, AMD GPUs only, off by default); the
-    # model of 0.3 with the fixes made since otherwise. "pc_memory", "old_memory_model",
-    # "new_memory_model" and "legacy_memory_model" of older settings are ignored.
-    env["BB_PC_MODEL"] = "1" if s.get("pc_model") and AMD_GPU is not False else "0"
+    # The memory model: "auto" is run.sh's choice by GPU (the new one on AMD, the 0.3 one
+    # elsewhere). "pc_model", "pc_memory", "old_memory_model", "new_memory_model" and
+    # "legacy_memory_model" of older settings are ignored (0.5: auto for everyone).
+    # BB_PC_MODEL from the shell (or the extra variables) still wins over "auto".
+    model = s.get("memory_model", "auto")
+    if model in ("new", "old"):
+        env["BB_PC_MODEL"] = "1" if model == "new" else "0"
     # Synchronisation and memory as released in 0.3 (run.sh: BB_AS_0_3), for comparisons.
     if s.get("as_0_3"):
         env["BB_AS_0_3"] = "1"
@@ -376,6 +387,21 @@ def connected_gamepads():
     return [tuple(line.split("\t", 1)) for line in run.stdout.splitlines() if "\t" in line]
 
 
+def connected_displays():
+    """(BB_DISPLAY value, label) of the monitors (bb-gpu-capabilities --displays), [] if unknown.
+    The value is the monitor's name, or its number when two monitors share a name."""
+    tool = PORT_DIR / ("bin" if PACKAGED else "out") / "bb-gpu-capabilities"
+    try:
+        run = subprocess.run([str(tool), "--displays"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = [line.split("\t") for line in run.stdout.splitlines() if line.count("\t") == 2]
+    names = [name for name, _, _ in rows]
+    return [(name if names.count(name) == 1 else str(number),
+             f"{number}: {name} ({size})" + (tr(", основной") if primary == "1" else ""))
+            for number, (name, size, primary) in enumerate(rows, 1)]
+
+
 class FolderList:
     """A preferences group with a folder row and one switch row per item below it."""
 
@@ -423,8 +449,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         toolbar.set_content(self.toasts)
         self.set_content(toolbar)
 
-        log_text = self.log_view.get_buffer().get_text(
-            *self.log_view.get_buffer().get_bounds(), False) if hasattr(self, "log_view") else ""
+        log_text = self.log_text() if hasattr(self, "log_view") else ""
         self.stack.add_titled_with_icon(self.build_settings_page(), "settings", tr("Настройки"),
                                         "preferences-system-symbolic")
         self.stack.add_titled_with_icon(self.build_log_page(), "log", tr("Журнал"),
@@ -485,15 +510,11 @@ class LauncherWindow(Adw.ApplicationWindow):
         game.add(self.language_row)
         page.add(game)
 
-        # Off: the memory model of 0.3 (with the fixes made since); on: the new one.
+        # Auto: the new memory model on AMD, the 0.3 one elsewhere; or either by hand.
         mode = Adw.PreferencesGroup(title=tr("Режим работы"))
-        self.pc_model_row = Adw.SwitchRow(
-            title=tr("Новая модель памяти и трансляции"),
-            subtitle=tr(PC_MODEL_SUBTITLE if AMD_GPU is not False else PC_MODEL_NO_AMD),
-            active=self.settings.get("pc_model", False) and AMD_GPU is not False)
-        # Without an AMD GPU it shows the mode in use (off); the saved choice is kept.
-        self.pc_model_row.set_sensitive(AMD_GPU is not False)
-        mode.add(self.pc_model_row)
+        self.memory_model_row = combo_row(tr("Модель памяти и трансляции"), tr(PC_MODEL_SUBTITLE),
+                                          MEMORY_MODELS, self.settings.get("memory_model", "auto"))
+        mode.add(self.memory_model_row)
         page.add(mode)
 
         self.mods_group = Adw.PreferencesGroup(
@@ -544,6 +565,12 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.fullscreen_row = Adw.SwitchRow(title=tr("Полноэкранный режим"),
                                             active=self.settings["fullscreen"])
         screen.add(self.fullscreen_row)
+        # Issue #69: the window (and fullscreen) went to the monitor SDL calls primary.
+        self.display_row = Adw.ComboRow(title=tr("Монитор"))
+        self.display_row.add_suffix(flat_button("view-refresh-symbolic", tr("Обновить список"),
+                                                lambda _button: self.fill_displays()))
+        self.fill_displays()
+        screen.add(self.display_row)
         self.present_row = combo_row(tr("Режим показа кадров"), None, PRESENT_MODES,
                                      self.settings["present_mode"])
         screen.add(self.present_row)
@@ -639,10 +666,16 @@ class LauncherWindow(Adw.ApplicationWindow):
             row = Adw.SwitchRow(title=tr(title),
                                 active=self.ini.get(key, "1" if default else "0") == "1")
             if key == "debug_menu":
-                row.set_subtitle(tr("Установите DbgFont14h.ccm и DbgFont14h.tpf в dvdroot_ps4/font "
-                                    "из мода Nexus #253"))
+                row.set_subtitle(tr("Нужна папка adhoc из мода Nexus #253 (шрифты adhoc/font) — в "
+                                    "dvdroot_ps4 игры или модом; без неё патч не применяется"))
             self.effect_rows[key] = row
             effects.add(row)
+        # The title's "play online / play offline": the port has no PSN.
+        self.skip_network_row = Adw.SwitchRow(
+            title=tr("Пропускать выбор «по сети / вне сети»"),
+            subtitle=tr("Игра сразу открывает главное меню в режиме вне сети (патч игры)"),
+            active=self.settings.get("skip_network_choice", True))
+        effects.add(self.skip_network_row)
         page.add(effects)
 
         frames = Adw.PreferencesGroup(title=tr("Частота кадров"))
@@ -817,6 +850,7 @@ class LauncherWindow(Adw.ApplicationWindow):
                 "wrong_eboot": tr("eboot.bin не от версии 1.09: скопируйте eboot.bin из дампа обновления 1.09 в папку игры с заменой"),
                 "other_title": tr("Поддерживается только CUSA03173 с обновлением 1.09 (найдено {})").format(title),
                 "unreadable": tr("eboot.bin не читается как расшифрованный исполняемый файл PS4: сделайте дамп заново"),
+                "damaged_files": tr("Файлы игры повреждены при распаковке: шейдеры не распаковываются, игра зависнет на загрузке. Распакуйте игру и обновление 1.09 заново исправленным инструментом (issue #81)"),
             }[kind]
             self.game_row.set_subtitle(f"{path}\n{tooltip}")
         else:
@@ -884,6 +918,17 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.gamepad_row.set_selected(self.gamepad_row.values.index(current) if current in self.gamepad_row.values else 0)
         self.show_gamepad()
 
+    def fill_displays(self):
+        """The monitor choices: the primary one, the connected ones, and the saved choice while it
+        is not connected."""
+        current = self.settings.get("display", "")
+        choices = [(tr("Основной"), "")] + [(label, value) for value, label in connected_displays()]
+        if current and current not in [value for _, value in choices]:
+            choices.append((tr("{} (не подключён)").format(current), current))
+        self.display_row.set_model(Gtk.StringList.new([label for label, _ in choices]))
+        self.display_row.values = [value for _, value in choices]
+        self.display_row.set_selected(self.display_row.values.index(current) if current in self.display_row.values else 0)
+
     def show_gamepad(self):
         names = getattr(self.gamepad_row, "names", None)
         selected = names[self.gamepad_row.get_selected()] if names else ""
@@ -894,6 +939,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         s = self.settings
         s["gamepad"] = combo_value(self.gamepad_row)
         s["gamepad_name"] = self.gamepad_row.names[self.gamepad_row.get_selected()]
+        s["display"] = combo_value(self.display_row)
+        s["skip_network_choice"] = self.skip_network_row.get_active()
         s["language"] = combo_value(self.language_row)
         s["fullscreen"] = self.fullscreen_row.get_active()
         s["present_mode"] = combo_value(self.present_row)
@@ -907,8 +954,7 @@ class LauncherWindow(Adw.ApplicationWindow):
         s["frame_stats"] = self.stats_row.get_active()
         s["save_log"] = self.save_log_row.get_active()
         s["crash_diag"] = self.crash_diag_row.get_active()
-        if self.pc_model_row.get_sensitive():
-            s["pc_model"] = self.pc_model_row.get_active()
+        s["memory_model"] = combo_value(self.memory_model_row)
         s["as_0_3"] = self.as_0_3_row.get_active()
         s["gpu_profile"] = self.profile_row.get_active()
         s["vk_validation"] = self.validation_row.get_active()
@@ -948,13 +994,13 @@ class LauncherWindow(Adw.ApplicationWindow):
         rows = self.mod_list.rows
         profile = {"order": [name for name, _ in rows],
                    "disabled": [name for name, row in rows if not row.get_active()]}
-        (DATA_DIR / "mods.json").write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n")
+        (DATA_DIR / "mods.json").write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     def refresh_mods(self):
         self.mod_list.clear()
         self.mods_folder_row.set_subtitle(str(self.mods_dir()))
         try:
-            profile = json.loads((DATA_DIR / "mods.json").read_text())
+            profile = json.loads((DATA_DIR / "mods.json").read_text(encoding='utf-8'))
         except (OSError, ValueError):
             profile = {}
         available = discover_mods(self.mods_dir())
@@ -1001,7 +1047,7 @@ class LauncherWindow(Adw.ApplicationWindow):
                 (enabled if row.get_active() else disabled).append(key)
         path = DATA_DIR / "patches.json"
         try:
-            profile = json.loads(path.read_text())
+            profile = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             profile = {}
         # Patches of files not listed now (another folder) keep their choice.
@@ -1009,13 +1055,13 @@ class LauncherWindow(Adw.ApplicationWindow):
         profile = {"enabled": sorted({k for k in profile.get("enabled", []) if k not in shown} | set(enabled)),
                    "disabled": sorted({k for k in profile.get("disabled", []) if k not in shown} | set(disabled))}
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n")
+        path.write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     def refresh_patches(self):
         self.patch_list.clear()
         directory = patches_dir(self.settings)
         try:
-            profile = json.loads((DATA_DIR / "patches.json").read_text())
+            profile = json.loads((DATA_DIR / "patches.json").read_text(encoding='utf-8'))
         except (OSError, ValueError):
             profile = {}
         found = external_patches(directory)
@@ -1059,7 +1105,52 @@ class LauncherWindow(Adw.ApplicationWindow):
         scroller = Gtk.ScrolledWindow(vexpand=True, child=self.log_view)
         self.log_scroller = scroller
         box.append(scroller)
+        bar = Gtk.ActionBar()
+        self.export_log_button = Gtk.Button(label=tr("Экспорт журнала…"))
+        self.export_log_button.connect("clicked", self.on_export_log)
+        bar.pack_end(self.export_log_button)
+        self.copy_log_button = Gtk.Button(label=tr("Копировать"))
+        self.copy_log_button.connect("clicked", self.on_copy_log)
+        bar.pack_end(self.copy_log_button)
+        box.append(bar)
+        buffer = self.log_view.get_buffer()
+        buffer.connect("changed", self.on_log_changed)
+        self.on_log_changed(buffer)
         return box
+
+    def on_log_changed(self, buffer):
+        has_text = buffer.get_char_count() > 0
+        self.copy_log_button.set_sensitive(has_text)
+        self.export_log_button.set_sensitive(has_text)
+
+    def log_text(self):
+        buffer = self.log_view.get_buffer()
+        return buffer.get_text(*buffer.get_bounds(), False)
+
+    def on_copy_log(self, _button):
+        self.get_clipboard().set(self.log_text())
+        self.toasts.add_toast(Adw.Toast(title=tr("Журнал скопирован")))
+
+    def on_export_log(self, _button):
+        text = self.log_text()
+        dialog = Gtk.FileDialog(title=tr("Экспорт журнала"))
+        dialog.set_initial_name(f"bbport-{time.strftime('%Y%m%d_%H%M%S')}.log")
+
+        def finish(dialog, result):
+            try:
+                chosen = dialog.save_finish(result)
+            except GLib.Error:
+                return
+            if not chosen or not chosen.get_path():
+                return
+            try:
+                Path(chosen.get_path()).write_text(text, encoding="utf-8")
+            except OSError as error:
+                self.toasts.add_toast(Adw.Toast(
+                    title=tr("Не удалось сохранить журнал: {}").format(error.strerror or error)))
+                return
+            self.toasts.add_toast(Adw.Toast(title=tr("Журнал сохранён: {}").format(chosen.get_path())))
+        dialog.save(self, None, finish)
 
     def append_log(self, text):
         buffer = self.log_view.get_buffer()
