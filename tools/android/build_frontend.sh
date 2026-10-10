@@ -37,10 +37,15 @@ with zipfile.ZipFile(apk) as z:
         z.extract(name, out)
 PY
 cp tools/android/frontend/THIRD_PARTY_LICENSES.txt "$out/assets/"
+# The Steam sign-in's libraries (SteamDllDialog.java: JavaSteam and its dependencies, ZXing, zstd).
+steam_libs=$PWD/.local-deps/android/steam-libs
+[[ -f $steam_libs/jars.txt ]] || bash tools/android/fetch_steam_libs.sh
+mapfile -t steam_jars < <(sed "s|^|$steam_libs/jars/|" "$steam_libs/jars.txt")
+mkdir -p "$out/lib/arm64-v8a" && cp "$steam_libs"/jni/*.so "$out/lib/arm64-v8a/"
 mapfile -t sources < <(rg --files tools/android/frontend/src -g '*.java')
-javac --release 8 -classpath "$android_jar" -d "$out/classes" "${sources[@]}"
+javac --release 8 -classpath "$android_jar:$(IFS=:; echo "${steam_jars[*]}")" -d "$out/classes" "${sources[@]}"
 mapfile -t classes < <(rg --files "$out/classes" -g '*.class')
-"$build_tools/d8" --min-api 28 --lib "$android_jar" --output "$out/dex" "${classes[@]}"
+"$build_tools/d8" --release --min-api 28 --lib "$android_jar" --output "$out/dex" "${classes[@]}" "${steam_jars[@]}"
 "$build_tools/aapt" package -f -M tools/android/frontend/AndroidManifest.xml \
     -S "$out/res" -A "$out/assets" -I "$android_jar" -0 payload -F "$out/unsigned.apk"
 python3 - "$out" <<'PY'
