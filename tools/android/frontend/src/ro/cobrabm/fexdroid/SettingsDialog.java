@@ -41,10 +41,9 @@ final class SettingsDialog {
         {"effect_ssr","Screen-space reflections (not in the original)","0"},
         {"skip_intro","Skip startup intros","0"},
     };
-    // FSR 4 and 4.1.1 are experimental; without their assets run-thor.sh uses FSR 3.1.
-    private static final String[] UPSCALER_VALUES={"off","fsr3","fsr4","fsr411"};
-    private static final String[] UPSCALER_NAMES={"Off (render at 1280×720)","FSR 3.1",
-        "FSR 4 (experimental)","FSR 4.1.1 (experimental, needs fsr4_411 assets)"};
+    // FSR 4 (INT8) is not offered: ~470 ms a frame and a black scene on the Adreno 740 (run-thor.sh).
+    private static final String[] UPSCALER_VALUES={"off","fsr3"};
+    private static final String[] UPSCALER_NAMES={"Off (render at 1280×720)","FSR 3.1"};
     private static final int FSR3=1;
     private static final String[] LSFG_VALUES={"0","2","3","4"};
     private static final String[] LSFG_NAMES={"Off","2× frames","3× frames","4× frames"};
@@ -174,12 +173,7 @@ final class SettingsDialog {
             boolean on=upscaler!=0;
             for (int i=0;i<presets.getChildCount();++i) presets.getChildAt(i).setEnabled(on);
             frameGen.setEnabled(upscaler==FSR3);
-            presetNote.setText(!on ? "Without upscaling the game renders at 1280×720."
-                : upscaler==FSR3 ? "Lower is faster; the upscaler fills the screen."
-                : "Lower is faster. FSR 4 is heavy on phone GPUs; its first start compiles shaders for "
-                  +"a minute or more (black screen), later starts are quick. FSR 4.1.1 needs the fsr4_411 "
-                  +"folder (built from your own AMD DLL) next to the game folder. Without its files the "
-                  +"game uses FSR 3.1. Frame generation works with FSR 3.1 only.");
+            presetNote.setText(on ? "Lower is faster; the upscaler fills the screen." : "Without upscaling the game renders at 1280×720.");
         };
         upscalers.setOnCheckedChangeListener(upscaling); upscaling.onCheckedChanged(upscalers,0);
 
@@ -255,8 +249,12 @@ final class SettingsDialog {
     }
 
     /** Lossless Scaling frame generation (run-thor.sh: lsfg-vk with the player's Lossless.dll). */
-    void showLossless() {
+    /** Lossless Scaling frame generation. While the game runs with the lsfg-vk layer loaded
+     *  (run-thor.sh wrote lsfg-vk.toml), changes go to that file and apply at once (lsfg-vk watches
+     *  it; off is multiplier 1). Turning it on when the layer was not loaded restarts the game. */
+    void showLossless(java.util.function.BooleanSupplier gameRunning) {
         load();
+        final File live=new File(file.getParentFile(),"lsfg-vk.toml");
         LinearLayout box=new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(24),dp(4),dp(24),dp(8));
         heading(box,"Frames");
@@ -265,9 +263,11 @@ final class SettingsDialog {
         final RadioGroup lsfgFlow=choices(box,LSFG_FLOW_NAMES,indexOf(LSFG_FLOW_VALUES,get("lsfg_flow_scale","1.0"),0));
         final Switch lsfgPerformance=toggle(box,"Performance mode","1".equals(get("lsfg_performance","0")));
         TextView lsfgNote=new TextView(activity); lsfgNote.setTextSize(13); lsfgNote.setAlpha(0.7f);
-        lsfgNote.setText("Needs Lossless.dll from your own Lossless Scaling (Steam) next to the game folder. "
-            +"Works with any upscaler and replaces FSR 3.1 frame generation. It sees only finished frames, "
-            +"so fast motion and the HUD show more artifacts. Lower flow scale and performance mode are faster.");
+        lsfgNote.setText("Needs Lossless.dll from your own Lossless Scaling (Steam) next to the game "
+            +"folder. Works with any upscaler and replaces FSR 3.1 frame generation. "
+            +"It sees only finished frames, so fast motion and the HUD show more artifacts. Lower flow "
+            +"scale and performance mode are faster. Changes apply while you play; only turning it on "
+            +"after starting without it restarts the game.");
         box.addView(lsfgNote);
         RadioGroup.OnCheckedChangeListener lossless=(g,id) -> {
             boolean on=checkedIndex(lsfg)>0;
@@ -279,12 +279,42 @@ final class SettingsDialog {
         ScrollView scroll=new ScrollView(activity); scroll.addView(box);
         new AlertDialog.Builder(activity).setTitle("Lossless Scaling frame generation").setView(scroll)
             .setNegativeButton("Cancel",null)
-            .setPositiveButton("Apply & restart",(d,w) -> {
+            .setPositiveButton("Apply",(d,w) -> {
                 Map<String,String> changed=new LinkedHashMap<>();
-                changed.put("lsfg_multiplier",LSFG_VALUES[Math.max(0,checkedIndex(lsfg))]);
+                String multiplier=LSFG_VALUES[Math.max(0,checkedIndex(lsfg))];
+                changed.put("lsfg_multiplier",multiplier);
                 changed.put("lsfg_flow_scale",LSFG_FLOW_VALUES[Math.max(0,checkedIndex(lsfgFlow))]);
                 changed.put("lsfg_performance",lsfgPerformance.isChecked() ? "1" : "0");
-                apply(changed);
+                if (gameRunning.getAsBoolean() && live.isFile()) {
+                    boolean ok=save(changed) && writeLsfgProfile(live,"0".equals(multiplier) ? "1" : multiplier,
+                        changed.get("lsfg_flow_scale"),lsfgPerformance.isChecked());
+                    android.widget.Toast.makeText(activity,ok ? "Lossless Scaling: applied"
+                        : "Lossless Scaling: could not apply",android.widget.Toast.LENGTH_SHORT).show();
+                } else if (!"0".equals(multiplier) && gameRunning.getAsBoolean()) {
+                    apply(changed); // the layer loads at start only
+                } else if (!save(changed)) {
+                    new AlertDialog.Builder(activity).setMessage("The settings could not be saved.").setPositiveButton("OK",null).show();
+                }
             }).show();
+    }
+
+    /** Rewrites the profile values of the running layer's config (written whole, then renamed:
+     *  lsfg-vk reloads on the rename). */
+    private static boolean writeLsfgProfile(File config,String multiplier,String flowScale,boolean performance) {
+        List<String> out=new ArrayList<>();
+        try (BufferedReader r=new BufferedReader(new InputStreamReader(new FileInputStream(config),"UTF-8"))) {
+            for (String line; (line=r.readLine())!=null;) {
+                String t=line.trim();
+                if (t.startsWith("multiplier")) line="multiplier = "+multiplier;
+                else if (t.startsWith("flow_scale")) line="flow_scale = "+flowScale;
+                else if (t.startsWith("performance_mode")) line="performance_mode = "+performance;
+                out.add(line);
+            }
+        } catch (Exception ex) { android.util.Log.e("Bloodborne","lsfg config: "+ex); return false; }
+        File temporary=new File(config.getPath()+".tmp");
+        try (Writer w=new OutputStreamWriter(new FileOutputStream(temporary),"UTF-8")) {
+            for (String line:out) w.write(line+"\n");
+        } catch (Exception ex) { android.util.Log.e("Bloodborne","lsfg config: "+ex); return false; }
+        return temporary.renameTo(config);
     }
 }

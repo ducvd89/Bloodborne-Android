@@ -45,22 +45,10 @@ fi
 # 1280x720 display; the preset sets the scene size, FSR 3.1 upscales it to the output.
 setting() { sed -n "s/^$1=//p" "$BB_CONFIG" 2>/dev/null | tail -n 1; }
 upscaler=$(setting upscaler); preset=$(setting preset)
-# FSR 4 (v07 INT8, assets in the bundle) and FSR 4.1.1 (INT8; assets built from the player's own
-# AMD DLL with tools/fsr4cap, the fsr4_411 folder next to the game folder or in bbport/) are
-# experimental: Turnip compiles their model passes on first use (over a minute, cached after).
-# Without their assets they fall back to FSR 3.1, as does any other value.
-case $upscaler in
-    off|fsr3) ;;
-    fsr4) [ -d "$base/arm64/fsr4_shaders" ] || upscaler=fsr3 ;;
-    fsr411)
-        upscaler=fsr3
-        for dir in "${BB_GAME_DIR:+${BB_GAME_DIR%/*}/fsr4_411}" "$base/fsr4_411"; do
-            if [ -n "$dir" ] && [ -d "$dir" ]; then
-                export BB_FSR411_DIR="$dir"; upscaler=fsr411; break
-            fi
-        done ;;
-    *) upscaler=fsr3 ;;
-esac
+# FSR 4 and 4.1.1 (INT8 models) are not offered: on the Thor's Adreno 740 FSR 4 took ~3 min to
+# compile in Turnip, then ran at 2.4 FPS (~470 ms of GPU time a frame) with a black scene, and with
+# the Lossless Scaling layer it crashed in Turnip. Any value but off means FSR 3.1.
+case $upscaler in off) ;; *) upscaler=fsr3 ;; esac
 echo "Upscaler setting: $upscaler"
 case $preset in 0|1|2|3|4) ;; *) preset=3 ;; esac
 render=1280x720
@@ -70,12 +58,13 @@ fi
 export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
 [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
-# Lossless Scaling frame generation (lsfg_multiplier 2-4): the lsfg-vk layer (bbport/arm64/lsfg,
-# build_lsfg.sh) with the player's own Lossless.dll next to the game folder or in bbport/. It
-# replaces FSR 3.1 frame generation. Its log: logs/lsfg.log.
+# Lossless Scaling frame generation (lsfg_multiplier 2-4): the lsfg-vk 1.0 layer with our Turnip
+# patches (bbport/arm64/lsfg, build_lsfg.sh) and Lossless.dll from the player's own Lossless
+# Scaling (Steam), next to the game folder or in bbport/. It replaces FSR 3.1 frame generation.
+# Its messages (lsfg-vk: ...) go to the game log.
 lsfg=$(setting lsfg_multiplier)
 case $lsfg in 2|3|4) ;; *) lsfg= ;; esac
-if [ -n "$lsfg" ] && [ -f "$base/arm64/lsfg/VkLayer_LSFGVK_frame_generation.json" ]; then
+if [ -n "$lsfg" ] && [ -f "$base/arm64/lsfg/VkLayer_LS_frame_generation.json" ]; then
     lsfg_dll=
     for dll in "${BB_GAME_DIR:+${BB_GAME_DIR%/*}/Lossless.dll}" "$base/Lossless.dll"; do
         [ -n "$dll" ] && [ -f "$dll" ] && { lsfg_dll=$dll; break; }
@@ -83,13 +72,29 @@ if [ -n "$lsfg" ] && [ -f "$base/arm64/lsfg/VkLayer_LSFGVK_frame_generation.json
     if [ -n "$lsfg_dll" ]; then
         flow=$(setting lsfg_flow_scale)
         case $flow in 0.25|0.5|0.75|1|1.0) ;; *) flow=1.0 ;; esac
+        performance=$([ "$(setting lsfg_performance)" = 1 ] && echo true || echo false)
         unset BB_FRAME_GEN
-        export VK_ADD_LAYER_PATH="$base/arm64/lsfg"
-        export VK_LOADER_LAYERS_ENABLE=VK_LAYER_LSFGVK_frame_generation
-        export VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation
-        export LSFGVK_ENV=1 LSFGVK_DLL_PATH="$lsfg_dll" LSFGVK_MULTIPLIER=$lsfg LSFGVK_FLOW_SCALE=$flow
-        export LSFGVK_PERFORMANCE_MODE=$([ "$(setting lsfg_performance)" = 1 ] && echo 1 || echo 0)
-        export LSFGVK_LOG_FILE="$base/logs/lsfg.log" LSFGVK_LOG_LEVEL=info
+        # Config file mode: lsfg-vk watches it, so the app changes the multiplier (1: off), flow
+        # scale and performance mode while the game runs (SettingsDialog.showLossless). The file
+        # exists only while the layer is loaded; BB_LSFG: vk_swapchain.cpp restarts without it if
+        # it fails. An implicit layer, so the layer's own framegen instance skips it (DISABLE_LSFG).
+        # Present mode: FIFO paces the generated frames (LSFG_PRESENT=mailbox|immediate to try).
+        export BB_LSFG=1 LSFG_CONFIG="$base/lsfg-vk.toml"
+        export VK_ADD_IMPLICIT_LAYER_PATH="$base/arm64/lsfg"
+        cat > "$LSFG_CONFIG.tmp" <<EOF
+version = 1
+
+[global]
+dll = "$lsfg_dll"
+
+[[game]]
+exe = "bb-probe"
+multiplier = $lsfg
+flow_scale = $flow
+performance_mode = $performance
+experimental_present_mode = "${LSFG_PRESENT:-fifo}"
+EOF
+        mv -f "$LSFG_CONFIG.tmp" "$LSFG_CONFIG"
         echo "Lossless Scaling frame generation: x$lsfg, flow scale $flow, $lsfg_dll"
     else
         lsfg=; echo 'Lossless Scaling frame generation: no Lossless.dll next to the game folder'
@@ -97,6 +102,7 @@ if [ -n "$lsfg" ] && [ -f "$base/arm64/lsfg/VkLayer_LSFGVK_frame_generation.json
 else
     lsfg=
 fi
+[ -n "$lsfg" ] || rm -f "$base/lsfg-vk.toml"
 # FSR 4 model assets (fetch_fsr4_assets.sh), in the native bundle when fetched.
 [ -d "$base/arm64/fsr4_shaders" ] && export BB_FSR4_DIR="$base/arm64/fsr4_shaders"
 export BB_WINDOW_SIZE=1280x720

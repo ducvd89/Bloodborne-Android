@@ -2,7 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <string>
+#include <vector>
+#include <unistd.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -12,6 +19,33 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
+
+namespace {
+/// bbport: runs this program again, same arguments, with the Lossless Scaling layer disabled
+/// (its manifest's disable_environment, DISABLE_LSFG). Returns only when that is impossible.
+void RestartWithoutLsfg() {
+    std::ifstream file("/proc/self/cmdline", std::ios::binary);
+    const std::string cmdline{std::istreambuf_iterator<char>(file), {}};
+    std::vector<std::string> args;
+    for (size_t at = 0; at < cmdline.size();) {
+        const size_t end = cmdline.find('\0', at);
+        args.emplace_back(cmdline.substr(at, end == std::string::npos ? std::string::npos : end - at));
+        at = end == std::string::npos ? cmdline.size() : end + 1;
+    }
+    if (args.empty()) {
+        return;
+    }
+    std::vector<char*> argv;
+    for (auto& arg : args) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+    setenv("DISABLE_LSFG", "1", 1);
+    std::fflush(nullptr);
+    execv("/proc/self/exe", argv.data());
+    std::perror("Swapchain: restart without Lossless Scaling frame generation failed");
+}
+} // namespace
 
 static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
     .format = vk::Format::eA2B10G10R10UnormPack32,
@@ -79,6 +113,15 @@ void Swapchain::Create(u32 width_, u32 height_) {
     };
 
     auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
+    // bbport: the Lossless Scaling layer (lsfg-vk, run-thor.sh) fails swapchain creation when it
+    // cannot start (its DLL, the driver): the game restarts itself without it instead of stopping.
+    if (swapchain_result != vk::Result::eSuccess && std::getenv("BB_LSFG") &&
+        !std::getenv("DISABLE_LSFG")) {
+        std::printf("Swapchain: Lossless Scaling frame generation failed (%s): restarting without "
+                    "it (logs/lsfg.log)\n",
+                    vk::to_string(swapchain_result).c_str());
+        RestartWithoutLsfg();
+    }
     ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                vk::to_string(swapchain_result));
     swapchain = chain;
@@ -147,6 +190,14 @@ bool Swapchain::Present() {
     auto result = instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
+    } else if (result != vk::Result::eSuccess && std::getenv("BB_LSFG") &&
+               !std::getenv("DISABLE_LSFG")) {
+        // bbport: lsfg-vk 1.0 returns an error from a present that failed in the layer.
+        std::printf("Swapchain: Lossless Scaling frame generation failed to present (%s): "
+                    "restarting without it\n",
+                    vk::to_string(result).c_str());
+        RestartWithoutLsfg();
+        UNREACHABLE_MSG("Swapchain presentation failed: {}", vk::to_string(result));
     } else {
         ASSERT_MSG(result == vk::Result::eSuccess, "Swapchain presentation failed: {}",
                    vk::to_string(result));

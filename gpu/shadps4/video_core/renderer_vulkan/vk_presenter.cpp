@@ -602,6 +602,18 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+namespace {
+// bbport: BB_PRESENT_TRACE=1: the steps of the first presents (a layer in vkQueuePresentKHR).
+void PresentTrace(const char* step) {
+    static const bool on = std::getenv("BB_PRESENT_TRACE") != nullptr;
+    static std::atomic<int> lines{0};
+    if (on && lines.fetch_add(1) < 160) {
+        std::printf("PresentTrace: %s\n", step);
+        std::fflush(stdout);
+    }
+}
+} // namespace
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
     // Free the frame for reuse
     const auto free_frame = [&] {
@@ -628,6 +640,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     }
 
+    PresentTrace("acquire");
     if (!swapchain.AcquireNextImage()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
@@ -641,6 +654,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
     // the frame's present fence and future GetRenderFrame() call will hang waiting for this frame.
+    PresentTrace("acquired");
     const auto reset_result = instance.GetDevice().resetFences(frame->present_done);
     ASSERT_MSG(reset_result == vk::Result::eSuccess,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
@@ -769,15 +783,27 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
+    // bbport: a Vulkan layer in vkQueuePresentKHR (Lossless Scaling frame generation, BB_LSFG)
+    // waits there for the present-ready semaphore of that submission. Sent by a recording thread
+    // (BB_ASYNC_SUBMIT), it needs submit_mutex, held below for the present: a deadlock unless
+    // it is in the queue first.
+    static const bool present_layer = std::getenv("BB_LSFG") != nullptr;
+    PresentTrace("flushed");
+    if (present_layer) {
+        scheduler.WaitSubmitted(scheduler.CurrentTick() - 1);
+    }
+    PresentTrace("submitted");
 
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        PresentTrace("present");
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
 
+    PresentTrace("presented");
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
