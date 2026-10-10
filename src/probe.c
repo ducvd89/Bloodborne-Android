@@ -27,6 +27,7 @@
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <pthread.h>
+#include <time.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #endif
@@ -290,12 +291,58 @@ static int sfo_value(const char *path, const char *key, char *text, size_t text_
     }
     return 0;
 }
+/* A segment's mapping: its size rounded to whole pages, as protect() maps it (segments start on a
+ * page). The tail past its data is mapped with its permissions, zero: the cheats' code goes in the
+ * code segment's (build_thor_patch_parts.py). */
 static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t bytes) {
-    for (uint64_t i = 0; i < count; ++i)
-        if (address >= segments[i].address && bytes <= segments[i].size &&
-            address - segments[i].address <= segments[i].size - bytes) return 1;
+    for (uint64_t i = 0; i < count; ++i) {
+        const uint64_t size = round_page(segments[i].size);
+        if (address >= segments[i].address && bytes <= size &&
+            address - segments[i].address <= size - bytes) return 1;
+    }
     return 0;
 }
+#ifndef _WIN32
+/* bbport: live cheats (the Android app's Cheats menu). The cheat hooks (patch part cheats.bin,
+ * build_thor_patch_parts.py) test flag bytes in the unused end of the data segment's last page;
+ * BB_CHEATS_FILE holds them as digits ("10": infinite health on, items off). The file is read a
+ * few times a second and the bytes follow it: the cheats switch while the game runs. */
+enum { CheatFlags = 0x56d3f00, CheatCount = 2 };
+static void *cheat_poller(void *arg) {
+    const char *path = arg;
+    char last[CheatCount + 1] = "";
+    for (;;) {
+        char now[CheatCount + 1] = "";
+        FILE *f = fopen(path, "r");
+        if (f) {
+            size_t n = fread(now, 1, CheatCount, f);
+            fclose(f);
+            now[n] = 0;
+        }
+        if (strcmp(now, last) != 0) {
+            for (int i = 0; i < CheatCount; ++i)
+                __atomic_store_n(image + CheatFlags + i, (unsigned char)(now[i] == '1'), __ATOMIC_RELAXED);
+            printf("Cheats: infinite health %s, infinite items %s\n", now[0] == '1' ? "on" : "off",
+                   now[1] == '1' ? "on" : "off");
+            fflush(stdout);
+            memcpy(last, now, sizeof(last));
+        }
+        struct timespec pause = {0, 250 * 1000 * 1000};
+        nanosleep(&pause, NULL);
+    }
+    return NULL;
+}
+static void start_cheats(Segment *segments, uint64_t ns) {
+    const char *path = getenv("BB_CHEATS_FILE");
+    if (!path || !*path) return;
+    if (!mapped(segments, ns, CheatFlags, CheatCount)) {
+        puts("Cheats: no flag bytes in this image");
+        return;
+    }
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, cheat_poller, (void *)path) == 0) pthread_detach(thread);
+}
+#endif
 /* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
  * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
  * function pointers): the patch holds the address at the patches' base, rebased here. */
@@ -579,6 +626,7 @@ int main(int argc, char **argv) {
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
 #ifndef _WIN32
+    start_cheats(segments, ns);
     /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
     enum { MAIN_STACK=8*1024*1024 };
     unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);

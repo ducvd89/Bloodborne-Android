@@ -1,3 +1,53 @@
+diff --git a/framegen/include/core/descriptorset.hpp b/framegen/include/core/descriptorset.hpp
+index 719035d..043f920 100644
+--- a/framegen/include/core/descriptorset.hpp
++++ b/framegen/include/core/descriptorset.hpp
+@@ -103,7 +103,10 @@ namespace LSFG::Core {
+ 
+         /// Add an optional resource to the descriptor set update.
+         DescriptorSetUpdateBuilder& add(VkDescriptorType type, const std::optional<Image>& image) {
+-            if (image.has_value()) this->add(type, *image); else this->add(type); return *this; }
++            // an absent image reads as zero from a real image, not from a null descriptor
++            if (image.has_value()) this->add(type, *image);
++            else this->add(type, this->device->getZeroImage());
++            return *this; }
+         DescriptorSetUpdateBuilder& add(VkDescriptorType type, const std::optional<Sampler>& sampler) {
+             if (sampler.has_value()) this->add(type, *sampler); else this->add(type); return *this; }
+         DescriptorSetUpdateBuilder& add(VkDescriptorType type, const std::optional<Buffer>& buffer) {
+diff --git a/framegen/include/core/device.hpp b/framegen/include/core/device.hpp
+index d03a89c..9ac6ddf 100644
+--- a/framegen/include/core/device.hpp
++++ b/framegen/include/core/device.hpp
+@@ -9,6 +9,8 @@
+ 
+ namespace LSFG::Core {
+ 
++    class Image;
++
+     ///
+     /// C++ wrapper class for a Vulkan device.
+     ///
+@@ -30,6 +32,10 @@ namespace LSFG::Core {
+         [[nodiscard]] auto handle() const { return *this->device; }
+         /// Get the physical device associated with this logical device.
+         [[nodiscard]] VkPhysicalDevice getPhysicalDevice() const { return this->physicalDevice; }
++
++        /// A 1x1 zero-filled image (GENERAL layout), bound where a shader's optional input is
++        /// absent instead of a null descriptor. Created on first use.
++        [[nodiscard]] const Image& getZeroImage() const;
+         /// Get the compute queue family index.
+         [[nodiscard]] uint32_t getComputeFamilyIdx() const { return this->computeFamilyIdx; }
+         /// Get the compute queue.
+@@ -48,6 +54,9 @@ namespace LSFG::Core {
+         uint32_t computeFamilyIdx{0};
+ 
+         VkQueue computeQueue{};
++        // last: destroyed before the device (shared by the copies, as the device is)
++        std::shared_ptr<std::shared_ptr<Image>> zeroImage =
++            std::make_shared<std::shared_ptr<Image>>();
+     };
+ 
+ }
 diff --git a/framegen/include/core/semaphore.hpp b/framegen/include/core/semaphore.hpp
 index 773ca0c..eb6c041 100644
 --- a/framegen/include/core/semaphore.hpp
@@ -70,6 +120,19 @@ index fb7f725..4a801ec 100644
  
      ///
      /// Delete an LSFG context.
+diff --git a/framegen/src/core/commandbuffer.cpp b/framegen/src/core/commandbuffer.cpp
+index 7deea63..f581ea9 100644
+--- a/framegen/src/core/commandbuffer.cpp
++++ b/framegen/src/core/commandbuffer.cpp
+@@ -81,7 +81,7 @@ void CommandBuffer::submit(VkQueue queue, std::optional<Fence> fence,
+         throw std::logic_error("Command buffer is not in Full state");
+ 
+     const std::vector<VkPipelineStageFlags> waitStages(waitSemaphores.size(),
+-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); // TOP_OF_PIPE would hold back nothing
+     VkTimelineSemaphoreSubmitInfo timelineInfo{
+         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+     };
 diff --git a/framegen/src/core/semaphore.cpp b/framegen/src/core/semaphore.cpp
 index 102898a..a53b6cc 100644
 --- a/framegen/src/core/semaphore.cpp
@@ -146,6 +209,70 @@ index 102898a..a53b6cc 100644
  void Semaphore::signal(const Core::Device& device, uint64_t value) const {
      if (!this->isTimeline)
          throw std::logic_error("Invalid timeline semaphore");
+diff --git a/framegen/src/core/zeroimage.cpp b/framegen/src/core/zeroimage.cpp
+new file mode 100644
+index 0000000..804cc68
+--- /dev/null
++++ b/framegen/src/core/zeroimage.cpp
+@@ -0,0 +1,58 @@
++#include <volk.h>
++#include <vulkan/vulkan_core.h>
++
++#include "core/device.hpp"
++#include "core/image.hpp"
++#include "core/commandpool.hpp"
++#include "core/commandbuffer.hpp"
++#include "core/fence.hpp"
++#include "common/exception.hpp"
++
++#include <memory>
++
++using namespace LSFG::Core;
++
++const Image& Device::getZeroImage() const {
++    if (*this->zeroImage)
++        return **this->zeroImage;
++
++    auto image = std::make_shared<Image>(*this, VkExtent2D{ 1, 1 }, VK_FORMAT_R16G16B16A16_SFLOAT,
++        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++        VK_IMAGE_ASPECT_COLOR_BIT);
++
++    const CommandPool pool(*this);
++    CommandBuffer cmd(*this, pool);
++    cmd.begin();
++    const VkImageSubresourceRange range{ .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++        .levelCount = 1, .layerCount = 1 };
++    VkImageMemoryBarrier2 barrier{
++        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
++        .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
++        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
++        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++        .image = image->handle(),
++        .subresourceRange = range
++    };
++    VkDependencyInfo dependency{ .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++        .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier };
++    vkCmdPipelineBarrier2(cmd.handle(), &dependency);
++    const VkClearColorValue zero{};
++    vkCmdClearColorImage(cmd.handle(), image->handle(), VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
++    barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
++    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
++    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
++    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
++    vkCmdPipelineBarrier2(cmd.handle(), &dependency);
++    cmd.end();
++
++    const Fence fence(*this);
++    cmd.submit(this->getComputeQueue(), fence);
++    if (!fence.wait(*this))
++        throw LSFG::vulkan_error(VK_TIMEOUT, "Failed to clear the zero image");
++
++    image->setLayout(VK_IMAGE_LAYOUT_GENERAL);
++    *this->zeroImage = image;
++    return *image;
++}
 diff --git a/framegen/v3.1_include/v3_1/context.hpp b/framegen/v3.1_include/v3_1/context.hpp
 index 16e3ffa..ac87d9a 100644
 --- a/framegen/v3.1_include/v3_1/context.hpp
@@ -167,10 +294,20 @@ index 16e3ffa..ac87d9a 100644
          // Trivially copyable, moveable and destructible
          Context(const Context&) = default;
 diff --git a/framegen/v3.1_src/context.cpp b/framegen/v3.1_src/context.cpp
-index 4984842..fc1b1aa 100644
+index 4984842..c826b00 100644
 --- a/framegen/v3.1_src/context.cpp
 +++ b/framegen/v3.1_src/context.cpp
-@@ -18,10 +18,12 @@ Context::Context(Vulkan& vk,
+@@ -7,6 +7,9 @@
+ 
+ #include <vector>
+ #include <cstddef>
++#include <chrono>
++#include <iostream>
++#include <thread>
+ #include <algorithm>
+ #include <optional>
+ #include <cstdint>
+@@ -18,10 +21,12 @@ Context::Context(Vulkan& vk,
          VkExtent2D extent, VkFormat format) {
      // import input images
      this->inImg_0 = Core::Image(vk.device, extent, format,
@@ -185,7 +322,7 @@ index 4984842..fc1b1aa 100644
          VK_IMAGE_ASPECT_COLOR_BIT, in1);
  
      // prepare render data
-@@ -61,8 +63,9 @@ Context::Context(Vulkan& vk,
+@@ -61,8 +66,9 @@ Context::Context(Vulkan& vk,
  }
  
  void Context::present(Vulkan& vk,
@@ -196,7 +333,7 @@ index 4984842..fc1b1aa 100644
  
      // 3. wait for completion of previous frame in this slot
      if (data.shouldWait)
-@@ -95,7 +98,8 @@ void Context::present(Vulkan& vk,
+@@ -95,7 +101,8 @@ void Context::present(Vulkan& vk,
      for (size_t pass = 0; pass < vk.generationCount; pass++) {
          auto& internalSemaphore = data.internalSemaphores.at(pass);
          auto& outSemaphore = data.outSemaphores.at(pass);
@@ -206,7 +343,7 @@ index 4984842..fc1b1aa 100644
          auto& completionFence = data.completionFences.at(pass);
          completionFence = Core::Fence(vk.device);
  
-@@ -112,10 +116,12 @@ void Context::present(Vulkan& vk,
+@@ -112,10 +119,22 @@ void Context::present(Vulkan& vk,
  
          buf2.end();
          std::vector<Core::Semaphore> signals = { outSemaphore };
@@ -215,8 +352,18 @@ index 4984842..fc1b1aa 100644
          buf2.submit(vk.device.getComputeQueue(), completionFence,
              { internalSemaphore }, std::nullopt,
              signals, std::nullopt);
-+        if (signalOut)
-+            outSem.at(pass) = outSemaphore.exportSyncFd(vk.device);
++        if (signalOut) {
++            // KGSL exports "-1" (signaled) while the submission has not reached the kernel yet
++            int fd = outSemaphore.exportSyncFd(vk.device);
++            while (fd < 0 && !completionFence.wait(vk.device, 0)) {
++                static uint64_t early{};
++                if (early++ % 120 == 0)
++                    std::cerr << "lsfg-vk: early sync export of a generated frame (" << early << ")\n";
++                std::this_thread::sleep_for(std::chrono::microseconds(100));
++                fd = outSemaphore.exportSyncFd(vk.device);
++            }
++            outSem.at(pass) = fd;
++        }
      }
  
      this->frameIdx++;
@@ -268,10 +415,20 @@ index ce965a0..8b72ff5 100644
          // Trivially copyable, moveable and destructible
          Context(const Context&) = default;
 diff --git a/framegen/v3.1p_src/context.cpp b/framegen/v3.1p_src/context.cpp
-index e4d94c5..7d35438 100644
+index e4d94c5..7639bdb 100644
 --- a/framegen/v3.1p_src/context.cpp
 +++ b/framegen/v3.1p_src/context.cpp
-@@ -19,10 +19,12 @@ Context::Context(Vulkan& vk,
+@@ -7,6 +7,9 @@
+ 
+ #include <vector>
+ #include <cstddef>
++#include <chrono>
++#include <iostream>
++#include <thread>
+ #include <algorithm>
+ #include <optional>
+ #include <cstdint>
+@@ -19,10 +22,12 @@ Context::Context(Vulkan& vk,
          VkExtent2D extent, VkFormat format) {
      // import input images
      this->inImg_0 = Core::Image(vk.device, extent, format,
@@ -286,7 +443,7 @@ index e4d94c5..7d35438 100644
          VK_IMAGE_ASPECT_COLOR_BIT, in1);
  
      // prepare render data
-@@ -62,8 +64,9 @@ Context::Context(Vulkan& vk,
+@@ -62,8 +67,9 @@ Context::Context(Vulkan& vk,
  }
  
  void Context::present(Vulkan& vk,
@@ -297,7 +454,7 @@ index e4d94c5..7d35438 100644
  
      // 3. wait for completion of previous frame in this slot
      if (data.shouldWait)
-@@ -96,7 +99,8 @@ void Context::present(Vulkan& vk,
+@@ -96,7 +102,8 @@ void Context::present(Vulkan& vk,
      for (size_t pass = 0; pass < vk.generationCount; pass++) {
          auto& internalSemaphore = data.internalSemaphores.at(pass);
          auto& outSemaphore = data.outSemaphores.at(pass);
@@ -307,7 +464,7 @@ index e4d94c5..7d35438 100644
          auto& completionFence = data.completionFences.at(pass);
          completionFence = Core::Fence(vk.device);
  
-@@ -113,10 +117,12 @@ void Context::present(Vulkan& vk,
+@@ -113,10 +120,22 @@ void Context::present(Vulkan& vk,
  
          buf2.end();
          std::vector<Core::Semaphore> signals = { outSemaphore };
@@ -316,8 +473,18 @@ index e4d94c5..7d35438 100644
          buf2.submit(vk.device.getComputeQueue(), completionFence,
              { internalSemaphore }, std::nullopt,
              signals, std::nullopt);
-+        if (signalOut)
-+            outSem.at(pass) = outSemaphore.exportSyncFd(vk.device);
++        if (signalOut) {
++            // KGSL exports "-1" (signaled) while the submission has not reached the kernel yet
++            int fd = outSemaphore.exportSyncFd(vk.device);
++            while (fd < 0 && !completionFence.wait(vk.device, 0)) {
++                static uint64_t early{};
++                if (early++ % 120 == 0)
++                    std::cerr << "lsfg-vk: early sync export of a generated frame (" << early << ")\n";
++                std::this_thread::sleep_for(std::chrono::microseconds(100));
++                fd = outSemaphore.exportSyncFd(vk.device);
++            }
++            outSem.at(pass) = fd;
++        }
      }
  
      this->frameIdx++;
@@ -348,11 +515,23 @@ index 5f511da..09d1a59 100644
              VK_IMAGE_ASPECT_COLOR_BIT, fds.empty() ? -1 : fds.at(i));
  
      // hook up shaders
+diff --git a/include/context.hpp b/include/context.hpp
+index 3438e48..7d61108 100644
+--- a/include/context.hpp
++++ b/include/context.hpp
+@@ -67,6 +67,7 @@ class LsContext {
+     struct RenderPassInfo {
+         Mini::CommandBuffer preCopyBuf; // copy from swapchain image to frame_0/frame_1
+         std::array<Mini::Semaphore, 2> preCopySemaphores; // signal when preCopyBuf is done
++        std::shared_ptr<VkFence> preCopyFence; // signaled when preCopyBuf is done
+ 
+         std::vector<Mini::Semaphore> renderSemaphores; // signal when lsfg is done with frame n
+ 
 diff --git a/include/layer.hpp b/include/layer.hpp
-index 6ebe903..04756ea 100644
+index 6ebe903..0704de6 100644
 --- a/include/layer.hpp
 +++ b/include/layer.hpp
-@@ -171,6 +171,10 @@ namespace Layer {
+@@ -171,6 +171,18 @@ namespace Layer {
          VkDevice device,
          const VkSemaphoreGetFdInfoKHR* pGetFdInfo,
          int* pFd);
@@ -360,9 +539,31 @@ index 6ebe903..04756ea 100644
 +    VkResult ovkImportSemaphoreFdKHR(
 +        VkDevice device,
 +        const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo);
++    /// Calls to the original fence functions.
++    VkResult ovkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreateInfo,
++        const VkAllocationCallbacks* pAllocator, VkFence* pFence);
++    void ovkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator);
++    VkResult ovkGetFenceStatus(VkDevice device, VkFence fence);
++    VkResult ovkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences,
++        VkBool32 waitAll, uint64_t timeout);
++    VkResult ovkResetFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences);
  
      /// Call to the original vkGetDeviceQueue function.
      void ovkGetDeviceQueue(
+diff --git a/include/mini/commandbuffer.hpp b/include/mini/commandbuffer.hpp
+index 2189596..d53063d 100644
+--- a/include/mini/commandbuffer.hpp
++++ b/include/mini/commandbuffer.hpp
+@@ -70,7 +70,8 @@ namespace Mini {
+         ///
+         void submit(VkQueue queue,
+             const std::vector<VkSemaphore>& waitSemaphores = {},
+-            const std::vector<VkSemaphore>& signalSemaphores = {});
++            const std::vector<VkSemaphore>& signalSemaphores = {},
++            VkFence fence = VK_NULL_HANDLE);
+ 
+         /// Get the state of the command buffer.
+         [[nodiscard]] CommandBufferState getState() const { return *this->state; }
 diff --git a/include/mini/semaphore.hpp b/include/mini/semaphore.hpp
 index 03df4d9..0922a90 100644
 --- a/include/mini/semaphore.hpp
@@ -404,10 +605,22 @@ index 03df4d9..0922a90 100644
          /// Get the Vulkan handle.
          [[nodiscard]] auto handle() const { return *this->semaphore; }
 diff --git a/src/context.cpp b/src/context.cpp
-index e00804a..355b2bc 100644
+index e00804a..8999a2d 100644
 --- a/src/context.cpp
 +++ b/src/context.cpp
-@@ -133,8 +133,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -23,6 +23,11 @@
+ #include <thread>
+ #include <array>
+ 
++namespace {
++    /// Exports that KGSL answered "signaled" before the submission reached the kernel.
++    uint64_t& earlySyncExports() { static uint64_t count{}; return count; }
++}
++
+ LsContext::LsContext(const Hooks::DeviceInfo& info, VkSwapchainKHR swapchain,
+         VkExtent2D extent, const std::vector<VkImage>& swapchainImages)
+         : swapchain(swapchain), swapchainImages(swapchainImages),
+@@ -133,8 +138,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
      auto& pass = this->passInfos.at(this->frameIdx % 8);
  
      // 1. copy swapchain image to frame_0/frame_1
@@ -417,21 +630,61 @@ index e00804a..355b2bc 100644
      pass.preCopySemaphores.at(1) = Mini::Semaphore(info.device);
      pass.preCopyBuf = Mini::CommandBuffer(info.device, this->cmdPool);
      pass.preCopyBuf.begin();
-@@ -157,10 +156,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -143,11 +147,28 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+         this->swapchainImages.at(presentIdx),
+         this->frameIdx % 2 == 0 ? this->frame_0.handle() : this->frame_1.handle(),
+         this->extent.width, this->extent.height,
+-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+         true, false);
+ 
+     pass.preCopyBuf.end();
+ 
++    // the slot's fence (its previous use finished frames ago)
++    if (!pass.preCopyFence) {
++        const VkFenceCreateInfo fenceInfo{ .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++        VkFence fence{};
++        auto fres = Layer::ovkCreateFence(info.device, &fenceInfo, nullptr, &fence);
++        if (fres != VK_SUCCESS)
++            throw LSFG::vulkan_error(fres, "Unable to create fence");
++        pass.preCopyFence = std::shared_ptr<VkFence>(new VkFence(fence),
++            [dev = info.device](VkFence* f) {
++                Layer::ovkWaitForFences(dev, 1, f, VK_TRUE, UINT64_MAX);
++                Layer::ovkDestroyFence(dev, *f, nullptr);
++            });
++    } else {
++        Layer::ovkWaitForFences(info.device, 1, pass.preCopyFence.get(), VK_TRUE, UINT64_MAX);
++        Layer::ovkResetFences(info.device, 1, pass.preCopyFence.get());
++    }
++
+     std::vector<VkSemaphore> gameRenderSemaphores2 = gameRenderSemaphores;
+     if (this->frameIdx > 0)
+         gameRenderSemaphores2.emplace_back(this->passInfos.at((this->frameIdx - 1) % 8)
+@@ -155,12 +176,18 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+     pass.preCopyBuf.submit(info.queue.second,
+         gameRenderSemaphores2,
          { pass.preCopySemaphores.at(0).handle(),
-           pass.preCopySemaphores.at(1).handle() });
+-          pass.preCopySemaphores.at(1).handle() });
++          pass.preCopySemaphores.at(1).handle() },
++        *pass.preCopyFence);
  
 -    // 2. render intermediary frames
 -    std::vector<int> renderSemaphoreFds(conf.multiplier - 1);
 -    for (size_t i = 0; i < (conf.multiplier - 1); ++i)
 -        pass.renderSemaphores.at(i) = Mini::Semaphore(info.device, &renderSemaphoreFds.at(i));
 +    // 2. render intermediary frames: sync files both ways, exported after the signaling submission
-+    const int preCopySemaphoreFd = pass.preCopySemaphores.at(0).exportSyncFd(info.device);
++    int preCopySemaphoreFd = pass.preCopySemaphores.at(0).exportSyncFd(info.device);
++    while (preCopySemaphoreFd < 0
++            && Layer::ovkGetFenceStatus(info.device, *pass.preCopyFence) == VK_NOT_READY) {
++        earlySyncExports()++; // not in the kernel yet: KGSL said "signaled"
++        std::this_thread::sleep_for(std::chrono::microseconds(100));
++        preCopySemaphoreFd = pass.preCopySemaphores.at(0).exportSyncFd(info.device);
++    }
 +    std::vector<int> renderSemaphoreFds(conf.multiplier - 1, -1);
  
      if (conf.performance)
          LSFG_3_1P::presentContext(*this->lsfgCtxId,
-@@ -170,6 +168,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -170,6 +197,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          LSFG_3_1::presentContext(*this->lsfgCtxId,
              preCopySemaphoreFd,
              renderSemaphoreFds);
@@ -442,7 +695,16 @@ index e00804a..355b2bc 100644
  
      for (size_t i = 0; i < (conf.multiplier - 1); i++) {
          // 3. acquire next swapchain image
-@@ -234,5 +236,23 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+@@ -190,7 +221,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+             this->out_n.at(i).handle(),
+             this->swapchainImages.at(imageIdx),
+             this->extent.width, this->extent.height,
+-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+             false, true);
+ 
+         pass.postCopyBufs.at(i).end();
+@@ -234,5 +265,24 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
          throw LSFG::vulkan_error(res, "Failed to present swapchain image");
  
      this->frameIdx++;
@@ -459,7 +721,8 @@ index e00804a..355b2bc 100644
 +        const double seconds = std::chrono::duration<double>(now - since).count();
 +        if (seconds >= 2.0) {
 +            std::cerr << "lsfg-vk: " << static_cast<double>(real) / seconds << " real + "
-+                << static_cast<double>(generated) / seconds << " generated frames/s\n";
++                << static_cast<double>(generated) / seconds << " generated frames/s, "
++                << earlySyncExports() << " early sync exports\n";
 +            since = now;
 +            real = generated = 0;
 +        }
@@ -467,26 +730,36 @@ index e00804a..355b2bc 100644
      return res;
  }
 diff --git a/src/layer.cpp b/src/layer.cpp
-index 9c2694b..120b0d5 100644
+index 9c2694b..f029c51 100644
 --- a/src/layer.cpp
 +++ b/src/layer.cpp
-@@ -49,6 +49,7 @@ namespace {
+@@ -49,6 +49,12 @@ namespace {
      PFN_vkDestroySemaphore next_vkDestroySemaphore{};
      PFN_vkGetMemoryFdKHR next_vkGetMemoryFdKHR{};
      PFN_vkGetSemaphoreFdKHR next_vkGetSemaphoreFdKHR{};
 +    PFN_vkImportSemaphoreFdKHR next_vkImportSemaphoreFdKHR{};
++    PFN_vkCreateFence next_vkCreateFence{};
++    PFN_vkDestroyFence next_vkDestroyFence{};
++    PFN_vkGetFenceStatus next_vkGetFenceStatus{};
++    PFN_vkWaitForFences next_vkWaitForFences{};
++    PFN_vkResetFences next_vkResetFences{};
      PFN_vkGetDeviceQueue next_vkGetDeviceQueue{};
      PFN_vkQueueSubmit next_vkQueueSubmit{};
      PFN_vkCmdPipelineBarrier next_vkCmdPipelineBarrier{};
-@@ -219,6 +220,7 @@ namespace {
+@@ -219,6 +225,12 @@ namespace {
              success &= initDeviceFunc(*pDevice, "vkCreateSemaphore", &next_vkCreateSemaphore);
              success &= initDeviceFunc(*pDevice, "vkDestroySemaphore", &next_vkDestroySemaphore);
              success &= initDeviceFunc(*pDevice, "vkGetSemaphoreFdKHR", &next_vkGetSemaphoreFdKHR);
 +            success &= initDeviceFunc(*pDevice, "vkImportSemaphoreFdKHR", &next_vkImportSemaphoreFdKHR);
++            success &= initDeviceFunc(*pDevice, "vkCreateFence", &next_vkCreateFence);
++            success &= initDeviceFunc(*pDevice, "vkDestroyFence", &next_vkDestroyFence);
++            success &= initDeviceFunc(*pDevice, "vkGetFenceStatus", &next_vkGetFenceStatus);
++            success &= initDeviceFunc(*pDevice, "vkWaitForFences", &next_vkWaitForFences);
++            success &= initDeviceFunc(*pDevice, "vkResetFences", &next_vkResetFences);
              success &= initDeviceFunc(*pDevice, "vkGetDeviceQueue", &next_vkGetDeviceQueue);
              success &= initDeviceFunc(*pDevice, "vkQueueSubmit", &next_vkQueueSubmit);
              success &= initDeviceFunc(*pDevice, "vkCmdPipelineBarrier", &next_vkCmdPipelineBarrier);
-@@ -479,6 +481,11 @@ namespace Layer {
+@@ -479,6 +491,28 @@ namespace Layer {
              int* pFd) {
          return next_vkGetSemaphoreFdKHR(device, pGetFdInfo, pFd);
      }
@@ -494,6 +767,23 @@ index 9c2694b..120b0d5 100644
 +            VkDevice device,
 +            const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo) {
 +        return next_vkImportSemaphoreFdKHR(device, pImportSemaphoreFdInfo);
++    }
++    VkResult ovkCreateFence(VkDevice device, const VkFenceCreateInfo* pCreateInfo,
++            const VkAllocationCallbacks* pAllocator, VkFence* pFence) {
++        return next_vkCreateFence(device, pCreateInfo, pAllocator, pFence);
++    }
++    void ovkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* pAllocator) {
++        next_vkDestroyFence(device, fence, pAllocator);
++    }
++    VkResult ovkGetFenceStatus(VkDevice device, VkFence fence) {
++        return next_vkGetFenceStatus(device, fence);
++    }
++    VkResult ovkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences,
++            VkBool32 waitAll, uint64_t timeout) {
++        return next_vkWaitForFences(device, fenceCount, pFences, waitAll, timeout);
++    }
++    VkResult ovkResetFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences) {
++        return next_vkResetFences(device, fenceCount, pFences);
 +    }
  
      void ovkGetDeviceQueue(
@@ -542,6 +832,35 @@ index ac16086..1212902 100644
 +            return; // the game runs without frame generation
          }
          std::cerr << "lsfg-vk: Shaders extracted successfully.\n";
+ 
+diff --git a/src/mini/commandbuffer.cpp b/src/mini/commandbuffer.cpp
+index 3b0e49a..7ae3f7f 100644
+--- a/src/mini/commandbuffer.cpp
++++ b/src/mini/commandbuffer.cpp
+@@ -66,12 +66,13 @@ void CommandBuffer::end() {
+ 
+ void CommandBuffer::submit(VkQueue queue,
+         const std::vector<VkSemaphore>& waitSemaphores,
+-        const std::vector<VkSemaphore>& signalSemaphores) {
++        const std::vector<VkSemaphore>& signalSemaphores,
++        VkFence fence) {
+     if (*this->state != CommandBufferState::Full)
+         throw std::logic_error("Command buffer is not in Full state");
+ 
+     const std::vector<VkPipelineStageFlags> waitStages(waitSemaphores.size(),
+-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); // TOP_OF_PIPE would hold back nothing
+ 
+     const VkSubmitInfo submitInfo{
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+@@ -83,7 +84,7 @@ void CommandBuffer::submit(VkQueue queue,
+         .signalSemaphoreCount = static_cast<uint32_t>(signalSemaphores.size()),
+         .pSignalSemaphores = signalSemaphores.data()
+     };
+-    auto res = Layer::ovkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
++    auto res = Layer::ovkQueueSubmit(queue, 1, &submitInfo, fence);
+     if (res != VK_SUCCESS)
+         throw LSFG::vulkan_error(res, "Unable to submit command buffer");
  
 diff --git a/src/mini/image.cpp b/src/mini/image.cpp
 index 978c67c..2493d0d 100644
@@ -638,3 +957,23 @@ index 0f0d0fd..7ba5ee4 100644
  
          if (count % 50 == 0 && count > 0)
              std::cerr << "lsfg-vk: "
+diff --git a/src/utils/utils.cpp b/src/utils/utils.cpp
+index a83e80d..f2c26f0 100644
+--- a/src/utils/utils.cpp
++++ b/src/utils/utils.cpp
+@@ -96,6 +96,7 @@ void Utils::copyImage(VkCommandBuffer buf,
+         bool makeSrcPresentable, bool makeDstPresentable) {
+     const VkImageMemoryBarrier srcBarrier{
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+@@ -108,6 +109,7 @@ void Utils::copyImage(VkCommandBuffer buf,
+     };
+     const VkImageMemoryBarrier dstBarrier{
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .image = dst,

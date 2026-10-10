@@ -39,9 +39,22 @@ final class SettingsDialog {
         {"effect_game_aa","Game's own anti-aliasing","1"},
         {"effect_dynamic_shadows","Shadows from dynamic lights","1"},
         {"effect_ssr","Screen-space reflections (not in the original)","0"},
-        {"skip_intro","Skip startup intros","0"},
     };
     // FSR 4 (INT8) is not offered: ~470 ms a frame and a black scene on the Adreno 740 (run-thor.sh).
+    /** Game settings: the game patches run-thor.sh applies at start (patch-parts), as upstream's
+     *  System menu pages and launcher offer them: {key, title, note, default}. */
+    private static final String[][] GAME_PATCHES={
+        {"skip_network_choice","Skip the online/offline screen","Start straight at the main menu, offline (there is no PSN here)","1"},
+        {"skip_intro","Skip startup intros","The logos and intro movie at start","0"},
+        {"debug_camera","Free camera","Toggle it with Cross + L3","0"},
+        {"debug_menu","Debug menu","The game's own debug menu; needs its font files","0"},
+    };
+    /** Cheats: code hooks of the game applied at start (build_thor_patch_parts.py, run-thor.sh). */
+    private static final String[][] CHEATS={
+        {"cheat_health","Infinite health","Your HP refills to full every frame","0"},
+        {"cheat_items","Infinite blood vials and items","Using a blood vial, bullet or other item leaves its count as it was "
+            +"(items moved to storage or given away stay too)","0"},
+    };
     private static final String[] UPSCALER_VALUES={"off","fsr3"};
     private static final String[] UPSCALER_NAMES={"Off (render at 1280×720)","FSR 3.1"};
     private static final int FSR3=1;
@@ -249,6 +262,71 @@ final class SettingsDialog {
     }
 
     /** Lossless Scaling frame generation (run-thor.sh: lsfg-vk with the player's Lossless.dll). */
+    /** Game settings: the game's patches (applied when the game starts: Apply restarts it). */
+    void showGame() {
+        load();
+        LinearLayout box=new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24),dp(4),dp(24),dp(8));
+        final Switch[] toggles=new Switch[GAME_PATCHES.length];
+        for (int i=0;i<GAME_PATCHES.length;++i) {
+            toggles[i]=toggle(box,GAME_PATCHES[i][1],"1".equals(get(GAME_PATCHES[i][0],GAME_PATCHES[i][3])));
+            TextView note=new TextView(activity); note.setTextSize(12); note.setAlpha(0.65f);
+            note.setText(GAME_PATCHES[i][2]); note.setPadding(0,0,0,dp(6));
+            box.addView(note);
+        }
+        TextView restartNote=new TextView(activity); restartNote.setTextSize(13); restartNote.setAlpha(0.7f);
+        restartNote.setText("These are patches to the game: Apply restarts it (unsaved progress is lost).");
+        restartNote.setPadding(0,dp(8),0,0);
+        box.addView(restartNote);
+        ScrollView scroll=new ScrollView(activity); scroll.addView(box);
+        new AlertDialog.Builder(activity).setTitle("Game settings").setView(scroll)
+            .setNegativeButton("Cancel",null)
+            .setPositiveButton("Apply",(d,w) -> {
+                Map<String,String> changed=new LinkedHashMap<>();
+                for (int i=0;i<GAME_PATCHES.length;++i) changed.put(GAME_PATCHES[i][0],toggles[i].isChecked() ? "1" : "0");
+                apply(changed);
+            }).show();
+    }
+
+    /** Cheats (applied when the game starts: Apply restarts it). */
+    void showCheats() {
+        load();
+        LinearLayout box=new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24),dp(4),dp(24),dp(8));
+        final Switch[] toggles=new Switch[CHEATS.length];
+        for (int i=0;i<CHEATS.length;++i) {
+            toggles[i]=toggle(box,CHEATS[i][1],"1".equals(get(CHEATS[i][0],CHEATS[i][3])));
+            TextView note=new TextView(activity); note.setTextSize(12); note.setAlpha(0.65f);
+            note.setText(CHEATS[i][2]); note.setPadding(0,0,0,dp(6));
+            box.addView(note);
+        }
+        TextView restartNote=new TextView(activity); restartNote.setTextSize(13); restartNote.setAlpha(0.7f);
+        restartNote.setText("For Bloodborne 1.09 offline play. They switch at once, while you play.");
+        restartNote.setPadding(0,dp(8),0,0);
+        box.addView(restartNote);
+        ScrollView scroll=new ScrollView(activity); scroll.addView(box);
+        new AlertDialog.Builder(activity).setTitle("Cheats").setView(scroll)
+            .setNegativeButton("Cancel",null)
+            .setPositiveButton("Apply",(d,w) -> {
+                Map<String,String> changed=new LinkedHashMap<>();
+                for (int i=0;i<CHEATS.length;++i) changed.put(CHEATS[i][0],toggles[i].isChecked() ? "1" : "0");
+                // The running game follows cheats.state (probe.c reads it): no restart.
+                boolean ok=save(changed) && writeCheatState(new File(file.getParentFile(),"cheats.state"),
+                    toggles[0].isChecked(),toggles[1].isChecked());
+                android.widget.Toast.makeText(activity,ok ? "Cheats applied" : "The cheats could not be saved",
+                    android.widget.Toast.LENGTH_SHORT).show();
+            }).show();
+    }
+
+    /** "10": infinite health on, items off (run-thor.sh's BB_CHEATS_FILE), written whole then renamed. */
+    private static boolean writeCheatState(File state,boolean health,boolean items) {
+        File temporary=new File(state.getPath()+".tmp");
+        try (Writer w=new OutputStreamWriter(new FileOutputStream(temporary),"UTF-8")) {
+            w.write((health ? "1" : "0")+(items ? "1" : "0")+"\n");
+        } catch (Exception ex) { android.util.Log.e("Bloodborne","cheats: "+ex); return false; }
+        return temporary.renameTo(state);
+    }
+
     /** Lossless Scaling frame generation. While the game runs with the lsfg-vk layer loaded
      *  (run-thor.sh wrote lsfg-vk.toml), changes go to that file and apply at once (lsfg-vk watches
      *  it; off is multiplier 1). Turning it on when the layer was not loaded restarts the game. */
