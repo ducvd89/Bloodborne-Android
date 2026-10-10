@@ -8,3 +8,6 @@ patches here to its working tree when they are not applied yet:
 - `0002-...`: device-local images on unified-memory GPUs (Adreno/Turnip): FFX skipped every
   host-visible type for device-local requests, and there every allocatable type is one, so FSR 3
   context creation failed (`FFX_ERROR_BACKEND_API_ERROR`) once the world loaded.
+- `0003-...`: frame generation frees its per-frame descriptor pools and constant buffers. It
+  never began or retired frames on its bridge, so each job's pool and buffer stayed: on Turnip a
+  mapped KGSL buffer each, which reached Android's 65530 mapping limit within two minutes.
