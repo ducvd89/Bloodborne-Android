@@ -7,6 +7,10 @@ Turnip Vulkan driver: Mesa (MIT), https://gitlab.freedesktop.org/mesa/mesa
 commit 35b085c4c067f198ce0b6437d94678e47b9c645f, with fexdroid's Mesa patches
 0001, 0005, 0006 and 0007 (patches/mesa at fexdroid revision
 dbf9808b07570faf5aa912af16d4c4a1b5d0130f), under the fexdroid license below.
+Adreno 8xx variant: Mesa from https://github.com/whitebelyash/mesa-unified
+(turnip/gen8, commit 9c7e022677dfa3abb356c2b6732cbd2e25783d01, MIT), with
+upstream Mesa commits b889ab52, b7ad24ad, e984ef29, 6cb65e61 and the same
+fexdroid patches.
 
 MIT License
 
