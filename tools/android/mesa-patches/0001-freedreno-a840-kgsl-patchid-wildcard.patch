@@ -1,0 +1,30 @@
+From: fexdroid
+Subject: [PATCH] freedreno/common: add patch-id wildcard fallback for Adreno 840 (KGSL)
+
+Mesa 26.2.3 already carries the upstream A840 entry (chip_id 0xffff44050A31,
+upstream commit 6e359817 "freedreno/common: Add A840 and X2-85", Rob Clark,
+Qualcomm, MR !38450).  Over KGSL the kernel reports a 32-bit chip id and
+dev_id_compare() only matches it against that entry when it is exactly
+0x44050A31 (fuse-id wildcard, exact patch id).  Add a second entry with the
+0xff patch-id wildcard so other A840 revisions (e.g. the 2-slice SKU, or a
+different patch level on Samsung firmware) still bind to the A840 properties
+instead of failing with VK_ERROR_INCOMPATIBLE_DRIVER.  Same GPU properties as
+the upstream entry; the distinct name shows in VkPhysicalDeviceProperties.
+
+License: MIT (same as Mesa).  Local fexdroid patch, not upstream.
+---
+--- a/src/freedreno/common/freedreno_devices.py	2026-09-25 19:54:17.874104330 +0300
++++ b/src/freedreno/common/freedreno_devices.py	2026-09-25 19:54:17.886236357 +0300
+@@ -1425,6 +1425,12 @@
+ 
+ add_gpus([
+         GPUId(chip_id=0xffff44050A31, name="Adreno (TM) 840"),
++        # KGSL (Android) reports the 32-bit chip id; the proprietary driver on a
++        # Galaxy S26 Ultra reports 0x44050A31, which the entry above already
++        # matches once the fuse-id wildcard is applied.  Keep a patch-id
++        # wildcard fallback for other A840 revisions/SKUs so they are not
++        # rejected as "unsupported" outright (the name makes this visible).
++        GPUId(chip_id=0xffff44050Aff, name="Adreno (TM) 840 (unknown patchid)"),
+     ], A6xxGPUInfo(
+         CHIP.A8XX,
+         [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen2,

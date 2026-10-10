@@ -22,7 +22,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         }
     }
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
-    if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+    // In the Android app (BB_ANDROID_INPUT=1) the app hands over every pad (BB_PAD_FILE) and SDL
+    // has none to find: its hotplug scan loaded libudev every second, which the app sandbox
+    // denies (a stream of SELinux denials that ColorOS reported as an attack).
+    const char* android_input = std::getenv("BB_ANDROID_INPUT");
+    const bool sdl_pads = !(android_input && android_input[0] == '1');
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO | (sdl_pads ? SDL_INIT_GAMEPAD : 0))) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
     }
     SDL_PropertiesID props = SDL_CreateProperties();

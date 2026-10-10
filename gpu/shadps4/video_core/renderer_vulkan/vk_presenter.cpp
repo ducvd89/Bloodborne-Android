@@ -461,13 +461,29 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         draw_scheduler.EndRendering();
         // The game's display buffer view: sRGB when it is, the generated frame's bits likewise.
         const bool srgb = vk::to_string(view_info.format).find("Srgb") != std::string::npos;
+        // The game frame is shown in the video out format's channel order (view_info.format),
+        // which may differ from the order it was rendered in (display.format): the generated
+        // frame holds the rendered order, so red and blue swap here when the two differ (else
+        // every generated frame flickers with swapped colours).
+        const auto bgra = [](vk::Format f) {
+            return f == vk::Format::eB8G8R8A8Srgb || f == vk::Format::eB8G8R8A8Unorm;
+        };
+        const bool swap_rb = bgra(view_info.format) != bgra(display.format);
+        static std::once_flag logged;
+        std::call_once(logged, [&] {
+            std::printf("Frame generation: shown as %s, rendered as %s%s\n",
+                        vk::to_string(view_info.format).c_str(),
+                        vk::to_string(display.format).c_str(),
+                        swap_rb ? ": red and blue swapped for generated frames" : "");
+        });
+        const auto red = swap_rb ? vk::ComponentSwizzle::eB : vk::ComponentSwizzle::eIdentity;
+        const auto blue = swap_rb ? vk::ComponentSwizzle::eR : vk::ComponentSwizzle::eIdentity;
         const auto device = instance.GetDevice();
         const vk::ImageView gen_view = Check(device.createImageView({
             .image = generated.image,
             .viewType = vk::ImageViewType::e2D,
             .format = srgb ? vk::Format::eR8G8B8A8Srgb : vk::Format::eR8G8B8A8Unorm,
-            .components = {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
-                           vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eOne},
+            .components = {red, vk::ComponentSwizzle::eIdentity, blue, vk::ComponentSwizzle::eOne},
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         }));
         draw_scheduler.DeferOperation([device, gen_view] { device.destroyImageView(gen_view); });

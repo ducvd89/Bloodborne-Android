@@ -61,6 +61,7 @@ def main():
     (stage / 'bin').mkdir(parents=True)
     (stage / 'lib').mkdir()
     shutil.copy2(OUT / 'bb-probe', stage / 'bin/bb-probe')
+    shutil.copy2(OUT / 'kgsl-chip-id', stage / 'bin/kgsl-chip-id')
     # The game patches the settings screen chooses from (run-thor.sh), compiled here.
     subprocess.run([sys.executable, str(ROOT / 'tools/android/build_thor_patch_parts.py'),
                     '--out', str(stage / 'patch-parts')], check=True)
@@ -69,7 +70,7 @@ def main():
         shutil.copytree(ROOT / 'fsr4_shaders', stage / 'fsr4_shaders')
     for name, source in sorted(ship.items()):
         shutil.copy2(source.resolve(), stage / 'lib' / name)
-    for path in [stage / 'bin/bb-probe', *(stage / 'lib').iterdir()]:
+    for path in [stage / 'bin/bb-probe', stage / 'bin/kgsl-chip-id', *(stage / 'lib').iterdir()]:
         subprocess.run(['llvm-strip', '--strip-debug', str(path)], check=True)
         if path.parent.name == 'lib':
             subprocess.run(['patchelf', '--set-rpath', '$ORIGIN', str(path)], check=True)

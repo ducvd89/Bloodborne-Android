@@ -92,11 +92,24 @@ public final class MainActivity extends Activity {
     private FrameLayout.LayoutParams frame(int width,int height,int gravity) {
         return new FrameLayout.LayoutParams(width,height,gravity);
     }
+    private void fitSurface(int width,int height) {
+        if (width<=0 || height<=0) return;
+        int w=width, h=height;
+        if ((long)w*9>(long)h*16) w=h*16/9; else h=w*9/16;
+        FrameLayout.LayoutParams p=(FrameLayout.LayoutParams)surface.getLayoutParams();
+        if (p.width==w && p.height==h) return;
+        p.width=w; p.height=h;
+        // Not during the layout pass that reported the size.
+        surface.post(() -> surface.setLayoutParams(p));
+    }
 
     private void buildScreen() {
         screen=new FrameLayout(this); screen.setBackgroundColor(Color.BLACK);
         surface=new SurfaceView(this);
         screen.addView(surface,frame(-1,-1,Gravity.CENTER));
+        // The game is 16:9: the largest 16:9 area of the screen, black bars around it (a foldable's
+        // near-square inner screen, a tall cover screen). Refitted when folding or rotating.
+        screen.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob) -> fitSurface(r-l,b-t));
         surface.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override public void surfaceCreated(SurfaceHolder h) {
                 if (shmid>=0) attach(h);

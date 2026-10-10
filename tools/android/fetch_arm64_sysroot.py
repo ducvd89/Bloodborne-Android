@@ -96,13 +96,15 @@ def extract_deb(data, dest):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path, default=ROOT / '.local-deps/android/arm64-sysroot')
+    parser.add_argument('--packages', nargs='+', default=WANTED,
+                        help='packages to fetch instead of the runtime build set (build_turnip.sh)')
     args = parser.parse_args()
     out = args.out
     cache = out.parent / 'arm64-debs'
     cache.mkdir(parents=True, exist_ok=True)
     index = lzma.decompress(fetch(f'{MIRROR}/dists/{SUITE}/main/binary-arm64/Packages.xz')).decode()
     packages = parse_packages(index)
-    chosen, queue = {}, list(WANTED)
+    chosen, queue = {}, list(args.packages)
     while queue:
         name = queue.pop()
         if name in chosen or SKIP.match(name):

@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
@@ -53,6 +55,53 @@ std::string prompt_title, prompt_text;
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
+
+// The backend copies its vertices into mapped buffers without checking the map: a failed
+// vkMapMemory crashed the game (memcpy to address 0, android-0.2 with frame generation). A failed
+// map gets scratch memory instead (that frame's overlay draws stale vertices) and is logged.
+// Called under imgui_mutex, as everything the backend does.
+PFN_vkMapMemory real_map_memory;
+PFN_vkUnmapMemory real_unmap_memory;
+PFN_vkFlushMappedMemoryRanges real_flush_ranges;
+std::unordered_map<VkDeviceMemory, std::vector<std::byte>> scratch_maps;
+
+void LogVkResult(const char* what, VkResult result) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 16) {
+        std::printf("Overlay: %s failed: %s\n", what, vk::to_string(vk::Result(result)).c_str());
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL MapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset,
+                                         VkDeviceSize size, VkMemoryMapFlags flags, void** data) {
+    const VkResult result = real_map_memory(device, memory, offset, size, flags, data);
+    if (result == VK_SUCCESS && *data) {
+        return result;
+    }
+    LogVkResult("vkMapMemory", result == VK_SUCCESS ? VK_ERROR_MEMORY_MAP_FAILED : result);
+    auto& scratch = scratch_maps[memory];
+    scratch.resize(size);
+    *data = scratch.data();
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL UnmapMemory(VkDevice device, VkDeviceMemory memory) {
+    if (!scratch_maps.erase(memory)) {
+        real_unmap_memory(device, memory);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FlushMappedMemoryRanges(VkDevice device, uint32_t count,
+                                                       const VkMappedMemoryRange* ranges) {
+    std::vector<VkMappedMemoryRange> mapped;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!scratch_maps.contains(ranges[i].memory)) {
+            mapped.push_back(ranges[i]);
+        }
+    }
+    return mapped.empty() ? VK_SUCCESS
+                          : real_flush_ranges(device, uint32_t(mapped.size()), mapped.data());
+}
 
 float PixelDensity(SDL_WindowID id);
 
@@ -620,9 +669,23 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     const vk::Instance vk_instance = instance.GetInstance();
     ImGui_ImplVulkan_LoadFunctions(
         instance.ApiVersion(),
-        [](const char* name, void* user) {
-            return VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr(
+        [](const char* name, void* user) -> PFN_vkVoidFunction {
+            const PFN_vkVoidFunction function = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr(
                 *static_cast<const vk::Instance*>(user), name);
+            const std::string_view n{name};
+            if (function && n == "vkMapMemory") {
+                real_map_memory = reinterpret_cast<PFN_vkMapMemory>(function);
+                return reinterpret_cast<PFN_vkVoidFunction>(&MapMemory);
+            }
+            if (function && n == "vkUnmapMemory") {
+                real_unmap_memory = reinterpret_cast<PFN_vkUnmapMemory>(function);
+                return reinterpret_cast<PFN_vkVoidFunction>(&UnmapMemory);
+            }
+            if (function && n == "vkFlushMappedMemoryRanges") {
+                real_flush_ranges = reinterpret_cast<PFN_vkFlushMappedMemoryRanges>(function);
+                return reinterpret_cast<PFN_vkVoidFunction>(&FlushMappedMemoryRanges);
+            }
+            return function;
         },
         const_cast<vk::Instance*>(&vk_instance));
 
@@ -639,6 +702,11 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
     // bbport: two more, as the presenter (frame generation: two presents per game frame).
     info.ImageCount = std::max(image_count, 2u) + 2;
     info.UseDynamicRendering = true;
+    info.CheckVkResultFn = [](VkResult result) {
+        if (result != VK_SUCCESS) {
+            LogVkResult("Vulkan call", result);
+        }
+    };
     info.PipelineInfoMain.PipelineRenderingCreateInfo = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
         .colorAttachmentCount = 1,
