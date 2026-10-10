@@ -1,17 +1,34 @@
 #!/usr/bin/env bash
 # Turnip (Mesa's Adreno Vulkan driver) for the Thor's Debian trixie arm64 rootfs, KGSL only,
-# cross-compiled with Clang: Mesa at MESA_COMMIT plus tools/android/mesa-patches (README there).
-# Output: out/arm64/turnip/{libvulkan_freedreno.so,freedreno_icd.aarch64.json,drirc.d/};
-# build_release_runtime.py ships them in place of the rootfs's own.
+# cross-compiled with Clang, in one of two variants (README in tools/android/mesa-patches):
+#   main: Mesa at the pinned commit + mesa-patches/*.patch -> out/arm64/turnip
+#         (libvulkan_freedreno.so, freedreno_icd.aarch64.json, drirc.d/)
+#   gen8: the turnip/gen8 branch (Adreno 8xx) + mesa-patches/gen8/*.patch (upstream KGSL fixes it
+#         predates) + mesa-patches/*.patch -> out/arm64/turnip-gen8 (libvulkan_freedreno_gen8.so,
+#         freedreno_gen8_icd.aarch64.json); run-thor.sh picks it on Adreno 8xx.
+# build_release_runtime.py ships both.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
-MESA_COMMIT=${MESA_COMMIT:-35b085c4c067f198ce0b6437d94678e47b9c645f}
+variant=${1:-main}
+case $variant in
+    main)
+        repo=https://gitlab.freedesktop.org/mesa/mesa.git
+        MESA_COMMIT=${MESA_COMMIT:-35b085c4c067f198ce0b6437d94678e47b9c645f}
+        patches=(tools/android/mesa-patches/*.patch)
+        suffix= ;;
+    gen8)
+        repo=https://github.com/whitebelyash/mesa-unified.git
+        MESA_COMMIT=${MESA_COMMIT:-9c7e022677dfa3abb356c2b6732cbd2e25783d01}
+        patches=(tools/android/mesa-patches/gen8/*.patch tools/android/mesa-patches/*.patch)
+        suffix=_gen8 ;;
+    *) echo 'usage: build_turnip.sh [main|gen8]' >&2; exit 2 ;;
+esac
 rootfs=/data/data/com.ducvd89.bloodborne/files/rootfs
 deps=$PWD/.local-deps/android
 sysroot=$deps/mesa-sysroot
-src=$deps/src/mesa
-build=$PWD/out/arm64/turnip-build
-out=$PWD/out/arm64/turnip
+src=$deps/src/mesa${suffix/_/-}
+build=$PWD/out/arm64/turnip${suffix/_/-}-build
+out=$PWD/out/arm64/turnip${suffix/_/-}
 
 # Only libraries the rootfs has: no xcb-keysyms (it would add a NEEDED the Thor lacks).
 if [[ ! -f $sysroot/packages.json ]]; then
@@ -34,12 +51,12 @@ export PATH="$venv/bin:$PATH"
 # A pristine tree at the pinned commit, then the patches.
 if [[ ! -d $src/.git ]]; then
     git init -q "$src"
-    git -C "$src" remote add origin https://gitlab.freedesktop.org/mesa/mesa.git
+    git -C "$src" remote add origin "$repo"
 fi
 git -C "$src" fetch -q --depth 1 origin "$MESA_COMMIT"
 git -C "$src" checkout -q --force FETCH_HEAD
 git -C "$src" clean -q -fdx
-for patch in tools/android/mesa-patches/*.patch; do
+for patch in "${patches[@]}"; do
     git -C "$src" apply "$PWD/$patch"
 done
 
@@ -80,12 +97,16 @@ DESTDIR="$build/install" meson install -C "$build" --no-rebuild >> "$build.log" 
 
 installed=$build/install$rootfs/usr
 mkdir -p "$out"
-llvm-strip --strip-debug -o "$out/libvulkan_freedreno.so" \
+library=libvulkan_freedreno$suffix.so
+manifest=freedreno${suffix}_icd.aarch64.json
+llvm-strip --strip-debug -o "$out/$library" \
     "$installed/lib/aarch64-linux-gnu/libvulkan_freedreno.so"
-cp "$installed/share/vulkan/icd.d/freedreno_icd.aarch64.json" "$out/"
+sed "s|/libvulkan_freedreno.so\"|/$library\"|" \
+    "$installed/share/vulkan/icd.d/freedreno_icd.aarch64.json" > "$out/$manifest"
+grep -q "/$library\"" "$out/$manifest" || { echo "Manifest does not name $library" >&2; exit 1; }
 cp -r "$installed/share/drirc.d" "$out/drirc.d"
-if readelf -d "$out/libvulkan_freedreno.so" | grep -q keysyms; then
-    echo 'libvulkan_freedreno.so needs libxcb-keysyms, which the rootfs lacks' >&2
+if readelf -d "$out/$library" | grep -q keysyms; then
+    echo "$library needs libxcb-keysyms, which the rootfs lacks" >&2
     exit 1
 fi
-echo "Turnip: $out (Mesa $(git -C "$src" rev-parse --short HEAD) + $(ls tools/android/mesa-patches/*.patch | wc -l) patches)"
+echo "Turnip $variant: $out (Mesa $(git -C "$src" rev-parse --short HEAD) + ${#patches[@]} patches)"

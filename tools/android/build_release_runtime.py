@@ -19,12 +19,18 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / '.local-deps/android/migration/x/rootfs'
 NATIVE = ROOT / 'out/arm64/bundle'
 TURNIP = ROOT / 'out/arm64/turnip'
+TURNIP_GEN8 = ROOT / 'out/arm64/turnip-gen8'
 # The rootfs's Turnip, replaced by TURNIP's (rootfs-relative path: file there).
 TURNIP_FILES = {
     'usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so': 'libvulkan_freedreno.so',
     'usr/share/vulkan/icd.d/freedreno_icd.aarch64.json': 'freedreno_icd.aarch64.json',
     'usr/share/drirc.d/00-mesa-defaults.conf': 'drirc.d/00-mesa-defaults.conf',
     'usr/share/drirc.d/00-turnip-defaults.conf': 'drirc.d/00-turnip-defaults.conf',
+}
+# The Adreno 8xx variant (build_turnip.sh gen8), beside it; run-thor.sh picks one.
+TURNIP_GEN8_FILES = {
+    'usr/lib/aarch64-linux-gnu/libvulkan_freedreno_gen8.so': 'libvulkan_freedreno_gen8.so',
+    'usr/share/vulkan/icd.d/freedreno_gen8_icd.aarch64.json': 'freedreno_gen8_icd.aarch64.json',
 }
 OUT = ROOT / 'out/release'
 PYTHON = ('python3.13-minimal', 'libpython3.13-minimal', 'libpython3.13-stdlib')
@@ -90,6 +96,8 @@ def main():
         raise SystemExit('Build the native ARM64 bundle first')
     if not all((TURNIP / name).is_file() for name in TURNIP_FILES.values()):
         raise SystemExit('Build Turnip first: tools/android/build_turnip.sh')
+    if not all((TURNIP_GEN8 / name).is_file() for name in TURNIP_GEN8_FILES.values()):
+        raise SystemExit('Build the Adreno 8xx Turnip first: tools/android/build_turnip.sh gen8')
     OUT.mkdir(exist_ok=True)
     overlay = OUT / 'python-overlay'
     overlay.mkdir(exist_ok=True)
@@ -106,6 +114,8 @@ def main():
             tar.add(child, arcname='rootfs/' + child.name, filter=scrub)
         for relative, name in TURNIP_FILES.items():
             tar.add(TURNIP / name, arcname='rootfs/' + relative, filter=owned_by_root)
+        for relative, name in TURNIP_GEN8_FILES.items():
+            tar.add(TURNIP_GEN8 / name, arcname='rootfs/' + relative, filter=owned_by_root)
         for name, mode in (('rootfs/tmp', 0o1777), ('rootfs/tmp/.X11-unix', 0o1777),
                            ('rootfs/run', 0o755), ('rootfs/home', 0o755),
                            ('rootfs/var', 0o755),

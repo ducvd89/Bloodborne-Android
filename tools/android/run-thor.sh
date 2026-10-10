@@ -12,7 +12,20 @@ export FEX_ROOTFS="$base/rootfs"
 export FEX_APP_CONFIG_LOCATION="$HOME/.fex-emu/"
 export FEX_APP_DATA_LOCATION="$HOME/.fex-emu/"
 export FEX_APP_CACHE_LOCATION="$HOME/.cache/fex-emu/"
-export VK_DRIVER_FILES="$host/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json"
+# Turnip: Mesa main for Adreno 6xx/7xx (the Thor's 740, chip id 0x43...), the turnip/gen8 build on
+# Adreno 8xx (0x44..., e.g. the 8 Elite's 830). BB_TURNIP=main|gen8 overrides the choice.
+turnip=${BB_TURNIP:-}
+if [ -z "$turnip" ]; then
+    case $("$base/arm64/bin/kgsl-chip-id" 2>/dev/null || true) in
+        0x44*) turnip=gen8 ;;
+        *) turnip=main ;;
+    esac
+fi
+icd="$host/usr/share/vulkan/icd.d/freedreno_icd.aarch64.json"
+[ "$turnip" = gen8 ] && [ -f "$host/usr/share/vulkan/icd.d/freedreno_gen8_icd.aarch64.json" ] &&
+    icd="$host/usr/share/vulkan/icd.d/freedreno_gen8_icd.aarch64.json"
+echo "Turnip: ${icd##*/}"
+export VK_DRIVER_FILES="$icd"
 export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
 export GLIBC_TUNABLES='glibc.cpu.hwcaps=-AVX2,-AVX,-AVX_Fast_Unaligned_Load,-AVX2_Usable,-AVX_Usable'
 export BB_CONFIG="$base/bbport.ini"

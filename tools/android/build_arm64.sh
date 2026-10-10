@@ -60,4 +60,8 @@ links=(-L"$out/gpu" -lbbgpu -L"$out/fex" -lbbcpu -Wl,-rpath,'$ORIGIN/../lib'
 "${cc[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc \
     src/probe.c src/runtime*.c src/vulkan_smoke.c "$out/libatrac9.a" -lm "${links[@]}" "${libraries[@]}" \
     -o "$out/bb-probe"
+# run-thor.sh asks it for the GPU's chip id to pick the Turnip variant (Adreno 8xx: gen8).
+"${cc[@]}" -std=c11 -O2 -Wall -Wextra -Werror tools/android/kgsl_chip_id.c \
+    -Wl,--dynamic-linker="$rootfs/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
+    -o "$out/kgsl-chip-id"
 echo "Built $out/bb-probe (aarch64)"
