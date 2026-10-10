@@ -2,6 +2,11 @@
 
 Android port of Bloodborne (PS4, CUSA03173 v1.09) for Snapdragon phones and handhelds. The runtime and renderer run natively on ARM64; FEXCore translates the game's x86-64 code; Mesa Turnip is the Vulkan driver. Experimental.
 
+## Features
+
+- AMD FSR 3.1 upscaling and FSR 3.1 frame generation
+- On-screen PlayStation controller overlay with an editable layout; physical controllers work too
+
 ## Devices
 
 | Tested | SoC | GPU | Driver |
