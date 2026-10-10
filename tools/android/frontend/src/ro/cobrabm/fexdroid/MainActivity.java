@@ -164,6 +164,10 @@ public final class MainActivity extends Activity {
             closeDrawer();
             new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).show();
         });
+        menuButton("Lossless Scaling frame generation",() -> {
+            closeDrawer();
+            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showLossless();
+        });
         controllerButton=menuButton("On-screen controller: " + (controllerEnabled() ? "On" : "Off"),() -> {
             boolean enabled=!controllerEnabled();
             getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("controller_overlay",enabled).apply();

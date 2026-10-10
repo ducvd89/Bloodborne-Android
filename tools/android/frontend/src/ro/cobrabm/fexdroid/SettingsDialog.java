@@ -46,6 +46,10 @@ final class SettingsDialog {
     private static final String[] UPSCALER_NAMES={"Off (render at 1280×720)","FSR 3.1",
         "FSR 4 (experimental)","FSR 4.1.1 (experimental, needs fsr4_411 assets)"};
     private static final int FSR3=1;
+    private static final String[] LSFG_VALUES={"0","2","3","4"};
+    private static final String[] LSFG_NAMES={"Off","2× frames","3× frames","4× frames"};
+    private static final String[] LSFG_FLOW_VALUES={"1.0","0.75","0.5"};
+    private static final String[] LSFG_FLOW_NAMES={"1.0 (best quality)","0.75","0.5 (fastest)"};
     private static final String[] FPS_VALUES={"30","40","45","60","0"};
     private static final String[] FPS_NAMES={"30 (the game's own)","40","45","60","Unlimited"};
     /** Snapdragon 8 Gen 2: three Cortex-A510, four Cortex-A715, one Cortex-X3. */
@@ -237,11 +241,50 @@ final class SettingsDialog {
                 changed.put("show_fps",fps.isChecked() ? "1" : "0");
                 for (int i=0;i<EFFECTS.length;++i) changed.put(EFFECTS[i][0],effects[i].isChecked() ? "1" : "0");
                 changed.put("model_lod",LOD_VALUES[Math.max(0,checkedIndex(lods))]);
-                boolean same=true;
-                for (Map.Entry<String,String> e:changed.entrySet()) if (!e.getValue().equals(values.get(e.getKey()))) same=false;
-                if (same) return;
-                if (save(changed)) restart.run();
-                else new AlertDialog.Builder(activity).setMessage("The settings could not be saved.").setPositiveButton("OK",null).show();
+                apply(changed);
+            }).show();
+    }
+
+    /** Saves the changed keys and restarts the game when any differs from the file. */
+    private void apply(Map<String,String> changed) {
+        boolean same=true;
+        for (Map.Entry<String,String> e:changed.entrySet()) if (!e.getValue().equals(values.get(e.getKey()))) same=false;
+        if (same) return;
+        if (save(changed)) restart.run();
+        else new AlertDialog.Builder(activity).setMessage("The settings could not be saved.").setPositiveButton("OK",null).show();
+    }
+
+    /** Lossless Scaling frame generation (run-thor.sh: lsfg-vk with the player's Lossless.dll). */
+    void showLossless() {
+        load();
+        LinearLayout box=new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(24),dp(4),dp(24),dp(8));
+        heading(box,"Frames");
+        final RadioGroup lsfg=choices(box,LSFG_NAMES,indexOf(LSFG_VALUES,get("lsfg_multiplier","0"),0));
+        heading(box,"Flow scale");
+        final RadioGroup lsfgFlow=choices(box,LSFG_FLOW_NAMES,indexOf(LSFG_FLOW_VALUES,get("lsfg_flow_scale","1.0"),0));
+        final Switch lsfgPerformance=toggle(box,"Performance mode","1".equals(get("lsfg_performance","0")));
+        TextView lsfgNote=new TextView(activity); lsfgNote.setTextSize(13); lsfgNote.setAlpha(0.7f);
+        lsfgNote.setText("Needs Lossless.dll from your own Lossless Scaling (Steam) next to the game folder. "
+            +"Works with any upscaler and replaces FSR 3.1 frame generation. It sees only finished frames, "
+            +"so fast motion and the HUD show more artifacts. Lower flow scale and performance mode are faster.");
+        box.addView(lsfgNote);
+        RadioGroup.OnCheckedChangeListener lossless=(g,id) -> {
+            boolean on=checkedIndex(lsfg)>0;
+            for (int i=0;i<lsfgFlow.getChildCount();++i) lsfgFlow.getChildAt(i).setEnabled(on);
+            lsfgPerformance.setEnabled(on);
+        };
+        lsfg.setOnCheckedChangeListener(lossless); lossless.onCheckedChanged(lsfg,0);
+
+        ScrollView scroll=new ScrollView(activity); scroll.addView(box);
+        new AlertDialog.Builder(activity).setTitle("Lossless Scaling frame generation").setView(scroll)
+            .setNegativeButton("Cancel",null)
+            .setPositiveButton("Apply & restart",(d,w) -> {
+                Map<String,String> changed=new LinkedHashMap<>();
+                changed.put("lsfg_multiplier",LSFG_VALUES[Math.max(0,checkedIndex(lsfg))]);
+                changed.put("lsfg_flow_scale",LSFG_FLOW_VALUES[Math.max(0,checkedIndex(lsfgFlow))]);
+                changed.put("lsfg_performance",lsfgPerformance.isChecked() ? "1" : "0");
+                apply(changed);
             }).show();
     }
 }

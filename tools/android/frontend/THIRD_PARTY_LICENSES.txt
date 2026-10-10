@@ -12,6 +12,14 @@ Adreno 8xx variant: Mesa from https://github.com/whitebelyash/mesa-unified
 upstream Mesa commits b889ab52, b7ad24ad, e984ef29, 6cb65e61 and the same
 fexdroid patches.
 
+lsfg-vk 2.0.0 (bbport/arm64/lsfg): Lossless Scaling frame generation on Linux,
+https://lsfg-vk.dev, by the lsfg-vk authors. Licensed under Creative Commons
+Attribution-NonCommercial-NoDerivatives 4.0 International (bbport/arm64/lsfg/
+LICENSE.txt, https://creativecommons.org/licenses/by-nc-nd/4.0/). Built for
+ARM64 from the unmodified 2.0.0 source; distributed free of charge. It
+includes toml++ (MIT), the RenderDoc API header (MIT) and the Vulkan headers
+(Apache-2.0 OR MIT). Lossless Scaling and its Lossless.dll are not included.
+
 FSR 4 v07 INT8 assets (bbport/arm64/fsr4_shaders): built by FireBurn/Q2RTX from
 WinLinux1028/FidelityFX-SDK_WithFSR4, a copy of AMD's FidelityFX SDK FSR 4
 source as AMD briefly published it under the MIT licence; notice in

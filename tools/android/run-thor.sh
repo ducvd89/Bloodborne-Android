@@ -70,6 +70,33 @@ fi
 export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
 [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
+# Lossless Scaling frame generation (lsfg_multiplier 2-4): the lsfg-vk layer (bbport/arm64/lsfg,
+# build_lsfg.sh) with the player's own Lossless.dll next to the game folder or in bbport/. It
+# replaces FSR 3.1 frame generation. Its log: logs/lsfg.log.
+lsfg=$(setting lsfg_multiplier)
+case $lsfg in 2|3|4) ;; *) lsfg= ;; esac
+if [ -n "$lsfg" ] && [ -f "$base/arm64/lsfg/VkLayer_LSFGVK_frame_generation.json" ]; then
+    lsfg_dll=
+    for dll in "${BB_GAME_DIR:+${BB_GAME_DIR%/*}/Lossless.dll}" "$base/Lossless.dll"; do
+        [ -n "$dll" ] && [ -f "$dll" ] && { lsfg_dll=$dll; break; }
+    done
+    if [ -n "$lsfg_dll" ]; then
+        flow=$(setting lsfg_flow_scale)
+        case $flow in 0.25|0.5|0.75|1|1.0) ;; *) flow=1.0 ;; esac
+        unset BB_FRAME_GEN
+        export VK_ADD_LAYER_PATH="$base/arm64/lsfg"
+        export VK_LOADER_LAYERS_ENABLE=VK_LAYER_LSFGVK_frame_generation
+        export VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation
+        export LSFGVK_ENV=1 LSFGVK_DLL_PATH="$lsfg_dll" LSFGVK_MULTIPLIER=$lsfg LSFGVK_FLOW_SCALE=$flow
+        export LSFGVK_PERFORMANCE_MODE=$([ "$(setting lsfg_performance)" = 1 ] && echo 1 || echo 0)
+        export LSFGVK_LOG_FILE="$base/logs/lsfg.log" LSFGVK_LOG_LEVEL=info
+        echo "Lossless Scaling frame generation: x$lsfg, flow scale $flow, $lsfg_dll"
+    else
+        lsfg=; echo 'Lossless Scaling frame generation: no Lossless.dll next to the game folder'
+    fi
+else
+    lsfg=
+fi
 # FSR 4 model assets (fetch_fsr4_assets.sh), in the native bundle when fetched.
 [ -d "$base/arm64/fsr4_shaders" ] && export BB_FSR4_DIR="$base/arm64/fsr4_shaders"
 export BB_WINDOW_SIZE=1280x720
@@ -87,7 +114,7 @@ case $fps_limit in 40|45|60|0) export BB_VBLANK_HZ=480 BB_FPS_LIMIT=$fps_limit ;
     *) fps_limit=30; export BB_VBLANK_HZ=60 ;; esac
 # Frame generation adds frames on screen only: at the game's own 30 FPS timing a slower frame
 # still slows the game down. With it, 30 means the delta-time patch at 30 real frames a second.
-if [ "${BB_FRAME_GEN:-0}" = 1 ] && [ "$fps_limit" = 30 ]; then
+if { [ "${BB_FRAME_GEN:-0}" = 1 ] || [ -n "$lsfg" ]; } && [ "$fps_limit" = 30 ]; then
     fps_limit=30-delta; export BB_VBLANK_HZ=480 BB_FPS_LIMIT=30
 fi
 # CPU cores (thor_cpus, a taskset list such as 3-7): empty for all of them.
