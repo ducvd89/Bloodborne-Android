@@ -50,6 +50,13 @@ final class TouchControllerOverlay extends View {
         setContentDescription("On-screen PlayStation controller");
     }
     private PointF center(String name) { return centers.get(name); }
+    // The 1280x720 layout drawn at one scale in the centred 16:9 area, as the game (MainActivity):
+    // round on any screen shape. Controls may be dragged into the bars around it.
+    private float scale() { return Math.max(1e-3f,Math.min(getWidth()/1280f,getHeight()/720f)); }
+    private float offsetX() { return (getWidth()-1280f*scale())/2f; }
+    private float offsetY() { return (getHeight()-720f*scale())/2f; }
+    private float layoutX(MotionEvent e,int index) { return (e.getX(index)-offsetX())/scale(); }
+    private float layoutY(MotionEvent e,int index) { return (e.getY(index)-offsetY())/scale(); }
     private static float distance(float x,float y,PointF p) { return (float)Math.hypot(x-p.x,y-p.y); }
     private static boolean stick(String name) { return name.equals("leftstick") || name.equals("rightstick"); }
     private static boolean rectangle(String name) {
@@ -103,7 +110,8 @@ final class TouchControllerOverlay extends View {
             } else if (control.equals("l2")) l2=255;
             else if (control.equals("r2")) r2=255;
             else if (control.equals("mouse")) {
-                if (!mouse) XInput.moveTo(Math.round(p.x),Math.round(p.y));
+                if (!mouse) XInput.moveTo(Math.max(0,Math.min(1279,Math.round(p.x))),
+                                          Math.max(0,Math.min(719,Math.round(p.y))));
                 mouse=true;
             } else pressed.add(control);
         }
@@ -132,14 +140,15 @@ final class TouchControllerOverlay extends View {
         if (editing) {
             if (action==MotionEvent.ACTION_CANCEL) { editPointer=-1; dragged=null; return true; }
             if (action==MotionEvent.ACTION_DOWN) {
-                float x=e.getX(at)*1280f/getWidth(),y=e.getY(at)*720f/getHeight();
+                float x=layoutX(e,at),y=layoutY(e,at);
                 if (x>548 && x<732 && y<72) { finishEdit(); return true; }
                 dragged=hit(x,y); editPointer=dragged==null ? -1 : id;
             } else if (action==MotionEvent.ACTION_MOVE && editPointer>=0 && dragged!=null) {
                 int index=e.findPointerIndex(editPointer);
+                float barX=offsetX()/scale(),barY=offsetY()/scale();
                 if (index>=0) center(dragged).set(
-                    Math.max(36,Math.min(1244,e.getX(index)*1280f/getWidth())),
-                    Math.max(36,Math.min(684,e.getY(index)*720f/getHeight())));
+                    Math.max(36-barX,Math.min(1244+barX,layoutX(e,index))),
+                    Math.max(36-barY,Math.min(684+barY,layoutY(e,index))));
                 invalidate();
             } else if ((action==MotionEvent.ACTION_UP || action==MotionEvent.ACTION_POINTER_UP)
                        && id==editPointer && dragged!=null) {
@@ -152,7 +161,7 @@ final class TouchControllerOverlay extends View {
         }
         if (action==MotionEvent.ACTION_CANCEL) { release(); return true; }
         if (action==MotionEvent.ACTION_DOWN || action==MotionEvent.ACTION_POINTER_DOWN) {
-            float x=e.getX(at)*1280f/getWidth(),y=e.getY(at)*720f/getHeight();
+            float x=layoutX(e,at),y=layoutY(e,at);
             String name=hit(x,y);
             controls.put(id,name==null ? "mouse" : name);
             positions.put(id,new PointF(x,y));
@@ -162,7 +171,7 @@ final class TouchControllerOverlay extends View {
         if (action==MotionEvent.ACTION_MOVE) {
             for (int i=0;i<e.getPointerCount();i++) {
                 PointF p=positions.get(e.getPointerId(i));
-                if (p!=null) p.set(e.getX(i)*1280f/getWidth(),e.getY(i)*720f/getHeight());
+                if (p!=null) p.set(layoutX(e,i),layoutY(e,i));
             }
         }
         publish(); return true;
@@ -215,7 +224,7 @@ final class TouchControllerOverlay extends View {
                    knobY-(paint.ascent()+paint.descent())/2,paint);
     }
     @Override protected void onDraw(Canvas c) {
-        super.onDraw(c); c.save(); c.scale(getWidth()/1280f,getHeight()/720f);
+        super.onDraw(c); c.save(); c.translate(offsetX(),offsetY()); c.scale(scale(),scale());
         rectangle(c,"l2",108,"L2"); rectangle(c,"l1",108,"L1");
         rectangle(c,"r1",108,"R1"); rectangle(c,"r2",108,"R2");
         rectangle(c,"touchpad",126,"TOUCH"); rectangle(c,"options",108,"OPTIONS");
