@@ -1,0 +1,63 @@
+From: fexdroid
+Subject: [PATCH] wsi/x11: software present waits for the GPU on the present thread
+
+With MESA_VK_WSI_DEBUG=sw on a hardware driver (Turnip on KGSL has no DRI3
+path to Xvfb), vkQueuePresentKHR waited for the frame's fence in the calling
+thread, so the game's render thread sat in IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID
+until the GPU was done and only then started the next frame: CPU and GPU time
+added up instead of overlapping. Dota 2 on an Adreno 660: 22 ms of every 35 ms
+frame were that wait.
+
+The X11 backend already has a present thread that can wait for fences (it
+does for MAILBOX). Let it do so for software presents and skip the wait in
+the caller.
+
+Local patch, not upstream (NOTES.md N-031, N-035: +8% in Dota 2 on an Adreno 660).
+---
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -2879,7 +2879,7 @@
+ #endif
+       }
+ 
+-      if (wsi->sw) {
++      if (wsi->sw && !swapchain->sw_fence_wait_in_backend) {
+          wsi->WaitForFences(vk_device_to_handle(dev),
+                             1, &swapchain->fences[image_index], true, ~0ull);
+       }
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -232,6 +232,12 @@
+    VkFence* fences;
+    VkPresentModeKHR present_mode;
+    /**
++    * With a software present (wsi->sw) the pixels must be complete before
++    * they are handed over.  Set when the backend waits for that on its own
++    * present thread, so QueuePresent does not block the caller on the GPU.
++    */
++   bool sw_fence_wait_in_backend;
++   /**
+     * Timeline for presents completing according to VK_KHR_present_wait.  The
+     * present should complete as close as possible (before or after!) to the
+     * first pixel being scanned out.
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -2525,6 +2525,10 @@
+             x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) &&
+             !chain->base.image_info.explicit_sync;
+ 
++      /* Software present: the X server reads the pixels as soon as we present. */
++      if (chain->base.sw_fence_wait_in_backend)
++         need_fence_wait = true;
++
+       bool need_timing_fence_wait = x11_swapchain_present_timing_is_out_of_order_completion(
+             chain, wsi_conn, &chain->images[image_index].timing_request);
+ 
+@@ -3272,6 +3276,7 @@
+    chain->status = VK_SUCCESS;
+    chain->has_dri3_modifiers = wsi_conn->has_dri3_modifiers;
+    chain->has_mit_shm = wsi_conn->has_mit_shm;
++   chain->base.sw_fence_wait_in_backend = chain->base.wsi->sw;
+    chain->has_async_may_tear = present_caps & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR;
+    chain->has_reliable_msc = !wsi_conn->is_xwayland;
+ 

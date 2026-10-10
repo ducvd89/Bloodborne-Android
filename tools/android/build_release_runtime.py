@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Build the game-free Android runtime archive embedded in release 0.1 APK.
+"""Build the game-free Android runtime archive embedded in the release APK.
 
-Inputs are the migrated Debian/Turnip/FEX rootfs and the local native ARM64 build.
+Inputs are the migrated Debian/FEX rootfs, Turnip from build_turnip.sh (in place of the
+rootfs's own) and the local native ARM64 build.
 Python packages are fetched from Debian trixie with Packages-index SHA-256 checks.
 """
 import hashlib
@@ -17,6 +18,14 @@ from fetch_arm64_sysroot import MIRROR, SUITE, extract_deb, fetch, parse_package
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / '.local-deps/android/migration/x/rootfs'
 NATIVE = ROOT / 'out/arm64/bundle'
+TURNIP = ROOT / 'out/arm64/turnip'
+# The rootfs's Turnip, replaced by TURNIP's (rootfs-relative path: file there).
+TURNIP_FILES = {
+    'usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so': 'libvulkan_freedreno.so',
+    'usr/share/vulkan/icd.d/freedreno_icd.aarch64.json': 'freedreno_icd.aarch64.json',
+    'usr/share/drirc.d/00-mesa-defaults.conf': 'drirc.d/00-mesa-defaults.conf',
+    'usr/share/drirc.d/00-turnip-defaults.conf': 'drirc.d/00-turnip-defaults.conf',
+}
 OUT = ROOT / 'out/release'
 PYTHON = ('python3.13-minimal', 'libpython3.13-minimal', 'libpython3.13-stdlib')
 SCRIPTS = ('prepare_game.py', 'prepare.py', 'link_modules.py', 'link_libc.py',
@@ -48,6 +57,8 @@ def scrub(member):
     if relative and any(relative == item or relative.startswith(item + '/')
                         for item in EXCLUDE_ROOTFS):
         return None
+    if member.name.startswith('rootfs/') and relative in TURNIP_FILES:
+        return None
     if member.isdev() or member.isfifo():
         return None
     if member.issym() and member.linkname.startswith('/'):
@@ -66,11 +77,19 @@ def scrub(member):
     return member
 
 
+def owned_by_root(member):
+    member.uid = member.gid = 0
+    member.uname = member.gname = ''
+    return member
+
+
 def main():
     if not (SOURCE / 'usr/bin/FEX').is_file() or not (SOURCE / 'usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so').is_file():
         raise SystemExit('Missing migrated FEX/Turnip rootfs')
     if not (NATIVE / 'bin/bb-probe').is_file() or not (NATIVE / 'lib/libbbcpu.so').is_file():
         raise SystemExit('Build the native ARM64 bundle first')
+    if not all((TURNIP / name).is_file() for name in TURNIP_FILES.values()):
+        raise SystemExit('Build Turnip first: tools/android/build_turnip.sh')
     OUT.mkdir(exist_ok=True)
     overlay = OUT / 'python-overlay'
     overlay.mkdir(exist_ok=True)
@@ -85,6 +104,8 @@ def main():
         # link the user's game files at first launch, never shipped in the APK.
         for child in sorted(overlay.iterdir()):
             tar.add(child, arcname='rootfs/' + child.name, filter=scrub)
+        for relative, name in TURNIP_FILES.items():
+            tar.add(TURNIP / name, arcname='rootfs/' + relative, filter=owned_by_root)
         for name, mode in (('rootfs/tmp', 0o1777), ('rootfs/tmp/.X11-unix', 0o1777),
                            ('rootfs/run', 0o755), ('rootfs/home', 0o755),
                            ('rootfs/var', 0o755),

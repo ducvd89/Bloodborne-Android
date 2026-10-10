@@ -1,0 +1,83 @@
+From: fexdroid
+Subject: [PATCH] tu/kgsl: GPU power constraint from the environment
+
+TU_KGSL_PWR_CONSTRAINT=max (or a percentage of the maximum frequency on
+kernels that support it) sets KGSL_PROP_PWR_CONSTRAINT on the context
+Turnip creates, so the GPU runs at that frequency while the context has
+work. The kernel's governor follows the GPU's load; a program whose
+frames wait for the GPU one after the other (Dota 2 under FEX) keeps the
+load at 35-50%, the frequency stays low and every frame waits longer.
+Qualcomm's own driver uses the same kernel interface.
+
+Off unless the variable is set. Local patch, not upstream (NOTES.md N-037).
+---
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -8,6 +8,8 @@
+ #include <linux/dma-heap.h>
+ #include <poll.h>
+ #include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ 
+@@ -17,6 +19,8 @@
+ #include "msm_kgsl.h"
+ 
+ #include "util/libsync.h"
++#include "util/log.h"
++#include "util/os_misc.h"
+ #include "util/os_file.h"
+ #include "util/timespec.h"
+ #include "util/u_debug.h"
+@@ -55,13 +59,49 @@
+               KGSL_CONTEXT_NO_GMEM_ALLOC |
+               KGSL_CONTEXT_PREAMBLE,
+    };
++   /* The constraint set below is applied with every submit of such a context. */
++   if (os_get_option("TU_KGSL_PWR_CONSTRAINT"))
++      req.flags |= KGSL_CONTEXT_PWR_CONSTRAINT;
+ 
+    int ret = safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req);
++   if (ret && (req.flags & KGSL_CONTEXT_PWR_CONSTRAINT)) {
++      /* A kernel that does not take the flag: without the constraint, then. */
++      req.flags &= ~KGSL_CONTEXT_PWR_CONSTRAINT;
++      ret = safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req);
++   }
+    if (ret)
+       return ret;
+ 
+    queue->msm_queue_id = req.drawctxt_id;
+ 
++   /* TU_KGSL_PWR_CONSTRAINT=max (or a percentage of the maximum frequency, on kernels
++    * that know those): the GPU runs at that frequency while this context has work.
++    * The kernel's governor follows the GPU's load; a program whose frames wait for the
++    * GPU one after the other keeps that load low, the governor keeps the frequency low
++    * and every frame waits longer than it has to.
++    */
++   const char *constraint = os_get_option("TU_KGSL_PWR_CONSTRAINT");
++   if (constraint && constraint[0]) {
++      struct kgsl_device_constraint_pwrlevel level = {
++         .level = !strcmp(constraint, "max") ? KGSL_CONSTRAINT_PWR_MAX :
++                                               (unsigned) atoi(constraint),
++      };
++      struct kgsl_device_constraint pwr = {
++         .type = KGSL_CONSTRAINT_PWRLEVEL,
++         .context_id = req.drawctxt_id,
++         .data = &level,
++         .size = sizeof(level),
++      };
++      struct kgsl_device_getproperty prop = {
++         .type = KGSL_PROP_PWR_CONSTRAINT,
++         .value = &pwr,
++         .sizebytes = sizeof(pwr),
++      };
++      ret = safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_SETPROPERTY, &prop);
++      mesa_logi("kgsl: power constraint %s on context %u: %s", constraint,
++                req.drawctxt_id, ret ? strerror(errno) : "set");
++   }
++
+    return 0;
+ }
+ 

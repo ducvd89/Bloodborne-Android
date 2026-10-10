@@ -18,27 +18,28 @@ The Android build runs the bbport runtime and Vulkan renderer natively on ARM64.
 - An Android gamepad-event bridge for launching without ADB input permissions, including analog sticks and triggers. Its runtime translation has unit coverage; full gameplay validation remains outstanding.
 - Scripts for staging the Linux runtime, fetching generic x86-64 libraries, deploying to the device, and running CPU/Vulkan/controller diagnostics.
 
-The 0.1 APK includes the ARM64 runtime, FEXCore, Turnip, FSR 3.1, and the tools to prepare the player's game dump on the phone. The first-run installer and game preparation were tested on the Thor; the generated game image matched the existing image byte for byte. Gameplay remains unstable.
+The APK includes the ARM64 runtime, FEXCore, Turnip, FSR 3.1, and the tools to prepare the player's game dump on the phone. Release 0.2 fixes a Turnip driver bug that serialized the CPU and GPU (on the Thor, gameplay measured about 19 FPS before and is reported at 30 FPS or more after), fixes flicker with frame generation, and turns diagnostics off. Gameplay remains experimental.
 
-## Install release 0.1
+## Install release 0.2
 
-Download `Bloodborne-0.1.apk` from the [0.1 release](https://github.com/ducvd89/Bloodborne-Android/releases). Install it on an **AYN Thor**, grant storage access, and select your own extracted **CUSA03173 v1.09** folder containing `eboot.bin`. First launch unpacks the Linux runtime and prepares the game image in the app's private storage. Keep at least 1 GB free in addition to the game dump. The APK contains the game icon, but no game executable, modules, assets, or saves.
+Download `Bloodborne-0.2.apk` from the [0.2 release](https://github.com/ducvd89/Bloodborne-Android/releases/tag/android-0.2). It installs over 0.1 and keeps settings and saves. Install it on an **AYN Thor**, grant storage access, and select your own extracted **CUSA03173 v1.09** folder containing `eboot.bin`. First launch unpacks the Linux runtime and prepares the game image in the app's private storage. Keep at least 1 GB free in addition to the game dump. The APK contains the game icon, but no game executable, modules, assets, or saves.
 
 Open the left-edge menu to show or hide the touch controls. Tap **Edit on-screen controller** to drag each control, then tap **Done**. **Reset controller layout** restores the original positions. The layout and visibility persist across launches.
 
-See [release setup and build details](docs/ANDROID_RELEASE_0_1.md). The older [Thor development notes](docs/ANDROID_THOR.md) describe the earlier manual prototype.
+See [release 0.2 notes](docs/ANDROID_RELEASE_0_2.md) and [setup and build details](docs/ANDROID_RELEASE_0_1.md). The older [Thor development notes](docs/ANDROID_THOR.md) describe the earlier manual prototype.
 
-## Build release 0.1
+## Build the release APK
 
 ```bash
 git clone --recursive https://github.com/ducvd89/Bloodborne-Android.git
 cd Bloodborne-Android
 # Prepare the ARM64 build, migrated runtime rootfs, Android SDK, pinned bridge APK,
 # signing key, and your own game icon as described in docs/ANDROID_RELEASE_0_1.md.
+bash tools/android/build_turnip.sh
 bash tools/android/build_release_apk.sh
 ```
 
-The output is `out/release/Bloodborne-0.1.apk`, package `com.ducvd89.bloodborne`. No game files, saves, proprietary upscaler runtimes, signing keys, or downloaded dependencies are committed to this repository. The 0.1 APK bundles the runtime dependencies and the locally supplied game icon. FSR 4 remains disabled on the Thor; FSR 3.1 is included.
+The output is `out/release/Bloodborne-<version>.apk` (version from `AndroidManifest.xml`), package `com.ducvd89.bloodborne`. No game files, saves, proprietary upscaler runtimes, signing keys, or downloaded dependencies are committed to this repository. The APK bundles the runtime dependencies and the locally supplied game icon. FSR 4 remains disabled on the Thor; FSR 3.1 is included.
 
 ## Known limitations
 

@@ -65,9 +65,8 @@ if [ "${BB_FRAME_GEN:-0}" = 1 ] && [ "$fps_limit" = 30 ]; then
 fi
 # CPU cores (thor_cpus, a taskset list such as 3-7): empty for all of them.
 [ -z "${BB_THOR_CPUS:-}" ] && BB_THOR_CPUS=$(setting thor_cpus)
-export BB_FRAME_STATS=1
-export BB_PRESENT_DUMP_TRIGGER="$base/logs/present.capture" BB_PRESENT_DUMP_COUNT=1
-export BB_DUMP_DIR="$base/logs/frames"
+# Diagnostics stay off in releases: BB_FRAME_STATS (per-frame timers and stall logs; any value
+# turns them on) and BB_PRESENT_DUMP_TRIGGER go in thor-local.sh when needed.
 export SDL_VIDEODRIVER=x11 DISPLAY=:0
 export MESA_VK_WSI_DEBUG=sw MESA_VK_WSI_PRESENT_MODE=relaxed
 export FEXDROID_PRESENT="$host/tmp/fxpresent.sock"
@@ -85,7 +84,7 @@ done
 export SDL_GAMECONTROLLERCONFIG_FILE="$base/thor-gamecontrollerdb.txt"
 export BB_GAMEPAD='030018dc202000001201000000000000'
 export PULSE_SERVER="unix:$host/tmp/pulse/native" PULSE_LATENCY_MSEC=60
-mkdir -p "$HOME/.fex-emu" "$HOME/.cache/fex-emu" "$base/user" "$base/logs/frames"
+mkdir -p "$HOME/.fex-emu" "$HOME/.cache/fex-emu" "$base/user" "$base/logs"
 cp "$base/fex-compatible.json" "$HOME/.fex-emu/Config.json"
 # Local overrides for this device (experiments, tuning): sourced last, not part of the bundle.
 [ -f "$base/thor-local.sh" ] && . "$base/thor-local.sh"

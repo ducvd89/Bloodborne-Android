@@ -1,0 +1,323 @@
+From: fexdroid
+Subject: [PATCH] wsi/x11: software present hands the frames to the app (fxpresent)
+
+Turnip on KGSL has no DRI3 path to Xvfb, so every frame went through the X
+socket with PutImage (4.6 MB at 1600x720), was copied by Xvfb into its
+framebuffer and copied again from there by the app: four copies a frame, the
+present thread at 12-35% of a core and Xvfb at 6-20%.
+
+With FEXDROID_PRESENT=<socket of the app>, a swapchain whose window covers the
+whole X screen copies each frame into memory it shares with the app and tells
+the app; nothing is sent to the X server. The pointer, which Xvfb draws into
+its framebuffer, is drawn into the frame from XFixesGetCursorImage. A window
+that does not cover the screen, or an app that does not listen, gets the
+frames through the X server as before.
+
+Protocol: tools/fxpresent/fxpresent-proto.h in fexdroid.
+Local patch, not upstream (NOTES.md N-048).
+---
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -1304,6 +1304,9 @@
+    bool                                         has_reliable_msc;
+    bool                                         last_complete_is_flip;
+ 
++   /* fexdroid: frames straight to the app, see fxpresent_frame(). */
++   struct fxpresent *                           fxpresent;
++
+    struct x11_image                             images[0];
+ };
+ VK_DEFINE_NONDISP_HANDLE_CASTS(x11_swapchain, base.base, VkSwapchainKHR,
+@@ -1840,6 +1843,247 @@
+    return x11_swapchain_result(chain, VK_SUCCESS);
+ }
+ #endif
++/* fexdroid: a game's frames go straight to the app, not through the X server.
++ * The same definitions are in tools/fxpresent/fxpresent-proto.h of fexdroid. */
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <xcb/xfixes.h>
++#include "util/anon_file.h"
++
++#define FXPRESENT_MAGIC 0x50445846u
++#define FXPRESENT_VERSION 1
++#define FXPRESENT_SLOTS 3
++#define FXPRESENT_NONE 0xffffffffu
++#define FXPRESENT_RETRY_FRAMES 120
++
++struct fxpresent_hello {
++   uint32_t magic, version;
++   uint32_t width, height;
++   uint32_t stride;
++   uint32_t slots;
++   uint32_t first_frame;
++   uint32_t frame_size;
++   int32_t pid;
++};
++
++struct fxpresent_shared {
++   _Atomic uint32_t published;
++   _Atomic uint32_t reading;
++   _Atomic uint64_t frames;
++   _Atomic int32_t x, y;
++};
++
++struct fxpresent_frame {
++   uint64_t frames;
++};
++
++struct fxpresent {
++   int sock;
++   uint8_t *map;
++   size_t size;
++   struct fxpresent_hello hello;
++   /* What the last frame's answers said: the frame goes to the app only while the window
++    * covers the whole screen, else through the X server as before. */
++   xcb_window_t root;
++   bool covers_screen;
++   uint32_t frames_without;
++};
++
++static void
++fxpresent_close(struct fxpresent *d)
++{
++   if (d->map)
++      munmap(d->map, d->size);
++   if (d->sock >= 0)
++      close(d->sock);
++   d->map = NULL;
++   d->sock = -1;
++}
++
++/* Connects to the app and hands over memory for the frames. */
++static bool
++fxpresent_open(struct fxpresent *d, uint32_t width, uint32_t height, uint32_t stride)
++{
++   const char *path = os_get_option("FEXDROID_PRESENT");
++   struct sockaddr_un sa = { .sun_family = AF_UNIX };
++   if (!path || !path[0] || strlen(path) >= sizeof(sa.sun_path))
++      return false;
++   strcpy(sa.sun_path, path);
++
++   const long page = sysconf(_SC_PAGESIZE);
++   struct fxpresent_hello hello = {
++      .magic = FXPRESENT_MAGIC, .version = FXPRESENT_VERSION,
++      .width = width, .height = height, .stride = stride, .slots = FXPRESENT_SLOTS,
++      .first_frame = page,
++      .frame_size = ALIGN_POT((uint64_t)stride * height, page),
++      .pid = getpid(),
++   };
++   const size_t size = hello.first_frame + (size_t)hello.frame_size * FXPRESENT_SLOTS;
++
++   int fd = os_create_anonymous_file(size, "fxpresent");
++   if (fd < 0)
++      return false;
++   uint8_t *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++   int sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++   bool ok = map != MAP_FAILED && sock >= 0 &&
++             connect(sock, (struct sockaddr *)&sa, sizeof(sa)) == 0;
++   if (ok) {
++      struct fxpresent_shared *sh = (struct fxpresent_shared *)map;
++      atomic_store(&sh->published, FXPRESENT_NONE);
++      atomic_store(&sh->reading, FXPRESENT_NONE);
++
++      char cbuf[CMSG_SPACE(sizeof(int))] = { 0 };
++      struct iovec iov = { &hello, sizeof(hello) };
++      struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1,
++                            .msg_control = cbuf, .msg_controllen = sizeof(cbuf) };
++      struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
++      c->cmsg_level = SOL_SOCKET;
++      c->cmsg_type = SCM_RIGHTS;
++      c->cmsg_len = CMSG_LEN(sizeof(int));
++      memcpy(CMSG_DATA(c), &fd, sizeof(int));
++      ok = sendmsg(sock, &msg, MSG_NOSIGNAL) == (ssize_t)sizeof(hello);
++   }
++   close(fd);
++   if (!ok) {
++      if (map != MAP_FAILED)
++         munmap(map, size);
++      if (sock >= 0)
++         close(sock);
++      return false;
++   }
++   d->sock = sock;
++   d->map = map;
++   d->size = size;
++   d->hello = hello;
++   return true;
++}
++
++/* The pointer as the X server would have drawn it over the window. The image is ARGB with
++ * the colours already multiplied by the alpha, the frame is the same order of bytes. */
++static void
++fxpresent_draw_cursor(const struct fxpresent *d, uint8_t *frame,
++                      const xcb_xfixes_get_cursor_image_reply_t *cur, int win_x, int win_y)
++{
++   const uint32_t *image = xcb_xfixes_get_cursor_image_cursor_image(cur);
++   const int count = xcb_xfixes_get_cursor_image_cursor_image_length(cur);
++   if (count < cur->width * cur->height)
++      return;
++   const int left = cur->x - cur->xhot - win_x, top = cur->y - cur->yhot - win_y;
++   for (int cy = 0; cy < cur->height; cy++) {
++      const int y = top + cy;
++      if (y < 0 || y >= (int)d->hello.height)
++         continue;
++      uint32_t *row = (uint32_t *)(frame + (size_t)y * d->hello.stride);
++      for (int cx = 0; cx < cur->width; cx++) {
++         const int x = left + cx;
++         const uint32_t p = image[cy * cur->width + cx];
++         const uint32_t a = p >> 24;
++         if (x < 0 || x >= (int)d->hello.width || a == 0)
++            continue;
++         if (a == 255) {
++            row[x] = p;
++            continue;
++         }
++         const uint32_t q = row[x], k = 255 - a;
++         const uint32_t rb = (((q & 0x00ff00ffu) * k + 0x00800080u) >> 8) & 0x00ff00ffu;
++         const uint32_t g = (((q & 0x0000ff00u) * k + 0x00008000u) >> 8) & 0x0000ff00u;
++         row[x] = 0xff000000u | ((p & 0x00ffffffu) + (rb | g));
++      }
++   }
++}
++
++/* One frame to the app. False: it has to go through the X server. */
++static bool
++fxpresent_frame(struct x11_swapchain *chain, struct x11_image *image)
++{
++   struct fxpresent *d = chain->fxpresent;
++   if (!d)
++      return false;
++   const uint32_t stride = image->base.row_pitches[0];
++   if (d->sock >= 0 && (d->hello.width != chain->extent.width || d->hello.height != chain->extent.height ||
++                        d->hello.stride != stride))
++      fxpresent_close(d);
++   if (d->sock < 0) {
++      /* The app may start to listen later, or again. */
++      if (d->frames_without++ % FXPRESENT_RETRY_FRAMES != 0 ||
++          !fxpresent_open(d, chain->extent.width, chain->extent.height, stride))
++         return false;
++   }
++
++   /* Where the window and the pointer are: asked now, answered after the copy. */
++   xcb_translate_coordinates_cookie_t place_cookie = { 0 };
++   xcb_xfixes_get_cursor_image_cookie_t cursor_cookie = xcb_xfixes_get_cursor_image(chain->conn);
++   if (d->root)
++      place_cookie = xcb_translate_coordinates(chain->conn, chain->window, d->root, 0, 0);
++   xcb_flush(chain->conn);
++
++   struct fxpresent_shared *sh = (struct fxpresent_shared *)d->map;
++   const bool direct = d->covers_screen;
++   uint8_t *frame = NULL;
++   if (direct) {
++      const uint32_t published = atomic_load(&sh->published);
++      const uint32_t reading = atomic_load(&sh->reading);
++      uint32_t slot = 0;
++      while (slot == published || slot == reading)
++         slot++;
++      frame = d->map + d->hello.first_frame + (size_t)slot * d->hello.frame_size;
++      memcpy(frame, image->base.cpu_map, (size_t)stride * chain->extent.height);
++
++      int win_x = atomic_load(&sh->x), win_y = atomic_load(&sh->y);
++      xcb_xfixes_get_cursor_image_reply_t *cur = xcb_xfixes_get_cursor_image_reply(chain->conn, cursor_cookie, NULL);
++      xcb_translate_coordinates_reply_t *place =
++         d->root ? xcb_translate_coordinates_reply(chain->conn, place_cookie, NULL) : NULL;
++      if (place) {
++         win_x = place->dst_x;
++         win_y = place->dst_y;
++      }
++      if (cur)
++         fxpresent_draw_cursor(d, frame, cur, win_x, win_y);
++      free(cur);
++      free(place);
++
++      atomic_store(&sh->x, win_x);
++      atomic_store(&sh->y, win_y);
++      atomic_store(&sh->published, slot);
++      struct fxpresent_frame f = { .frames = atomic_fetch_add(&sh->frames, 1) + 1 };
++      if (send(d->sock, &f, sizeof(f), MSG_NOSIGNAL | MSG_DONTWAIT) < 0 &&
++          errno != EAGAIN && errno != EWOULDBLOCK) {
++         /* The app is gone. */
++         fxpresent_close(d);
++         return false;
++      }
++   } else {
++      xcb_discard_reply(chain->conn, cursor_cookie.sequence);
++      if (d->root)
++         xcb_discard_reply(chain->conn, place_cookie.sequence);
++   }
++   return direct;
++}
++
++/* After a frame: does the window cover the screen? Decides for the next frame. */
++static void
++fxpresent_window(struct x11_swapchain *chain, const xcb_get_geometry_reply_t *geom)
++{
++   struct fxpresent *d = chain->fxpresent;
++   if (!d)
++      return;
++   d->root = geom->root;
++   const xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(chain->conn)).data;
++   const struct fxpresent_shared *sh = (const struct fxpresent_shared *)d->map;
++   int x = geom->x, y = geom->y;
++   if (d->map && d->covers_screen) {
++      x = atomic_load(&sh->x);
++      y = atomic_load(&sh->y);
++   }
++   /* geom's place is inside the parent: right for a window of the root, which is what a
++    * session without a window manager has. The translated place replaces it from the
++    * second frame on. */
++   d->covers_screen = screen && x <= 0 && y <= 0 &&
++                      x + (int)geom->width >= screen->width_in_pixels &&
++                      y + (int)geom->height >= screen->height_in_pixels;
++}
++
+ /**
+  * Send image to X server unaccelerated (software drivers).
+  */
+@@ -1860,7 +2104,9 @@
+    size_t size = (hdr_len + stride_b * chain->extent.height) >> 2;
+    uint64_t max_req_len = xcb_get_maximum_request_length(chain->conn);
+ 
+-   if (image->rectangle_count > 0) {
++   if (fxpresent_frame(chain, image)) {
++      /* The app has the frame. */
++   } else if (image->rectangle_count > 0) {
+       for (int i = 0; i < image->rectangle_count; i++) {
+          xcb_rectangle_t rect = chain->images[image_index].rects[i];
+          const uint8_t *data = (const uint8_t*)myptr + (rect.y * stride_b) + (rect.x * 4);
+@@ -1920,6 +2166,7 @@
+       if (chain->extent.width != geom->width ||
+           chain->extent.height != geom->height)
+          result = VK_ERROR_OUT_OF_DATE_KHR;
++      fxpresent_window(chain, geom);
+    } else {
+       result = VK_ERROR_SURFACE_LOST_KHR;
+    }
+@@ -2984,6 +3231,11 @@
+       wsi_queue_destroy(&chain->acquire_queue);
+    wsi_queue_destroy(&chain->present_queue);
+ 
++   if (chain->fxpresent) {
++      fxpresent_close(chain->fxpresent);
++      vk_free(pAllocator, chain->fxpresent);
++   }
++
+    for (uint32_t i = 0; i < chain->base.image_count; i++)
+       x11_image_finish(chain, pAllocator, &chain->images[i]);
+ #ifdef HAVE_X11_DRM
+@@ -3277,6 +3529,13 @@
+    chain->has_dri3_modifiers = wsi_conn->has_dri3_modifiers;
+    chain->has_mit_shm = wsi_conn->has_mit_shm;
+    chain->base.sw_fence_wait_in_backend = chain->base.wsi->sw;
++   /* fexdroid: frames straight to the app, when it asks for them. */
++   if (chain->base.wsi->sw && !chain->has_mit_shm && os_get_option("FEXDROID_PRESENT")) {
++      chain->fxpresent = vk_zalloc(pAllocator, sizeof(*chain->fxpresent), 8,
++                                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++      if (chain->fxpresent)
++         chain->fxpresent->sock = -1;
++   }
+    chain->has_async_may_tear = present_caps & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR;
+    chain->has_reliable_msc = !wsi_conn->is_xwayland;
+ 

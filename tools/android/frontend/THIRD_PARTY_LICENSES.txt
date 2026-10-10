@@ -3,6 +3,11 @@ https://github.com/cobrabm12/fexdroid
 Source revision 2b03ec73c3507b640fba1942fb8d99b43b88945a
 Reused unmodified from the verified fexdroid legacy APK.
 
+Turnip Vulkan driver: Mesa (MIT), https://gitlab.freedesktop.org/mesa/mesa
+commit 35b085c4c067f198ce0b6437d94678e47b9c645f, with fexdroid's Mesa patches
+0001, 0005, 0006 and 0007 (patches/mesa at fexdroid revision
+dbf9808b07570faf5aa912af16d4c4a1b5d0130f), under the fexdroid license below.
+
 MIT License
 
 Copyright (c) 2026 Marius
