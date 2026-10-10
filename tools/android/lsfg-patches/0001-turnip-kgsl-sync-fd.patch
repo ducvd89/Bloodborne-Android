@@ -1,0 +1,640 @@
+diff --git a/framegen/include/core/semaphore.hpp b/framegen/include/core/semaphore.hpp
+index 773ca0c..eb6c041 100644
+--- a/framegen/include/core/semaphore.hpp
++++ b/framegen/include/core/semaphore.hpp
+@@ -39,6 +39,25 @@ namespace LSFG::Core {
+         ///
+         Semaphore(const Core::Device& device, int fd);
+ 
++        /// Tag: a binary semaphore whose payload is exported as a sync file after the submission
++        /// that signals it (Turnip/KGSL exports binary semaphores only as SYNC_FD).
++        struct ExportSyncFd {};
++
++        ///
++        /// Create a binary semaphore exportable as a sync file.
++        ///
++        /// @throws LSFG::vulkan_error if object creation fails.
++        ///
++        Semaphore(const Core::Device& device, ExportSyncFd);
++
++        ///
++        /// Export the pending signal as a sync file (-1: already signaled).
++        /// Call only after the signaling submission.
++        ///
++        /// @throws LSFG::vulkan_error if the export fails.
++        ///
++        [[nodiscard]] int exportSyncFd(const Core::Device& device) const;
++
+         ///
+         /// Signal the semaphore to a specific value.
+         ///
+diff --git a/framegen/public/lsfg_3_1.hpp b/framegen/public/lsfg_3_1.hpp
+index 40a60b5..525725b 100644
+--- a/framegen/public/lsfg_3_1.hpp
++++ b/framegen/public/lsfg_3_1.hpp
+@@ -46,13 +46,13 @@ namespace LSFG_3_1 {
+     /// Present a context.
+     ///
+     /// @param id Unique identifier of the context to present.
+-    /// @param inSem Semaphore to wait on before starting the generation.
+-    /// @param outSem Semaphores to signal once each output image is ready.
++    /// @param inSem Sync fd to wait on before starting the generation (-1: none).
++    /// @param outSem Filled with a sync fd per output image, signaled once it is ready.
+     ///
+     /// @throws LSFG::vulkan_error if the context cannot be presented.
+     ///
+     __attribute__((visibility("default")))
+-    void presentContext(int32_t id, int inSem, const std::vector<int>& outSem);
++    void presentContext(int32_t id, int inSem, std::vector<int>& outSem);
+ 
+     ///
+     /// Delete an LSFG context.
+diff --git a/framegen/public/lsfg_3_1p.hpp b/framegen/public/lsfg_3_1p.hpp
+index fb7f725..4a801ec 100644
+--- a/framegen/public/lsfg_3_1p.hpp
++++ b/framegen/public/lsfg_3_1p.hpp
+@@ -46,13 +46,13 @@ namespace LSFG_3_1P {
+     /// Present a context.
+     ///
+     /// @param id Unique identifier of the context to present.
+-    /// @param inSem Semaphore to wait on before starting the generation.
+-    /// @param outSem Semaphores to signal once each output image is ready.
++    /// @param inSem Sync fd to wait on before starting the generation (-1: none).
++    /// @param outSem Filled with a sync fd per output image, signaled once it is ready.
+     ///
+     /// @throws LSFG::vulkan_error if the context cannot be presented.
+     ///
+     __attribute__((visibility("default")))
+-    void presentContext(int32_t id, int inSem, const std::vector<int>& outSem);
++    void presentContext(int32_t id, int inSem, std::vector<int>& outSem);
+ 
+     ///
+     /// Delete an LSFG context.
+diff --git a/framegen/src/core/semaphore.cpp b/framegen/src/core/semaphore.cpp
+index 102898a..a53b6cc 100644
+--- a/framegen/src/core/semaphore.cpp
++++ b/framegen/src/core/semaphore.cpp
+@@ -39,14 +39,9 @@ Semaphore::Semaphore(const Core::Device& device, std::optional<uint32_t> initial
+ }
+ 
+ Semaphore::Semaphore(const Core::Device& device, int fd) {
+-    // create semaphore
+-    const VkExportSemaphoreCreateInfo exportInfo{
+-        .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+-        .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT
+-    };
++    // create semaphore (the sync file is imported temporarily, consumed by the next wait)
+     const VkSemaphoreCreateInfo desc{
+-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+-        .pNext = &exportInfo
++        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+     };
+     VkSemaphore semaphoreHandle{};
+     auto res = vkCreateSemaphore(device.handle(), &desc, nullptr, &semaphoreHandle);
+@@ -60,7 +55,8 @@ Semaphore::Semaphore(const Core::Device& device, int fd) {
+     const VkImportSemaphoreFdInfoKHR importInfo{
+         .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+         .semaphore = semaphoreHandle,
+-        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
++        .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
++        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+         .fd = fd // closes the fd
+     };
+     res = vkImportSemaphoreFdKHR(device.handle(), &importInfo);
+@@ -77,6 +73,44 @@ Semaphore::Semaphore(const Core::Device& device, int fd) {
+     );
+ }
+ 
++Semaphore::Semaphore(const Core::Device& device, ExportSyncFd) {
++    const VkExportSemaphoreCreateInfo exportInfo{
++        .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
++        .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
++    };
++    const VkSemaphoreCreateInfo desc{
++        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
++        .pNext = &exportInfo
++    };
++    VkSemaphore semaphoreHandle{};
++    auto res = vkCreateSemaphore(device.handle(), &desc, nullptr, &semaphoreHandle);
++    if (res != VK_SUCCESS || semaphoreHandle == VK_NULL_HANDLE)
++        throw LSFG::vulkan_error(res, "Unable to create exportable semaphore");
++
++    this->isTimeline = false;
++    this->semaphore = std::shared_ptr<VkSemaphore>(
++        new VkSemaphore(semaphoreHandle),
++        [dev = device.handle()](VkSemaphore* semaphoreHandle) {
++            vkDestroySemaphore(dev, *semaphoreHandle, nullptr);
++        }
++    );
++}
++
++int Semaphore::exportSyncFd(const Core::Device& device) const {
++    auto vkGetSemaphoreFdKHR = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
++        vkGetDeviceProcAddr(device.handle(), "vkGetSemaphoreFdKHR"));
++    const VkSemaphoreGetFdInfoKHR fdInfo{
++        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
++        .semaphore = this->handle(),
++        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
++    };
++    int fd{-1};
++    auto res = vkGetSemaphoreFdKHR(device.handle(), &fdInfo, &fd);
++    if (res != VK_SUCCESS)
++        throw LSFG::vulkan_error(res, "Unable to export semaphore to sync fd");
++    return fd;
++}
++
+ void Semaphore::signal(const Core::Device& device, uint64_t value) const {
+     if (!this->isTimeline)
+         throw std::logic_error("Invalid timeline semaphore");
+diff --git a/framegen/v3.1_include/v3_1/context.hpp b/framegen/v3.1_include/v3_1/context.hpp
+index 16e3ffa..ac87d9a 100644
+--- a/framegen/v3.1_include/v3_1/context.hpp
++++ b/framegen/v3.1_include/v3_1/context.hpp
+@@ -44,12 +44,13 @@ namespace LSFG_3_1 {
+         /// Present on the context.
+         ///
+         /// @param inSem Semaphore to wait on before starting the generation.
+-        /// @param outSem Semaphores to signal after each generation is done.
++        /// @param outSem Filled with one sync fd per generated frame, signaled when it is done
++        ///               (-1: already done). Empty: nothing is signaled (benchmark).
+         ///
+         /// @throws LSFG::vulkan_error if the context fails to present.
+         ///
+         void present(Vulkan& vk,
+-            int inSem, const std::vector<int>& outSem);
++            int inSem, std::vector<int>& outSem);
+ 
+         // Trivially copyable, moveable and destructible
+         Context(const Context&) = default;
+diff --git a/framegen/v3.1_src/context.cpp b/framegen/v3.1_src/context.cpp
+index 4984842..fc1b1aa 100644
+--- a/framegen/v3.1_src/context.cpp
++++ b/framegen/v3.1_src/context.cpp
+@@ -18,10 +18,12 @@ Context::Context(Vulkan& vk,
+         VkExtent2D extent, VkFormat format) {
+     // import input images
+     this->inImg_0 = Core::Image(vk.device, extent, format,
+-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+         VK_IMAGE_ASPECT_COLOR_BIT, in0);
+     this->inImg_1 = Core::Image(vk.device, extent, format,
+-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+         VK_IMAGE_ASPECT_COLOR_BIT, in1);
+ 
+     // prepare render data
+@@ -61,8 +63,9 @@ Context::Context(Vulkan& vk,
+ }
+ 
+ void Context::present(Vulkan& vk,
+-        int inSem, const std::vector<int>& outSem) {
++        int inSem, std::vector<int>& outSem) {
+     auto& data = this->data.at(this->frameIdx % 8);
++    const bool signalOut = outSem.size() == vk.generationCount;
+ 
+     // 3. wait for completion of previous frame in this slot
+     if (data.shouldWait)
+@@ -95,7 +98,8 @@ void Context::present(Vulkan& vk,
+     for (size_t pass = 0; pass < vk.generationCount; pass++) {
+         auto& internalSemaphore = data.internalSemaphores.at(pass);
+         auto& outSemaphore = data.outSemaphores.at(pass);
+-        if (inSem >= 0) outSemaphore = Core::Semaphore(vk.device, outSem.empty() ? -1 : outSem.at(pass));
++        if (signalOut)
++            outSemaphore = Core::Semaphore(vk.device, Core::Semaphore::ExportSyncFd{});
+         auto& completionFence = data.completionFences.at(pass);
+         completionFence = Core::Fence(vk.device);
+ 
+@@ -112,10 +116,12 @@ void Context::present(Vulkan& vk,
+ 
+         buf2.end();
+         std::vector<Core::Semaphore> signals = { outSemaphore };
+-        if (inSem < 0) signals.clear();
++        if (!signalOut) signals.clear();
+         buf2.submit(vk.device.getComputeQueue(), completionFence,
+             { internalSemaphore }, std::nullopt,
+             signals, std::nullopt);
++        if (signalOut)
++            outSem.at(pass) = outSemaphore.exportSyncFd(vk.device);
+     }
+ 
+     this->frameIdx++;
+diff --git a/framegen/v3.1_src/lsfg.cpp b/framegen/v3.1_src/lsfg.cpp
+index a894f12..02c0ee8 100644
+--- a/framegen/v3.1_src/lsfg.cpp
++++ b/framegen/v3.1_src/lsfg.cpp
+@@ -63,7 +63,7 @@ int32_t LSFG_3_1::createContext(
+     return id;
+ }
+ 
+-void LSFG_3_1::presentContext(int32_t id, int inSem, const std::vector<int>& outSem) {
++void LSFG_3_1::presentContext(int32_t id, int inSem, std::vector<int>& outSem) {
+     if (!instance.has_value() || !device.has_value())
+         throw LSFG::vulkan_error(VK_ERROR_INITIALIZATION_FAILED, "LSFG not initialized");
+ 
+diff --git a/framegen/v3.1_src/shaders/generate.cpp b/framegen/v3.1_src/shaders/generate.cpp
+index 44af35a..d3a3842 100644
+--- a/framegen/v3.1_src/shaders/generate.cpp
++++ b/framegen/v3.1_src/shaders/generate.cpp
+@@ -35,7 +35,8 @@ Generate::Generate(Vulkan& vk,
+     const VkExtent2D extent = this->inImg1.getExtent();
+     for (size_t i = 0; i < vk.generationCount; i++)
+         this->outImgs.emplace_back(vk.device, extent, format,
+-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+             VK_IMAGE_ASPECT_COLOR_BIT, fds.empty() ? -1 : fds.at(i));
+ 
+     // hook up shaders
+diff --git a/framegen/v3.1p_include/v3_1p/context.hpp b/framegen/v3.1p_include/v3_1p/context.hpp
+index ce965a0..8b72ff5 100644
+--- a/framegen/v3.1p_include/v3_1p/context.hpp
++++ b/framegen/v3.1p_include/v3_1p/context.hpp
+@@ -44,12 +44,13 @@ namespace LSFG_3_1P {
+         /// Present on the context.
+         ///
+         /// @param inSem Semaphore to wait on before starting the generation.
+-        /// @param outSem Semaphores to signal after each generation is done.
++        /// @param outSem Filled with one sync fd per generated frame, signaled when it is done
++        ///               (-1: already done). Empty: nothing is signaled (benchmark).
+         ///
+         /// @throws LSFG::vulkan_error if the context fails to present.
+         ///
+         void present(Vulkan& vk,
+-            int inSem, const std::vector<int>& outSem);
++            int inSem, std::vector<int>& outSem);
+ 
+         // Trivially copyable, moveable and destructible
+         Context(const Context&) = default;
+diff --git a/framegen/v3.1p_src/context.cpp b/framegen/v3.1p_src/context.cpp
+index e4d94c5..7d35438 100644
+--- a/framegen/v3.1p_src/context.cpp
++++ b/framegen/v3.1p_src/context.cpp
+@@ -19,10 +19,12 @@ Context::Context(Vulkan& vk,
+         VkExtent2D extent, VkFormat format) {
+     // import input images
+     this->inImg_0 = Core::Image(vk.device, extent, format,
+-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+         VK_IMAGE_ASPECT_COLOR_BIT, in0);
+     this->inImg_1 = Core::Image(vk.device, extent, format,
+-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+         VK_IMAGE_ASPECT_COLOR_BIT, in1);
+ 
+     // prepare render data
+@@ -62,8 +64,9 @@ Context::Context(Vulkan& vk,
+ }
+ 
+ void Context::present(Vulkan& vk,
+-        int inSem, const std::vector<int>& outSem) {
++        int inSem, std::vector<int>& outSem) {
+     auto& data = this->data.at(this->frameIdx % 8);
++    const bool signalOut = outSem.size() == vk.generationCount;
+ 
+     // 3. wait for completion of previous frame in this slot
+     if (data.shouldWait)
+@@ -96,7 +99,8 @@ void Context::present(Vulkan& vk,
+     for (size_t pass = 0; pass < vk.generationCount; pass++) {
+         auto& internalSemaphore = data.internalSemaphores.at(pass);
+         auto& outSemaphore = data.outSemaphores.at(pass);
+-        if (inSem >= 0) outSemaphore = Core::Semaphore(vk.device, outSem.empty() ? -1 : outSem.at(pass));
++        if (signalOut)
++            outSemaphore = Core::Semaphore(vk.device, Core::Semaphore::ExportSyncFd{});
+         auto& completionFence = data.completionFences.at(pass);
+         completionFence = Core::Fence(vk.device);
+ 
+@@ -113,10 +117,12 @@ void Context::present(Vulkan& vk,
+ 
+         buf2.end();
+         std::vector<Core::Semaphore> signals = { outSemaphore };
+-        if (inSem < 0) signals.clear();
++        if (!signalOut) signals.clear();
+         buf2.submit(vk.device.getComputeQueue(), completionFence,
+             { internalSemaphore }, std::nullopt,
+             signals, std::nullopt);
++        if (signalOut)
++            outSem.at(pass) = outSemaphore.exportSyncFd(vk.device);
+     }
+ 
+     this->frameIdx++;
+diff --git a/framegen/v3.1p_src/lsfg.cpp b/framegen/v3.1p_src/lsfg.cpp
+index a22609d..84adf0b 100644
+--- a/framegen/v3.1p_src/lsfg.cpp
++++ b/framegen/v3.1p_src/lsfg.cpp
+@@ -63,7 +63,7 @@ int32_t LSFG_3_1P::createContext(
+     return id;
+ }
+ 
+-void LSFG_3_1P::presentContext(int32_t id, int inSem, const std::vector<int>& outSem) {
++void LSFG_3_1P::presentContext(int32_t id, int inSem, std::vector<int>& outSem) {
+     if (!instance.has_value() || !device.has_value())
+         throw LSFG::vulkan_error(VK_ERROR_INITIALIZATION_FAILED, "LSFG not initialized");
+ 
+diff --git a/framegen/v3.1p_src/shaders/generate.cpp b/framegen/v3.1p_src/shaders/generate.cpp
+index 5f511da..09d1a59 100644
+--- a/framegen/v3.1p_src/shaders/generate.cpp
++++ b/framegen/v3.1p_src/shaders/generate.cpp
+@@ -35,7 +35,8 @@ Generate::Generate(Vulkan& vk,
+     const VkExtent2D extent = this->inImg1.getExtent();
+     for (size_t i = 0; i < vk.generationCount; i++)
+         this->outImgs.emplace_back(vk.device, extent, format,
+-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+             VK_IMAGE_ASPECT_COLOR_BIT, fds.empty() ? -1 : fds.at(i));
+ 
+     // hook up shaders
+diff --git a/include/layer.hpp b/include/layer.hpp
+index 6ebe903..04756ea 100644
+--- a/include/layer.hpp
++++ b/include/layer.hpp
+@@ -171,6 +171,10 @@ namespace Layer {
+         VkDevice device,
+         const VkSemaphoreGetFdInfoKHR* pGetFdInfo,
+         int* pFd);
++    /// Call to the original vkImportSemaphoreFdKHR function.
++    VkResult ovkImportSemaphoreFdKHR(
++        VkDevice device,
++        const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo);
+ 
+     /// Call to the original vkGetDeviceQueue function.
+     void ovkGetDeviceQueue(
+diff --git a/include/mini/semaphore.hpp b/include/mini/semaphore.hpp
+index 03df4d9..0922a90 100644
+--- a/include/mini/semaphore.hpp
++++ b/include/mini/semaphore.hpp
+@@ -24,15 +24,30 @@ namespace Mini {
+         ///
+         Semaphore(VkDevice device);
+ 
++        /// Tag: a binary semaphore exportable as a sync file (Turnip/KGSL has no OPAQUE_FD).
++        struct ExportSyncFd {};
++
+         ///
+-        /// Import a semaphore.
+-        ///
+-        /// @param device Vulkan device
+-        /// @param fd File descriptor to import the semaphore from.
++        /// Create a binary semaphore exportable as a sync file.
+         ///
+         /// @throws LSFG::vulkan_error if object creation fails.
+         ///
+-        Semaphore(VkDevice device, int* fd);
++        Semaphore(VkDevice device, ExportSyncFd);
++
++        ///
++        /// Export the pending signal as a sync file (-1: already signaled).
++        /// Call only after the signaling submission.
++        ///
++        /// @throws LSFG::vulkan_error if the export fails.
++        ///
++        [[nodiscard]] int exportSyncFd(VkDevice device) const;
++
++        ///
++        /// Import a sync file temporarily (consumed by the next wait). Takes ownership of fd.
++        ///
++        /// @throws LSFG::vulkan_error if the import fails.
++        ///
++        void importSyncFd(VkDevice device, int fd) const;
+ 
+         /// Get the Vulkan handle.
+         [[nodiscard]] auto handle() const { return *this->semaphore; }
+diff --git a/src/context.cpp b/src/context.cpp
+index e00804a..355b2bc 100644
+--- a/src/context.cpp
++++ b/src/context.cpp
+@@ -133,8 +133,7 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+     auto& pass = this->passInfos.at(this->frameIdx % 8);
+ 
+     // 1. copy swapchain image to frame_0/frame_1
+-    int preCopySemaphoreFd{};
+-    pass.preCopySemaphores.at(0) = Mini::Semaphore(info.device, &preCopySemaphoreFd);
++    pass.preCopySemaphores.at(0) = Mini::Semaphore(info.device, Mini::Semaphore::ExportSyncFd{});
+     pass.preCopySemaphores.at(1) = Mini::Semaphore(info.device);
+     pass.preCopyBuf = Mini::CommandBuffer(info.device, this->cmdPool);
+     pass.preCopyBuf.begin();
+@@ -157,10 +156,9 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+         { pass.preCopySemaphores.at(0).handle(),
+           pass.preCopySemaphores.at(1).handle() });
+ 
+-    // 2. render intermediary frames
+-    std::vector<int> renderSemaphoreFds(conf.multiplier - 1);
+-    for (size_t i = 0; i < (conf.multiplier - 1); ++i)
+-        pass.renderSemaphores.at(i) = Mini::Semaphore(info.device, &renderSemaphoreFds.at(i));
++    // 2. render intermediary frames: sync files both ways, exported after the signaling submission
++    const int preCopySemaphoreFd = pass.preCopySemaphores.at(0).exportSyncFd(info.device);
++    std::vector<int> renderSemaphoreFds(conf.multiplier - 1, -1);
+ 
+     if (conf.performance)
+         LSFG_3_1P::presentContext(*this->lsfgCtxId,
+@@ -170,6 +168,10 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+         LSFG_3_1::presentContext(*this->lsfgCtxId,
+             preCopySemaphoreFd,
+             renderSemaphoreFds);
++    for (size_t i = 0; i < (conf.multiplier - 1); ++i) {
++        pass.renderSemaphores.at(i) = Mini::Semaphore(info.device);
++        pass.renderSemaphores.at(i).importSyncFd(info.device, renderSemaphoreFds.at(i));
++    }
+ 
+     for (size_t i = 0; i < (conf.multiplier - 1); i++) {
+         // 3. acquire next swapchain image
+@@ -234,5 +236,23 @@ VkResult LsContext::present(const Hooks::DeviceInfo& info, const void* pNext, Vk
+         throw LSFG::vulkan_error(res, "Failed to present swapchain image");
+ 
+     this->frameIdx++;
++
++    // LSFG_STATS=1: real and generated frames presented, every 2 s
++    static const bool stats = std::getenv("LSFG_STATS") != nullptr;
++    if (stats) {
++        static auto since = std::chrono::steady_clock::now();
++        static uint64_t real{};
++        static uint64_t generated{};
++        real++;
++        generated += conf.multiplier - 1;
++        const auto now = std::chrono::steady_clock::now();
++        const double seconds = std::chrono::duration<double>(now - since).count();
++        if (seconds >= 2.0) {
++            std::cerr << "lsfg-vk: " << static_cast<double>(real) / seconds << " real + "
++                << static_cast<double>(generated) / seconds << " generated frames/s\n";
++            since = now;
++            real = generated = 0;
++        }
++    }
+     return res;
+ }
+diff --git a/src/layer.cpp b/src/layer.cpp
+index 9c2694b..120b0d5 100644
+--- a/src/layer.cpp
++++ b/src/layer.cpp
+@@ -49,6 +49,7 @@ namespace {
+     PFN_vkDestroySemaphore next_vkDestroySemaphore{};
+     PFN_vkGetMemoryFdKHR next_vkGetMemoryFdKHR{};
+     PFN_vkGetSemaphoreFdKHR next_vkGetSemaphoreFdKHR{};
++    PFN_vkImportSemaphoreFdKHR next_vkImportSemaphoreFdKHR{};
+     PFN_vkGetDeviceQueue next_vkGetDeviceQueue{};
+     PFN_vkQueueSubmit next_vkQueueSubmit{};
+     PFN_vkCmdPipelineBarrier next_vkCmdPipelineBarrier{};
+@@ -219,6 +220,7 @@ namespace {
+             success &= initDeviceFunc(*pDevice, "vkCreateSemaphore", &next_vkCreateSemaphore);
+             success &= initDeviceFunc(*pDevice, "vkDestroySemaphore", &next_vkDestroySemaphore);
+             success &= initDeviceFunc(*pDevice, "vkGetSemaphoreFdKHR", &next_vkGetSemaphoreFdKHR);
++            success &= initDeviceFunc(*pDevice, "vkImportSemaphoreFdKHR", &next_vkImportSemaphoreFdKHR);
+             success &= initDeviceFunc(*pDevice, "vkGetDeviceQueue", &next_vkGetDeviceQueue);
+             success &= initDeviceFunc(*pDevice, "vkQueueSubmit", &next_vkQueueSubmit);
+             success &= initDeviceFunc(*pDevice, "vkCmdPipelineBarrier", &next_vkCmdPipelineBarrier);
+@@ -479,6 +481,11 @@ namespace Layer {
+             int* pFd) {
+         return next_vkGetSemaphoreFdKHR(device, pGetFdInfo, pFd);
+     }
++    VkResult ovkImportSemaphoreFdKHR(
++            VkDevice device,
++            const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo) {
++        return next_vkImportSemaphoreFdKHR(device, pImportSemaphoreFdInfo);
++    }
+ 
+     void ovkGetDeviceQueue(
+             VkDevice device,
+diff --git a/src/main.cpp b/src/main.cpp
+index ac16086..1212902 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -56,29 +56,32 @@ namespace {
+         // remove mesa var in favor of config
+         unsetenv("MESA_VK_WSI_PRESENT_MODE"); // NOLINT
+ 
+-        // write latest file
++        // write latest file (TMPDIR: Android has no /tmp)
+         try {
+-            std::ofstream latest("/tmp/lsfg-vk_last", std::ios::trunc);
++            const char* tmpdir = std::getenv("TMPDIR");
++            const std::string latestPath =
++                std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") + "/lsfg-vk_last";
++            std::ofstream latest(latestPath, std::ios::trunc);
+             if (!latest.is_open())
+-                throw std::runtime_error("Failed to open /tmp/lsfg-vk_last for writing");
++                throw std::runtime_error("Failed to open " + latestPath + " for writing");
+             latest << "exe: " << name.first << '\n';
+             latest << "comm: " << name.second << '\n';
+             latest << "pid: " << getpid() << '\n';
+             if (!latest.good())
+-                throw std::runtime_error("Failed to write to /tmp/lsfg-vk_last");
++                throw std::runtime_error("Failed to write the latest file");
+         } catch (const std::exception& e) {
+-            std::cerr << "lsfg-vk: An error occurred while trying to write the latest file, exiting:\n";
++            std::cerr << "lsfg-vk: An error occurred while trying to write the latest file, ignoring:\n";
+             std::cerr << "- " << e.what() << '\n';
+-            exit(EXIT_FAILURE);
+         }
+ 
+         // load shaders
+         try {
+             Extract::extractShaders();
+         } catch (const std::exception& e) {
+-            std::cerr << "lsfg-vk: An error occurred while trying to extract the shaders, exiting:\n";
++            std::cerr << "lsfg-vk: An error occurred while trying to extract the shaders, disabling:\n";
+             std::cerr << "- " << e.what() << '\n';
+-            exit(EXIT_FAILURE);
++            conf.enable = false;
++            return; // the game runs without frame generation
+         }
+         std::cerr << "lsfg-vk: Shaders extracted successfully.\n";
+ 
+diff --git a/src/mini/image.cpp b/src/mini/image.cpp
+index 978c67c..2493d0d 100644
+--- a/src/mini/image.cpp
++++ b/src/mini/image.cpp
+@@ -32,7 +32,10 @@ Image::Image(VkDevice device, VkPhysicalDevice physicalDevice,
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+-        .usage = usage,
++        // the framegen device imports this memory: the same usage on both devices gives the same
++        // layout (Turnip decides tiling and UBWC from it)
++        .usage = usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
++            | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+     };
+     VkImage imageHandle{};
+diff --git a/src/mini/semaphore.cpp b/src/mini/semaphore.cpp
+index cd03031..0f42ea9 100644
+--- a/src/mini/semaphore.cpp
++++ b/src/mini/semaphore.cpp
+@@ -27,11 +27,11 @@ Semaphore::Semaphore(VkDevice device) {
+     );
+ }
+ 
+-Semaphore::Semaphore(VkDevice device, int* fd) {
++Semaphore::Semaphore(VkDevice device, ExportSyncFd) {
+     // create semaphore
+     const VkExportSemaphoreCreateInfo exportInfo{
+         .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+-        .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT
++        .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
+     };
+     const VkSemaphoreCreateInfo desc{
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+@@ -42,16 +42,6 @@ Semaphore::Semaphore(VkDevice device, int* fd) {
+     if (res != VK_SUCCESS || semaphoreHandle == VK_NULL_HANDLE)
+         throw LSFG::vulkan_error(res, "Unable to create semaphore");
+ 
+-    // export semaphore to fd
+-    const VkSemaphoreGetFdInfoKHR fdInfo{
+-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+-        .semaphore = semaphoreHandle,
+-        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT
+-    };
+-    res = Layer::ovkGetSemaphoreFdKHR(device, &fdInfo, fd);
+-    if (res != VK_SUCCESS || *fd < 0)
+-        throw LSFG::vulkan_error(res, "Unable to export semaphore to fd");
+-
+     // store semaphore in shared ptr
+     this->semaphore = std::shared_ptr<VkSemaphore>(
+         new VkSemaphore(semaphoreHandle),
+@@ -60,3 +50,29 @@ Semaphore::Semaphore(VkDevice device, int* fd) {
+         }
+     );
+ }
++
++int Semaphore::exportSyncFd(VkDevice device) const {
++    const VkSemaphoreGetFdInfoKHR fdInfo{
++        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
++        .semaphore = this->handle(),
++        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
++    };
++    int fd{-1};
++    auto res = Layer::ovkGetSemaphoreFdKHR(device, &fdInfo, &fd);
++    if (res != VK_SUCCESS)
++        throw LSFG::vulkan_error(res, "Unable to export semaphore to sync fd");
++    return fd;
++}
++
++void Semaphore::importSyncFd(VkDevice device, int fd) const {
++    const VkImportSemaphoreFdInfoKHR importInfo{
++        .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
++        .semaphore = this->handle(),
++        .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
++        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
++        .fd = fd // closes the fd
++    };
++    auto res = Layer::ovkImportSemaphoreFdKHR(device, &importInfo);
++    if (res != VK_SUCCESS)
++        throw LSFG::vulkan_error(res, "Unable to import semaphore from sync fd");
++}
+diff --git a/src/utils/benchmark.cpp b/src/utils/benchmark.cpp
+index 0f0d0fd..7ba5ee4 100644
+--- a/src/utils/benchmark.cpp
++++ b/src/utils/benchmark.cpp
+@@ -61,7 +61,8 @@ void Benchmark::run(uint32_t width, uint32_t height) {
+ 
+     std::cerr << "lsfg-vk: Benchmark started, running " << iterations << " iterations...\n";
+     for (uint64_t count = 0; count < iterations + 1; count++) {
+-        lsfgPresentContext(ctx, -1, {});
++        std::vector<int> noSignals;
++        lsfgPresentContext(ctx, -1, noSignals);
+ 
+         if (count % 50 == 0 && count > 0)
+             std::cerr << "lsfg-vk: "

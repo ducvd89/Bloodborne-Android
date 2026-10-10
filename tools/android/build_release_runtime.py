@@ -20,6 +20,7 @@ SOURCE = ROOT / '.local-deps/android/migration/x/rootfs'
 NATIVE = ROOT / 'out/arm64/bundle'
 TURNIP = ROOT / 'out/arm64/turnip'
 TURNIP_GEN8 = ROOT / 'out/arm64/turnip-gen8'
+LSFG = ROOT / 'out/arm64/lsfg'  # build_lsfg.sh: the lsfg-vk 1.0 layer with our Turnip patches
 # The rootfs's Turnip, replaced by TURNIP's (rootfs-relative path: file there).
 TURNIP_FILES = {
     'usr/lib/aarch64-linux-gnu/libvulkan_freedreno.so': 'libvulkan_freedreno.so',
@@ -98,6 +99,8 @@ def main():
         raise SystemExit('Build Turnip first: tools/android/build_turnip.sh')
     if not all((TURNIP_GEN8 / name).is_file() for name in TURNIP_GEN8_FILES.values()):
         raise SystemExit('Build the Adreno 8xx Turnip first: tools/android/build_turnip.sh gen8')
+    if not (LSFG / 'liblsfg-vk.so').is_file():
+        raise SystemExit('Build the Lossless Scaling layer first: tools/android/build_lsfg.sh')
     OUT.mkdir(exist_ok=True)
     overlay = OUT / 'python-overlay'
     overlay.mkdir(exist_ok=True)
@@ -126,6 +129,7 @@ def main():
             tar.addfile(info)
         for directory in ('bin', 'lib', 'patch-parts'):
             tar.add(NATIVE / directory, arcname='bbport/arm64/' + directory)
+        tar.add(LSFG, arcname='bbport/arm64/lsfg', filter=owned_by_root)
         for script in SCRIPTS:
             origin = (ROOT / 'tools/android' if script == 'prepare_game.py' else ROOT / 'scripts') / script
             tar.add(origin, arcname='bbport/scripts/' + script)
@@ -146,7 +150,7 @@ def main():
     (OUT / 'runtime.python-packages.txt').write_text('\n'.join(records) + '\n')
     with tarfile.open(archive) as tar:
         names = tar.getnames()
-    banned = ('boot-linked.bin', 'eboot.bin', 'eboot.elf', 'game/', 'save/')
+    banned = ('boot-linked.bin', 'eboot.bin', 'eboot.elf', 'game/', 'save/', 'Lossless.dll')
     if any(any(word in name for word in banned) for name in names):
         archive.unlink()
         raise SystemExit('Refusing to package a game-derived file')

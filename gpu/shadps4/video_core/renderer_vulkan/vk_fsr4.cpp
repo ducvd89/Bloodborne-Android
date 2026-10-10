@@ -234,16 +234,24 @@ struct Fsr4Upscaler::Impl {
     }
 
     bool Record411(const Frame& f) {
-        if (!instance.IsFsr411Supported()) {
-            Fail("FSR 4.1.1 needs INT8 dot products and VK_VALVE_shader_mixed_float_dot_product", true);
+        if (!instance.IsFsr4Int8Supported()) {
+            Fail("FSR 4.1.1 needs INT8 dot products", true);
             return false;
         }
         if (!fsr411) {
             const char* env = std::getenv("BB_FSR411_DIR");
+            std::string dir = env && env[0] ? env : "fsr4_411";
+            // Without VK_VALVE_shader_mixed_float_dot_product (Turnip): the INT8 passes translated
+            // with its dot2 as plain arithmetic (tools/fsr4cap/extract.py, portable/).
+            if (!instance.IsFsr411Supported()) {
+                dir += "/portable";
+                std::printf("Upscaler: FSR 4.1.1 without VK_VALVE_shader_mixed_float_dot_product: %s\n",
+                            dir.c_str());
+            }
             const Fsr411::Features features{.fp8_matrices = instance.IsFsr411Fp8Supported(),
                                             .fp16_matrices = instance.IsFsr411MatrixSupported()};
             fsr411 = std::make_unique<Fsr411::Upscaler>(instance.GetPhysicalDevice(), instance.GetDevice(),
-                                                        env && env[0] ? env : "fsr4_411", features);
+                                                        dir, features);
         }
         // Its constant ring holds kFramesInFlight frames: the oldest must be done.
         while (fsr411_ticks.size() >= Fsr411::kFramesInFlight) {

@@ -12,6 +12,30 @@ Adreno 8xx variant: Mesa from https://github.com/whitebelyash/mesa-unified
 upstream Mesa commits b889ab52, b7ad24ad, e984ef29, 6cb65e61 and the same
 fexdroid patches.
 
+lsfg-vk 1.0.0 (bbport/arm64/lsfg): Lossless Scaling frame generation on Linux,
+https://github.com/PancakeTAS/lsfg-vk (tag v1.0.0), MIT License, Copyright (c)
+2025 lsfg-vk (bbport/arm64/lsfg/LICENSE.md). Built for ARM64 with this port's
+changes for the Turnip driver (bbport/arm64/lsfg/0001-turnip-kgsl-sync-fd.patch).
+It includes dxbc from DXVK (zlib/libpng license; Copyright (c) 2017 Philip
+Rebohle, 2019 Joshua Ashton, 2019 Robin Kertels, 2023 Jeffrey Ellison),
+pe-parse (MIT, Copyright (c) 2013 Andrew Ruef), toml11 (MIT, Copyright (c) 2017
+Toru Niina) and volk (MIT, Copyright (c) 2018-2025 Arseny Kapoulkine).
+Lossless Scaling and its Lossless.dll are not included: the app downloads the
+player's own copy from Steam, or the player copies it.
+
+Steam sign-in (downloads Lossless.dll from the player's own Lossless Scaling):
+JavaSteam 1.8.0 (MIT, https://github.com/Longi94/JavaSteam), with Kotlin and
+kotlinx.coroutines/io/serialization (Apache-2.0, JetBrains), Ktor (Apache-2.0,
+JetBrains), OkHttp and Okio (Apache-2.0, Square), Protocol Buffers for Java
+(BSD-3-Clause, Google), Apache Commons Lang 3 (Apache-2.0), SLF4J API (MIT),
+JetBrains annotations (Apache-2.0), XZ for Java (0BSD, Lasse Collin) and
+zstd-jni (BSD-2-Clause, Luben Karavelov; bundles Zstandard, BSD). The QR code
+is drawn with ZXing core 3.5.4 (Apache-2.0). Menu icons: Material Design icons
+(Apache-2.0, Google).
+
+FSR 3.1: AMD FidelityFX (MIT) through
+FireBurn/FSR-Vulkan.
+
 MIT License
 
 Copyright (c) 2026 Marius

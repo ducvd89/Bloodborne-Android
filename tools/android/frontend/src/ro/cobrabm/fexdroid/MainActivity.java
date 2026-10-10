@@ -54,8 +54,8 @@ public final class MainActivity extends Activity {
     private LinearLayout drawer;
     private LinearLayout drawerItems;
     private TextView status;
-    private Button resume;
-    private Button controllerButton;
+    private View resume;
+    private LinearLayout graphicsItem, losslessItem, steamItem, controllerItem, folderItem;
     private TouchControllerOverlay controllerOverlay;
     private PadBridge pad;
     private AudioBridge audio;
@@ -147,50 +147,81 @@ public final class MainActivity extends Activity {
         screen.addView(scrim,frame(-1,-1,Gravity.FILL));
 
         drawer=new LinearLayout(this); drawer.setOrientation(LinearLayout.VERTICAL);
-        drawer.setBackgroundColor(0xff15171d);
+        GradientDrawable panel=new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+            new int[]{0xff1b1d24,0xff121318});
+        drawer.setBackground(panel);
         drawer.setElevation(dp(16)); drawer.setVisibility(View.GONE);
         drawerItems=new LinearLayout(this); drawerItems.setOrientation(LinearLayout.VERTICAL);
-        drawerItems.setPadding(dp(24),dp(18),dp(24),dp(16));
+        drawerItems.setPadding(dp(14),dp(20),dp(14),dp(16));
         android.widget.ScrollView drawerScroll=new android.widget.ScrollView(this);
         drawerScroll.setFillViewport(false);
         drawerScroll.addView(drawerItems);
-        drawer.addView(drawerScroll,new LinearLayout.LayoutParams(-1,-1));
-        TextView title=text("BLOODBORNE",25,0xffe8dfc9); title.setTypeface(Typeface.SERIF,Typeface.BOLD);
-        drawerItems.addView(title,new LinearLayout.LayoutParams(-1,dp(44)));
-        TextView hint=text("Swipe left or press A to return",12,0xffa6a7ac);
-        drawerItems.addView(hint,new LinearLayout.LayoutParams(-1,dp(30)));
-        resume=menuButton("Resume game",() -> closeDrawer());
-        menuButton("Graphics settings",() -> {
+        // A thin gold edge on the game side.
+        LinearLayout body=new LinearLayout(this);
+        body.addView(drawerScroll,new LinearLayout.LayoutParams(0,-1,1));
+        View edge=new View(this); edge.setBackgroundColor(0x55c6ad76);
+        body.addView(edge,new LinearLayout.LayoutParams(dp(1),-1));
+        drawer.addView(body,new LinearLayout.LayoutParams(-1,-1));
+
+        TextView title=text("BLOODBORNE",24,0xffe8dfc9); title.setTypeface(Typeface.SERIF,Typeface.BOLD);
+        title.setLetterSpacing(0.12f); title.setPadding(dp(10),0,0,0);
+        drawerItems.addView(title,new LinearLayout.LayoutParams(-1,-2));
+        TextView hint=text("Swipe left or press A to return",12,0xff8e9097);
+        hint.setPadding(dp(10),dp(2),0,dp(6));
+        drawerItems.addView(hint,new LinearLayout.LayoutParams(-1,-2));
+
+        section("Game");
+        resume=menuItem("ic_play","Resume game",null,() -> closeDrawer());
+        menuItem("ic_refresh","Restart game","Unsaved progress is lost",() -> new AlertDialog.Builder(this)
+            .setTitle("Restart Bloodborne?").setMessage("Any unsaved progress will be lost.")
+            .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> restartGame()).show());
+
+        section("Graphics");
+        graphicsItem=menuItem("ic_tune","Graphics settings","",() -> {
             closeDrawer();
             new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).show();
         });
-        controllerButton=menuButton("On-screen controller: " + (controllerEnabled() ? "On" : "Off"),() -> {
+        losslessItem=menuItem("ic_frames","Lossless Scaling","",() -> {
+            closeDrawer();
+            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame)
+                .showLossless(() -> { Process p=game; return p!=null && p.isAlive(); });
+        });
+        steamItem=menuItem("ic_download","Get Lossless.dll from Steam","",() -> {
+            closeDrawer();
+            new SteamDllDialog(this,new File(BASE,"Lossless.dll")).show();
+        });
+
+        section("Controls");
+        controllerItem=menuItem("ic_gamepad","On-screen controller","",() -> {
             boolean enabled=!controllerEnabled();
             getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("controller_overlay",enabled).apply();
             controllerOverlay.release();
-            controllerButton.setText("On-screen controller: " + (enabled ? "On" : "Off"));
             closeDrawer();
         });
-        menuButton("Edit on-screen controller",() -> {
+        menuItem("ic_edit","Edit controller layout","Drag and resize the buttons",() -> {
             getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("controller_overlay",true).apply();
-            controllerButton.setText("On-screen controller: On");
             closeDrawer();
             controllerOverlay.edit(null);
         });
-        menuButton("Reset controller layout",() -> {
+        menuItem("ic_restore","Reset controller layout",null,() -> {
             controllerOverlay.resetLayout();
             closeDrawer();
         });
-        menuButton("Game folder",() -> { closeDrawer(); askGameFolder(true); });
-        menuButton("Restart game",() -> new AlertDialog.Builder(this)
-            .setTitle("Restart Bloodborne?").setMessage("Any unsaved progress will be lost.")
-            .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> restartGame()).show());
-        menuButton("Quit game",() -> new AlertDialog.Builder(this)
+
+        section("Storage");
+        folderItem=menuItem("ic_folder","Game folder","",() -> { closeDrawer(); askGameFolder(true); });
+        menuItem("ic_exit","Quit game",null,() -> new AlertDialog.Builder(this)
             .setTitle("Quit Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Quit",(dialog,which) -> finish()).show());
-        TextView controls=text("B  Confirm     A  Cancel\nY  Item             X  Heal",13,0xffc6ad76);
-        controls.setPadding(0,dp(16),0,0); drawerItems.addView(controls);
-        screen.addView(drawer,frame(dp(300),-1,Gravity.LEFT));
+
+        TextView controls=text("B  Confirm      A  Cancel\nY  Item              X  Heal",12,0xffc6ad76);
+        controls.setPadding(dp(10),dp(18),0,dp(4)); drawerItems.addView(controls);
+        String version="";
+        try { version=" "+getPackageManager().getPackageInfo(getPackageName(),0).versionName; }
+        catch (Exception ignored) {}
+        TextView about=text("Bloodborne for Android"+version,11,0xff6e7077);
+        about.setPadding(dp(10),dp(6),0,0); drawerItems.addView(about);
+        screen.addView(drawer,frame(dp(320),-1,Gravity.LEFT));
         setContentView(screen);
     }
 
@@ -199,22 +230,86 @@ public final class MainActivity extends Activity {
         worker.execute(() -> { stopGame(); startGame(); });
     }
 
-    private Button menuButton(String title,Runnable action) {
-        Button b=new Button(this); b.setText(title); b.setAllCaps(false);
-        b.setTextSize(16); b.setTextColor(0xffe8dfc9); b.setGravity(Gravity.LEFT|Gravity.CENTER_VERTICAL);
-        b.setPadding(dp(14),0,dp(14),0); b.setOnClickListener(v -> action.run());
-        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,dp(46)); lp.bottomMargin=dp(4);
-        drawerItems.addView(b,lp); return b;
+    /** A small gold heading above a group of menu rows. */
+    private void section(String name) {
+        TextView t=text(name.toUpperCase(java.util.Locale.ROOT),11,0xffc6ad76);
+        t.setLetterSpacing(0.15f); t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setPadding(dp(10),dp(16),0,dp(6));
+        drawerItems.addView(t,new LinearLayout.LayoutParams(-1,-2));
+    }
+
+    /** A menu row: icon, title and an optional second line (null: none; "" filled by refreshDrawer).
+     *  Focusable for the gamepad, with a gold highlight when focused or pressed. */
+    private LinearLayout menuItem(String icon,String title,String detail,Runnable action) {
+        LinearLayout row=new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(dp(10),dp(8),dp(10),dp(8));
+        row.setFocusable(true); row.setClickable(true); row.setOnClickListener(v -> action.run());
+        android.graphics.drawable.StateListDrawable states=new android.graphics.drawable.StateListDrawable();
+        GradientDrawable lit=new GradientDrawable(); lit.setColor(0x33c6ad76); lit.setCornerRadius(dp(10));
+        lit.setStroke(dp(1),0x99c6ad76);
+        GradientDrawable pressed=new GradientDrawable(); pressed.setColor(0x44c6ad76); pressed.setCornerRadius(dp(10));
+        states.addState(new int[]{android.R.attr.state_pressed},pressed);
+        states.addState(new int[]{android.R.attr.state_focused},lit);
+        states.addState(new int[]{},new android.graphics.drawable.ColorDrawable(0));
+        row.setBackground(states);
+
+        android.widget.ImageView image=new android.widget.ImageView(this);
+        int id=getResources().getIdentifier(icon,"drawable",getPackageName());
+        if (id!=0) image.setImageResource(id);
+        LinearLayout.LayoutParams ip=new LinearLayout.LayoutParams(dp(24),dp(24)); ip.rightMargin=dp(14);
+        row.addView(image,ip);
+
+        LinearLayout texts=new LinearLayout(this); texts.setOrientation(LinearLayout.VERTICAL);
+        TextView name=text(title,15,0xffe8dfc9);
+        texts.addView(name);
+        if (detail!=null) {
+            TextView second=text(detail,12,0xff8e9097); second.setTag("detail");
+            texts.addView(second);
+        }
+        row.addView(texts,new LinearLayout.LayoutParams(0,-2,1));
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2); lp.bottomMargin=dp(2);
+        row.setMinimumHeight(dp(48));
+        drawerItems.addView(row,lp); return row;
+    }
+    private static void setDetail(LinearLayout row,String value) {
+        TextView detail=row==null ? null : (TextView)row.findViewWithTag("detail");
+        if (detail!=null) detail.setText(value);
+    }
+    /** Where run-thor.sh looks for Lossless.dll: next to the game folder, else the app's own copy. */
+    private File losslessDll() {
+        if (gameDir!=null) {
+            File beside=new File(new File(gameDir).getParentFile(),"Lossless.dll");
+            if (beside.isFile()) return beside;
+        }
+        File own=new File(BASE,"Lossless.dll");
+        return own.isFile() ? own : null;
+    }
+    /** The rows' second lines: the current settings, read when the drawer opens. */
+    private void refreshDrawer() {
+        String upscaler="off".equals(setting("upscaler")) ? "No upscaling" : "FSR 3.1";
+        String limit=setting("fps_limit");
+        setDetail(graphicsItem,upscaler+" · "+("0".equals(limit) ? "no FPS limit"
+            : (limit==null || !limit.matches("40|45|60") ? "30" : limit)+" FPS limit"));
+        String lsfg=setting("lsfg_multiplier"); boolean dll=losslessDll()!=null;
+        boolean on="2".equals(lsfg) || "3".equals(lsfg) || "4".equals(lsfg);
+        setDetail(losslessItem,!dll ? "Needs Lossless.dll" : on
+            ? lsfg+"× frames · flow "+(setting("lsfg_flow_scale")==null ? "1.0" : setting("lsfg_flow_scale")) : "Off");
+        File found=losslessDll();
+        setDetail(steamItem,found==null ? "Sign in with your Steam account"
+            : found.getParent().equals(BASE) ? "Downloaded from Steam" : "Using Lossless.dll next to the game folder");
+        setDetail(controllerItem,controllerEnabled() ? "On" : "Off");
+        setDetail(folderItem,gameDir==null ? "Not chosen" : gameDir);
     }
 
     private void openDrawer() {
         if (drawerOpen) return;
         drawerOpen=true; controllerOverlay.release(); pad.reset(); XInput.button(1,false);
+        refreshDrawer();
         controllerOverlay.setVisibility(View.GONE);
         handle.setVisibility(View.GONE);
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.setAlpha(0); scrim.setVisibility(View.VISIBLE); scrim.animate().alpha(1).setDuration(200).start();
-        drawer.setTranslationX(-dp(300)); drawer.setVisibility(View.VISIBLE);
+        drawer.setTranslationX(-dp(320)); drawer.setVisibility(View.VISIBLE);
         drawer.animate().translationX(0).setDuration(220).start(); resume.requestFocus();
     }
     private void closeDrawer() {
@@ -223,7 +318,7 @@ public final class MainActivity extends Activity {
         controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.animate().alpha(0).setDuration(180).withEndAction(() -> scrim.setVisibility(View.GONE)).start();
-        drawer.animate().translationX(-dp(300)).setDuration(200)
+        drawer.animate().translationX(-dp(320)).setDuration(200)
             .withEndAction(() -> { drawer.setVisibility(View.GONE); handle.setVisibility(View.VISIBLE); surface.requestFocus(); }).start();
         immersive();
     }
@@ -504,9 +599,46 @@ public final class MainActivity extends Activity {
         } catch (Exception ex) { android.util.Log.e("Bloodborne","text answer: "+ex); return; }
         if (!temporary.renameTo(result)) android.util.Log.e("Bloodborne","text answer: rename failed");
     }
+    /** The last value of a bbport.ini setting (as run-thor.sh reads it), or null. */
+    private String setting(String key) {
+        String value=null;
+        try (BufferedReader r=new BufferedReader(new java.io.FileReader(new File(BASE,"bbport.ini")))) {
+            for (String line; (line=r.readLine())!=null;)
+                if (line.startsWith(key+"=")) value=line.substring(key.length()+1).trim();
+        } catch (Exception ignored) {}
+        return value;
+    }
+    /** Frame generation (Lossless Scaling or FSR 3.1) presents 2-4 frames per game frame. Lossless
+     *  Scaling presents them back to back and FIFO spaces them, evenly only when the display runs at
+     *  FPS limit x frames: that mode when the display has it (30x2: 60 Hz, 30x4, 40x3, 60x2: 120 Hz),
+     *  else the fastest one (at the system's 60 Hz generated frames were dropped). Without frame
+     *  generation, the system's choice. */
+    private void pickRefreshRate() {
+        String lsfg=setting("lsfg_multiplier");
+        int frames="2".equals(lsfg) || "3".equals(lsfg) || "4".equals(lsfg) ? Integer.parseInt(lsfg)
+            : "1".equals(setting("frame_generation")) ? 2 : 1;
+        String limit=setting("fps_limit"); // as run-thor.sh: 40, 45, 60, 0 (none), else 30
+        final float target=frames*("40".equals(limit) || "45".equals(limit) || "60".equals(limit)
+            ? Integer.parseInt(limit) : "0".equals(limit) ? 1000 : 30);
+        main.post(() -> {
+            if (destroyed) return;
+            android.view.Display display=Build.VERSION.SDK_INT>=30 ? getDisplay() : getWindowManager().getDefaultDisplay();
+            android.view.Display.Mode current=display.getMode();
+            int id=0, fastest=0; float best=0;
+            if (frames>1) for (android.view.Display.Mode mode:display.getSupportedModes()) {
+                if (mode.getPhysicalWidth()!=current.getPhysicalWidth() || mode.getPhysicalHeight()!=current.getPhysicalHeight()) continue;
+                if (Math.abs(mode.getRefreshRate()-target)<1) id=mode.getModeId();
+                if (mode.getRefreshRate()>best) { best=mode.getRefreshRate(); fastest=mode.getModeId(); }
+            }
+            if (id==0) id=fastest;
+            WindowManager.LayoutParams attrs=getWindow().getAttributes();
+            if (attrs.preferredDisplayModeId!=id) { attrs.preferredDisplayModeId=id; getWindow().setAttributes(attrs); }
+        });
+    }
     private void startGame() {
         if (destroyed) return;
         hadError=false;
+        pickRefreshRate();
         new File(BASE,"ime.request").delete(); new File(BASE,"ime.request.result").delete();
         try {
             Process launched=process(ROOT+"/bin/sh",BASE+"/run-thor.sh","game"); game=launched;

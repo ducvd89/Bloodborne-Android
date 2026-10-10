@@ -45,9 +45,11 @@ fi
 # 1280x720 display; the preset sets the scene size, FSR 3.1 upscales it to the output.
 setting() { sed -n "s/^$1=//p" "$BB_CONFIG" 2>/dev/null | tail -n 1; }
 upscaler=$(setting upscaler); preset=$(setting preset)
-# FSR 4 is off on the Thor for now (Turnip compiles its model passes for over a minute, then
-# crashed in a dispatch): fsr4, like anything else but off, means FSR 3.1.
+# FSR 4 and 4.1.1 (INT8 models) are not offered: on the Thor's Adreno 740 FSR 4 took ~3 min to
+# compile in Turnip, then ran at 2.4 FPS (~470 ms of GPU time a frame) with a black scene, and with
+# the Lossless Scaling layer it crashed in Turnip. Any value but off means FSR 3.1.
 case $upscaler in off) ;; *) upscaler=fsr3 ;; esac
+echo "Upscaler setting: $upscaler"
 case $preset in 0|1|2|3|4) ;; *) preset=3 ;; esac
 render=1280x720
 if [ "$upscaler" != off ]; then
@@ -56,6 +58,51 @@ fi
 export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
 [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
+# Lossless Scaling frame generation (lsfg_multiplier 2-4): the lsfg-vk 1.0 layer with our Turnip
+# patches (bbport/arm64/lsfg, build_lsfg.sh) and Lossless.dll from the player's own Lossless
+# Scaling (Steam), next to the game folder or in bbport/. It replaces FSR 3.1 frame generation.
+# Its messages (lsfg-vk: ...) go to the game log.
+lsfg=$(setting lsfg_multiplier)
+case $lsfg in 2|3|4) ;; *) lsfg= ;; esac
+if [ -n "$lsfg" ] && [ -f "$base/arm64/lsfg/VkLayer_LS_frame_generation.json" ]; then
+    lsfg_dll=
+    for dll in "${BB_GAME_DIR:+${BB_GAME_DIR%/*}/Lossless.dll}" "$base/Lossless.dll"; do
+        [ -n "$dll" ] && [ -f "$dll" ] && { lsfg_dll=$dll; break; }
+    done
+    if [ -n "$lsfg_dll" ]; then
+        flow=$(setting lsfg_flow_scale)
+        case $flow in 0.25|0.5|0.75|1|1.0) ;; *) flow=1.0 ;; esac
+        performance=$([ "$(setting lsfg_performance)" = 1 ] && echo true || echo false)
+        unset BB_FRAME_GEN
+        # Config file mode: lsfg-vk watches it, so the app changes the multiplier (1: off), flow
+        # scale and performance mode while the game runs (SettingsDialog.showLossless). The file
+        # exists only while the layer is loaded; BB_LSFG: vk_swapchain.cpp restarts without it if
+        # it fails. An implicit layer, so the layer's own framegen instance skips it (DISABLE_LSFG).
+        # Present mode: FIFO paces the generated frames (LSFG_PRESENT=mailbox|immediate to try).
+        export BB_LSFG=1 LSFG_CONFIG="$base/lsfg-vk.toml"
+        export VK_ADD_IMPLICIT_LAYER_PATH="$base/arm64/lsfg"
+        cat > "$LSFG_CONFIG.tmp" <<EOF
+version = 1
+
+[global]
+dll = "$lsfg_dll"
+
+[[game]]
+exe = "bb-probe"
+multiplier = $lsfg
+flow_scale = $flow
+performance_mode = $performance
+experimental_present_mode = "${LSFG_PRESENT:-fifo}"
+EOF
+        mv -f "$LSFG_CONFIG.tmp" "$LSFG_CONFIG"
+        echo "Lossless Scaling frame generation: x$lsfg, flow scale $flow, $lsfg_dll"
+    else
+        lsfg=; echo 'Lossless Scaling frame generation: no Lossless.dll next to the game folder'
+    fi
+else
+    lsfg=
+fi
+[ -n "$lsfg" ] || rm -f "$base/lsfg-vk.toml"
 # FSR 4 model assets (fetch_fsr4_assets.sh), in the native bundle when fetched.
 [ -d "$base/arm64/fsr4_shaders" ] && export BB_FSR4_DIR="$base/arm64/fsr4_shaders"
 export BB_WINDOW_SIZE=1280x720
@@ -73,7 +120,7 @@ case $fps_limit in 40|45|60|0) export BB_VBLANK_HZ=480 BB_FPS_LIMIT=$fps_limit ;
     *) fps_limit=30; export BB_VBLANK_HZ=60 ;; esac
 # Frame generation adds frames on screen only: at the game's own 30 FPS timing a slower frame
 # still slows the game down. With it, 30 means the delta-time patch at 30 real frames a second.
-if [ "${BB_FRAME_GEN:-0}" = 1 ] && [ "$fps_limit" = 30 ]; then
+if { [ "${BB_FRAME_GEN:-0}" = 1 ] || [ -n "$lsfg" ]; } && [ "$fps_limit" = 30 ]; then
     fps_limit=30-delta; export BB_VBLANK_HZ=480 BB_FPS_LIMIT=30
 fi
 # CPU cores (thor_cpus, a taskset list such as 3-7): empty for all of them.
