@@ -3,6 +3,7 @@
 
 #include <boost/container/small_vector.hpp>
 #include "bbport_toggles.h"
+#include "bblayer_write_traps.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -51,6 +52,7 @@
 #endif
 
 extern "C" void runtime_memory_set_write_watch(uintptr_t address, uint64_t size, int watch);
+extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
 
 namespace VideoCore {
 
@@ -230,6 +232,26 @@ void PageManager::ReportFaultSites() {
     std::printf("\n");
 }
 
+// bbport: with the game's memory in place (no write tracking), the pages under images are
+// trapped for writes (BbLayer::WriteTraps::Image): a write nobody announced (the game's own copy
+// loops, its heap over an old texture) still reaches the texture cache, on any game and GPU,
+// without hooks in the game's code; the hooks and the libc wrappers only make it sooner.
+// BB_IMAGE_TRAPS=0: announced writes only, as before. Latched at the first use: the counts must
+// match their traps for the whole run.
+static bool ImageTraps() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_IMAGE_TRAPS");
+        const bool enabled = !(env && env[0] == '0') && VideoCore::GuestInPlace() &&
+                             !VideoCore::WriteTracking() && !VideoCore::WriteVerify();
+        if (enabled) {
+            std::printf("Guest memory: writes under images are trapped (BB_IMAGE_TRAPS=0: "
+                        "announced writes only)\n");
+        }
+        return enabled;
+    }();
+    return on;
+}
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers : 7;
@@ -301,7 +323,24 @@ struct PageManager::Impl {
         if (is_gpu_thread) {
             BbStats::gpu_signal_faults.fetch_add(1, std::memory_order_relaxed);
         }
+        // Traps on reads too (no access, BbLayer::WriteTraps::NoAccess): their owner first.
+        if (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::VramData) {
+            return rasterizer->OnVramDataAccess(addr, is_gpu_thread);
+        }
+        if (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::QueryReads) {
+            return rasterizer->OnOcclusionPageAccess(
+                addr, u64(reinterpret_cast<uintptr_t>(Common::GetRip(context))),
+                Common::IsWriteError(context), is_gpu_thread);
+        }
         if (Common::IsWriteError(context)) {
+            if (ImageTraps() &&
+                !(BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::Image)) {
+                // Not an image's trap: another owner's being lifted by another thread, or one
+                // lifted meanwhile (the write runs again), or a write the game may not do.
+                int prot = 0, type = -1;
+                uintptr_t end = 0;
+                return runtime_memory_vma_info(addr, &prot, &type, &end) && (prot & 0x2);
+            }
             BbStats::Timer timer{BbStats::t_write_faults};
             const bool handled = rasterizer->OnWriteFault(addr, is_gpu_thread, rip);
             current_fault_rip = 0;
@@ -451,6 +490,54 @@ struct PageManager::Impl {
         release_pending();
     }
 
+    /// bbport ImageTraps: the images over each page; a page is trapped while one is there.
+    template <bool track>
+    void UpdateImageTraps(VAddr addr, u64 size) {
+        std::call_once(image_watchers_once, [this] {
+            void* mem = mmap(nullptr, NUM_ADDRESS_PAGES * sizeof(u16), PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            ASSERT_MSG(mem != MAP_FAILED, "image watcher table");
+            image_watchers = static_cast<u16*>(mem);
+        });
+        size_t page = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
+        const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
+        Common::RangeLockGuard lk(lock_start, lock_end);
+        // Runs of pages whose first image came or last one went: one trap change each.
+        u64 run_begin = 0, run_pages = 0;
+        const auto flush = [&] {
+            if (run_pages != 0) {
+                BbLayer::WriteTraps::Set(run_begin << PM_PAGE_BITS, run_pages << PM_PAGE_BITS,
+                                         BbLayer::WriteTraps::Image, track);
+                run_pages = 0;
+            }
+        };
+        for (; page != page_end; ++page) {
+            u16& count = image_watchers[page];
+            bool change;
+            if constexpr (track) {
+                change = count++ == 0;
+            } else {
+                ASSERT_MSG(count > 0, "image watchers below zero");
+                change = --count == 0;
+            }
+            if (!change) {
+                continue;
+            }
+            if (run_pages != 0 && run_begin + run_pages == page) {
+                ++run_pages;
+            } else {
+                flush();
+                run_begin = page;
+                run_pages = 1;
+            }
+        }
+        flush();
+    }
+    u16* image_watchers = nullptr;
+    std::once_flag image_watchers_once;
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     using LockType = Common::AdaptiveMutex;
@@ -502,7 +589,7 @@ public:
 
         // Read faults (readbacks) still arrive as signals.
         Core::Signals::Instance()->RegisterAccessViolationHandler(
-            GuestFaultSignalHandler, std::numeric_limits<u32>::min());
+            GuestFaultSignalHandler, 1u);
 
         ufd_thread = std::jthread([this](std::stop_token token) { UffdHandler(token); });
         std::printf("GPU: memory tracking with userfaultfd write-protection\n");
@@ -611,8 +698,8 @@ struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
 
-        // Should be called first.
-        constexpr auto priority = std::numeric_limits<u32>::min();
+        // Should be called first (bbport: after BB_VRAM_ACCESS_TRAP, priority 0, diagnostics only).
+        constexpr u32 priority = 1;
         Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
                                                                   priority);
     }
@@ -671,6 +758,10 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 template <bool track>
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size) const {
     impl->UpdatePageWatchers<track, false>(addr, size);
+    // bbport: only the texture cache comes here (the buffer cache: UpdatePageWatchersForRegion).
+    if (ImageTraps()) {
+        impl->UpdateImageTraps<track>(addr, size);
+    }
 }
 
 template <bool track, bool is_read>

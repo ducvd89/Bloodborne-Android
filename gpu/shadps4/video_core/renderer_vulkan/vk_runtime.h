@@ -101,6 +101,10 @@ public:
     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                           bool check_read_access = false);
 
+    /// bbport BB_LAYER_MEMORY: a shader reached memory through the page table (any buffer of the
+    /// game's memory). A write there makes every later access wait for a barrier.
+    void AccessGlobal(vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access);
+
     void FlushBarriers();
 
     /// bbport: runs before this thread changes image state (layouts, pending image
@@ -125,6 +129,7 @@ private:
     BarrierTracker barrier_tracker;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
+    bool global_write = false; ///< bbport: AccessGlobal wrote since the last FlushBarriers
     // bbport: ranges inserted into barrier_tracker since its last Clear(); re-inserting a
     // contained range is a no-op, and draws re-bind the same ranges constantly.
     struct AccessMemo {

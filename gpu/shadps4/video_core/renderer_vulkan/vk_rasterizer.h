@@ -203,6 +203,30 @@ public:
     /// recorded before it). Values of up to 8 bytes are registered for WAIT_REG_MEM until the GPU
     /// has written them. False: not in place (or BB_GPU_COMMAND_WRITES=0), the caller stores it.
     bool WriteDataOnGpu(VAddr address, const void* data, u32 size);
+    /// bbport BB_GUEST_IN_PLACE (in stream order: the recording thread): an end-of-pipe label
+    /// (EVENT_WRITE_EOP/EOS) written by the GPU itself once the work recorded before it is done,
+    /// as the command processor does: a buffer marker into the game's memory, where the CPU sees
+    /// it. Registered for WAIT_REG_MEM like the CPU-written ones. False (the caller signals it
+    /// from the CPU): not in GPU-visible guest memory, no VK_AMD_buffer_marker, BB_GPU_LABELS=0.
+    bool WriteLabelOnGpu(VAddr address, u64 value, u32 num_bytes);
+    /// bbport: a ZPASS_DONE event (the game's occlusion query) at `address` for `pairs` depth
+    /// blocks, in stream order (vk_occlusion.h). False when it is left to the caller (the old
+    /// memory model).
+    bool OcclusionEvent(VAddr address, u32 pairs);
+    /// Whether ZPASS_DONE events go to OcclusionEvent (the new memory model).
+    static bool OcclusionTranslated();
+    /// ZPASS_DONE events translated so far.
+    u64 OcclusionEvents() const;
+    /// bbport BB_GUEST_IN_PLACE (in stream order): the GPU clock (PS4: 100 MHz) written as 64 bits
+    /// at `address` by the GPU, at the end of the pipe or when it gets there (vk_timestamps.h).
+    /// False (the caller writes it with the CPU): BB_GPU_TIMESTAMPS=0, no timestamps, the old model.
+    bool WriteTimestampOnGpu(VAddr address, bool end_of_pipe);
+    /// A fault on a page of occlusion counters watched for the game's first access
+    /// (BB_OCCLUSION_READ_TRACE); false: not such a page.
+    bool OnOcclusionPageAccess(VAddr addr, u64 rip, bool write, bool gpu_thread);
+    /// A CPU access hit a page whose newest data the GPU wrote into a VRAM copy only
+    /// (BB_LAYER_READ_TRAPS): copied back first. False: not such a page.
+    bool OnVramDataAccess(VAddr addr, bool assume_locks);
     /// End of a guest submission: submits the work recorded so far when signals wait for it and
     /// the last submission is BB_HONEST_FLUSH_US (1000) old: the GPU starts on it as the hardware
     /// would, instead of at the end of the frame, and the guest's mid-frame waits end sooner.
@@ -405,7 +429,7 @@ private:
     void ResetBindings(bool is_compute);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
-    bool IsComputeImageCopy(const Pipeline* pipeline);
+    bool IsComputeImageCopy(const Pipeline* pipeline, bool dry_run = false);
     bool IsComputeImageClear(const Pipeline* pipeline);
 
 private:
@@ -645,6 +669,9 @@ private:
         return nullptr;
     }
     std::unique_ptr<ConstantRing> constant_ring;
+    std::unique_ptr<class OcclusionQueries> occlusion;
+    std::unique_ptr<class GpuTimestamps> timestamps;
+    std::unique_ptr<class IndirectGuard> indirect_guard; ///< stage B only (lazily)
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;

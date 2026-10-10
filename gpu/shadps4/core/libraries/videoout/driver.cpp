@@ -473,6 +473,30 @@ void VideoOutDriver::Flip(const Request& req) {
                         (t_now[0] - last_t[0]) / 1e6, (t_now[1] - last_t[1]) / 1e6,
                         (t_now[2] - last_t[2]) / 1e6, (t_now[3] - last_t[3]) / 1e6,
                         (t_now[4] - last_t[4]) / 1e6, (t_now[5] - last_t[5]) / 1e6);
+        }
+        static std::array<u64, 12> last_layer{};
+        static u64 last_mprotects = 0, last_entries = 0;
+        std::array<u64, 12> layer_now{};
+        for (size_t i = 0; i < layer_now.size(); ++i) {
+            layer_now[i] = BbStats::t_layer[i].load(std::memory_order_relaxed);
+        }
+        const u64 mprotects = BbStats::layer_mprotects.load(std::memory_order_relaxed);
+        const u64 entries = BbStats::layer_entries_written.load(std::memory_order_relaxed);
+        if (frame_ms > 40.0 && last_gpu_ns != 0 && layer_now != last_layer) {
+            const auto ms = [&](size_t i) { return (layer_now[i] - last_layer[i]) / 1e6; };
+            std::printf("       layer memory ms: traps set/cleared %.1f (%llu mprotect), "
+                        "to VRAM %.1f, back in place %.1f, trap hits %.1f, yield %.1f, "
+                        "volatile %.1f, republish %.1f (%llu entries: staging %.1f, guest view %.1f, "
+                        "mirrors %.1f, copy %.1f), paged uploads %.1f\n",
+                        ms(0), static_cast<unsigned long long>(mprotects - last_mprotects), ms(1),
+                        ms(2), ms(3), ms(4), ms(5), ms(6),
+                        static_cast<unsigned long long>(entries - last_entries), ms(8), ms(9),
+                        ms(10), ms(11), ms(7));
+        }
+        last_layer = layer_now;
+        last_mprotects = mprotects;
+        last_entries = entries;
+        if (frame_ms > 40.0 && last_gpu_ns != 0) {
             std::printf("       GPU thread page faults %llu (process %llu), protection faults %llu; "
                         "protect calls %llu (%llu pages), of which write-revoking %llu (%llu pages)\n",
                         static_cast<unsigned long long>(minflt - last_minflt),
@@ -656,10 +680,12 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::gnm_frame_waits.exchange(0) / double(frames),
                         BbStats::gnm_frame_wait_ns.exchange(0) / (1e6 * double(frames)),
                         BbStats::asc_submits.exchange(0) / double(frames));
-            std::printf("EOP fences: %llu decoded, %llu labels written, %lld pending\n",
+            std::printf("EOP fences: %llu decoded, %llu labels written, %lld pending; %.1f labels/frame "
+                        "written by the GPU\n",
                         (unsigned long long)BbStats::eop_decoded.load(),
                         (unsigned long long)BbStats::eop_written.load(),
-                        (long long)(BbStats::eop_decoded.load() - BbStats::eop_written.load()));
+                        (long long)(BbStats::eop_decoded.load() - BbStats::eop_written.load()),
+                        BbStats::gpu_labels.exchange(0) / double(frames));
             if (const u64 early = BbStats::idle_flushes.exchange(0)) {
                 std::printf("Honest labels: %.1f submissions/frame sent early (GPU idle)\n",
                             early / double(frames));
@@ -711,6 +737,18 @@ void VideoOutDriver::Flip(const Request& req) {
             frames = 0;
             worst_ms = 0;
         }
+    }
+
+    // bbport BB_HONEST_FLIPS=1 (experiment): the flip completes once the GPU has finished the
+    // frame, as on the PS4, where the display flips at a vblank after the end of the frame's
+    // commands, instead of when the frame is queued. It did not change how often the game drew
+    // every light with FSR on (2 of 4 route runs), so it stays off.
+    static const bool honest_flips = [] {
+        const char* env = std::getenv("BB_HONEST_FLIPS");
+        return env && env[0] == '1';
+    }();
+    if (honest_flips) {
+        presenter->WaitRendered(req.frame);
     }
 
     // Update flip status.

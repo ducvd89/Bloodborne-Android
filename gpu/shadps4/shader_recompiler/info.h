@@ -138,6 +138,8 @@ struct Info : InfoPersistent {
     bool uses_image_atomic_float_min_max{};
     bool uses_lane_id{};
     bool uses_shader_clock{};
+    /// bbport BB_LAYER_MEMORY: some guest buffer goes through the page table (IsPagedBuffer).
+    bool uses_paged_buffers{};
     bool uses_group_quad{};
     bool uses_group_shuffle{};
     bool uses_group_ballot{};

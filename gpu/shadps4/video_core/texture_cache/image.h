@@ -162,6 +162,9 @@ public:
     /// bbport: gc tick of the last LRU touch; skips the LRU list (a cache miss) when current.
     mutable u64 lru_touched_tick = ~0ULL;
     u64 tick_accessed_last{};
+    /// bbport: scheduler tick of the last binding that lets the GPU write it (render or depth target,
+    /// storage image); 0 never.
+    u64 gpu_write_tick{};
     ImageId depth_id{};
     u64 depth_uid{};
     u64 image_uid{};

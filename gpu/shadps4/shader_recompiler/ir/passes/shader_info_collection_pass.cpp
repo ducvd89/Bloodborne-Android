@@ -194,6 +194,25 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         });
         LOG_ERROR(Render, "Enabling DMA for shader {:#x}", info.pgm_hash);
     }
+
+    // bbport BB_LAYER_MEMORY: buffers over nearly all memory read the page table. Every shader with
+    // guest buffers gets it (a later permutation may have a paged buffer where the first one had
+    // none, and the program's resource list comes from the first).
+    if (profile.paged_buffers) {
+        bool guest_buffers = false;
+        for (const auto& buffer : info.buffers) {
+            if (buffer.buffer_type == BufferType::Guest) {
+                guest_buffers = true;
+                info.uses_paged_buffers |= IsPagedBuffer(true, buffer.GetSharp(info));
+            }
+        }
+        if (guest_buffers && !info.uses_dma) {
+            info.buffers.push_back({
+                .used_types = IR::Type::U64,
+                .buffer_type = BufferType::BdaPagetable,
+            });
+        }
+    }
 }
 
 } // namespace Shader::Optimization

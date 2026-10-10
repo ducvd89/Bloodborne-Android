@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: the game's occlusion counters (ZPASS_DONE events, vk_occlusion.cpp). The occlusion
+// query segments ended since the last resolve are added, in order, to a running total; every
+// event among them gets the total as it stood when it happened, written where the PS4's depth
+// blocks write theirs: one 64-bit counter per block, 16 bytes apart, the first with the total,
+// the others zero, all with the valid bit (63). The game takes end minus begin over the blocks:
+// the samples between its two events. 64-bit values are (low, high) dword pairs.
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) writeonly buffer Counters {
+    uvec2 counters[];
+};
+
+struct Event {
+    uvec2 address; // device address of the first block's counter
+    uint pairs;    // depth blocks
+    uint upto;     // segments (from the first of this resolve) before the event
+};
+
+layout(std430, binding = 0) readonly buffer Results { uvec2 results[]; };
+layout(std430, binding = 1) buffer Total { uvec2 total; };
+layout(std430, binding = 2) readonly buffer Events { Event events[]; };
+
+layout(push_constant) uniform Push {
+    uint count;  // segments to add
+    uint events; // events to write
+} push;
+
+uvec2 Add(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+void main() {
+    uvec2 sum = total;
+    uint segment = 0;
+    for (uint e = 0; e < push.events; ++e) {
+        const Event event = events[e];
+        for (; segment < event.upto && segment < push.count; ++segment) {
+            sum = Add(sum, results[segment]);
+        }
+        Counters guest = Counters(event.address);
+        const uint valid = 0x80000000u;
+        guest.counters[0] = uvec2(sum.x, (sum.y & 0x7fffffffu) | valid);
+        for (uint i = 1; i < event.pairs; ++i) {
+            guest.counters[i * 2] = uvec2(0u, valid);
+        }
+    }
+    for (; segment < push.count; ++segment) {
+        sum = Add(sum, results[segment]);
+    }
+    total = sum;
+}

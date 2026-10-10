@@ -102,6 +102,10 @@ public:
     bool IsGuestMemoryExportSupported() const {
         return guest_memory_export;
     }
+    /// bbport: host memory can be imported (VK_EXT_external_memory_host; BbGuestMemory).
+    bool IsHostMemoryImportSupported() const {
+        return host_memory_import;
+    }
 
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
@@ -130,6 +134,11 @@ public:
     /// Returns true if 64-bit ints are supported in shaders
     bool IsShaderInt64Supported() const {
         return features.shaderInt64;
+    }
+
+    /// bbport: occlusion queries count samples exactly (else only zero or not).
+    bool IsOcclusionQueryPrecise() const {
+        return features.occlusionQueryPrecise;
     }
 
     /// Returns true if 16-bit ints are supported in shaders
@@ -327,7 +336,6 @@ public:
     }
 
     /// Returns the vendor ID of the physical device
-    bool IsDlssSupported() const { return dlss_supported; }
 
     u32 GetVendorID() const {
         return properties.vendorID;
@@ -568,6 +576,7 @@ private:
     vk::Queue graphics_queue;
     vk::Queue readback_queue;
     bool guest_memory_export{};
+    bool host_memory_import{};
     u32 readback_family_index = NoFamily;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
@@ -601,7 +610,6 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool compute_shader_derivatives{};
-    bool dlss_supported = false;
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
     bool cooperative_matrix{};      // bbport: VK_KHR_cooperative_matrix (FSR 4.1.1 FP8 variant)
     bool shader_float8{};           // bbport: VK_EXT_shader_float8 with FP8 matrices (RDNA4)

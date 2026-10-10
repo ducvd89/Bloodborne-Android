@@ -125,6 +125,22 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
                             auto&& on_upload) {
+        // bbport: a write binding over pages the CPU did not change and the GPU already owns
+        // needs neither an upload nor a state change (it ran under the region lock for every
+        // GPU write binding, twice per page). Racing guest writes are as in the read path.
+        if (is_written && !BbToggle::Disabled(BbToggle::LockFreeUploadCheck)) {
+            bool settled = true;
+            IteratePages<true>(query_cpu_range, query_size,
+                               [&settled](RegionManager* manager, u64 offset, size_t size) {
+                                    settled = settled &&
+                                              !manager->template IsRegionModified<Type::CPU>(offset, size) &&
+                                              manager->template IsRegionFullyModified<Type::GPU>(offset, size);
+                                });
+            if (settled) {
+                on_upload();
+                return;
+            }
+        }
         IteratePages<true>(query_cpu_range, query_size,
                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
                                // bbport: read-only bindings skip the region lock when no page

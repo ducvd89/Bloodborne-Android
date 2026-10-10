@@ -6,6 +6,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "bbport_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -109,13 +110,31 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
         // Bound to exported guest memory chunks (BB_GUEST_IN_PLACE) as well as VRAM blocks.
         const vk::ExternalMemoryBufferCreateInfo external{
-            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+            .handleTypes = BbGuestMemory::HandleType(),
         };
         if (GuestInPlace()) {
             buffer_ci.pNext = &external;
             if (const auto [result, created] = device.createBuffer(buffer_ci);
                 result == vk::Result::eSuccess) {
                 buffer = created;
+                // bbport: VRAM blocks are bound into it too: the external memory type must not
+                // keep device-local memory out (a driver may restrict it).
+                const auto reqs = device.getBufferMemoryRequirements(created);
+                const VkPhysicalDeviceMemoryProperties* props = nullptr;
+                vmaGetMemoryProperties(allocator, &props);
+                bool vram = false;
+                for (u32 i = 0; i < props->memoryTypeCount; ++i) {
+                    vram |= (reqs.memoryTypeBits & (1u << i)) &&
+                            (props->memoryTypes[i].propertyFlags &
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                }
+                if (!vram) {
+                    std::printf("Guest memory: the arena for guest memory cannot take VRAM; the GPU "
+                                "uses copies in VRAM as before\n");
+                    device.destroyBuffer(created);
+                    buffer = vk::Buffer{};
+                    DisableGuestInPlace();
+                }
             } else {
                 std::printf("Guest memory: the arena cannot take exported memory (%s); the GPU "
                             "uses copies in VRAM as before\n",
@@ -144,15 +163,24 @@ Buffer::Buffer(const Vulkan::Instance& instance, u64 size_bytes_, vk::DeviceMemo
     : size_bytes{size_bytes_}, mem_type{MemoryType::HostCached},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
     const vk::ExternalMemoryBufferCreateInfo external{
-        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+        .handleTypes = BbGuestMemory::HandleType(),
     };
+    // bbport BB_LAYER_MEMORY: what the GPU binds for the game's memory in place (no arena):
+    // vertex, index and indirect data and device addresses too (the memory has them).
+    const bool layer = BbGuestMemory::LayerMemory();
+    vk::BufferUsageFlags usage =
+        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eUniformBuffer |
+        vk::BufferUsageFlagBits::eUniformTexelBuffer | vk::BufferUsageFlagBits::eStorageTexelBuffer;
+    if (layer) {
+        usage |= vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eIndexBuffer |
+                 vk::BufferUsageFlagBits::eIndirectBuffer |
+                 vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
     const vk::BufferCreateInfo buffer_ci = {
         .pNext = &external,
         .size = size_bytes,
-        .usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
-                 vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eUniformBuffer |
-                 vk::BufferUsageFlagBits::eUniformTexelBuffer |
-                 vk::BufferUsageFlagBits::eStorageTexelBuffer,
+        .usage = usage,
         .sharingMode = vk::SharingMode::eExclusive,
     };
     const auto device = instance.GetDevice();
@@ -160,6 +188,9 @@ Buffer::Buffer(const Vulkan::Instance& instance, u64 size_bytes_, vk::DeviceMemo
     const auto result = device.bindBufferMemory(buffer.buffer, memory, 0);
     ASSERT_MSG(result == vk::Result::eSuccess, "Binding a guest memory chunk failed: {}",
                vk::to_string(result));
+    if (layer) {
+        buffer.bda_addr = device.getBufferAddress({.buffer = buffer.buffer});
+    }
     Vulkan::SetObjectName(device, Handle(), debug_name);
     is_coherent = true;
 }

@@ -799,7 +799,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         g_srt_codegen_start = c.getCurr();
         auto* signals = Core::Signals::Instance();
         // Call after the memory invalidation handler
-        constexpr u32 priority = 1;
+        constexpr u32 priority = 2;
         signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
     }
 

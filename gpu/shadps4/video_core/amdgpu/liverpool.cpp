@@ -8,6 +8,8 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include <array>
+#include <optional>
+#include <utility>
 #include <time.h>
 #include "bbport_cpu.h"
 #include "bbport_threads.h"
@@ -33,6 +35,8 @@
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/pm4_selftest.h"
+#include "cp_decoder.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -442,10 +446,27 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.ProcessDownloadImages();
     // BB_HONEST_LABELS: written once the GPU has finished the work before it, as the hardware
     // does (an end-of-pipe event), instead of when that work is recorded.
+    // bbport: a timestamp without an interrupt: the GPU's own clock at the end of the pipe.
+    if (Vulkan::Rasterizer::HonestLabels() && eop.data_sel.Value() == DataSelect::GpuClock64 &&
+        eop.int_sel.Value() == InterruptSelect::None &&
+        rasterizer.WriteTimestampOnGpu(reinterpret_cast<VAddr>(eop.Address<u8>()), true)) {
+        BbStats::eop_written.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     if (Vulkan::Rasterizer::HonestLabels()) {
         const bool writes = eop.data_sel.Value() != DataSelect::None;
         const u64 value = eop.data_sel.Value() == DataSelect::Data32Low ? eop.DataDWord()
                                                                         : eop.DataQWord();
+        // bbport: the GPU writes the label at the end of the pipe, as the command processor does;
+        // labels with an interrupt keep the CPU signal (the interrupt comes from there).
+        if ((eop.data_sel.Value() == DataSelect::Data32Low ||
+             eop.data_sel.Value() == DataSelect::Data64) &&
+            eop.int_sel.Value() == InterruptSelect::None &&
+            rasterizer.WriteLabelOnGpu(reinterpret_cast<VAddr>(eop.Address<u8>()), value,
+                                       eop.data_sel.Value() == DataSelect::Data32Low ? 4 : 8)) {
+            BbStats::eop_written.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         rasterizer.SignalAfterGpu([eop, seq] { SignalEop(eop, seq); },
                                   writes ? reinterpret_cast<VAddr>(eop.Address<u8>()) : 0, value);
         return;
@@ -470,6 +491,23 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         rasterizer.WaitDeferredSignals();
         SignalEop(eop, seq);
     }
+}
+
+// bbport: a MEM_SEMAPHORE signal once the GPU has finished the work before it, in stream order
+// (BB_HONEST_LABELS), as the command processor gives it when it gets there: signalled when decoded
+// (a frame ahead of the GPU), a queue waiting on it would read what that work had not written
+// yet. BB_MEM_SEMAPHORE_ORDER=0: when decoded (as before).
+bool MemSemaphoreInOrder() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_MEM_SEMAPHORE_ORDER");
+        return !(env && env[0] == '0');
+    }();
+    return on && Vulkan::Rasterizer::HonestLabels();
+}
+
+void RunMemSemaphoreSignal(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    const auto semaphore = *reinterpret_cast<const PM4CmdMemSemaphore*>(data);
+    rasterizer.SignalAfterGpu([semaphore] { semaphore.Signal(); });
 }
 
 void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
@@ -518,9 +556,64 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     }
 }
 
+// bbport: a ZPASS_DONE event (the game's occlusion query) for the recording thread.
+struct ZpassEvent {
+    VAddr address;
+    u32 pairs;
+};
+
+void RunZpassDone(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    ZpassEvent event;
+    std::memcpy(&event, data, sizeof(event));
+    rasterizer.OcclusionEvent(event.address, event.pairs);
+}
+
+// bbport: COPY_DATA from memory or GDS, or of a value into GDS, on the recording thread in stream
+// order, as DMA_DATA (RunDmaData).
+struct CopyDataTask {
+    VAddr dst;
+    VAddr src;
+    u64 value;
+    u32 num_bytes;
+    bool dst_gds;
+    bool src_gds;
+    bool fill; ///< write `value` instead of copying from `src`
+};
+
+void RunCopyData(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    CopyDataTask task;
+    std::memcpy(&task, data, sizeof(task));
+    if (!task.dst_gds && rasterizer.DmaMayWriteOnCpu(task.dst, task.num_bytes)) {
+        rasterizer.WaitHostCopiesFor(task.dst, task.num_bytes);
+        rasterizer.WaitDeferredSignals();
+    }
+    if (task.fill) {
+        for (u32 at = 0; at < task.num_bytes; at += sizeof(u32)) {
+            rasterizer.FillBuffer(task.dst + at, sizeof(u32), u32(task.value >> (at * 8)),
+                                  task.dst_gds);
+        }
+        return;
+    }
+    rasterizer.CopyBuffer(task.dst, task.src, task.num_bytes, task.dst_gds, task.src_gds);
+}
+
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
     rasterizer.WaitDeferredSignals();
     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+}
+
+// bbport: COPY_DATA of the GPU clock (64-bit, to memory) in stream order: the GPU's own clock when
+// it gets there (vk_timestamps.h); else the CPU's, when this runs.
+void RunGpuClockCopy(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    VAddr target;
+    std::memcpy(&target, data, sizeof(target));
+    if (rasterizer.WriteTimestampOnGpu(target, false)) {
+        return;
+    }
+    const u64 value = GetGpuClock64();
+    if (!rasterizer.WriteDataOnGpu(target, &value, sizeof(value))) {
+        std::memcpy(reinterpret_cast<void*>(target), &value, sizeof(value));
+    }
 }
 
 void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
@@ -572,6 +665,10 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     if (Vulkan::Rasterizer::HonestLabels() &&
         event_eos.command == PM4CmdEventWriteEos::Command::SignalFence) {
         rasterizer.ProcessDownloadImages();
+        if (rasterizer.WriteLabelOnGpu(reinterpret_cast<VAddr>(event_eos.Address()),
+                                       event_eos.DataDWord(), sizeof(u32))) {
+            return; // written by the GPU once the shaders before it are done
+        }
         const PM4CmdEventWriteEos eos = event_eos;
         rasterizer.SignalAfterGpu([eos] { eos.SignalFence(&WriteEosLabel); },
                                   reinterpret_cast<VAddr>(eos.Address()), eos.DataDWord());
@@ -584,6 +681,13 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     event_eos.SignalFence(&WriteEosLabel);
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
         ASSERT(event_eos.size == 1);
+        // bbport BB_GUEST_IN_PLACE: a GPU copy from GDS in stream order, as the command processor
+        // stores it, instead of waiting for the whole GPU and storing on the CPU.
+        if (VideoCore::GuestInPlace()) {
+            rasterizer.CopyBuffer(reinterpret_cast<VAddr>(event_eos.Address()),
+                                  event_eos.gds_index * sizeof(u32), sizeof(u32), false, true);
+            return;
+        }
         rasterizer.Finish();
         const u32 value = rasterizer.ReadDataFromGds(event_eos.gds_index);
         BbFreeCheck::Check(reinterpret_cast<u64>(event_eos.Address()), sizeof(u32), &value,
@@ -747,6 +851,54 @@ u64 Liverpool::HashRegisterPacket(u64 checksum, const u32* words, u32 count) {
     return checksum;
 }
 
+bool Liverpool::CpDecoderEnabled() {
+    static const bool enabled = [] {
+        // Opt-in for now: the GPU thread spends ~7 % more per draw than the old walk (3.86 vs
+        // 4.13 us on a 5700X3D), the cause not found yet.
+        const char* env = std::getenv("BB_CP_DECODER");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            std::printf("GPU: command buffers decoded by the translator's own decoder (gpu/cp)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+BbCp::Decoder& Liverpool::CpDecoder() {
+    if (cp_decoder) {
+        return *cp_decoder;
+    }
+    // Exactly what ApplyGraphicsRegisterPacket records: the blocks written, the packets' checksum.
+    struct Observer final : BbCp::RegisterObserver {
+        Liverpool* self;
+        void OnRegisterPacket(std::span<const u32> words, std::span<const BbCp::RegisterWrite> writes,
+                              bool clear_state) override {
+            if (clear_state) {
+                self->pipe_dirty.Clear();
+                self->pipe_dirty.reset = true;
+            }
+            for (const auto& write : writes) {
+                self->pipe_dirty.Mark(write.index, write.count);
+            }
+            self->gfx_reg_checksum =
+                HashRegisterPacket(self->gfx_reg_checksum, words.data(), u32(words.size()));
+        }
+    };
+    auto observer = std::make_unique<Observer>();
+    observer->self = this;
+    cp_decoder = std::make_unique<BbCp::Decoder>(
+        std::span<u32, BbCp::Bank::End>{regs.reg_array.data(), BbCp::Bank::End},
+        BbCp::DecoderOptions{.compute_sh_to_owner = true,
+                             .compute_words = sizeof(ComputeProgram) / 4});
+    static Regs defaults;
+    defaults.SetDefaults();
+    cp_decoder->Registers().SetDefaults(defaults.reg_array);
+    cp_decoder->SetObserver(observer.get());
+    cp_observer = std::move(observer);
+    return *cp_decoder;
+}
+
 void Liverpool::ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header, u64& checksum,
                                              RegDirty* dirty) {
     const u32 count = header->type3.NumWords();
@@ -876,6 +1028,12 @@ struct DcbStats {
     u64 buffers[2]{}, with_draws[2]{}, draws[2]{}, dispatches[2]{}, max_draws[2]{};
     u64 clear_first[2]{}, ctx_before[2]{}, sh_before[2]{}, ibs[2]{}, dwords[2]{};
     u64 hist[2][6]{}; // draws per buffer: 0, 1-9, 10-99, 100-499, 500-1999, 2000+
+    // Packets by opcode (graphics, any depth), EVENT_WRITE by event type, EOP by data and
+    // interrupt select, EOS by command, WAIT_REG_MEM by memory space and engine.
+    u64 opcodes[256]{}, events[64]{}, eop_data[8]{}, eop_int[4]{}, eos_cmd[8]{}, wait_mem[2][2]{};
+    // WAIT_REG_MEM outcomes: VO label, a fence pending in stream order, met at once, waited; and
+    // the time waited.
+    u64 wait_outcome[4]{}; double wait_ms = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 DcbStats g_dcb_stats;
@@ -897,6 +1055,112 @@ bool IsDrawOpcode(PM4ItOpcode op) {
     }
 }
 
+// bbport BB_CP_SHADOW=1: the translator's own decoder (gpu/cp, step 2 of
+// docs/TRANSLATOR_ARCHITECTURE.ru.md) decodes every top-level graphics buffer as well, from the
+// same state. Once this decoder is done with the buffer both register files must be equal (the
+// compute program's SH range aside: this one keeps it per queue); the first differences are
+// printed and the shadow takes this state again. Off with the PM4 self-test (its packets are not
+// in the game's buffers).
+namespace {
+static_assert(offsetof(Regs, index_base_address) / 4 == BbCp::Reg::VgtDmaBaseHi);
+static_assert(offsetof(Regs, draw_initiator) / 4 == BbCp::Reg::VgtDrawInitiator);
+static_assert(offsetof(Regs, max_index_size) / 4 == BbCp::Reg::VgtDmaMaxSize);
+static_assert(offsetof(Regs, index_buffer_type) / 4 == BbCp::Reg::VgtDmaIndexType);
+static_assert(offsetof(Regs, cp_strmout_cntl) / 4 == BbCp::Reg::CpStrmoutCntl);
+static_assert(offsetof(Regs, num_indices) / 4 == BbCp::Reg::VgtNumIndices);
+static_assert(offsetof(Regs, num_instances) / 4 == BbCp::Reg::VgtNumInstances);
+static_assert(Regs::NumRegs == BbCp::Bank::End && Regs::ShRegWordOffset == BbCp::Bank::Sh);
+static_assert(Regs::ContextRegWordOffset == BbCp::Bank::Context);
+static_assert(Regs::ConfigRegWordOffset == BbCp::Bank::Config);
+static_assert(Regs::UconfigRegWordOffset == BbCp::Bank::Uconfig);
+
+struct CpShadowSink final : BbCp::Sink {
+    std::span<const u32> ResolveIndirectBuffer(u64 address, u32 dwords) override {
+        return {reinterpret_cast<const u32*>(address), dwords};
+    }
+    u32 ConditionalSkip(u64 address, u32 exec_count, const BbCp::Packet&) override {
+        ++conditionals;
+        return *reinterpret_cast<const u32*>(address) == 0 ? exec_count : 0;
+    }
+    void OnBadPacket(std::span<const u32>, const char* what, int depth) override {
+        std::printf("CP shadow: %s (depth %d)\n", what, depth);
+    }
+    u64 conditionals = 0;
+};
+
+struct CpShadow {
+    BbCp::Decoder decoder;
+    bool started = false;
+    u64 buffers = 0, equal = 0, conditionals = 0;
+    std::chrono::steady_clock::time_point report = std::chrono::steady_clock::now();
+};
+
+CpShadow& Shadow() {
+    static CpShadow shadow;
+    return shadow;
+}
+
+bool CpShadowEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_CP_SHADOW");
+        return env && env[0] == '1' && !Pm4SelfTest::Enabled() && !Liverpool::CpDecoderEnabled();
+    }();
+    return enabled;
+}
+
+void CpShadowDecode(std::span<const u32> dcb, const Regs& regs) {
+    auto& shadow = Shadow();
+    if (!shadow.started) {
+        static Regs defaults;
+        defaults.SetDefaults();
+        shadow.decoder.Registers().SetDefaults(defaults.reg_array);
+        shadow.decoder.Registers().Write(0, regs.reg_array);
+        shadow.started = true;
+    }
+    CpShadowSink sink;
+    shadow.decoder.Decode(dcb, sink);
+    shadow.conditionals += sink.conditionals;
+}
+
+void CpShadowCompare(const Regs& regs) {
+    auto& shadow = Shadow();
+    ++shadow.buffers;
+    const auto words = shadow.decoder.Registers().Words();
+    constexpr u32 ComputeFirst = BbCp::ComputeShFirst;
+    constexpr u32 ComputeEnd = ComputeFirst + sizeof(ComputeProgram) / 4 + 1;
+    u32 differences = 0;
+    for (u32 i = 0; i < Regs::NumRegs; ++i) {
+        if (words[i] == regs.reg_array[i] || (i >= ComputeFirst && i < ComputeEnd)) {
+            continue;
+        }
+        if (++differences <= 8) {
+            std::printf("CP shadow: register %#x: own decoder %#x, this one %#x (buffer %llu)\n",
+                        i, words[i], regs.reg_array[i], (unsigned long long)shadow.buffers);
+        }
+    }
+    if (differences == 0) {
+        ++shadow.equal;
+    } else {
+        std::printf("CP shadow: %u registers differ; taking this decoder's state\n", differences);
+        shadow.decoder.Registers().Write(0, regs.reg_array);
+    }
+    if (const auto now = std::chrono::steady_clock::now();
+        now - shadow.report >= std::chrono::seconds(5)) {
+        const auto& stats = shadow.decoder.Stats();
+        std::printf("CP shadow: %llu of %llu buffers with equal registers; %llu packets, %llu "
+                    "draws, %llu dispatches, %llu indirect buffers, %llu bad, %llu conditional\n",
+                    (unsigned long long)shadow.equal, (unsigned long long)shadow.buffers,
+                    (unsigned long long)stats.packets, (unsigned long long)stats.draws,
+                    (unsigned long long)stats.dispatches,
+                    (unsigned long long)stats.indirect_buffers, (unsigned long long)stats.bad,
+                    (unsigned long long)shadow.conditionals);
+        shadow.decoder.ResetStats();
+        shadow.buffers = shadow.equal = shadow.conditionals = 0;
+        shadow.report = now;
+    }
+}
+} // namespace
+
 void ScanDcb(std::span<const u32> dcb, int depth) {
     auto& st = g_dcb_stats;
     const int d = depth > 0 ? 1 : 0;
@@ -913,6 +1177,22 @@ void ScanDcb(std::span<const u32> dcb, int depth) {
             break;
         }
         const PM4ItOpcode op = header->type3.opcode;
+        ++st.opcodes[static_cast<u8>(op)];
+        if (op == PM4ItOpcode::EventWrite) {
+            ++st.events[reinterpret_cast<const PM4CmdEventWrite*>(header)->event_control & 63];
+        } else if (op == PM4ItOpcode::EventWriteEop) {
+            const auto* eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+            ++st.eop_data[static_cast<u32>(eop->data_sel.Value()) & 7];
+            ++st.eop_int[static_cast<u32>(eop->int_sel.Value()) & 3];
+        } else if (op == PM4ItOpcode::EventWriteEos) {
+            ++st.eos_cmd[static_cast<u32>(
+                             reinterpret_cast<const PM4CmdEventWriteEos*>(header)->command.Value()) &
+                         7];
+        } else if (op == PM4ItOpcode::WaitRegMem) {
+            const auto* wait = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+            ++st.wait_mem[static_cast<u32>(wait->mem_space.Value())]
+                         [static_cast<u32>(wait->engine.Value())];
+        }
         if (IsDrawOpcode(op)) {
             ++draws;
         } else if (op == PM4ItOpcode::DispatchDirect || op == PM4ItOpcode::DispatchIndirect) {
@@ -967,6 +1247,35 @@ void ScanDcb(std::span<const u32> dcb, int depth) {
                         static_cast<unsigned long long>(st.hist[k][4]),
                         static_cast<unsigned long long>(st.hist[k][5]));
         }
+        std::string line;
+        for (u32 op = 0; op < 256; ++op) {
+            if (st.opcodes[op]) {
+                line += fmt::format(" {}:{:.0f}", magic_enum::enum_name(PM4ItOpcode(op)),
+                                    st.opcodes[op] / secs);
+            }
+        }
+        std::printf("PM4 packets/s:%s\n", line.c_str());
+        line.clear();
+        for (u32 ev = 0; ev < 64; ++ev) {
+            if (st.events[ev]) {
+                line += fmt::format(" {}:{:.0f}", magic_enum::enum_name(EventType(ev)),
+                                    st.events[ev] / secs);
+            }
+        }
+        std::printf("PM4 events/s:%s; EOP data_sel %.0f/%.0f/%.0f/%.0f/%.0f (none/32/64/clock/perf)"
+                    " int_sel %.0f/%.0f/%.0f/%.0f; EOS cmd %.0f/%.0f/%.0f/%.0f/%.0f; WAIT_REG_MEM "
+                    "reg me/pfp %.0f/%.0f mem me/pfp %.0f/%.0f\n",
+                    line.c_str(), st.eop_data[0] / secs, st.eop_data[1] / secs,
+                    st.eop_data[2] / secs, st.eop_data[3] / secs, st.eop_data[4] / secs,
+                    st.eop_int[0] / secs, st.eop_int[1] / secs, st.eop_int[2] / secs,
+                    st.eop_int[3] / secs, st.eos_cmd[0] / secs, st.eos_cmd[1] / secs,
+                    st.eos_cmd[2] / secs, st.eos_cmd[3] / secs, st.eos_cmd[4] / secs,
+                    st.wait_mem[0][0] / secs, st.wait_mem[0][1] / secs, st.wait_mem[1][0] / secs,
+                    st.wait_mem[1][1] / secs);
+        std::printf("WAIT_REG_MEM outcomes/s: VO label %.0f, pending fence %.0f, met %.0f, waited "
+                    "%.0f (%.2f ms/s)\n",
+                    st.wait_outcome[0] / secs, st.wait_outcome[1] / secs,
+                    st.wait_outcome[2] / secs, st.wait_outcome[3] / secs, st.wait_ms / secs);
         st = DcbStats{};
     }
 }
@@ -997,6 +1306,70 @@ void ReportBadPacket(uintptr_t base, std::size_t dwords, const u32* at, u64 seq,
 }
 } // namespace
 
+void Liverpool::SyncForCpuRead(VAddr address, u64 size) {
+    if (!rasterizer) {
+        return;
+    }
+    // The command processor reads memory when it reaches the packet; the GPU work recorded before
+    // it may still be queued or running here (this thread decodes ahead of it).
+    static const bool trace = std::getenv("BB_SYNC_TRACE") != nullptr;
+    if (trace) std::printf("SyncForCpuRead %#llx: drain\n", (unsigned long long)address);
+    rasterizer->DrainDrawPipe();
+    if (trace) std::printf("SyncForCpuRead: finish\n");
+    rasterizer->Finish();
+    if (trace) std::printf("SyncForCpuRead: read memory\n");
+    rasterizer->ReadMemory(address, size, true); // this is the thread ReadMemory would ask
+    if (trace) std::printf("SyncForCpuRead: done\n");
+}
+
+bool Liverpool::PredicationSkips(const PM4Header* header) {
+    if (!predication.active || header->type3.predicate.Value() == PM4Predicate::PredDisable) {
+        return false;
+    }
+    if (!predication.evaluated) {
+        predication.evaluated = true;
+        bool any = false, ready = true;
+        for (const auto& test : predication.tests) {
+            switch (static_cast<PM4CmdSetPredication::Op>(test.op)) {
+            case PM4CmdSetPredication::Op::ZPass: {
+                SyncForCpuRead(test.address, u64(num_counter_pairs) * 16);
+                // The samples between the begin and the end counters of every depth block.
+                constexpr u64 Valid = 0x8000000000000000ULL;
+                const auto* counters = reinterpret_cast<const u64*>(test.address);
+                u64 samples = 0;
+                for (u32 i = 0; i < num_counter_pairs; ++i) {
+                    const u64 begin = counters[i * 2], end = counters[i * 2 + 1];
+                    if (!(begin & Valid) || !(end & Valid)) {
+                        ready = false;
+                        continue;
+                    }
+                    samples += (end & ~Valid) - (begin & ~Valid);
+                }
+                any |= samples != 0;
+                break;
+            }
+            case PM4CmdSetPredication::Op::Bool64:
+                SyncForCpuRead(test.address, sizeof(u64));
+                any |= *reinterpret_cast<const u64*>(test.address) != 0;
+                break;
+            case PM4CmdSetPredication::Op::Bool32:
+                SyncForCpuRead(test.address, sizeof(u32));
+                any |= *reinterpret_cast<const u32*>(test.address) != 0;
+                break;
+            default:
+                // PrimCount (streamout overflow): no streamout overflow is tracked; it held.
+                any |= !predication.draw_if_true;
+                break;
+            }
+        }
+        const bool draw = (!ready && predication.hint_no_wait) ||
+                          (predication.draw_if_true ? any : !any);
+        predication.skip = !draw;
+    }
+    predication.skipped += predication.skip ? 1 : 0;
+    return predication.skip;
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
                                            u64 seq, std::shared_ptr<SubmittedCopy> copy) {
     FIBER_ENTER(dcb_task_name);
@@ -1024,10 +1397,64 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         RESUME_GFX(ce_task);
     }
 
+    // bbport BB_PM4_SELFTEST: test packets decoded before and after this submission, as a
+    // nested indirect buffer would be (pm4_selftest.h).
+    Pm4SelfTest::Injection selftest{};
+    if (seq != NoSeq && Pm4SelfTest::Enabled()) {
+        selftest = Pm4SelfTest::Next(
+            static_cast<u32>(dcb.size()),
+            {.sync_for_cpu_read = [this](VAddr address, u64 size) { SyncForCpuRead(address, size); },
+             .predicated_skips = [this] { return predication.skipped; },
+             .occlusion_events = [this] { return rasterizer ? rasterizer->OcclusionEvents() : 0; }});
+        if (!selftest.before.empty()) {
+            auto task = ProcessGraphics(selftest.before, {});
+            g_dcb_depth = dcb_depth + 1;
+            RESUME_GFX(task);
+            g_dcb_depth = dcb_depth;
+            while (!task.handle.done()) {
+                YIELD_GFX();
+                RESUME_GFX(task);
+            }
+        }
+    }
+
+    if (seq != NoSeq && CpShadowEnabled()) {
+        CpShadowDecode(dcb, regs);
+    }
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     const std::size_t dcb_dwords = dcb.size();
-    while (!dcb.empty()) {
+    // bbport BB_CP_DECODER=1: packets and their register writes come from the
+    // translator's own decoder (gpu/cp); what each packet does stays below.
+    const u32* const dcb_end = dcb.data() + dcb.size();
+    struct CpSink final : BbCp::Sink {
+        uintptr_t base;
+        std::size_t dwords;
+        u64 seq;
+        int depth;
+        void OnBadPacket(std::span<const u32> rest, const char* what, int) override {
+            ReportBadPacket(base, dwords, rest.data(), seq, depth);
+            UNREACHABLE_MSG("PM4: {}", what);
+        }
+    } cp_sink;
+    cp_sink.base = base_addr;
+    cp_sink.dwords = dcb_dwords;
+    cp_sink.seq = seq;
+    cp_sink.depth = dcb_depth;
+    std::optional<BbCp::Cursor> cp_cursor;
+    if (CpDecoderEnabled()) {
+        cp_cursor.emplace(CpDecoder(), dcb, cp_sink, dcb_depth, false);
+    }
+    while (true) {
         ProcessCommands();
+        if (cp_cursor) {
+            const auto packet = cp_cursor->Next();
+            if (!packet) {
+                break;
+            }
+            dcb = {packet->body.data() - 1, dcb_end}; // its packet first
+        } else if (dcb.empty()) {
+            break;
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -1049,7 +1476,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
-            ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
+            if (!cp_cursor) {
+                ApplyGraphicsRegisterPacket(regs, header, gfx_reg_checksum, &pipe_dirty);
+            }
             // DmaData to 0x3022C does nothing here (skipped below): no need to wait.
             if (rasterizer && !PipelinedOpcode(opcode) &&
                 !(opcode == PM4ItOpcode::DmaData &&
@@ -1205,7 +1634,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break; // registers: ApplyGraphicsRegisterPacket
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                // bbport: evaluated at the first predicated draw or dispatch (PredicationSkips).
+                const auto* set = reinterpret_cast<const PM4CmdSetPredication*>(header);
+                if (set->op == PM4CmdSetPredication::Op::Clear) {
+                    predication.active = false;
+                    predication.tests.clear();
+                    break;
+                }
+                if (!set->continue_ || !predication.active) {
+                    predication.tests.clear();
+                }
+                predication.tests.push_back({u32(set->op.Value()), set->Address()});
+                predication.active = true;
+                predication.evaluated = false;
+                predication.draw_if_true = set->draw_if_true != 0;
+                predication.hint_no_wait = set->hint_no_wait != 0;
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -1220,6 +1663,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const auto* prepared = draw_prep ? draw_prep->NextDraw() : nullptr;
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 rasterizer->ScopeMarker("gfx:{}:DrawIndex2", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->Draw(true, 0, prepared); });
                 break;
@@ -1235,6 +1681,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const auto* prepared = draw_prep ? draw_prep->NextDraw() : nullptr;
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 rasterizer->ScopeMarker(
                     "gfx:{}:DrawIndexOffset2", fmt::make_format_args(cmd_address),
                     [&] { rasterizer->Draw(true, draw_index_off->index_offset, prepared); });
@@ -1250,11 +1699,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 const auto* prepared = draw_prep ? draw_prep->NextDraw() : nullptr;
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto", fmt::make_format_args(cmd_address),
                                         [&] { rasterizer->Draw(false, 0, prepared); });
                 break;
             }
             case PM4ItOpcode::DrawIndirect: {
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirect*>(header);
                 const auto offset = draw_indirect->data_offset;
                 const auto stride = sizeof(DrawIndirectArgs);
@@ -1274,6 +1729,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DrawIndirectMulti: {
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 const auto* draw_indirect =
                     reinterpret_cast<const PM4CmdDrawIndirectMulti*>(header);
                 const auto offset = draw_indirect->data_offset;
@@ -1294,6 +1752,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirect: {
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 const auto* draw_index_indirect =
                     reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
                 const auto offset = draw_index_indirect->data_offset;
@@ -1314,6 +1775,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirectMulti: {
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 const auto* draw_index_indirect =
                     reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
                 const auto offset = draw_index_indirect->data_offset;
@@ -1334,6 +1798,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirectCountMulti: {
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 const auto* draw_index_indirect =
                     reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
                 const auto offset = draw_index_indirect->data_offset;
@@ -1357,6 +1824,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DispatchDirect: {
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
                 auto& cs_program = GetCsRegs();
                 cs_program.dim_x = dispatch_direct->dim_x;
@@ -1376,6 +1846,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DispatchIndirect: {
+                if (PredicationSkips(header)) {
+                    break;
+                }
                 const auto* dispatch_indirect =
                     reinterpret_cast<const PM4CmdDispatchIndirect*>(header);
                 auto& cs_program = GetCsRegs();
@@ -1413,7 +1886,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
                     // registers: ApplyGraphicsRegisterPacket
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-                    if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                    if (event->event_type.Value() == EventType::PixelPipeStatDump ||
+                        event->event_type.Value() == EventType::ZpassDone) {
+                        // bbport: the samples that passed, counted by Vulkan occlusion queries
+                        // and written by the GPU in stream order (vk_occlusion.h).
+                        if (rasterizer && Vulkan::Rasterizer::OcclusionTranslated()) {
+                            const ZpassEvent zpass{event->Address<VAddr>(), u32(num_counter_pairs)};
+                            rasterizer->RunInOrder(&RunZpassDone, &zpass, sizeof(zpass),
+                                                   BbToggle::PipelinedMemoryWrites, false);
+                            break;
+                        }
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
@@ -1516,21 +1998,118 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::CopyData: {
+                // bbport: the command processor's copy, translated: values known when it is
+                // decoded (immediates, registers, the clock) are written by the GPU in stream
+                // order like WRITE_DATA; copies from memory or GDS are GPU copies in stream order
+                // like DMA_DATA.
                 const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
-                LOG_WARNING(Render,
-                            "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
-                            "count_sel = {}, wr_confirm = {}, engine_sel = {}",
-                            u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
-                            copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
-                            u32(copy_data->engine_sel.Value()));
+                const u32 num_bytes = copy_data->count_sel.Value() ? 8 : 4;
+                const auto src = copy_data->src_sel.Value();
+                const auto dst = copy_data->dst_sel.Value();
+                const bool to_memory = dst == CopyDataDst::MemorySync ||
+                                       dst == CopyDataDst::TCL2 || dst == CopyDataDst::MemoryAsync;
+                const bool from_memory = src == CopyDataSrc::Memory || src == CopyDataSrc::TCL2;
+                std::optional<u64> value;
+                switch (src) {
+                case CopyDataSrc::Immediate:
+                    value = copy_data->src_addr_lo |
+                            (num_bytes == 8 ? u64(copy_data->src_addr_hi) << 32 : 0);
+                    break;
+                case CopyDataSrc::MappedRegister: {
+                    const u32 reg = copy_data->src_addr_lo & 0x3ffff;
+                    if (reg + num_bytes / 4 <= regs.reg_array.size()) {
+                        value = regs.reg_array[reg] |
+                                (num_bytes == 8 ? u64(regs.reg_array[reg + 1]) << 32 : 0);
+                    }
+                    break;
+                }
+                case CopyDataSrc::GpuClock:
+                    value = GetGpuClock64(); // the clock of the end-of-pipe timestamps
+                    break;
+                default:
+                    break;
+                }
+                if (src == CopyDataSrc::GpuClock && rasterizer && to_memory && num_bytes == 8 &&
+                    Vulkan::Rasterizer::HonestLabels()) {
+                    const VAddr target = copy_data->DstAddress<VAddr>();
+                    if (rasterizer->RunInOrder(&RunGpuClockCopy, &target, sizeof(target),
+                                               BbToggle::PipelinedMemoryWrites, false)) {
+                        rasterizer->NotePendingGpuWrite(target, num_bytes);
+                    }
+                    break;
+                }
+                const bool handled_source =
+                    value || from_memory || src == CopyDataSrc::Gds;
+                if (!rasterizer || !handled_source ||
+                    !(to_memory || dst == CopyDataDst::Gds)) {
+                    static bool warned = false;
+                    if (!std::exchange(warned, true)) {
+                        LOG_WARNING(Render,
+                                    "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
+                                    "count_sel = {}",
+                                    u32(src), u32(dst), copy_data->count_sel.Value());
+                    }
+                    break;
+                }
+                if (to_memory && value) {
+                    // A WRITE_DATA of the value, through its path (GPU write, fence tracking).
+                    alignas(8) std::array<u32, 6> packet{};
+                    auto* write = reinterpret_cast<PM4CmdWriteData*>(packet.data());
+                    write->header = PM4Type3Header{PM4ItOpcode::WriteData, 2 + num_bytes / 4};
+                    write->dst_sel.Assign(5);
+                    write->Address(copy_data->DstAddress<VAddr>());
+                    std::memcpy(write->data, &*value, num_bytes);
+                    if (rasterizer->RunInOrder(&RunWriteData, packet.data(),
+                                               (write->header.NumWords() + 1) * sizeof(u32),
+                                               BbToggle::PipelinedMemoryWrites, false)) {
+                        NotePendingWrite(*write, num_bytes);
+                        rasterizer->NotePendingGpuWrite(copy_data->DstAddress<VAddr>(), num_bytes);
+                    }
+                    break;
+                }
+                CopyDataTask task{};
+                task.num_bytes = num_bytes;
+                task.dst_gds = dst == CopyDataDst::Gds;
+                task.dst = task.dst_gds ? copy_data->dst_addr_lo : copy_data->DstAddress<VAddr>();
+                if (value) {
+                    task.fill = true;
+                    task.value = *value;
+                } else {
+                    task.src_gds = src == CopyDataSrc::Gds;
+                    task.src =
+                        task.src_gds ? copy_data->src_addr_lo : copy_data->SrcAddress<VAddr>();
+                    if (!task.src_gds) {
+                        rasterizer->NotePendingRead(task.src, num_bytes);
+                    }
+                }
+                rasterizer->RunInOrder(&RunCopyData, &task, sizeof(task),
+                                       BbToggle::PipelinedMemoryWrites, false);
+                if (!task.dst_gds) {
+                    rasterizer->NotePendingGpuWrite(task.dst, num_bytes);
+                }
                 break;
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
                 if (mem_semaphore->IsSignaling()) {
-                    mem_semaphore->Signal();
+                    if (rasterizer && MemSemaphoreInOrder()) {
+                        rasterizer->RunInOrder(&RunMemSemaphoreSignal, mem_semaphore,
+                                               sizeof(*mem_semaphore), BbToggle::PipelinedTasks,
+                                               false);
+                    } else {
+                        mem_semaphore->Signal();
+                    }
                 } else {
                     while (!mem_semaphore->Signaled()) {
+                        // A signal in stream order may wait for work still in the draw pipe or
+                        // not submitted yet; this thread would spin on it forever.
+                        if (rasterizer && !rasterizer->DrawPipeIdle()) {
+                            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                            continue;
+                        }
+                        if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
+                            rasterizer->Flush();
+                        }
                         YIELD_GFX();
                     }
                     mem_semaphore->Decrement();
@@ -1564,6 +2143,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rasterizer) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     }
+                    if (dcb_stats) {
+                        ++g_dcb_stats.wait_outcome[0];
+                    }
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
@@ -1574,10 +2156,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                !BbToggle::Disabled(BbToggle::PendingFenceWaits) &&
                                PendingFenceValue(wait_reg_mem->Address<VAddr>(), value) &&
                                wait_reg_mem->TestValue(value)) {
+                    if (dcb_stats) {
+                        ++g_dcb_stats.wait_outcome[1];
+                    }
                     break;
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
+                const bool met = wait_reg_mem->Test(regs.reg_array);
+                const auto wait_start = std::chrono::steady_clock::now();
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     if (rasterizer && !rasterizer->DrawPipeIdle()) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
@@ -1589,6 +2176,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         rasterizer->Flush();
                     }
                     YIELD_GFX();
+                }
+                if (dcb_stats) {
+                    ++g_dcb_stats.wait_outcome[met ? 2 : 3];
+                    g_dcb_stats.wait_ms += std::chrono::duration<double, std::milli>(
+                                               std::chrono::steady_clock::now() - wait_start)
+                                               .count();
                 }
                 break;
             }
@@ -1639,8 +2232,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
-                const auto skip = *cond_exec->Address() == false;
+                bool skip = *cond_exec->Address() == false;
+                // bbport: the condition as the command processor reads it when it gets here: a
+                // fence the recording thread has yet to write (in stream order), else once the
+                // GPU has done the work before this packet (this thread decodes ahead of it).
+                if (rasterizer && VideoCore::GuestInPlace()) {
+                    const VAddr address = reinterpret_cast<VAddr>(cond_exec->Address());
+                    u32 value = 0;
+                    if (!PendingFenceValue(address, value)) {
+                        SyncForCpuRead(address, sizeof(u32));
+                        value = *reinterpret_cast<const u32*>(address);
+                    }
+                    skip = value == 0;
+                }
                 if (skip) {
+                    if (cp_cursor) {
+                        cp_cursor->Skip(cond_exec->exec_count.Value());
+                    }
                     dcb = NextPacket(dcb,
                                      header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
                     continue;
@@ -1656,6 +2264,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
     }
 
+    if (!selftest.after.empty()) {
+        auto task = ProcessGraphics(selftest.after, {});
+        g_dcb_depth = dcb_depth + 1;
+        RESUME_GFX(task);
+        g_dcb_depth = dcb_depth;
+        while (!task.handle.done()) {
+            YIELD_GFX();
+            RESUME_GFX(task);
+        }
+    }
+
     if (ce_task.handle) {
         while (!ce_task.handle.done()) {
             RESUME_GFX(ce_task);
@@ -1663,6 +2282,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ce_task.handle.destroy();
     }
 
+    if (seq != NoSeq && CpShadowEnabled()) {
+        CpShadowCompare(regs);
+    }
     if (rasterizer && seq != NoSeq) {
         rasterizer->RetireSubmission(); // prepared draws live until the recording thread is past
     }
@@ -1927,9 +2549,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
-                mem_semaphore->Signal();
+                // In stream order: after the dispatches recorded before it (MemSemaphoreInOrder).
+                if (rasterizer && MemSemaphoreInOrder()) {
+                    const PM4CmdMemSemaphore semaphore = *mem_semaphore;
+                    rasterizer->SignalAfterGpu([semaphore] { semaphore.Signal(); });
+                } else {
+                    mem_semaphore->Signal();
+                }
             } else {
                 while (!mem_semaphore->Signaled()) {
+                    if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
+                        rasterizer->Flush();
+                    }
                     YIELD_ASC(vqid);
                 }
                 mem_semaphore->Decrement();
@@ -1956,6 +2587,22 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 rasterizer && Vulkan::Rasterizer::HonestLabels() &&
                 rm->data_sel.Value() != DataSelect::GdsMemStore) {
                 rasterizer->ProcessDownloadImages();
+                if (rm->data_sel.Value() == DataSelect::GpuClock64 &&
+                    rm->int_sel.Value() == InterruptSelect::None &&
+                    rasterizer->WriteTimestampOnGpu(rm->Address<VAddr>(), true)) {
+                    break;
+                }
+                // bbport: a label without an interrupt is written by the GPU (end of pipe).
+                if ((rm->data_sel.Value() == DataSelect::Data32Low ||
+                     rm->data_sel.Value() == DataSelect::Data64) &&
+                    rm->int_sel.Value() == InterruptSelect::None &&
+                    rasterizer->WriteLabelOnGpu(
+                        rm->Address<VAddr>(),
+                        rm->data_sel.Value() == DataSelect::Data32Low ? rm->DataDWord()
+                                                                      : rm->DataQWord(),
+                        rm->data_sel.Value() == DataSelect::Data32Low ? 4 : 8)) {
+                    break;
+                }
                 const PM4CmdReleaseMem release = *rm;
                 const u32 pipe_id = queue.pipe_id;
                 const bool writes = release.data_sel.Value() != DataSelect::None;

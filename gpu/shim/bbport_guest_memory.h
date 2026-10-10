@@ -34,6 +34,17 @@ bool Usable(const Vulkan::Instance& instance);
 /// model) may run on this GPU: tested on AMD only. Elsewhere it stays off (the 0.3 model) unless
 /// BB_PC_MODEL_ANY_GPU=1.
 bool PcModelGpu(const Vulkan::Instance& instance);
+/// Whether the chunks are imported host memory (NVIDIA with BB_PC_MODEL_ANY_GPU=1). Valid after
+/// Usable(). The arena then keeps the first binding of every block (BufferCache FixedArena).
+bool HostImported();
+/// bbport BB_LAYER_MEMORY=1: the layer's memory module (gpu/layer/bblayer_gpu_memory.h) gives the
+/// GPU the game's memory through the chunk buffers instead of a sparse arena. Chunks are then one
+/// per direct memory allocation (a mapping lies whole in one chunk), their buffers take every use
+/// (vertex, index, indirect, texel, device address) and are registered with the module.
+bool LayerMemory();
+/// The external memory handle type of the chunks (dma-buf or imported host memory): buffers bound
+/// to them (the arena, chunk buffers) are created with it. Valid after Usable().
+vk::ExternalMemoryHandleTypeFlagBits HandleType();
 /// Hands the runtime direct memory chunks from now on (when enabled and supported).
 void Install(const Vulkan::Instance& instance);
 /// The chunk holding direct memory address `phys`, or null.

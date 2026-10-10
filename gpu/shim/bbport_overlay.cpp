@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <string_view>
 #include <vector>
 
 #include <SDL3/SDL.h>
@@ -45,7 +46,6 @@ std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
 float base_scale = 1.0f;
-
 // The game's text dialog (ImeDialog, the character name), typed on the keyboard: drawn while it
 // is open. In fullscreen the window title that showed it is not visible (issues #17, #19).
 std::mutex prompt_mutex;
@@ -206,6 +206,8 @@ void Hint(const char* text) {
     }
 }
 
+// The settings menu as in 0.3 and 0.4: one window (moved with the mouse, its place kept in
+// bbport.ini), sections one under the other, ImGui's own widgets and keyboard/gamepad navigation.
 void Menu() {
     auto& s = BbSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -252,8 +254,10 @@ void Menu() {
 
     ImGui::SeparatorText(BbSettings::MenuText("Temporal upscaler", "Временной апскейлер"));
     const char* upscalers[] = {
-        BbSettings::MenuText("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
-        BbSettings::MenuText("TAA (native anti-aliasing)", "TAA (нативное сглаживание)"), "DLSS 4.5 (experimental)"};
+        BbSettings::MenuText("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1",
+        BbSettings::MenuText("TAA (native anti-aliasing)", "TAA (нативное сглаживание)"),
+        "DLSS (NVIDIA RTX)"};
+    static_assert(sizeof(upscalers) / sizeof(upscalers[0]) == BbSettings::UpscalerCount);
     static const char* later[] = {"XeSS"};
     int upscaler = s.upscaler;
     if (ImGui::BeginCombo(BbSettings::MenuText("Upscaler", "Апскейлер"), upscalers[upscaler])) {
@@ -261,6 +265,7 @@ void Menu() {
             const bool supported = i == BbSettings::UpscalerFsr4     ? s.fsr4_supported.load()
                                    : i == BbSettings::UpscalerDlss ? s.dlss_supported.load()
                                    : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
+                                   : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load()
                                                                      : true;
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
@@ -282,36 +287,51 @@ void Menu() {
         }
         ImGui::EndCombo();
     }
-    if (const char* problem = s.fsr4_problem.load()) {
+    if (s.upscaler == BbSettings::UpscalerDlss) {
+        Hint(BbSettings::MenuText(
+            "NVIDIA DLSS Super Resolution (RTX GPUs; Native AA is DLAA). Needs the DLSS bridge "
+            "and NVIDIA's library next to the game; otherwise FSR 3.1 is used.",
+            "NVIDIA DLSS Super Resolution (видеокарты RTX; Native AA — это DLAA). Нужны мост DLSS "
+            "и библиотека NVIDIA рядом с игрой; без них используется FSR 3.1."));
+    }
+    const auto problem_text = [](const char* text) {
         ImGui::PushTextWrapPos();
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
-                           BbSettings::MenuText("FSR 4 unavailable: %s", "FSR 4 недоступен: %s"),
-                           problem);
-        if (!BbSettings::IsFsr4(s.upscaler))
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "%s", text);
+        ImGui::PopTextWrapPos();
+    };
+    if (const char* problem = s.dlss_problem.load(); problem && s.upscaler == BbSettings::UpscalerDlss) {
+        char line[192];
+        std::snprintf(line, sizeof(line), "DLSS: %s", problem);
+        problem_text(line);
+    }
+    if (const char* problem = s.fsr4_problem.load()) {
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      BbSettings::MenuText("FSR 4 unavailable: %s", "FSR 4 недоступен: %s"), problem);
+        problem_text(line);
+        if (!BbSettings::IsFsr4(s.upscaler)) {
+            ImGui::PushTextWrapPos();
             ImGui::TextUnformatted(BbSettings::MenuText(
                 "The mode selected above is active. You can select FSR 4 again.",
                 "Активен режим, выбранный выше. FSR 4 можно выбрать снова."));
-        ImGui::PopTextWrapPos();
+            ImGui::PopTextWrapPos();
+        }
     }
     if (BbSettings::IsFsr4(s.upscaler)) {
         if (s.upscaler == BbSettings::UpscalerFsr411) {
             Hint(BbSettings::MenuText(
-                "FSR 4.1.1 in INT8 mode: the model from AMD's 4.1.1 DLL, reproduced in Vulkan "
-                "(output matches the DLL). One model for Native through Performance and another "
-                "for Ultra Performance. Assets: tools/fsr4cap/build_assets.sh (requires the DLL "
-                "and Proton).",
-                "FSR 4.1.1 в режиме INT8: модель из DLL AMD 4.1.1, воспроизведённая в Vulkan "
-                "(результат совпадает с DLL). Одна модель для Native..Performance и отдельная "
-                "для Ultra Performance. Ассеты: tools/fsr4cap/build_assets.sh (нужны DLL и "
-                "Proton)."));
+                "FSR 4.1.1: the model from AMD's 4.1.1 DLL, reproduced in Vulkan (output matches "
+                "the DLL). Assets are built from your DLL in the launcher.",
+                "FSR 4.1.1: модель из DLL AMD 4.1.1, воспроизведённая в Vulkan (результат совпадает "
+                "с DLL). Ассеты собираются из вашей DLL в лаунчере."));
         } else {
             Hint(BbSettings::MenuText(
                 "FSR 4 in INT8 mode (v07 model from AMD FidelityFX SDK sources). Higher quality "
                 "than FSR 3.1, but the pass is more demanding. Changing the preset rebuilds the "
-                "model (a brief pause). Assets: tools/fetch_fsr4_assets.sh.",
+                "model (a brief pause).",
                 "FSR 4 в режиме INT8 (модель v07 из исходников AMD FidelityFX SDK). Качество выше, "
                 "чем у FSR 3.1, но проход тяжелее. Смена пресета пересобирает модель (короткая "
-                "пауза). Ассеты: tools/fetch_fsr4_assets.sh."));
+                "пауза)."));
         }
         Checkbox(BbSettings::MenuText("FSR 4: auto exposure", "FSR 4: авто-экспозиция"),
                  s.fsr4_auto_exposure);
@@ -367,11 +387,10 @@ void Menu() {
             automatic && automatic[0] == '1') {
             Hint(BbSettings::MenuText(
                 "When output is not 1080p, the entire game renders at the preset resolution "
-                "(startup patch): "
-                "this is fastest on Steam Deck and weaker GPUs. Preset or output resolution "
-                "changes "
-                "require a restart. Enable Live resolution changes below to change them without "
-                "restarting (post-processing then stays at 1080p, which is slower).",
+                "(startup patch): this is fastest on Steam Deck and weaker GPUs. Preset or output "
+                "resolution changes require a restart. Enable Live resolution changes below to "
+                "change them without restarting (post-processing then stays at 1080p, which is "
+                "slower).",
                 "При выводе не 1080p вся игра рисуется в разрешении пресета (патч при запуске): "
                 "это быстрее всего на Steam Deck и слабых GPU. Смена пресета или разрешения "
                 "вывода — после перезапуска. Пункт «Смена разрешения на лету» ниже включает "
@@ -385,11 +404,10 @@ void Menu() {
         }
     } else {
         Hint(BbSettings::MenuText(
-            "Native AA: FSR acts as anti-aliasing. Other presets reduce the scene render "
-            "resolution "
-            "relative to the output. The UI renders at output resolution. "
+            "Native AA: the upscaler acts as anti-aliasing. Other presets reduce the scene render "
+            "resolution relative to the output. The UI renders at output resolution. "
             "The preset applies from the next frame without restarting the game.",
-            "Native AA: FSR работает как сглаживание. Остальные пресеты уменьшают разрешение "
+            "Native AA: апскейлер работает как сглаживание. Остальные пресеты уменьшают разрешение "
             "отрисовки сцены относительно вывода. Интерфейс рисуется в разрешении вывода. "
             "Пресет применяется со следующего кадра без перезапуска игры."));
     }
@@ -486,10 +504,10 @@ void Menu() {
         Hint(BbSettings::MenuText(
             "The final frame and UI size changes at the next frame boundary. "
             "The preset sets the scene size relative to the output: 4K Performance = 1920x1080. "
-            "Changing the size resets FSR history and may cause a brief pause.",
+            "Changing the size resets the upscaler's history and may cause a brief pause.",
             "Размер готового кадра и интерфейса меняется на границе следующего кадра. "
             "Пресет задаёт размер сцены относительно вывода: 4K Performance = 1920x1080. "
-            "Смена размера сбрасывает историю FSR и может вызвать короткую паузу."));
+            "Смена размера сбрасывает историю апскейлера и может вызвать короткую паузу."));
     }
     const char* live_modes[] = {BbSettings::MenuText("Auto (based on GPU)", "Авто (по видеокарте)"),
                                 BbSettings::MenuText("Off (faster)", "Выключена (быстрее)"),
@@ -537,19 +555,22 @@ void Menu() {
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
         const auto& effect = BbSettings::Effects[e];
         Checkbox(BbSettings::MenuText(effect.label, effect.label_ru), s.effects[e]);
+        if (std::string_view(effect.key) == "debug_camera") {
+            Hint(BbSettings::MenuText("Hold Cross and press L3 (keyboard: Space + Z).",
+                                      "Удерживайте Cross и нажмите L3 (клавиатура: Space + Z)."));
+        } else if (std::string_view(effect.key) == "debug_menu") {
+            Hint(BbSettings::MenuText(
+                "Left side of the touchpad (Tab); right side: Backspace. Needs the adhoc folder "
+                "from Nexus mod #253 (the fonts in adhoc/font).",
+                "Левая сторона тачпада (Tab), правая — Backspace. Нужна папка adhoc из мода "
+                "Nexus #253 (шрифты в adhoc/font)."));
+        }
     }
     Hint(BbSettings::MenuText(
         "Effects are enabled and disabled by game patches at startup (patches/Bloodborne.xml). "
         "Motion blur and shadows from dynamic lights place a significant load on the GPU.",
         "Эффекты включаются и выключаются патчами игры при запуске (patches/Bloodborne.xml). "
         "Размытие в движении и тени от динамических источников заметно нагружают GPU."));
-    Hint(BbSettings::MenuText(
-        "Free camera: hold Cross and press L3 (keyboard: Space + Z). "
-        "Debug menu: left touchpad / Tab. Requires DbgFont14h.ccm and DbgFont14h.tpf "
-        "in dvdroot_ps4/font from Nexus mod #253. Right touchpad: Backspace.",
-        "Свободная камера: удерживайте Cross и нажимайте L3 (клавиатура: Space + Z). "
-        "Debug menu: левый touchpad / Tab. Нужны DbgFont14h.ccm и DbgFont14h.tpf "
-        "в dvdroot_ps4/font из мода Nexus #253. Правый touchpad: Backspace."));
 
     bool restart =
         s.object_motion != s.startup_object_motion || s.model_lod != s.startup_model_lod ||
@@ -602,6 +623,7 @@ void FpsCounter() {
                 : s.upscaler == BbSettings::UpscalerFsr4   ? "FSR 4"
                 : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
                 : s.upscaler == BbSettings::UpscalerTaa    ? "TAA"
+                : s.upscaler == BbSettings::UpscalerDlss   ? "DLSS"
                                                            : "");
     ImGui::End();
 }
@@ -628,6 +650,59 @@ void TextPrompt() {
     ImGui::Separator();
     ImGui::TextUnformatted("Keyboard: type, Backspace = delete, Enter = OK, Esc = cancel");
     ImGui::End();
+}
+
+/// BB_MENU_KEYS_FILE=<file> (scripted tests): tokens toggle up down left right enter back l1 r1,
+/// consumed when the file appears (it is removed), one key press per frame.
+void ScriptedKeys() {
+    static const char* path = std::getenv("BB_MENU_KEYS_FILE");
+    static std::chrono::steady_clock::time_point last_check{};
+    static std::vector<std::string> queue;
+    static bool release = false;
+    static ImGuiKey held = ImGuiKey_None;
+    if (!path) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    if (release) {
+        io.AddKeyEvent(held, false);
+        release = false;
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (queue.empty() && now - last_check > std::chrono::milliseconds(100)) {
+        last_check = now;
+        if (FILE* f = std::fopen(path, "r")) {
+            char token[32];
+            while (std::fscanf(f, "%31s", token) == 1) {
+                queue.emplace_back(token);
+            }
+            std::fclose(f);
+            std::remove(path);
+        }
+    }
+    if (queue.empty()) {
+        return;
+    }
+    const std::string token = queue.front();
+    queue.erase(queue.begin());
+    if (token == "toggle") {
+        SetOpen(!menu_open);
+        return;
+    }
+    held = token == "up" ? ImGuiKey_GamepadDpadUp : token == "down" ? ImGuiKey_GamepadDpadDown
+         : token == "left" ? ImGuiKey_GamepadDpadLeft : token == "right" ? ImGuiKey_GamepadDpadRight
+         : token == "enter" ? ImGuiKey_GamepadFaceDown : token == "l1" ? ImGuiKey_GamepadL1
+         : token == "r1" ? ImGuiKey_GamepadR1 : token == "kdown" ? ImGuiKey_DownArrow
+         : token == "kup" ? ImGuiKey_UpArrow : ImGuiKey_None;
+    if (token == "back") {
+        SetOpen(false);
+        return;
+    }
+    if (held != ImGuiKey_None) {
+        io.AddKeyEvent(held, true);
+        release = true;
+    }
 }
 
 } // namespace
@@ -840,12 +915,17 @@ bool CapturesInput() {
 }
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
+
     // Present interval for the FPS readout (measured also while nothing is drawn).
     const auto now = std::chrono::steady_clock::now();
     const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
     last_present = now;
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
+    }
+    if (std::getenv("BB_MENU_KEYS_FILE") && initialized) {
+        std::scoped_lock lock{imgui_mutex};
+        ScriptedKeys();
     }
     if (!Visible()) {
         return;

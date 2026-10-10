@@ -19,6 +19,17 @@ data=${BB_DATA_DIR:-.}
 out=$data/out
 mkdir -p "$out"
 export BB_CONFIG=${BB_CONFIG:-$data/bbport.ini}
+# GPU paths are initialized when libbbgpu is loaded, before bbgpu_init receives --user.
+# Select the same user directory now, including for an AppImage or a separate save profile.
+export BB_GPU_USER_DIR=${BB_GPU_USER_DIR:-${BB_USER_DIR:-$data/user}}
+# The drivers' own shader caches keep compiled pipelines between sessions (the port's cache gives
+# them the shaders again at startup): NVIDIA's without its cleanup and with room for the game's
+# pipelines (as Steam sets it), Mesa's with more room than its default.
+export __GL_SHADER_DISK_CACHE=${__GL_SHADER_DISK_CACHE:-1}
+export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=${__GL_SHADER_DISK_CACHE_SKIP_CLEANUP:-1}
+export __GL_SHADER_DISK_CACHE_SIZE=${__GL_SHADER_DISK_CACHE_SIZE:-10737418240}
+export MESA_SHADER_CACHE_MAX_SIZE=${MESA_SHADER_CACHE_MAX_SIZE:-4G}
+mkdir -p "$BB_GPU_USER_DIR"
 # FSR 4.1.1 assets (tools/fsr4cap/build_assets.sh): next to run.sh or in the data directory.
 if [[ -z ${BB_FSR411_DIR:-} && ! -d fsr4_411 && -d $data/fsr4_411 ]]; then
     export BB_FSR411_DIR=$data/fsr4_411
@@ -81,6 +92,10 @@ fps=${BB_FPS:-uncap}
 # and scene targets are copied back: much slower on the Steam Deck and older GPUs). Chosen by
 # BB_LIVE_RES=0/1, else bbport.ini live_resolution=0/1/auto (auto: the GPU check, strong
 # discrete GPUs get them); off when unset. 1080p output and TAA always use the live path.
+# The GPU tools (bb-gpu-capabilities: the game's GPU, its live resolution support).
+if [[ -n ${BB_PROBE:-} ]]; then caps=$(dirname -- "$BB_PROBE")/bb-gpu-capabilities
+elif [[ -n ${BB_PREBUILT:-} ]]; then caps=bin/bb-gpu-capabilities
+else caps=out/bb-gpu-capabilities; fi
 if [[ -z ${BB_RENDER_RES:-} ]]; then
     read -r scaled_render scaled_output < <("$PYTHON" scripts/patches.py --print-scaled --settings "$BB_CONFIG") || true
 fi
@@ -94,9 +109,6 @@ if [[ -n ${scaled_output:-} ]]; then
         done < "$BB_CONFIG"
     fi
     if [[ $live == auto ]]; then
-        if [[ -n ${BB_PROBE:-} ]]; then caps=$(dirname -- "$BB_PROBE")/bb-gpu-capabilities
-        elif [[ -n ${BB_PREBUILT:-} ]]; then caps=bin/bb-gpu-capabilities
-        else caps=out/bb-gpu-capabilities; fi
         live=$("$caps" --live-resolution 2> >(while IFS= read -r line; do
             [[ $line == *MANGOHUD* ]] || printf '%s\n' "$line"; done >&2)) || live=0
     fi
@@ -116,17 +128,46 @@ fi
 # VRAM), 0 = off. BB_GUEST_GPU_MEMORY=1 puts guest direct memory in GPU-visible dma-buf chunks
 # (BB_GUEST_IN_PLACE below implies it: it commits all allocated memory up front and rules out BB_UFFD).
 export BB_PREUPLOAD=${BB_PREUPLOAD:-1}
-# Memory model and translation. BB_PC_MODEL=1 (the launcher's "New memory and translation model",
-# experimental, off by default) selects how a PC release would work: the GPU uses the game's
-# memory where it is (GPU-visible system memory) and keeps the data it reads often in VRAM, the
-# command processor's work is translated rather than emulated (BB_GUEST_IN_PLACE=1 and what
-# depends on it). AMD GPUs only for now: on others the GPU library keeps it off
-# (BB_PC_MODEL_ANY_GPU=1: try it anyway; NVIDIA, whose dma-buf maps at offset 0 only, gets one
-# chunk per direct memory allocation). 0 (default): the model of 0.3 (VRAM copies of the game's
-# memory, write tracking), with the fixes made since. BB_GUEST_IN_PLACE set by hand overrides it.
+# Memory model and translation. BB_PC_MODEL=1 (the launcher's "Memory model": "Auto" gives it to
+# AMD GPUs, the 0.3 model to the others; BB_PC_MODEL=1/0 by hand) selects how a PC release would
+# work: the GPU uses the game's memory where it is (GPU-visible system memory) and keeps the data
+# it reads often in VRAM, the command processor's work is translated rather than emulated
+# (BB_GUEST_IN_PLACE=1 and what depends on it). AMD keeps the game's memory in a sparse arena;
+# other GPUs get the layer's memory module, which binds it in place and keeps VRAM copies without
+# sparse binding (NVIDIA's sparse binding stalls the GPU for seconds); BB_LAYER_MEMORY=1/0 by hand.
+# 0 (the default off AMD): the model of 0.3 (VRAM copies of the game's memory, write tracking),
+# with the fixes made since. BB_GUEST_IN_PLACE set by hand overrides it.
 # BB_AS_0_3=1 (the launcher's developer switch "Synchronisation as in 0.3"): what changed since the
 # 0.3 release is reverted for comparisons: the 0.3 memory model, WRITE_DATA/DMA waiting for every
 # host copy, the scheduler's concurrent recording check.
+# The game's GPU (vendor ID and name), for the choices below that depend on it.
+gpu_vendor= gpu_name=
+if [[ -z ${BB_PC_MODEL:-} || ( ${BB_AUTO_NOHIZ:-1} != 0 && -z ${RADV_DEBUG:-} ) ]]; then
+    IFS=$'\t' read -r gpu_vendor gpu_name < <("$caps" --device 2> /dev/null) || true
+fi
+# Memory model left to the port: the new one on AMD (0x1002), the 0.3 one elsewhere (NVIDIA's
+# path through the memory module is still being measured with testers).
+if [[ -z ${BB_PC_MODEL:-} ]]; then
+    if [[ $gpu_vendor == 0x1002 ]]; then
+        export BB_PC_MODEL=1
+        echo "Memory model: new (AMD GPU${gpu_name:+, $gpu_name}; BB_PC_MODEL=0: the 0.3 model)"
+    else
+        export BB_PC_MODEL=0
+        echo "Memory model: the 0.3 one (${gpu_name:-GPU unknown}; BB_PC_MODEL=1: the new one)"
+    fi
+fi
+# GCN 3-5 under RADV (Polaris, Vega and their APUs): with HiZ, depth compression showed black
+# halos and missing geometry (issues #54, #99); RADV_DEBUG=nohiz fixed it at some cost. Set
+# unless RADV_DEBUG is the user's, BB_AUTO_NOHIZ=0: off.
+if [[ ${BB_AUTO_NOHIZ:-1} != 0 && -z ${RADV_DEBUG:-} && $gpu_name == *"(RADV "* ]]; then
+    for chip in TONGA ICELAND CARRIZO FIJI STONEY POLARIS VEGA RAVEN RENOIR; do
+        if [[ $gpu_name == *"(RADV $chip"* ]]; then
+            export RADV_DEBUG=nohiz
+            echo "RADV: $gpu_name: RADV_DEBUG=nohiz (depth compression artifacts on GCN 3-5; BB_AUTO_NOHIZ=0: off)"
+            break
+        fi
+    done
+fi
 if [[ ${BB_AS_0_3:-0} == 1 ]]; then
     export BB_GUEST_IN_PLACE=0 BB_HOST_COPY_WAITS=all BB_PRODUCER_CHECK=1
 fi

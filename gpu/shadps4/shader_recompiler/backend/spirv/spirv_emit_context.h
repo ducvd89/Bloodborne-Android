@@ -350,6 +350,9 @@ public:
         BufferType buffer_type;
         std::array<Id, u32(PointerSize::NumClass)> offsets;
         std::array<BufferSpv, u32(PointerType::NumAlias)> aliases;
+        /// bbport BB_LAYER_MEMORY: reached through the page table (IsPagedBuffer); the descriptor
+        /// holds {guest address lo, hi, size, write-through, trash address lo, hi} (PagedPointer).
+        bool paged = false;
 
         template <class Self>
         auto& Alias(this Self& self, PointerType alias) {
@@ -361,6 +364,19 @@ public:
             return self.offsets[u32(size)];
         }
     };
+    /// bbport BB_LAYER_MEMORY: an access of `access_bytes` at `byte_offset` of a paged buffer:
+    /// the guest address translated through the page table. `guard` is false out of the
+    /// buffer's range or on an unmapped page; the pointer then goes to a trash area (loads
+    /// select zero with the guard, stores and atomics land there).
+    struct PagedAccess {
+        Id pointer;
+        Id guard;
+    };
+    PagedAccess PagedPointer(const BufferDefinition& buffer, Id byte_offset, u32 access_bytes,
+                             Id pointee, bool guest_write = false);
+    /// A PhysicalStorageBuffer pointer to `pointee` (cached per type).
+    Id PhysicalPointer(Id pointee);
+
 
     Bindings& binding;
     boost::container::small_vector<Id, 16> buf_type_ids;
@@ -427,6 +443,7 @@ private:
     Id DefineUfloatM5ToFloat32(u32 mantissa_bits, std::string_view name);
 
     Id DefineGetBdaPointer();
+    std::unordered_map<u32, Id> physical_pointer_types; ///< by pointee Id (PhysicalPointer)
 
     Id DefineReadConst(bool dynamic);
 

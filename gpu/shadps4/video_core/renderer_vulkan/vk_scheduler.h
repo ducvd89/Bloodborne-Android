@@ -728,7 +728,10 @@ public:
     void BeginRendering(const RenderState& new_state);
 
     /// Ends current rendering scope.
-    void EndRendering();
+    [[gnu::noinline]] void EndRendering();
+    /// BB_PASS_BREAK_TRACE=1 (diagnostics): who ended a render pass that began again with the same
+    /// state (a break: its attachments stored and loaded again), every 5 s.
+    static void TracePassBreak(void* caller);
 
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
@@ -812,9 +815,9 @@ public:
             func(current_cmdbuf);
             return;
         }
-        if (!record_chunk->Push(std::forward<Func>(func))) {
+        if (!CurrentChunk().Push(std::forward<Func>(func))) {
             RetireChunk();
-            const bool pushed = record_chunk->Push(std::forward<Func>(func));
+            const bool pushed = CurrentChunk().Push(std::forward<Func>(func));
             ASSERT(pushed);
         }
     }
@@ -865,7 +868,7 @@ public:
             return;
         }
         ASSERT(bytes + 1024 <= RecordChunk::Capacity);
-        if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
+        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 1024) {
             RetireChunk();
         }
     }
@@ -881,7 +884,7 @@ public:
         // Room for the data and the command that follows it, so both stay in one chunk.
         const size_t bytes = data.size_bytes();
         ReserveRecordData(bytes + alignof(T));
-        auto* dst = static_cast<T*>(record_chunk->Allocate(bytes, alignof(T)));
+        auto* dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
         std::memcpy(dst, data.data(), bytes);
         return {dst, data.size()};
     }
@@ -891,6 +894,21 @@ public:
     /// dispatch: nothing but the dynamic state and the render pass carries over to the next
     /// command) a long enough segment is cut there, and the next one goes to another thread.
     void KickRecording(bool force = false);
+
+    /// bbport: work that may not span command buffers or render pass instances (an occlusion
+    /// query, vk_occlusion.h). While one is set, Suspend is called before every boundary (a
+    /// render pass beginning or ending, a segment cut, a direct segment, a submission) and Resume
+    /// right after it; `inside_render_pass` tells where the commands they record go. Called on
+    /// the recording side, as Record.
+    struct CarriedScope {
+        virtual void Suspend(bool inside_render_pass) = 0;
+        virtual void Resume(bool inside_render_pass) = 0;
+    protected:
+        ~CarriedScope() = default;
+    };
+    void SetCarriedScope(CarriedScope* scope) {
+        carried_scope = scope;
+    }
 
     /// Waits until every recorded command is in the command buffer.
     void SyncRecording();
@@ -933,6 +951,11 @@ public:
     void WaitDeferredSignals();
 
     /// Whether a render pass with exactly this state is open.
+    /// bbport: a render pass instance is open in the command stream.
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
+
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return is_rendering && render_state == state;
     }
@@ -1011,12 +1034,31 @@ private:
 
     std::unique_ptr<RecordChunk> AcquireChunk();
 
-    /// Moves the full current chunk aside; a new one takes its place.
+    /// Moves the full current chunk aside; a new one takes its place (swapped in: never null).
     void RetireChunk() {
         ProducerScope producer{*this, "RetireChunk"};
-        segment_bytes += record_chunk->Size();
-        full_chunks.push_back(std::move(record_chunk));
-        record_chunk = AcquireChunk();
+        auto full = AcquireChunk();
+        record_chunk.swap(full);
+        if (full) {
+            segment_bytes += full->Size();
+            full_chunks.push_back(std::move(full));
+        }
+    }
+
+    /// The current chunks, never null: replacements are swapped in, so a fault handler that
+    /// records on this thread while one is replaced still finds one; a null one (a build without
+    /// that, issue #100: a read of RecordChunk::Capacity at address 0x20000) is replaced here.
+    RecordChunk& CurrentChunk() {
+        if (!record_chunk) [[unlikely]] {
+            record_chunk = AcquireChunk();
+        }
+        return *record_chunk;
+    }
+    RecordChunk& OrderedChunk() {
+        if (!ordered_chunk) [[unlikely]] {
+            ordered_chunk = AcquireChunk();
+        }
+        return *ordered_chunk;
     }
 
     /// Waits for the recording threads, then records on this thread into the current segment's
@@ -1058,10 +1100,11 @@ private:
             return;
         }
         auto command = [func = std::forward<Func>(func)](vk::CommandBuffer) mutable { func(); };
-        if (!ordered_chunk->Push(std::move(command))) {
-            ordered_full.push_back(std::move(ordered_chunk));
-            ordered_chunk = AcquireChunk();
-            const bool pushed = ordered_chunk->Push(std::move(command));
+        if (!OrderedChunk().Push(std::move(command))) {
+            auto full = AcquireChunk();
+            ordered_chunk.swap(full);
+            ordered_full.push_back(std::move(full));
+            const bool pushed = OrderedChunk().Push(std::move(command));
             ASSERT(pushed);
         }
     }
@@ -1120,6 +1163,7 @@ private:
     size_t segment_bytes = 0;          ///< closures of the current segment handed over or retired
     size_t split_bytes = 0;            ///< segment length at which the stream is cut
     bool resume_rendering = false;     ///< a cut closed the render pass with render_state
+    void* pass_end_caller = nullptr;   ///< BB_PASS_BREAK_TRACE: who ended the last render pass
     std::unique_ptr<RecordChunk> record_chunk;
     std::vector<std::unique_ptr<RecordChunk>> full_chunks;
     std::unique_ptr<RecordChunk> ordered_chunk;
@@ -1134,6 +1178,17 @@ private:
     /// bbport: direct_mode in a segment of its own (direct_pool), the recording threads going on
     /// with the segments before it.
     bool direct_segment = false;
+    CarriedScope* carried_scope = nullptr;
+    void CarrySuspend(bool inside_render_pass) {
+        if (carried_scope) {
+            carried_scope->Suspend(inside_render_pass);
+        }
+    }
+    void CarryResume(bool inside_render_pass) {
+        if (carried_scope) {
+            carried_scope->Resume(inside_render_pass);
+        }
+    }
     std::unique_ptr<CommandPool> direct_pool; ///< used by the producer thread only
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};

@@ -3,6 +3,7 @@
 
 #include <thread>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
@@ -183,8 +184,12 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     // bbport: a cut of the command stream (MaybeSplit) closed this render pass; it continues
     // in the next command buffer without clearing its attachments again.
     const bool resume = resume_rendering && !is_rendering && render_state == new_state;
+    if (!is_rendering && render_state == new_state && pass_end_caller) {
+        TracePassBreak(pass_end_caller);
+    }
     resume_rendering = false;
     EndRendering();
+    CarrySuspend(false);
     is_rendering = true;
     render_state = new_state;
 
@@ -237,6 +242,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 
     if (workers.empty()) {
         current_cmdbuf.beginRendering(rendering_info);
+        CarryResume(true);
         return;
     }
     // The attachment infos live on this stack frame: the recorded closure keeps copies.
@@ -251,14 +257,58 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         }
         cmdbuf.beginRendering(info);
     });
+    CarryResume(true);
 }
 
 void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
+    static const bool trace = [] {
+        const char* env = std::getenv("BB_PASS_BREAK_TRACE");
+        return env && env[0] == '1';
+    }();
+    if (trace) {
+        pass_end_caller = __builtin_return_address(0);
+    }
+    CarrySuspend(true);
     is_rendering = false;
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+    CarryResume(false);
+}
+
+void Scheduler::TracePassBreak(void* caller) {
+    static std::mutex mutex;
+    static std::unordered_map<void*, u64> callers;
+    static u64 breaks = 0;
+    static auto last = std::chrono::steady_clock::now();
+    std::scoped_lock lk{mutex};
+    ++callers[caller];
+    ++breaks;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(5)) {
+        return;
+    }
+    std::vector<std::pair<u64, void*>> top;
+    for (const auto& [address, count] : callers) {
+        top.emplace_back(count, address);
+    }
+    std::ranges::sort(top, std::greater{});
+    std::printf("Render pass breaks (the same pass begun again): %llu in %.0f s\n",
+                static_cast<unsigned long long>(breaks),
+                std::chrono::duration<double>(now - last).count());
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 10); ++i) {
+        Dl_info info{};
+        dladdr(top[i].second, &info);
+        std::printf("Render pass break caller: %llu x %s+0x%lx\n",
+                    static_cast<unsigned long long>(top[i].first),
+                    info.dli_fname ? info.dli_fname : "?",
+                    static_cast<unsigned long>(reinterpret_cast<uintptr_t>(top[i].second) -
+                                               reinterpret_cast<uintptr_t>(info.dli_fbase)));
+    }
+    callers.clear();
+    breaks = 0;
+    last = now;
 }
 
 void Scheduler::TraceDirectRecording(void* caller) {
@@ -431,7 +481,7 @@ void Scheduler::KickRecording(bool force) {
         MaybeSplit();
     }
     // Batches of tens of KiB keep the queue handoff cheap relative to the work it carries.
-    if (!force && full_chunks.empty() && record_chunk->Size() < 32 * 1024) {
+    if (!force && full_chunks.empty() && CurrentChunk().Size() < 32 * 1024) {
         return;
     }
     HandOver();
@@ -443,14 +493,17 @@ void Scheduler::MaybeSplit() {
         return;
     }
     // Cutting inside a render pass closes and reopens it: only after a longer stretch.
-    const size_t bytes = segment_bytes + record_chunk->Size();
+    const size_t bytes = segment_bytes + CurrentChunk().Size();
     if (bytes < (is_rendering ? 2 * split_bytes : split_bytes)) {
         return;
     }
     if (is_rendering) {
+        CarrySuspend(true);
         Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
         is_rendering = false;
         resume_rendering = true;
+    } else {
+        CarrySuspend(false);
     }
     if (async_submit) {
         // Its recording thread ends the segment's command buffer (the pool is that thread's).
@@ -465,6 +518,7 @@ void Scheduler::MaybeSplit() {
     // Everything else (pipeline, vertex and index buffers, descriptors, push constants) every
     // draw and dispatch records itself.
     dynamic_state.Invalidate();
+    CarryResume(false);
 }
 
 void Scheduler::HandOver() {
@@ -492,6 +546,11 @@ void Scheduler::HandOver() {
     if (!commands && !ordered) {
         return;
     }
+    // The chunks that take the current ones' places, taken first (AcquireChunk locks
+    // recorder_mutex) and swapped in below: record_chunk and ordered_chunk are never null, not
+    // even for a fault handler recording on this thread meanwhile (issue #100).
+    std::unique_ptr<RecordChunk> next_record = record_chunk->Empty() ? nullptr : AcquireChunk();
+    std::unique_ptr<RecordChunk> next_ordered = ordered_chunk->Empty() ? nullptr : AcquireChunk();
     Worker& worker = *workers[current_segment % workers.size()];
     bool wake = false;
     {
@@ -503,11 +562,12 @@ void Scheduler::HandOver() {
                 worker.queue.push_back(std::move(chunk));
                 ++batch->handed[current_segment];
             }
-            if (!record_chunk->Empty()) {
-                segment_bytes += record_chunk->Size();
-                record_chunk->segment = current_segment;
-                record_chunk->batch = batch;
-                worker.queue.push_back(std::move(record_chunk));
+            if (next_record) {
+                record_chunk.swap(next_record); // next_record: the chunk handed over
+                segment_bytes += next_record->Size();
+                next_record->segment = current_segment;
+                next_record->batch = batch;
+                worker.queue.push_back(std::move(next_record));
                 ++batch->handed[current_segment];
             }
             worker.queued.store(worker.queue.size(), std::memory_order_release);
@@ -524,8 +584,9 @@ void Scheduler::HandOver() {
             for (auto& chunk : ordered_full) {
                 queue(std::move(chunk));
             }
-            if (!ordered_chunk->Empty()) {
-                queue(std::move(ordered_chunk));
+            if (next_ordered) {
+                ordered_chunk.swap(next_ordered); // next_ordered: the chunk handed over
+                queue(std::move(next_ordered));
             }
             ordered_queued.store(ordered_queue.size(), std::memory_order_release);
             // Any thread may run them; the current segment's thread is woken for them (when it
@@ -542,12 +603,6 @@ void Scheduler::HandOver() {
     // A busy thread picks the new chunks up by itself: waking it is a syscall per draw.
     if (wake) {
         worker.cv.notify_one();
-    }
-    if (!record_chunk) {
-        record_chunk = AcquireChunk();
-    }
-    if (!ordered_chunk) {
-        ordered_chunk = AcquireChunk();
     }
 }
 
@@ -598,13 +653,16 @@ void Scheduler::EnterDirectMode() {
     if (own_segment && async_submit && current_segment + 2 < MaxSegments &&
         !BbToggle::Disabled(BbToggle::ThreadedRecording)) {
         if (is_rendering) {
+            CarrySuspend(true);
             Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
             is_rendering = false;
             resume_rendering = true;
+        } else {
+            CarrySuspend(false);
         }
         // A segment nothing was handed to yet is not begun: it becomes the direct one.
         const bool untouched =
-            batch->handed[current_segment] == 0 && full_chunks.empty() && record_chunk->Empty();
+            batch->handed[current_segment] == 0 && full_chunks.empty() && CurrentChunk().Empty();
         if (!untouched) {
             // Its recording thread ends the segment's command buffer (the pool is that thread's).
             Record([](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
@@ -620,6 +678,7 @@ void Scheduler::EnterDirectMode() {
         direct_mode = true;
         direct_segment = true;
         dynamic_state.Invalidate();
+        CarryResume(false);
         return;
     }
     SyncRecording();
@@ -634,9 +693,12 @@ void Scheduler::EnterDirectMode() {
 
 void Scheduler::LeaveDirectSegment() {
     if (is_rendering) {
+        CarrySuspend(true);
         current_cmdbuf.endRendering();
         is_rendering = false;
         resume_rendering = true;
+    } else {
+        CarrySuspend(false);
     }
     Check(current_cmdbuf.end());
     current_cmdbuf = vk::CommandBuffer{};
@@ -647,6 +709,7 @@ void Scheduler::LeaveDirectSegment() {
     segment_bytes = 0;
     active_worker.store(current_segment % workers.size(), std::memory_order_relaxed);
     dynamic_state.Invalidate();
+    CarryResume(false);
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
@@ -866,6 +929,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 
     EndRendering();
+    CarrySuspend(false);
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
         // Until the next submission's first timestamp: mostly the GPU waiting for it.
         profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });
@@ -933,6 +997,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     // bbport: no semaphore query here (an ioctl per submission, ~3% of the recording thread):
     // PopPendingOperations asks when an operation waits, the GPU signal thread on every fence.
     AllocateWorkerCommandBuffers();
+    CarryResume(false);
 
     // Apply pending operations
     PopPendingOperations();
@@ -944,6 +1009,7 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
         on_submit(info);
     }
     EndRendering();
+    CarrySuspend(false);
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
         profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });
     }
@@ -1014,6 +1080,7 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
     });
     KickRecording(true);
     AllocateWorkerCommandBuffers();
+    CarryResume(false);
     PopPendingOperations();
 }
 

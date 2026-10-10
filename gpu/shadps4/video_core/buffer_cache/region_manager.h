@@ -178,6 +178,18 @@ public:
      * @param offset Offset in bytes from the start of the buffer
      * @param size   Size in bytes of the region to query for modifications
      */
+    /// bbport: every page of the region modified.
+    template <Type type>
+    [[nodiscard]] bool IsRegionFullyModified(u64 offset, u64 size) noexcept {
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return true;
+        }
+        return GetRegionBits<type>().AllInRange(start_page, std::min<size_t>(end_page, NUM_PAGES_PER_REGION));
+    }
+
     template <Type type>
     [[nodiscard]] bool IsRegionModified(u64 offset, u64 size) noexcept {
         RENDERER_TRACE;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -401,6 +402,33 @@ void EmitSetPatch(EmitContext& ctx, IR::Patch patch, Id value) {
     ctx.OpStore(pointer, value);
 }
 
+// bbport BB_LAYER_MEMORY: accesses of paged buffers (EmitContext::PagedPointer). `index` is in
+// units of the access (as for the bound buffers); zero is read where the guard fails.
+static Id PagedLoad(EmitContext& ctx, const EmitContext::BufferDefinition& buffer, Id index,
+                    u32 bytes, Id type, Id zero) {
+    const Id byte_offset =
+        ctx.OpShiftLeftLogical(ctx.U32[1], index, ctx.ConstU32(u32(std::countr_zero(bytes))));
+    const auto access = ctx.PagedPointer(buffer, byte_offset, bytes, type);
+    const Id value = ctx.OpLoad(type, access.pointer, spv::MemoryAccessMask::Aligned, bytes);
+    return ctx.OpSelect(type, access.guard, value, zero);
+}
+
+static void PagedStore(EmitContext& ctx, const EmitContext::BufferDefinition& buffer, Id index,
+                       u32 bytes, Id type, Id value) {
+    const Id byte_offset =
+        ctx.OpShiftLeftLogical(ctx.U32[1], index, ctx.ConstU32(u32(std::countr_zero(bytes))));
+    const auto access = ctx.PagedPointer(buffer, byte_offset, bytes, type);
+    ctx.OpStore(access.pointer, value, spv::MemoryAccessMask::Aligned, bytes);
+    if (ctx.profile.buffer_copy_shader_hash != 0 &&
+        ctx.info.pgm_hash == ctx.profile.buffer_copy_shader_hash) {
+        // Original shader, original copy list, executed on the GPU. Its destinations include
+        // CPU-consumed data: update the guest bytes as well as the current VRAM view. Other
+        // compute shaders retain their normal mirror ownership and copy-back bookkeeping.
+        const auto guest = ctx.PagedPointer(buffer, byte_offset, bytes, type, true);
+        ctx.OpStore(guest.pointer, value, spv::MemoryAccessMask::Aligned, bytes);
+    }
+}
+
 template <u32 N, PointerType alias>
 static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
@@ -413,6 +441,11 @@ static Id EmitLoadBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
     boost::container::static_vector<Id, N> ids;
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
+        if (spv_buffer.paged) {
+            const Id zero = alias == PointerType::U32 ? ctx.u32_zero_value : ctx.f32_zero_value;
+            ids.push_back(PagedLoad(ctx, spv_buffer, index_i, 4, data_types[1], zero));
+            continue;
+        }
         const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         const Id result_i = ctx.OpLoad(data_types[1], ptr_i);
         ids.push_back(result_i);
@@ -427,6 +460,9 @@ Id EmitLoadBufferU8(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
     }
+    if (spv_buffer.paged) {
+        return PagedLoad(ctx, spv_buffer, address, 1, ctx.U8, ctx.Constant(ctx.U8, 0U));
+    }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
     const Id result{ctx.OpLoad(ctx.U8, ptr)};
@@ -437,6 +473,9 @@ Id EmitLoadBufferU16(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    if (spv_buffer.paged) {
+        return PagedLoad(ctx, spv_buffer, address, 2, ctx.U16, ctx.Constant(ctx.U16, 0U));
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
@@ -464,6 +503,9 @@ Id EmitLoadBufferU64(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    if (spv_buffer.paged) {
+        return PagedLoad(ctx, spv_buffer, address, 8, ctx.U64, ctx.u64_zero_value);
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U64);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, address)};
@@ -503,8 +545,12 @@ static void EmitStoreBufferB32xN(EmitContext& ctx, IR::Inst* inst, u32 handle, I
 
     for (u32 i = 0; i < N; i++) {
         const Id index_i = i == 0 ? address : ctx.OpIAdd(ctx.U32[1], address, ctx.ConstU32(i));
-        const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         const Id value_i = N == 1 ? value : ctx.OpCompositeExtract(data_types[1], value, i);
+        if (spv_buffer.paged) {
+            PagedStore(ctx, spv_buffer, index_i, 4, data_types[1], value_i);
+            continue;
+        }
+        const Id ptr_i = ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, index_i);
         ctx.OpStore(ptr_i, value_i);
     }
 }
@@ -513,6 +559,10 @@ void EmitStoreBufferU8(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id v
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B8); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    if (spv_buffer.paged) {
+        PagedStore(ctx, spv_buffer, address, 1, ctx.U8, value);
+        return;
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U8);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
@@ -523,6 +573,10 @@ void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B16); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    if (spv_buffer.paged) {
+        PagedStore(ctx, spv_buffer, address, 2, ctx.U16, value);
+        return;
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U16);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u32_zero_value, address)};
@@ -549,6 +603,10 @@ void EmitStoreBufferU64(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
     const auto& spv_buffer = ctx.buffers[handle];
     if (const Id offset = spv_buffer.Offset(PointerSize::B64); Sirit::ValidId(offset)) {
         address = ctx.OpIAdd(ctx.U32[1], address, offset);
+    }
+    if (spv_buffer.paged) {
+        PagedStore(ctx, spv_buffer, address, 8, ctx.U64, value);
+        return;
     }
     const auto [id, pointer_type] = spv_buffer.Alias(PointerType::U64);
     const Id ptr{ctx.OpAccessChain(pointer_type, id, ctx.u64_zero_value, address)};
