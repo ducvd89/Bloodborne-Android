@@ -41,9 +41,11 @@ final class SettingsDialog {
         {"effect_ssr","Screen-space reflections (not in the original)","0"},
         {"skip_intro","Skip startup intros","0"},
     };
-    // FSR 4 is off on the Thor for now (run-thor.sh treats a stored fsr4 as FSR 3.1).
-    private static final String[] UPSCALER_VALUES={"off","fsr3"};
-    private static final String[] UPSCALER_NAMES={"Off (render at 1280×720)","FSR 3.1"};
+    // FSR 4 and 4.1.1 are experimental; without their assets run-thor.sh uses FSR 3.1.
+    private static final String[] UPSCALER_VALUES={"off","fsr3","fsr4","fsr411"};
+    private static final String[] UPSCALER_NAMES={"Off (render at 1280×720)","FSR 3.1",
+        "FSR 4 (experimental)","FSR 4.1.1 (experimental, needs fsr4_411 assets)"};
+    private static final int FSR3=1;
     private static final String[] FPS_VALUES={"30","40","45","60","0"};
     private static final String[] FPS_NAMES={"30 (the game's own)","40","45","60","Unlimited"};
     /** Snapdragon 8 Gen 2: three Cortex-A510, four Cortex-A715, one Cortex-X3. */
@@ -164,10 +166,16 @@ final class SettingsDialog {
         final TextView presetNote=new TextView(activity); presetNote.setTextSize(13); presetNote.setAlpha(0.7f);
         box.addView(presetNote);
         RadioGroup.OnCheckedChangeListener upscaling=(g,id) -> {
-            boolean on=checkedIndex(upscalers)!=0;
+            int upscaler=checkedIndex(upscalers);
+            boolean on=upscaler!=0;
             for (int i=0;i<presets.getChildCount();++i) presets.getChildAt(i).setEnabled(on);
-            frameGen.setEnabled(on);
-            presetNote.setText(on ? "Lower is faster; the upscaler fills the screen." : "Without upscaling the game renders at 1280×720.");
+            frameGen.setEnabled(upscaler==FSR3);
+            presetNote.setText(!on ? "Without upscaling the game renders at 1280×720."
+                : upscaler==FSR3 ? "Lower is faster; the upscaler fills the screen."
+                : "Lower is faster. FSR 4 is heavy on phone GPUs; its first start compiles shaders for "
+                  +"a minute or more (black screen), later starts are quick. FSR 4.1.1 needs the fsr4_411 "
+                  +"folder (built from your own AMD DLL) next to the game folder. Without its files the "
+                  +"game uses FSR 3.1. Frame generation works with FSR 3.1 only.");
         };
         upscalers.setOnCheckedChangeListener(upscaling); upscaling.onCheckedChanged(upscalers,0);
 

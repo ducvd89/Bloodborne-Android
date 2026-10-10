@@ -45,9 +45,23 @@ fi
 # 1280x720 display; the preset sets the scene size, FSR 3.1 upscales it to the output.
 setting() { sed -n "s/^$1=//p" "$BB_CONFIG" 2>/dev/null | tail -n 1; }
 upscaler=$(setting upscaler); preset=$(setting preset)
-# FSR 4 is off on the Thor for now (Turnip compiles its model passes for over a minute, then
-# crashed in a dispatch): fsr4, like anything else but off, means FSR 3.1.
-case $upscaler in off) ;; *) upscaler=fsr3 ;; esac
+# FSR 4 (v07 INT8, assets in the bundle) and FSR 4.1.1 (INT8; assets built from the player's own
+# AMD DLL with tools/fsr4cap, the fsr4_411 folder next to the game folder or in bbport/) are
+# experimental: Turnip compiles their model passes on first use (over a minute, cached after).
+# Without their assets they fall back to FSR 3.1, as does any other value.
+case $upscaler in
+    off|fsr3) ;;
+    fsr4) [ -d "$base/arm64/fsr4_shaders" ] || upscaler=fsr3 ;;
+    fsr411)
+        upscaler=fsr3
+        for dir in "${BB_GAME_DIR:+${BB_GAME_DIR%/*}/fsr4_411}" "$base/fsr4_411"; do
+            if [ -n "$dir" ] && [ -d "$dir" ]; then
+                export BB_FSR411_DIR="$dir"; upscaler=fsr411; break
+            fi
+        done ;;
+    *) upscaler=fsr3 ;;
+esac
+echo "Upscaler setting: $upscaler"
 case $preset in 0|1|2|3|4) ;; *) preset=3 ;; esac
 render=1280x720
 if [ "$upscaler" != off ]; then

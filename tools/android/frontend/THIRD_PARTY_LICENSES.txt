@@ -12,6 +12,12 @@ Adreno 8xx variant: Mesa from https://github.com/whitebelyash/mesa-unified
 upstream Mesa commits b889ab52, b7ad24ad, e984ef29, 6cb65e61 and the same
 fexdroid patches.
 
+FSR 4 v07 INT8 assets (bbport/arm64/fsr4_shaders): built by FireBurn/Q2RTX from
+WinLinux1028/FidelityFX-SDK_WithFSR4, a copy of AMD's FidelityFX SDK FSR 4
+source as AMD briefly published it under the MIT licence; notice in
+fsr4_shaders/LICENSE-FSR4-v07.txt. FSR 3.1: AMD FidelityFX (MIT) through
+FireBurn/FSR-Vulkan.
+
 MIT License
 
 Copyright (c) 2026 Marius

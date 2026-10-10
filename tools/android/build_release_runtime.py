@@ -126,6 +126,10 @@ def main():
             tar.addfile(info)
         for directory in ('bin', 'lib', 'patch-parts'):
             tar.add(NATIVE / directory, arcname='bbport/arm64/' + directory)
+        # FSR 4 v07 INT8 assets (MIT: built from AMD's FSR 4 source), fetched with
+        # tools/fetch_fsr4_assets.sh: the upscaler=fsr4 setting needs them.
+        if (NATIVE / 'fsr4_shaders').is_dir():
+            tar.add(NATIVE / 'fsr4_shaders', arcname='bbport/arm64/fsr4_shaders')
         for script in SCRIPTS:
             origin = (ROOT / 'tools/android' if script == 'prepare_game.py' else ROOT / 'scripts') / script
             tar.add(origin, arcname='bbport/scripts/' + script)

@@ -10,7 +10,8 @@
 # --class-bindings: binding = register + 32 * class, SRV/UAV/CBV/sampler), named after the pass,
 # and the model's initializer (weights). Tiers: t1080 (output up to 1920x1080), t2160 (larger).
 # Models: m0 (quality ratios up to 2.0), m1 (ultra performance, 3.0).
-# Variants: INT8 in <output dir>/<set> (every GPU); the FP8 matrix variant in fp8/<set>, translated
+# Variants: INT8 in <output dir>/<set> (every GPU; portable/<set> without the VALVE mixed float dot
+# product extension); the FP8 matrix variant in fp8/<set>, translated
 # for FP8 cooperative matrices (VK_EXT_shader_float8, RDNA4) as vkd3d-proton does there, and in
 # fp8emu/<set> with FP8 emulated through FP16 matrices as vkd3d-proton does on RDNA3
 # (DXIL_SPIRV_CONFIG=wmma_rdna3_workaround): slower, for testing the variant without RDNA4.
@@ -20,8 +21,9 @@
 import glob, hashlib, math, os, re, struct, subprocess, sys
 
 dxil_spirv, root, out = sys.argv[1:4]
-FLAGS = ['--enable-shader-i8-dot', '--ssbo-uav', '--ssbo-srv', '--class-bindings', '--use-reflection-names',
-         '--mixed-float-dot-product']  # as vkd3d-proton: dot2 of halves into float (VALVE extension)
+FLAGS = ['--enable-shader-i8-dot', '--ssbo-uav', '--ssbo-srv', '--class-bindings', '--use-reflection-names']
+# As vkd3d-proton: dot2 of halves into float through VK_VALVE_shader_mixed_float_dot_product (RADV).
+MIXED = ['--mixed-float-dot-product']
 PREFIX = 'fsr4_model_v07_fp8_no_scale_'
 SEQUENCE = ['spd', 'prepass', 'pass0_post'] + [f'pass{k}{s}' for k in range(1, 13) for s in ('', '_post')] + ['postpass', 'rcas']
 LEVEL = {1: 1, 2: 1, 3: 2, 4: 2, 5: 2, 6: 3, 7: 3, 8: 3, 9: 3, 10: 2, 11: 2, 12: 1}
@@ -39,10 +41,12 @@ VARIANTS = {
 }
 POST_LOCAL_SIZE = 32
 # Output folder, extra dxil-spirv flags and environment of each translation of a variant.
+# portable/: INT8 without the VALVE extension (its dot2 as plain arithmetic), for drivers lacking it
+# (Turnip on Android); vk_fsr4.cpp picks it there.
 TRANSLATIONS = {
-    'int8': [('', [], {})],
-    'fp8': [('fp8', ['--full-wmma', '1', '0'], {}),
-            ('fp8emu', [], {'DXIL_SPIRV_CONFIG': 'wmma_rdna3_workaround'})],
+    'int8': [('', MIXED, {}), ('portable', [], {})],
+    'fp8': [('fp8', MIXED + ['--full-wmma', '1', '0'], {}),
+            ('fp8emu', MIXED, {'DXIL_SPIRV_CONFIG': 'wmma_rdna3_workaround'})],
 }
 errors = 0
 
