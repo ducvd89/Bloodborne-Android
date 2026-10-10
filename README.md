@@ -44,6 +44,8 @@ Other Adreno 6xx/7xx/8xx devices are untested. Requires Android 9+ and 4 KB memo
 
 The APK contains no game files. Updates keep settings and saves. The left-edge menu holds settings and the on-screen controller.
 
+On ColorOS / OxygenOS (Oppo, OnePlus) a "Security warning" about a malicious app may appear at launch. Tap **Got it**; the game keeps running. ColorOS shows it for any app that runs Linux programs, such as Termux and Winlator.
+
 ## Build
 
 ```bash
