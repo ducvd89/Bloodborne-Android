@@ -1,3 +1,20 @@
+# Android release 0.5.2
+
+Upstream bloodborne_pc 0.51 merged, the parts that apply on Android:
+
+- **Every retail release with update 1.09** runs with the game's profile (US CUSA00900, EU, UK,
+  JP, Asia and The Old Hunters editions; upstream #119): before, only CUSA03173 did. The folder
+  picker also finds any of these releases' folders inside the one chosen.
+- The swapchain is replaced through `oldSwapchain` instead of destroyed first (upstream PR #93).
+- The title menu no longer flickers between 1080p and the output size while it animates.
+- Upstream's VRAM fixes (4 GB cards, motion blur in the new memory model) come along; with
+  `BB_GUEST_IN_PLACE=0` and the Adreno's shared memory they change nothing here.
+
+Left out: online play (the shadNet module calls the game's code directly and starts host
+functions as guest threads, neither of which runs under FEX), the overlay's Quit game, the DLSS
+changes, upstream's mouse look and the desktop launcher and packaging. Tested on the Thor:
+starts and plays with Lossless Scaling on. The rest is as 0.5.1 below.
+
 # Android release 0.5.1
 
 Fixes 0.5.0's GPU crashes while playing ("Game stopped (23)": device lost after a few minutes, an
