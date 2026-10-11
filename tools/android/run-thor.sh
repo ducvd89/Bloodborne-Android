@@ -58,9 +58,10 @@ fi
 export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
 [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
-# The GPU's check of indirect dispatch counts (upstream 0.5, vk_indirect_guard.h) is off: on the
-# Thor's Adreno 740 the game hung in an indirect dispatch with it (device lost after ~3 minutes of
-# play), not without it nor in 0.4. BB_INDIRECT_GUARD=1 in thor-local.sh turns it on.
+# The GPU's check of indirect dispatch counts (upstream 0.5, vk_indirect_guard.h) is off: it was
+# suspected of 0.5.0's hangs on the Thor (those came from the Lossless Scaling layer's later
+# changes, undone in 0.5.1) and is not tested here on its own. BB_INDIRECT_GUARD=1 in
+# thor-local.sh turns it on.
 export BB_INDIRECT_GUARD=${BB_INDIRECT_GUARD:-0}
 # Lossless Scaling frame generation (lsfg_multiplier 2-4): the lsfg-vk 1.0 layer with our Turnip
 # patches (bbport/arm64/lsfg, build_lsfg.sh) and Lossless.dll from the player's own Lossless

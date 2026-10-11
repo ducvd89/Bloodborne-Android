@@ -161,7 +161,7 @@ public final class MainActivity extends Activity {
         body.addView(drawerScroll,new LinearLayout.LayoutParams(0,-1,1));
         View edge=new View(this); edge.setBackgroundColor(0x55c6ad76);
         body.addView(edge,new LinearLayout.LayoutParams(dp(1),-1));
-        drawer.addView(body,new LinearLayout.LayoutParams(-1,-1));
+        drawer.addView(body,new LinearLayout.LayoutParams(-1,0,1));
 
         TextView title=text("BLOODBORNE",24,0xffe8dfc9); title.setTypeface(Typeface.SERIF,Typeface.BOLD);
         title.setLetterSpacing(0.12f); title.setPadding(dp(10),0,0,0);
@@ -222,13 +222,13 @@ public final class MainActivity extends Activity {
             .setTitle("Quit Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Quit",(dialog,which) -> finish()).show());
 
-        TextView controls=text("B  Confirm      A  Cancel\nY  Item              X  Heal",12,0xffc6ad76);
-        controls.setPadding(dp(10),dp(18),0,dp(4)); drawerItems.addView(controls);
+        // The version, pinned under the scrolling menu.
         String version="";
         try { version=" "+getPackageManager().getPackageInfo(getPackageName(),0).versionName; }
         catch (Exception ignored) {}
-        TextView about=text("Bloodborne for Android"+version,11,0xff6e7077);
-        about.setPadding(dp(10),dp(6),0,0); drawerItems.addView(about);
+        TextView about=text("Bloodborne for Android"+version,12,0xff8e9097);
+        about.setPadding(dp(24),dp(8),dp(14),dp(14));
+        drawer.addView(about,new LinearLayout.LayoutParams(-1,-2));
         screen.addView(drawer,frame(dp(320),-1,Gravity.LEFT));
         setContentView(screen);
     }

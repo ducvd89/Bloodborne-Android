@@ -1,3 +1,11 @@
+# Android release 0.5.1
+
+Fixes 0.5.0's GPU crashes while playing ("Game stopped (23)": device lost after a few minutes, an
+indirect draw or dispatch "STUCK"). They came from the changes to the Lossless Scaling layer after
+0.4.0 (the semaphore wait stages, fence-checked sync file exports and the zero image instead of null
+descriptors, made while looking into the Adreno 830's doubled frames): 0.5.1 has 0.4.0's layer
+again, and 15 minutes of play on the Thor ran without a crash. The rest is as 0.5.0 below.
+
 # Android release 0.5.0
 
 **Target:** AYN Thor (Snapdragon 8 Gen 2, Adreno 740, Android 13). Gameplay is experimental. 0.5.0
@@ -27,8 +35,9 @@ shows doubled frames there (an open issue).
   jumps to x86-64 code beside it: under FEX the game's code cannot run there (it crashed at the
   title). The pages are off on AArch64 (`gpu/shim/bbport_game_menu.cpp`); the app's menu has the
   settings that apply here, the hooks stay traps (`gpu/shim/bbport_guest_hooks.cpp`).
-- The GPU check of indirect dispatch counts (`BB_INDIRECT_GUARD`) is off: on the Thor the game hung
-  in an indirect dispatch with it after a few minutes of play, not without it nor in 0.4.
+- The GPU check of indirect dispatch counts (`BB_INDIRECT_GUARD`) is off. It was turned off after
+  the first crash; 0.5.1 found the crashes came from the Lossless Scaling layer instead, and the
+  check stays off until it is tested on its own.
 - The new memory model (AMD and NVIDIA desktop GPUs), DLSS, MangoHud, monitor and mouse settings.
 
 ## Build
