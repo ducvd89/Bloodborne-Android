@@ -593,6 +593,7 @@ private:
     u32 arena_memory_type_index{};
     /// bbport: system memory for residency when VRAM is full (4 GB cards), if sparse binding takes it
     std::optional<u32> arena_fallback_type_index;
+    u32 arena_memory_type_bits = 0; ///< memory types the arena's blocks can be bound to
     vk::DeviceMemory residency_memory{}; ///< bbport: the 64 MiB block arena residency comes from
     u64 residency_size = 0, residency_used = 0;
     std::future<vk::DeviceMemory> spare_residency; ///< the next block, allocated in the background

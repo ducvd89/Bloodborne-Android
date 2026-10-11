@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""The game files bbport runs: Bloodborne CUSA03173 with the 1.09 update merged in.
+"""The game files bbport runs: Bloodborne with the 1.09 update merged in. The retail releases (the
+US CUSA00900, the European Game of the Year edition CUSA03173, the Asian The Old Hunters Edition
+CUSA03023, ...) share the same 1.09 executable.
 
 Other versions start and then fail inside the game's code (the base game 1.00 faults at guest
 offset 0x20348b8): hooks and patches use the addresses of this one executable. The check compares
@@ -17,9 +19,16 @@ import sys
 import zlib
 from pathlib import Path
 
-SUPPORTED_TITLE = 'CUSA03173'
+# The retail releases (the list of content IDs from PR #117): Bloodborne, then the editions with
+# The Old Hunters. The executable decides in the end: SUPPORTED_IMAGE.
+SUPPORTED_TITLES = ('CUSA00900', 'CUSA00207', 'CUSA00208', 'CUSA00299', 'CUSA01363',  # US EU UK JP AS
+                    'CUSA03179', 'CUSA03173', 'CUSA03014', 'CUSA03023')  # US EU JP AS
 SUPPORTED_VERSION = '01.09'
 SUPPORTED_IMAGE = '071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444c0a'
+# The 1.09 executable with Lance McDonald's 60 fps patch applied to it, as some dumps ship it
+# (seen on US CUSA00900): one of its edits inverts a branch in the menu code (+0xf6d90d) and the
+# gestures menu crashes the game. bbport has its own 60 fps; the clean 1.09 eboot.bin is needed.
+LANCE_60FPS_IMAGE = 'bbc91f4dff6bc3118b039464289e39878a8fdfc802a07fab9d5fe84d935a676f'
 # The game loads these first; a broken extraction damages most files, these among them.
 CHECKED_FOLDER = 'dvdroot_ps4/shader'
 
@@ -57,8 +66,9 @@ def broken_files(game, folder=CHECKED_FOLDER):
 def problem(game, image_hash=None):
     """None for the supported game, else (kind, title, version): kind is 'missing_update' (base
     game or an older update), 'wrong_eboot' (param.sfo says 1.09, eboot.bin is another version),
-    'other_title' (another edition or region), 'unreadable' or 'damaged_files' (the right game,
-    but its shaders do not unpack: a broken extraction)."""
+    'patched_eboot' (the 1.09 eboot.bin with a 60 fps patch baked in), 'other_title' (another
+    edition), 'unreadable' or 'damaged_files' (the right game, but its shaders do not unpack: a
+    broken extraction)."""
     if os.environ.get('BB_SKIP_GAME_CHECK') == '1':
         return None
     from prepare import sfo
@@ -68,11 +78,14 @@ def problem(game, image_hash=None):
         info = {}
     title, version = info.get('TITLE_ID', '?'), info.get('APP_VER', '?')
     try:
-        if (image_hash or image_sha256(game)) == SUPPORTED_IMAGE:
+        image_hash = image_hash or image_sha256(game)
+        if image_hash == SUPPORTED_IMAGE:
             return ('damaged_files', title, version) if broken_files(game) else None
     except (OSError, ValueError, IndexError, StopIteration, KeyError):
         return 'unreadable', title, version
-    if title != SUPPORTED_TITLE:
+    if image_hash == LANCE_60FPS_IMAGE:
+        return 'patched_eboot', title, version
+    if title not in SUPPORTED_TITLES:
         return 'other_title', title, version
     if version != SUPPORTED_VERSION:
         return 'missing_update', title, version
@@ -88,8 +101,12 @@ def explain(kind, title, version):
                           'game folder, replacing files (eboot.bin and sce_sys too).',
         'wrong_eboot': f'{found} param.sfo is from 1.09 but eboot.bin is not: copy eboot.bin from '
                        'the dumped 1.09 update into the game folder, replacing the old one.',
-        'other_title': f'{found} Only Bloodborne {SUPPORTED_TITLE} with update 1.09 is supported '
-                       'for now; other editions and regions have a different executable.',
+        'patched_eboot': f'{found} This eboot.bin has the 60 fps patch by Lance McDonald applied '
+                         'to it, which crashes the game when the gestures menu opens (bbport has its '
+                         'own 60 fps): copy eboot.bin from a clean dump of the 1.09 update into the '
+                         'game folder, replacing this one.',
+        'other_title': f'{found} This is not a retail release of Bloodborne: bbport runs Bloodborne '
+                       '(any region, The Old Hunters editions too) with update 1.09.',
         'unreadable': f'{found} eboot.bin could not be read as a decrypted PS4 executable: dump '
                       'the game and the 1.09 update again.',
         'damaged_files': f'{found} The game files are damaged: the shaders in {CHECKED_FOLDER} do '

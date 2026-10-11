@@ -81,6 +81,11 @@ void Swapchain::Create(u32 width_, u32 height_) {
     }
     zero_extent = false;
 
+    // bbport: the old swapchain is retired through oldSwapchain instead of destroyed first.
+    // NVIDIA's Wayland WSI keeps a wp_tearing_control per swapchain; a fresh swapchain on the
+    // same surface was rejected ("Surface already has a tearing controller", SurfaceLost).
+    const vk::SwapchainKHR old_swapchain = swapchain;
+    swapchain = nullptr;
     Destroy();
 
     const std::array queue_family_indices = {
@@ -109,7 +114,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
         .compositeAlpha = composite_alpha,
         .presentMode = present_mode,
         .clipped = true,
-        .oldSwapchain = nullptr,
+        .oldSwapchain = old_swapchain,
     };
 
     auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
@@ -125,6 +130,9 @@ void Swapchain::Create(u32 width_, u32 height_) {
     ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                vk::to_string(swapchain_result));
     swapchain = chain;
+    if (old_swapchain) {
+        instance.GetDevice().destroySwapchainKHR(old_swapchain);
+    }
 
     SetupImages();
     RefreshSemaphores();

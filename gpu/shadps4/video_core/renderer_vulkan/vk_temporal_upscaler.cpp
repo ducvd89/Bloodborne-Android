@@ -393,6 +393,18 @@ bool TemporalUpscaler::OnFrameStart() {
     last_jitter = jitter_on;
     dispatched_last_frame = false;
 
+    // Diagnostics BB_UI_TRACE=1: the draws of frames that ended without the output-size UI
+    // (their display buffer is shown as the game drew it, at its own size), and of one that had it.
+    if (ui_trace_on) {
+        static int bad = 0, good = 0;
+        if ((!ui_phase && Scaled() && good > 0 && bad < 12) || (ui_phase && good < 1)) {
+            ++(ui_phase ? good : bad);
+            std::printf("UI trace: frame %llu %s:%s\n",
+                        (unsigned long long)BbStats::frame_number.load(std::memory_order_relaxed),
+                        ui_phase ? "with the output-size UI" : "WITHOUT it", ui_trace.c_str());
+        }
+        ui_trace.clear();
+    }
     // The display pass of an upscaled frame reads the upscaled UI image.
     display_redirect = ui_phase;
     ui_phase = false;
@@ -1488,6 +1500,12 @@ void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
     const auto& image = texture_cache.GetImage(color);
     const bool movie = vs_hash == ui_trigger_vs || UiComposition::MovieShader(vs_hash) ||
                        (scaled_session && native_viewport);
+    if (ui_trace_on && ui_trace.size() < 1500) {
+        ui_trace += fmt::format(" [vs {:x} {}x{} fmt {} movie {} display {}]", vs_hash,
+                                image.info.size.width, image.info.size.height,
+                                u32(image.info.pixel_format), movie ? 1 : 0,
+                                FrameCapture::IsDisplayBuffer(image.info.guest_address) ? 1 : 0);
+    }
     const bool ui_draw = movie &&
         (image.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
          image.info.pixel_format == vk::Format::eR8G8B8A8Srgb) &&

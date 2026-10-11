@@ -291,6 +291,11 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// bbport: VRAM ran out (BufferCache::AllocateResidency, any thread): for the next 30 s the
+    /// collector evicts by submissions under pressure again, as before 0.5, instead of keeping
+    /// textures unused for seconds.
+    static void NoteVramShort();
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -423,6 +428,7 @@ private:
     const bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
+    static inline std::atomic<u64> vram_short_until{0}; ///< steady seconds (NoteVramShort)
     // bbport: FindImage results for unchanged image registrations (guarded by `mutex`).
     struct FindImageCacheEntry {
         VAddr address = 0;
