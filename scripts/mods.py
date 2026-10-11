@@ -14,6 +14,9 @@ import tempfile
 GAME_FOLDERS = {'action', 'adhoc', 'chr', 'event', 'facegen', 'font', 'map', 'menu', 'movie', 'msg', 'mtd',
                 'obj', 'other', 'param', 'paramdef', 'parts', 'remo', 'script', 'sfx', 'shader',
                 'sound'}
+# The retail releases' folder names (game_check.py SUPPORTED_TITLES), as a mod's wrapper folder.
+SERIALS = ('CUSA03173', 'CUSA00900', 'CUSA00207', 'CUSA00208', 'CUSA00299', 'CUSA01363',
+           'CUSA03179', 'CUSA03014', 'CUSA03023')
 
 
 def child(folder, name):
@@ -29,13 +32,13 @@ def child(folder, name):
 def content_root(folder):
     """(root, prefix): where a mod's files are and the game path they go to, or None.
 
-    Accepted layouts: <mod>/dvdroot_ps4, <mod>/app0/dvdroot_ps4, <mod>/CUSA03173/dvdroot_ps4,
+    Accepted layouts: <mod>/dvdroot_ps4, <mod>/app0/dvdroot_ps4, <mod>/<serial>/dvdroot_ps4 (CUSA03173, CUSA00900, ...),
     one wrapper folder around any of these (an archive extracted into a folder of its name), and
     the game's folders without dvdroot_ps4 (<mod>/chr, <mod>/parts, ...)."""
     folder = Path(folder)
     if not folder.is_dir():
         return None
-    for wrapper in ('', 'app0', 'CUSA03173'):
+    for wrapper in ('', 'app0', *SERIALS):
         base = child(folder, wrapper) if wrapper else folder
         dvdroot = child(base, 'dvdroot_ps4')
         if dvdroot.is_dir():

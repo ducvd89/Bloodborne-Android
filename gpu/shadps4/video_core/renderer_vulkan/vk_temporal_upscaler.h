@@ -233,6 +233,8 @@ private:
     VideoCore::ImageId ldr_target{};
     VideoCore::ImageId ui_color{}, ui_depth{};
     bool ui_phase = false;         ///< from the upscale to the next display pass
+    const bool ui_trace_on = std::getenv("BB_UI_TRACE") != nullptr; ///< diagnostics
+    std::string ui_trace;
     bool display_redirect = false; ///< the display pass of an upscaled frame
     bool ui_read_barrier = false;
     VideoCore::UniqueImage ui_image;

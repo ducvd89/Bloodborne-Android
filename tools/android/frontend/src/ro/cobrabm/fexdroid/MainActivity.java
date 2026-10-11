@@ -42,7 +42,7 @@ public final class MainActivity extends Activity {
     /** The app's files (by package: com.ducvd89.bloodborne), its Linux rootfs and the bbport runtime.
      *  The rootfs programs name its absolute path (their interpreter), set when it was installed. */
     private String FILES, ROOT, BASE;
-    /** The game (CUSA03173, with eboot.bin) in shared storage, chosen by the player. */
+    /** The game (e.g. CUSA03173, with eboot.bin) in shared storage, chosen by the player. */
     private String gameDir;
     private static final int REQUEST_FOLDER=1, REQUEST_STORAGE=2;
     private SurfaceHolder pendingHolder;
@@ -495,7 +495,10 @@ public final class MainActivity extends Activity {
         pollFrames();
         if (!imePolling) { imePolling=true; pollIme(); }
     }
-    // ---- Game folder: the extracted game (CUSA03173) in shared storage ----
+    // ---- Game folder: the extracted game (any retail release with 1.09) in shared storage ----
+    /** The retail releases' folder names (scripts/game_check.py SUPPORTED_TITLES): one 1.09 executable. */
+    private static final String[] SERIALS={"CUSA03173","CUSA00900","CUSA00207","CUSA00208","CUSA00299",
+        "CUSA01363","CUSA03179","CUSA03014","CUSA03023"};
     private static boolean isGame(File dir) { return dir!=null && new File(dir,"eboot.bin").isFile(); }
     private boolean hasGame() {
         if (Build.VERSION.SDK_INT>=23 && checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
@@ -511,10 +514,10 @@ public final class MainActivity extends Activity {
             return;
         }
         status.setText(change ? "Choose the Bloodborne game folder." :
-            "Choose your Bloodborne game folder (CUSA03173, the folder with eboot.bin).");
+            "Choose your Bloodborne game folder (e.g. CUSA03173, the folder with eboot.bin).");
         status.setVisibility(View.VISIBLE);
         new AlertDialog.Builder(this).setTitle("Bloodborne game folder")
-            .setMessage("Select the extracted game folder (CUSA03173, which contains eboot.bin) or the folder "
+            .setMessage("Select the extracted game folder (e.g. CUSA03173 or CUSA00900, which contains eboot.bin) or the folder "
                 +"that holds it, in your phone's storage."+(gameDir!=null ? "\n\nCurrent: "+gameDir : ""))
             .setPositiveButton("Choose folder",(d,w) -> {
                 Intent pick=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
@@ -536,7 +539,8 @@ public final class MainActivity extends Activity {
         if (code!=REQUEST_FOLDER) return;
         if (result!=RESULT_OK || data==null || data.getData()==null) { if (!hasGame()) askGameFolder(false); return; }
         File dir=folderOf(data.getData());
-        if (dir!=null && !isGame(dir) && isGame(new File(dir,"CUSA03173"))) dir=new File(dir,"CUSA03173");
+        if (dir!=null && !isGame(dir))
+            for (String serial : SERIALS) if (isGame(new File(dir,serial))) { dir=new File(dir,serial); break; }
         if (!isGame(dir)) {
             new AlertDialog.Builder(this).setTitle("Not a Bloodborne folder")
                 .setMessage((dir==null ? "That location" : dir.getPath())+" has no eboot.bin.")

@@ -617,6 +617,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
+    arena_memory_type_bits = reqs.memoryTypeBits;
     {
         const auto& properties = instance.GetMemoryProperties();
         for (u32 i = 0; i < properties.memoryTypeCount; ++i) {
@@ -1364,6 +1365,16 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
         return true;
     }
     // bbport BB_GUEST_IN_PLACE: GPU writes are not tracked per page; one not done yet counts.
+    // So does what the GPU wrote into a VRAM copy (NoteGpuWrite: its data, as a default heap):
+    // the game's memory under it is older (issue #122). BB_GPU_DATA_CHECK=0: not counted.
+    static const bool gpu_data_check = [] {
+        const char* env = std::getenv("BB_GPU_DATA_CHECK");
+        return !(env && env[0] == '0');
+    }();
+    if (gpu_data_check && GuestInPlace() && !LayerMode() && gpu_written_bytes.Overlaps(addr, addr + size) &&
+        !IsInPlace(addr, size)) {
+        return true;
+    }
     if (GuestInPlace()) {
         const u64 tick = WriteTicks().Newest(addr, size);
         if (tick == 0 || scheduler.GetWorkSemaphore()->IsFree(tick)) {
@@ -1622,17 +1633,48 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
             memory = Vulkan::Check(device.allocateMemory(
                 {.allocationSize = size, .memoryTypeIndex = *arena_fallback_type_index}));
         } else {
-            ASSERT_MSG(false, "Failed to allocate {} MiB for guest memory copies: {}", size >> 20,
-                       vk::to_string(result));
+            // No system-memory type for the arena (NVIDIA's sparse buffers take VRAM only):
+            // AllocateResidency tries a smaller block and the other memory types.
+            return vk::DeviceMemory{};
         }
         BbStats::device_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
         BbStats::residency_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
         return memory;
     };
     if (residency_used + bytes > residency_size) {
-        const u64 size = std::max(bytes, ResidencyBlock);
-        residency_memory = size == ResidencyBlock && spare_residency.valid() ? spare_residency.get()
-                                                                              : allocate(size);
+        u64 size = std::max(bytes, ResidencyBlock);
+        vk::DeviceMemory memory =
+            size == ResidencyBlock && spare_residency.valid() ? spare_residency.get() : vk::DeviceMemory{};
+        // bbport: VRAM full and no system memory to spill to (NVIDIA's sparse buffers take VRAM
+        // only; RTX 3050 4 GB: "Failed to allocate 64 MiB for guest memory copies", the game
+        // stopped): the texture collector evicts by submissions again for a while, and this
+        // request gets just its size, then any other memory type the arena can be bound to.
+        if (!memory) {
+            memory = allocate(size);
+        }
+        if (!memory) {
+            TextureCache::NoteVramShort();
+            static std::atomic<u32> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::printf("Guest memory: VRAM is full (%llu MiB wanted): textures go sooner\n",
+                            (unsigned long long)(size >> 20));
+            }
+            size = bytes;
+            memory = allocate(size);
+        }
+        const auto& types = instance.GetMemoryProperties();
+        for (u32 i = 0; !memory && i < types.memoryTypeCount; ++i) {
+            if (((arena_memory_type_bits >> i) & 1) && i != arena_memory_type_index) {
+                auto other = instance.GetDevice().allocateMemory({.allocationSize = size, .memoryTypeIndex = i});
+                if (other.result == vk::Result::eSuccess) {
+                    memory = other.value;
+                    BbStats::device_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+                    BbStats::residency_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+                }
+            }
+        }
+        ASSERT_MSG(memory, "Failed to allocate {} MiB for guest memory copies: VRAM is full", size >> 20);
+        residency_memory = memory;
         residency_size = size;
         residency_used = 0;
         residency_chunks[static_cast<VkDeviceMemory>(residency_memory)] = {size, 0, 0, 0};
@@ -1876,6 +1918,17 @@ void BufferCache::ProcessIdleBlocks() {
 
 bool BufferCache::VramEligible(u64 block, bool garlic_known) {
     if (!GarlicInVram() || dynamic_blocks.Contains(block)) {
+        return false;
+    }
+    // Diagnostics: BB_GARLIC_VRAM_RANGE=begin,end keeps VRAM copies to guest addresses in
+    // [begin, end) (finding the block whose copy goes stale by halving the range).
+    static const std::pair<u64, u64> vram_range = [] {
+        const char* env = std::getenv("BB_GARLIC_VRAM_RANGE");
+        char* end = nullptr;
+        const u64 begin = env ? std::strtoull(env, &end, 0) : 0;
+        return std::pair<u64, u64>{begin, end && *end == ',' ? std::strtoull(end + 1, nullptr, 0) : ~0ull};
+    }();
+    if ((block << block_shift) < vram_range.first || (block << block_shift) >= vram_range.second) {
         return false;
     }
     if (LayerMode()) {
