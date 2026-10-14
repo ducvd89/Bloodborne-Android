@@ -133,7 +133,7 @@ public final class MainActivity extends Activity {
         surface.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override public void surfaceCreated(SurfaceHolder h) {
                 if (shmid>=0) attach(h);
-                else if (!hasGame()) { pendingHolder=h; askGameFolder(false); }
+                else if (!hasGame()) { pendingHolder=h; if (!installer.active() && !folderDialogShowing()) askGameFolder(false); }
                 else if (!startingX) { startingX=true; worker.execute(() -> startX(h)); }
             }
             @Override public void surfaceChanged(SurfaceHolder h,int format,int w,int height) {}
@@ -549,6 +549,8 @@ public final class MainActivity extends Activity {
                 !=android.content.pm.PackageManager.PERMISSION_GRANTED) return false;
         return gameDir!=null && isGame(new File(gameDir));
     }
+    private AlertDialog folderDialog;
+    private boolean folderDialogShowing() { return folderDialog!=null && folderDialog.isShowing(); }
     /** Explains, asks for storage access when needed, then opens the folder picker. */
     private void askGameFolder(boolean change) {
         if (Build.VERSION.SDK_INT>=23 && checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
@@ -560,7 +562,8 @@ public final class MainActivity extends Activity {
         status.setText(change ? "Choose the Bloodborne game folder." :
             "Choose your Bloodborne game folder (e.g. CUSA03173, the folder with eboot.bin).");
         status.setVisibility(View.VISIBLE);
-        new AlertDialog.Builder(this).setTitle("Bloodborne game folder")
+        if (folderDialogShowing()) folderDialog.dismiss();
+        folderDialog=new AlertDialog.Builder(this).setTitle("Bloodborne game folder")
             .setMessage("Select the extracted game folder (e.g. CUSA03173 or CUSA00900, which contains eboot.bin) or the folder "
                 +"that holds it, in your phone's storage."+(gameDir!=null ? "\n\nCurrent: "+gameDir : ""))
             .setPositiveButton("Choose folder",(d,w) -> {
@@ -722,6 +725,7 @@ public final class MainActivity extends Activity {
     private GameInstaller.Host modsHost() {
         return new GameInstaller.Host() {
             @Override public String script(String... args) throws java.io.IOException {
+                unpackRuntime();
                 if (!new File(BASE,ModsDialog.SCRIPT).isFile()) return null;
                 Process p=process(scriptCommand(ModsDialog.SCRIPT,args));
                 try {
@@ -735,6 +739,7 @@ public final class MainActivity extends Activity {
                 finally { p.destroyForcibly(); }
             }
             @Override public boolean scriptStream(String script,java.util.function.Consumer<String> lines,AtomicBoolean cancel,String... args) throws java.io.IOException {
+                unpackRuntime();
                 if (!new File(BASE,script).isFile()) return false;
                 Process p=process(scriptCommand(script,args));
                 // Cancel (or the app closing) stops the process, which ends the read below.
@@ -784,6 +789,12 @@ public final class MainActivity extends Activity {
             @Override public void closed() { if (!destroyed) immersive(); }
             @Override public boolean destroyed() { return destroyed; }
         };
+    }
+    /** The tool scripts come with the runtime, which otherwise unpacks only when the game starts. */
+    private void unpackRuntime() throws java.io.IOException {
+        try { RuntimeInstaller.ensure(this,new File(FILES),message -> main.post(() -> status.setText(message))); }
+        catch (java.io.IOException ex) { throw ex; }
+        catch (Exception ex) { throw new java.io.IOException("The runtime could not be installed: "+ex.getMessage()); }
     }
     /** The runtime's tool scripts (mods.sh) run in the rootfs shell, like run-thor.sh. */
     private String[] scriptCommand(String script,String[] args) {

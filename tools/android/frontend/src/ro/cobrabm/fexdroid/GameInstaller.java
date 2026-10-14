@@ -51,6 +51,7 @@ final class GameInstaller {
 
     GameInstaller(Activity activity,Host host) { this.activity=activity; this.host=host; }
 
+    boolean active() { return !closed; }
     private boolean live() { return !closed && !host.destroyed() && !activity.isFinishing(); }
     private void background(Runnable r,String name) { Thread t=new Thread(r,name); t.setDaemon(true); t.start(); }
     private void end() { if (!closed) { closed=true; host.installEnded(stopped); } }
