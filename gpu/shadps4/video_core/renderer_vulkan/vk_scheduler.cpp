@@ -1308,8 +1308,11 @@ struct SubmissionTrace {
     u32 num_waits = 0;
     std::array<vk::Semaphore, 4> waits{};
     std::array<u64, 4> wait_ticks{};
+    u32 stream = 0;       ///< breadcrumb stream of the scheduler
+    u32 num_signals = 0;
+    double ms = 0;        ///< since the first submission
 };
-std::array<SubmissionTrace, 16> submission_trace{};
+std::array<SubmissionTrace, 32> submission_trace{};
 u32 submission_trace_next = 0;
 std::mutex submission_trace_mutex;
 } // namespace
@@ -1385,11 +1388,50 @@ void Scheduler::NoteSubmission(u64 tick, const SubmitInfo& info, vk::Result resu
     trace.scheduler = this;
     trace.tick = tick;
     trace.result = result;
+    trace.stream = crumb_stream;
+    trace.num_signals = info.num_signal_semas;
+    static const auto start = std::chrono::steady_clock::now();
+    trace.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    // Debug build for issue #15: BB_SUBMIT_TRACE=1 prints the first 400 submissions as they go out.
+    static const bool print = [] {
+        const char* env = std::getenv("BB_SUBMIT_TRACE");
+        return env && env[0] == '1';
+    }();
+    static u32 printed = 0;
+    if (print && printed < 400) {
+        ++printed;
+        std::printf("GPU submit #%u: stream %u tick %llu at %.1f ms (%s), %u waits, %u signals\n", printed,
+                    trace.stream, static_cast<unsigned long long>(tick), trace.ms,
+                    vk::to_string(result).c_str(), info.num_wait_semas, info.num_signal_semas);
+        std::fflush(stdout);
+    }
     trace.num_waits = std::min<u32>(info.num_wait_semas, u32(trace.waits.size()));
     for (u32 i = 0; i < trace.num_waits; ++i) {
         trace.waits[i] = info.wait_semas[i];
         trace.wait_ticks[i] = info.wait_ticks[i];
     }
+}
+
+/// Debug build for issue #15: the last submissions of all schedulers, printed at device lost (no Vulkan calls:
+/// the device may be gone).
+void PrintSubmissionTrace() {
+    std::scoped_lock lk{submission_trace_mutex};
+    std::printf("GPU last submissions (oldest first):\n");
+    for (u32 n = 0; n < submission_trace.size(); ++n) {
+        const auto& trace = submission_trace[(submission_trace_next + n) % submission_trace.size()];
+        if (trace.tick == 0) {
+            continue;
+        }
+        std::printf("  stream %u tick %llu at %.1f ms (%s), %u waits, %u signals:", trace.stream,
+                    static_cast<unsigned long long>(trace.tick), trace.ms,
+                    vk::to_string(trace.result).c_str(), trace.num_waits, trace.num_signals);
+        for (u32 i = 0; i < trace.num_waits; ++i) {
+            std::printf(" %p@%llu", static_cast<void*>(VkSemaphore(trace.waits[i])),
+                        static_cast<unsigned long long>(trace.wait_ticks[i]));
+        }
+        std::printf("\n");
+    }
+    std::fflush(stdout);
 }
 
 void Scheduler::PopPendingOperations() {

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdio>
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -17,12 +19,46 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Vulkan {
 
+// Debug build for issue #15: what the HLE copy shader did last, printed at device lost (and by the first
+// calls, with BB_COPY_SHADER_TRACE=1 or always for the first 12 batches: they are few).
+namespace {
+struct CopyShaderState {
+    std::atomic<u64> calls{0}, batches{0}, multi_dispatches{0}, hoisted{0}, plain_copies{0};
+    std::atomic<u32> last_ranges{0};
+    std::atomic<u64> last_src_min{0}, last_src_size{0}, last_dst_min{0}, last_dst_size{0};
+    std::atomic<u32> stage{0}; ///< 1: obtaining buffers, 2: recording the multi copy, 3: recording a plain copy, 0: idle
+    std::atomic<const char*> last_path{"none"};
+};
+CopyShaderState copy_state;
+} // namespace
+
+void PrintCopyShaderState() {
+    std::printf("GPU copy shader HLE state: %llu calls, %llu batches (%llu multi-copy dispatches, %llu hoisted, %llu "
+                "plain vkCmdCopyBuffer), recording stage %u (0 idle, 1 obtaining buffers, 2 multi-copy, 3 plain "
+                "copy); last batch: %u ranges, %s, src [%#llx +%#llx], dst [%#llx +%#llx]\n",
+                (unsigned long long)copy_state.calls.load(), (unsigned long long)copy_state.batches.load(),
+                (unsigned long long)copy_state.multi_dispatches.load(),
+                (unsigned long long)copy_state.hoisted.load(),
+                (unsigned long long)copy_state.plain_copies.load(), copy_state.stage.load(),
+                copy_state.last_ranges.load(), copy_state.last_path.load(),
+                (unsigned long long)copy_state.last_src_min.load(),
+                (unsigned long long)copy_state.last_src_size.load(),
+                (unsigned long long)copy_state.last_dst_min.load(),
+                (unsigned long long)copy_state.last_dst_size.load());
+    std::fflush(stdout);
+}
+
 // bbport: the copy shader runs ~57 times per frame with ~1024 small ranges each. As one
 // vkCmdCopyBuffer with that many regions it cost ~37 ns of GPU time per range (~2.1 ms per
 // frame) plus the recording; buffer_multi_copy.comp copies all ranges in one dispatch.
 static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
                       const VideoCore::Buffer* dst, std::span<const vk::BufferCopy> copies) {
-    if (copies.size() < 8 || BbToggle::Disabled(BbToggle::MultiCopyShader)) {
+    // Debug build for issue #15: BB_MULTI_COPY=0 uses plain vkCmdCopyBuffer regions only.
+    static const bool multi_copy = [] {
+        const char* env = std::getenv("BB_MULTI_COPY");
+        return !(env && env[0] == '0');
+    }();
+    if (copies.size() < 8 || !multi_copy || BbToggle::Disabled(BbToggle::MultiCopyShader)) {
         return false;
     }
     u64 src_min = ~0ull, src_max = 0, dst_min = ~0ull, dst_max = 0;
@@ -48,6 +84,8 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
         vk::UniquePipeline pipeline;
     };
     static Pipeline pipe = [&] {
+        std::printf("GPU copy shader HLE: creating the multi-copy compute pipeline (push descriptors)\n");
+        std::fflush(stdout);
         const auto device = instance.GetDevice();
         Pipeline p;
         std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
@@ -71,6 +109,8 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
         const auto module = CompileSPV(BUFFER_MULTI_COPY_COMP, device);
         p.pipeline = CreateComputePipeline(device, module, *p.layout);
         device.destroyShaderModule(module);
+        std::printf("GPU copy shader HLE: multi-copy pipeline created\n");
+        std::fflush(stdout);
         return p;
     }();
 
@@ -89,6 +129,13 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
 
     const u64 src_size = src_max - src_min, dst_size = dst_max - dst_min;
     const u32 count = static_cast<u32>(copies.size());
+    copy_state.last_ranges = count;
+    copy_state.last_src_min = src_min;
+    copy_state.last_src_size = src_size;
+    copy_state.last_dst_min = dst_min;
+    copy_state.last_dst_size = dst_size;
+    copy_state.multi_dispatches++;
+    copy_state.stage = 2;
     const auto dispatch = [src = src->Handle(), dst = dst->Handle(), table = stream.Handle(),
                            src_min, src_size, dst_min, dst_size, table_offset, table_size,
                            count](vk::CommandBuffer cmdbuf) {
@@ -116,6 +163,9 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
         const Scheduler::HoistAccess write{dst, dst_min, dst_min + dst_size};
         if (scheduler.TryHoist({&read, 1}, {&write, 1})) {
             scheduler.RecordHoisted(dispatch);
+            copy_state.hoisted++;
+            copy_state.last_path = "multi-copy dispatch, hoisted in front of the pass";
+            copy_state.stage = 0;
             return true;
         }
     }
@@ -132,6 +182,8 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
                          vk::AccessFlagBits2::eShaderRead);
     runtime.AccessBuffer(dst, dst_min, dst_size, vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);
+    copy_state.last_path = "multi-copy dispatch (crumb \"HLE copy shader\")";
+    copy_state.stage = 0;
     return true;
 }
 
@@ -139,6 +191,8 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
                                  Rasterizer& rasterizer) {
     auto& runtime = rasterizer.GetRuntime();
     auto& buffer_cache = rasterizer.GetBufferCache();
+    ++copy_state.calls;
+    copy_state.stage = 1;
 
     // Copy shader defines three formatted buffers as inputs: control, source, and destination.
     const auto ctl_buf_sharp = info.buffers[0].GetSharp(info);
@@ -255,8 +309,28 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // Execute buffer copies.
         LOG_TRACE(Render_Vulkan, "HLE buffer copy: src_size = {}, dst_size = {}",
                   src_offset_max - src_offset_min, dst_offset_max - dst_offset_min);
+        copy_state.stage = 0;
+        const u64 batch_number = ++copy_state.batches;
+        if (batch_number <= 12) {
+            std::printf("GPU copy shader HLE batch %llu: %zu ranges, src %#llx +%#llx, dst %#llx +%#llx\n",
+                        (unsigned long long)batch_number, vk_copies.size(),
+                        (unsigned long long)src_offset_min,
+                        (unsigned long long)(src_offset_max - src_offset_min),
+                        (unsigned long long)dst_offset_min,
+                        (unsigned long long)(dst_offset_max - dst_offset_min));
+            std::fflush(stdout);
+        }
         if (!MultiCopy(rasterizer, src_buf, dst_buf, vk_copies)) {
+            copy_state.stage = 3;
+            copy_state.last_ranges = static_cast<u32>(vk_copies.size());
+            copy_state.last_src_min = src_offset_min;
+            copy_state.last_src_size = src_offset_max - src_offset_min;
+            copy_state.last_dst_min = dst_offset_min;
+            copy_state.last_dst_size = dst_offset_max - dst_offset_min;
+            copy_state.last_path = "plain vkCmdCopyBuffer regions";
+            copy_state.plain_copies++;
             runtime.CopyBuffer(src_buf, dst_buf, vk_copies);
+            copy_state.stage = 0;
         }
         batch_start = batch_end;
     }

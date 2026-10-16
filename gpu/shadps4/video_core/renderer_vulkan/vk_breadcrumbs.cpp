@@ -9,12 +9,20 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <chrono>
+#include <thread>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 
 extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, uintptr_t* end);
+
+namespace Vulkan {
+// Debug build for issue #15: what the scheduler and the HLE copy shader last did (their files).
+void PrintSubmissionTrace();
+void PrintCopyShaderState();
+} // namespace Vulkan
 
 #include <vk_mem_alloc.h>
 
@@ -64,6 +72,12 @@ vk::Device ts_device{};
 vk::QueryPool ts_pool{};
 std::unique_ptr<std::atomic<u32>[]> ts_values; ///< the marker value each slot was written for
 std::unique_ptr<u32[]> cpu_markers;            ///< markers and args (zero) in timestamp mode
+/// Debug build for issue #15: the newest marker of each stream a read of the query pool gave. A device
+/// that is lost may refuse the read (or give nothing): the report then uses what was last seen alive.
+std::array<std::atomic<u32>, 16> polled_markers{};
+std::atomic<int> last_read_result{0};
+std::atomic<u64> poll_reads{0};
+u32 poll_ms = 0;
 
 void InitTimestamps(const Instance& instance) {
     const auto families = instance.GetPhysicalDevice().getQueueFamilyProperties();
@@ -102,8 +116,9 @@ u32 ReadMarker(u32 stream) {
     const auto result = ts_device.getQueryPoolResults(
         ts_pool, stream * TsPerStream, TsPerStream, results.size() * sizeof(u64), results.data(),
         2 * sizeof(u64), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+    last_read_result.store(int(result), std::memory_order_relaxed);
     if (result != vk::Result::eSuccess && result != vk::Result::eNotReady) {
-        return 0;
+        return stream < polled_markers.size() ? polled_markers[stream].load() : 0;
     }
     u64 newest_time = 0;
     u32 newest = 0;
@@ -119,7 +134,37 @@ u32 ReadMarker(u32 stream) {
             newest = value;
         }
     }
+    if (stream < polled_markers.size()) {
+        if (newest != 0) {
+            polled_markers[stream].store(newest);
+        } else {
+            newest = polled_markers[stream].load();
+        }
+    }
     return newest;
+}
+
+/// Debug build for issue #15 (timestamp mode only): reads the markers every BB_BREADCRUMBS_POLL_MS
+/// (default 20, 0: off) so that the last ones seen while the GPU was alive survive its loss.
+void StartPoller() {
+    const char* env = std::getenv("BB_BREADCRUMBS_POLL_MS");
+    poll_ms = env && *env ? u32(std::strtoul(env, nullptr, 10)) : 20;
+    if (!ts_pool || poll_ms == 0) {
+        return;
+    }
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+            const u32 count = std::min(num_streams.load(), MaxStreams);
+            for (u32 s = 0; s < count; ++s) {
+                if (streams[s].next.load(std::memory_order_relaxed) > 1) {
+                    ReadMarker(s);
+                }
+            }
+            poll_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    }).detach();
+    std::printf("GPU breadcrumbs: markers polled every %u ms (BB_BREADCRUMBS_POLL_MS)\n", poll_ms);
 }
 
 void Init(const Instance& instance) {
@@ -130,6 +175,7 @@ void Init(const Instance& instance) {
     if (!instance.IsBufferMarkerSupported()) {
         if (env && env[0] == '1') {
             InitTimestamps(instance);
+            StartPoller();
             return;
         }
         std::printf("GPU breadcrumbs: VK_AMD_buffer_marker unavailable, GPU hangs will not be "
@@ -374,6 +420,12 @@ void ReportStuck(const char* where) {
 namespace {
 void Report(const char* title, const char* where) {
     std::printf("GPU breadcrumbs %s (%s): what each command stream finished\n", title, where);
+    if (ts_pool) {
+        std::printf("  (timestamp markers: the newest the GPU wrote; last read of the query pool: %s, "
+                    "%llu polls every %u ms)\n",
+                    vk::to_string(vk::Result(last_read_result.load())).c_str(),
+                    (unsigned long long)poll_reads.load(), poll_ms);
+    }
     const u32 count = std::min(num_streams.load(), MaxStreams);
     for (u32 s = 0; s < count; ++s) {
         const Stream& stream = streams[s];
@@ -417,6 +469,20 @@ void Report(const char* title, const char* where) {
             PrintEntry(stream, next, "later");
         }
     }
+    // Debug build for issue #15: the newest commands noted (recorded) per stream, whatever the markers say,
+    // then the last submissions and the HLE copy shader's state.
+    std::printf("GPU breadcrumbs: the newest commands recorded per stream\n");
+    for (u32 s = 0; s < count; ++s) {
+        const Stream& stream = streams[s];
+        const u64 last = stream.next.load() - 1;
+        for (u64 id = last > 7 ? last - 7 : 1; id <= last && last != 0; ++id) {
+            std::printf("  stream %u (%s)", s, stream.name);
+            PrintEntry(stream, id, "recorded");
+        }
+    }
+    std::fflush(stdout);
+    PrintSubmissionTrace();
+    PrintCopyShaderState();
     std::fflush(stdout);
 }
 } // Anonymous namespace

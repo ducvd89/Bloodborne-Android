@@ -24,6 +24,54 @@ export FEX_APP_DATA_LOCATION="$HOME/.fex-emu/"
 export FEX_APP_CACHE_LOCATION="$HOME/.cache/fex-emu/"
 mkdir -p "$HOME/.fex-emu" "$HOME/.cache/fex-emu" "$TMPDIR" "$base/user" "$base/logs" "$base/logs/failed-shaders"
 
+# ---- DEBUG BUILD for issue #15 (Mali-G720 device lost): not for release ----
+# Extra diagnostics on by default, and a player-editable override file: debug.env in the Bloodborne folder of
+# shared storage (the game folder's parent: /storage/emulated/0/Bloodborne/debug.env; the app has legacy
+# external storage access). Lines NAME=value only, NAME one of BB_*, PANVK_*, PAN_*, MESA_* (capitals, digits,
+# underscore), the value letters, digits and _ . / : , = + @ % - only. The file is read, never sourced.
+echo "Debug build for issue #15 (0.9.2-debug15)"
+for prop in ro.product.manufacturer ro.product.model ro.board.platform ro.hardware.vulkan ro.hardware.egl \
+            ro.build.version.release ro.build.version.sdk ro.soc.model; do
+    echo "  $prop=$(getprop "$prop" 2>/dev/null || true)"
+done
+export BB_BREADCRUMBS=${BB_BREADCRUMBS:-1}
+export BB_SUBMIT_TRACE=${BB_SUBMIT_TRACE:-1}
+export BB_COPY_SHADER_TRACE=${BB_COPY_SHADER_TRACE:-1}
+debug_env=/storage/emulated/0/Bloodborne/debug.env
+debug_cr=$(printf '\r')
+apply_debug_env() { # $1 = 1: say what is applied (the second pass is silent)
+    if [ ! -r "$debug_env" ]; then
+        [ "$1" = 1 ] && echo "debug.env: none ($debug_env is not there or not readable)"
+        return 0
+    fi
+    [ "$1" = 1 ] && echo "debug.env: reading $debug_env"
+    debug_n=0
+    while IFS= read -r debug_line || [ -n "$debug_line" ]; do
+        debug_n=$((debug_n + 1))
+        debug_line=${debug_line%"$debug_cr"}
+        case $debug_line in ''|'#'*) continue ;; esac
+        case $debug_line in
+            *=*) ;;
+            *) [ "$1" = 1 ] && echo "debug.env line $debug_n ignored (not NAME=value): $debug_line"; continue ;;
+        esac
+        debug_name=${debug_line%%=*}
+        debug_value=${debug_line#*=}
+        case $debug_name in
+            BB_?*|PANVK_?*|PAN_?*|MESA_?*) ;;
+            *) [ "$1" = 1 ] && echo "debug.env line $debug_n ignored (the name must start with BB_, PANVK_, PAN_ or MESA_): $debug_line"; continue ;;
+        esac
+        case $debug_name in
+            *[!A-Z0-9_]*) [ "$1" = 1 ] && echo "debug.env line $debug_n ignored (bad characters in the name): $debug_line"; continue ;;
+        esac
+        case $debug_value in
+            *[!A-Za-z0-9_./:,=+@%-]*) [ "$1" = 1 ] && echo "debug.env line $debug_n ignored (the value may only have letters, digits and _ . / : , = + @ % -): $debug_line"; continue ;;
+        esac
+        export "$debug_name=$debug_value"
+        [ "$1" = 1 ] && echo "debug.env applied: $debug_name=$debug_value"
+    done < "$debug_env"
+    return 0
+}
+
 # ---- Settings: bbport.ini (the app's settings screen writes it) turned into BB_* variables ----
 export BB_CONFIG="$base/bbport.ini"
 [ -f "$BB_CONFIG" ] || cp "$base/bbport.default.ini" "$BB_CONFIG"
@@ -189,6 +237,9 @@ export BB_FAILED_SHADER_DIR="$base/logs/failed-shaders"
 cp "$base/fex-compatible.json" "$HOME/.fex-emu/Config.json"
 # Local overrides for this device (experiments, tuning): sourced last, not part of the runtime.
 [ -f "$base/bionic-local.sh" ] && . "$base/bionic-local.sh"
+# Debug build for issue #15: the player's overrides (before the frame rate logic below reads BB_FRAME_HOOKS, and
+# once more, silently, before the launch so that nothing computed in between replaces them).
+apply_debug_env 1
 # FPS limit (fps_limit: 30, 40, 45, 60 or 0 for none) and the game's frame rate. Hooks in the game's code
 # (gpu/shim/bbport_frame_rate.cpp, installed when the game loads) give the game each frame's real time
 # for its steps, at any limit including 30, and leave the limiting to the present thread (BB_FPS_LIMIT;
@@ -221,6 +272,9 @@ speed_floor=$(setting speed_floor)
 case $speed_floor in 20|30) ;; *) speed_floor=20 ;; esac
 export BB_FRAME_DT_MAX_FPS=$speed_floor
 echo "Frame rate: limit $fps_limit, hooks $([ "$frame_hooks" = 1 ] && echo on || echo 'off (BB_FRAME_HOOKS=0)'), game speed kept down to $speed_floor FPS"
+apply_debug_env 0
+echo "Debug build for issue #15: the effective environment of the game process:"
+env | grep -E '^(BB|PANVK|PAN|MESA|VK|FEX|LD)_' | sort | sed 's/^/  /' || true
 cd "$base"
 [ -x "$bionic/bin/bb-probe" ] || { echo "The Bionic runtime is missing: $bionic" >&2; exit 2; }
 
