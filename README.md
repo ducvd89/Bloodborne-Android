@@ -1,14 +1,14 @@
 <h1 align="center">Bloodborne-Android</h1>
 
 <p align="center">
-  <b>Bloodborne on Android.</b> Yharnam on Snapdragon phones and handhelds, and experimentally on Mali.
+  <b>Bloodborne on Android.</b> Yharnam on Snapdragon (Adreno) phones and handhelds.<br><b>Mali GPUs are not supported:</b> the Mali driver is in the app for testing only and does not run the game yet.
 </p>
 
 <p align="center">
   <a href="https://github.com/ducvd89/Bloodborne-Android/releases/latest"><img src="https://img.shields.io/github/v/release/ducvd89/Bloodborne-Android?label=download&color=8b1e1e" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/Android-9%2B-3ddc84?logo=android&logoColor=white" alt="Android 9+">
   <img src="https://img.shields.io/badge/GPU-Adreno%206xx%20%7C%207xx%20%7C%208xx-d6a64a" alt="Adreno">
-  <img src="https://img.shields.io/badge/GPU-Mali%20G610%2B%20(experimental)-5a7bbf" alt="Mali (experimental)">
+  <img src="https://img.shields.io/badge/Mali-not%20supported%20(testing%20only)-lightgrey" alt="Mali: not supported (testing only)">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--2.0-blue" alt="GPL-2.0"></a>
 </p>
 
@@ -19,7 +19,7 @@
   </tr>
 </table>
 
-Port of Bloodborne (PS4, **v1.09**, every retail release). The runtime and renderer run natively on ARM64, FEXCore translates the game's x86-64 code, and Mesa's Vulkan drivers drive the GPU (Turnip on Adreno, PanVK on Mali). Experimental.
+Port of Bloodborne (PS4, **v1.09**, every retail release). The runtime and renderer run natively on ARM64, FEXCore translates the game's x86-64 code, and Mesa's Vulkan drivers drive the GPU (Turnip on Adreno; PanVK on Mali for testing only). Experimental.
 
 ## How it works
 
@@ -67,8 +67,8 @@ flowchart LR
 
 - **Real game speed when the frame rate drops** — new in 0.9.1: frame-rate hooks from bloodborne_pc replace the 60 FPS patches, and the game keeps its speed down to 20 FPS instead of slowing below 30 ([Game speed](#default-settings-and-performance))
 - **Native Android program** — new in 0.9.0: no Linux system on the phone any more; the APK is about 37 MB and frames go straight to the screen
-- **GPU driver picked for you** — new in 0.9.0: Turnip for Adreno 6xx/7xx and 8xx and PanVK for Mali ship inside the APK ([GPU drivers](#gpu-drivers))
-- **Output resolution** (1080p, 720p or 480p) with **FSR 3.1** upscaling presets relative to it, and a **VSync** option — new in 0.9.0
+- **GPU driver picked for you** — new in 0.9.0: Turnip for Adreno 6xx/7xx and 8xx ships inside the APK ([GPU drivers](#gpu-drivers))
+- **Any aspect ratio and output resolution** — new in 0.9.3: Auto (your screen's own shape), 4:3, 16:10, 16:9, 21:9 or 32:9, and **Display native** output (your screen's own size) or a fixed 360p–1440p; **FSR 3.1** upscaling presets relative to it, and a **VSync** option ([Aspect ratio and resolution](#aspect-ratio-and-resolution))
 - **Lossless Scaling frame generation** (2×–4×, needs your own Lossless.dll), changed while you play from its own menu page — new in 0.9.0; also **FSR 3.1 frame generation** (poor image quality for now)
 - **Report a problem** — new in 0.9.0: saves a logs zip for a GitHub issue ([Reporting problems](#reporting-problems))
 - **Mods**: install .zip, .7z or PS4 .pkg mods for 1.09, switch them on and off and set their load order
@@ -76,7 +76,7 @@ flowchart LR
 - **Game settings** in the app's menu: skip the online/offline screen (straight to the main menu), skip intros, free camera, debug menu
 - **On-screen PlayStation controller** with an editable layout; physical controllers work too
 - **Updates from the app**: menu → **Check for updates** downloads and installs the newest release
-- 16:9 picture on any screen, including foldables
+- Wider or taller screens show more of the scene, with the HUD at the screen's edges; foldables' inner and outer screens each keep their own touch controller layout
 
 ## Devices
 
@@ -85,7 +85,7 @@ flowchart LR
 | AYN Thor | Snapdragon 8 Gen 2 | Adreno 740 | Turnip 26.3.0 |
 | Oppo Find N5 | Snapdragon 8 Elite | Adreno 830 | Turnip Gen8 V37 (0.8.x was tested with the Linux turnip/gen8 build) |
 
-Other Adreno 6xx/7xx/8xx devices are untested. Mali (G610 and newer, Android 15+) is experimental and has not been run on a Mali phone yet. Requires Android 9+ and 4 KB memory pages; tested with 16 GB RAM.
+Other Adreno 6xx/7xx/8xx devices are untested. **Mali GPUs are not supported.** The app carries a Mali driver (PanVK) only for testing; the game does not run on Mali phones yet, so please don't report Mali problems as bugs. Requires Android 9+ and 4 KB memory pages; tested with 16 GB RAM.
 
 ## Install
 
@@ -114,7 +114,7 @@ On ColorOS / OxygenOS (Oppo, OnePlus) a "Security warning" about a malicious app
 Swipe in from the left edge (or press Back) to open the menu. Its sections:
 
 - **Game:** resume, Game settings, Cheats, Mods, restart.
-- **Graphics:** graphics settings (output resolution, upscaler and preset, VSync, FPS limit, keeping the game's speed when the frame rate drops, model detail, effects), Frame generation (Lossless Scaling, applies at once) and the GPU driver.
+- **Graphics:** graphics settings (aspect ratio, output resolution, upscaler and preset, VSync, FPS limit, keeping the game's speed when the frame rate drops, model detail, effects), Frame generation (Lossless Scaling, applies at once) and the GPU driver.
 - **Controls:** turn the on-screen controller on or off; edit its layout (move, resize or reset the buttons). With the controller on, drag anywhere outside the buttons to turn the camera.
 - **Storage:** choose the game folder, back up and restore saves, quit.
 - **App:** report a problem, check for updates (installing one closes the game, so save first).
@@ -123,11 +123,15 @@ Each entry shows its current setting underneath.
 
 ## Default settings and performance
 
-The defaults are tuned on the AYN Thor: a 752×424 scene upscaled by FSR 3.1 to 1280×720, the costly effects (SSAO, SSR, dynamic shadows, depth of field, motion blur, the game's anti-aliasing) off, **lowest model detail** and a 60 FPS limit. Cheats start off. They apply on a first install and once when updating from 0.7.x or older; your controller mapping, GPU driver and mods choice are kept.
+The defaults are tuned on the AYN Thor: aspect ratio Auto, 1080p output (the width follows the aspect ratio) with FSR 3.1 Performance (a 960×540 scene at 16:9), the costly effects (SSAO, SSR, dynamic shadows, depth of field, motion blur, the game's anti-aliasing) off, **lowest model detail** and a 60 FPS limit. Cheats start off. They apply on a first install and once when updating from 0.7.x or older; your controller mapping, GPU driver and mods choice are kept.
 
 On the Thor most of the GPU's time goes to geometry, not pixels: a smaller render size barely changes the frame rate, the model detail setting does (lowest: about +10%).
 
-The **output resolution** (1080p, 720p or 480p) is the size of the final picture and the game's interface; the upscaler preset sets the scene size relative to it:
+### Aspect ratio and resolution
+
+**Aspect ratio** (Settings → Graphics): **Auto** uses your screen's own shape (for example 20:9 on most phones, or a foldable's inner screen); 4:3, 16:10, 16:9, 21:9 and 32:9 are fixed. On a wider screen the camera shows more at the sides, on a taller one more above and below; the HUD moves to the screen's edges, menus and fades cover the whole screen.
+
+**Output resolution** is the size of the final picture and the game's interface. **Display native** is your screen's own size; the other choices are 360p to 1440p at the chosen aspect ratio (the width follows it), up to your screen's size. The upscaler preset sets the scene size relative to the output. At 16:9:
 
 | Output | Native | Quality | Balanced | Performance | Ultra Perf. |
 |---|---|---|---|---|---|
@@ -135,7 +139,7 @@ The **output resolution** (1080p, 720p or 480p) is the size of the final picture
 | 720p | 1280×720 | 854×480 | 752×424 | 640×360 | 426×240 |
 | 480p | 854×480 | 570×320 | 502×282 | 428×240 | 284×160 |
 
-FSR 3.1 runs at the output size, so 1080p costs more GPU time than 720p. **VSync** (off by default) shows every frame for at least one screen refresh, in order: smoother pacing for a little more latency (best on Android 12+; pick an FPS limit that divides the refresh rate).
+Wider ratios add width at the same height (e.g. 1080p at 20:9 is 2400×1080). Both settings apply at the next game start. FSR 3.1 runs at the output size, so a higher output costs more GPU time; outputs above 1080p (including Display native on most phones) also use much more memory, so on phones with less than 12 GB of RAM keep 1080p or below. **VSync** (off by default) shows every frame for at least one screen refresh, in order: smoother pacing for a little more latency (best on Android 12+; pick an FPS limit that divides the refresh rate).
 
 **Game speed.** The game steps its world by a fixed 1/30 s and runs in slow motion below 30 FPS. Hooks in its code (ported from [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc), set at load; every spot is checked, and the community Uncap FPS++ patch is the fallback if one differs) give it each frame's real time instead, so it keeps its speed at any FPS limit. **Keep game speed when FPS drops** (on by default) extends that down to 20 FPS (a step of up to 50 ms); off, the game slows down below 30 FPS. Turn it off if physics or animations misbehave in a heavy scene.
 
@@ -147,7 +151,7 @@ The app carries three Android builds of Mesa's open-source Vulkan drivers and us
 |---|---|
 | Adreno 6xx / 7xx | Turnip, Mesa 26.3.0 ([release](https://github.com/ducvd89/Bloodborne-Android/releases/tag/turnip-android-main-26.3.0-35b085c)) |
 | Adreno 8xx | Turnip Gen8 V37 by StevenMXZ ([original](https://github.com/StevenMXZ/Adreno-Tools-Drivers/releases/tag/v37), [our mirror](https://github.com/ducvd89/Bloodborne-Android/releases/tag/turnip-android-gen8-26.3.0-9c7e022)) |
-| Mali G610 and newer (Android 15+) | PanVK V3.2 for mali_kbase, the Bachata S4 series ([release](https://github.com/ducvd89/Bloodborne-Android/releases/tag/panvk-android-v3.2-2a9358a)); experimental |
+| Mali G610 and newer (Android 15+) | PanVK V3.2 for mali_kbase, the Bachata S4 series ([release](https://github.com/ducvd89/Bloodborne-Android/releases/tag/panvk-android-v3.2-2a9358a)); **for testing only: Mali is not supported and the game does not run on it yet** |
 
 Other GPUs, and Mali on Android below 15, use the phone's own driver, which does not run the game yet on Adreno (black screen). A driver you chose yourself is kept. **Download** in the menu lists the 10 newest Android driver builds from this project's releases (Turnip and PanVK), marked for your GPU; **Install a zip** takes any adrenotools-style driver zip built for Android.
 
