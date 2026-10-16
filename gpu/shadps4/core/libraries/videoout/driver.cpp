@@ -15,6 +15,7 @@
 #include "common/assert.h"
 #include "bbport_adpf.h"
 #include "bbport_toggles.h"
+#include "bbport_guest_memory.h"
 #include "bbport_fault.h"
 #include "bbport_heap_sites.h"
 #include "bbport_wait_trace.h"
@@ -370,6 +371,51 @@ static void PrintMemory() {
                 (unsigned long long)BbStats::gc_kept_images.exchange(0));
 }
 
+/// bbport: where the memory goes, every ~10 s with BB_FRAME_STATS (phase 1 of the unified memory plan):
+/// Vulkan images, arena residency (VRAM/arena blocks), staging pool, direct memory chunks, and the
+/// kernel's own count for the process (/proc/self/smaps_rollup: one small file, no per-mapping walk).
+static void PrintMemorySplit() {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point last{};
+    const auto now = Clock::now();
+    if (last != Clock::time_point{} && now - last < std::chrono::seconds(10)) {
+        return;
+    }
+    last = now;
+    unsigned long long rss = 0, pss = 0, anon = 0, shared = 0, priv_dirty = 0, swap = 0;
+    if (FILE* file = std::fopen("/proc/self/smaps_rollup", "r")) {
+        char line[160];
+        unsigned long long kib;
+        while (std::fgets(line, sizeof(line), file)) {
+            if (std::sscanf(line, "Rss: %llu", &kib) == 1) {
+                rss = kib;
+            } else if (std::sscanf(line, "Pss: %llu", &kib) == 1) {
+                pss = kib;
+            } else if (std::sscanf(line, "Anonymous: %llu", &kib) == 1) {
+                anon = kib;
+            } else if (std::sscanf(line, "Shared_Dirty: %llu", &kib) == 1) {
+                shared += kib;
+            } else if (std::sscanf(line, "Shared_Clean: %llu", &kib) == 1) {
+                shared += kib;
+            } else if (std::sscanf(line, "Private_Dirty: %llu", &kib) == 1) {
+                priv_dirty = kib;
+            } else if (std::sscanf(line, "Swap: %llu", &kib) == 1) {
+                swap = kib;
+            }
+        }
+        std::fclose(file);
+    }
+    std::printf("Memory split: images %llu MiB, arena residency %llu MiB, staging %llu MiB, direct "
+                "memory chunks %llu MiB%s; process Rss %llu MiB, Pss %llu MiB, anon %llu MiB, shared "
+                "%llu MiB, private dirty %llu MiB, swap %llu MiB\n",
+                (unsigned long long)(BbStats::vk_image_bytes.load() >> 20),
+                (unsigned long long)(BbStats::residency_alloc_bytes.load() >> 20),
+                (unsigned long long)(BbStats::staging_bytes.load() >> 20),
+                (unsigned long long)(BbGuestMemory::ChunkBytes() >> 20),
+                BbGuestMemory::Unified() ? " (unified: shared with the GPU)" : "", rss >> 10, pss >> 10,
+                anon >> 10, shared >> 10, priv_dirty >> 10, swap >> 10);
+}
+
 void VideoOutDriver::Flip(const Request& req) {
     // bbport: frame generation: the generated frame goes first and the real one half a flip
     // interval later (the average of the last flips, so frames come at an even rate).
@@ -660,6 +706,7 @@ void VideoOutDriver::Flip(const Request& req) {
             }
             Vulkan::Breadcrumbs::PrintProgress();
             PrintMemory();
+            PrintMemorySplit();
             if (const u64 in_place = BbStats::bound_in_place_bytes.exchange(0)) {
                 std::printf("Buffer bindings: %.1f MB/frame in place (%.1f GPU-written), %.1f MB/frame "
                             "VRAM copies\n",

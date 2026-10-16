@@ -7,8 +7,13 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <csignal>
 #include <mutex>
+#include <string_view>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -33,6 +38,10 @@ bool whole_only = false; // the driver's dma-buf maps at offset 0 only: a chunk 
 enum class Mode { DmaBuf, HostImport };
 Mode mode = Mode::DmaBuf;
 std::atomic<u64> chunk_bytes{0};
+bool unified_mode = false;      // BB_UNIFIED: set in Usable() before the probes, cleared if one fails
+bool unified_noncoherent = false; // the chosen type is HOST_CACHED without HOST_COHERENT
+std::uint32_t unified_type = ~0u;
+std::string fallback_reason;
 
 bool GuestInVram() {
     // bbport BB_GUEST_VRAM=1 (experiment): the game's direct memory in VRAM the CPU maps through
@@ -44,7 +53,32 @@ bool GuestInVram() {
     return on;
 }
 
+/// Unified memory: a host-visible type the CPU maps cached (the game's code runs on it), device-local
+/// or not (an integrated GPU's memory is all of it); cached and coherent first, else cached only
+/// (explicit cache maintenance would be needed at handoffs, see UnifiedNeedsSync). Never a
+/// write-combined (uncached) type: the game would crawl on it.
+std::uint32_t PickUnifiedType(const vk::PhysicalDeviceMemoryProperties& props, std::uint32_t bits,
+                              bool* coherent) {
+    const auto cached = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached;
+    const auto both = cached | vk::MemoryPropertyFlagBits::eHostCoherent;
+    for (const auto want : {both, cached}) {
+        for (std::uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+            if ((bits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want) {
+                if (coherent) {
+                    *coherent = (want & vk::MemoryPropertyFlagBits::eHostCoherent) ==
+                                vk::MemoryPropertyFlagBits::eHostCoherent;
+                }
+                return i;
+            }
+        }
+    }
+    return ~0u;
+}
+
 std::uint32_t FindType(std::uint32_t bits) {
+    if (unified_mode) {
+        return PickUnifiedType(memory_properties, bits, nullptr);
+    }
     if (GuestInVram()) {
         const auto want = vk::MemoryPropertyFlagBits::eHostVisible |
                           vk::MemoryPropertyFlagBits::eDeviceLocal;
@@ -124,7 +158,7 @@ int AllocChunk(u64 phys, u64 size) {
     const std::uint32_t type = FindType(requirements.memoryTypeBits);
     if (type == ~0u) {
         device.destroyBuffer(buffer);
-        return fail("finding a cached system memory type", vk::Result::eErrorFeatureNotPresent);
+        return fail("finding a cached host-visible memory type", vk::Result::eErrorFeatureNotPresent);
     }
     const vk::MemoryAllocateFlagsInfo address_flags{
         .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
@@ -168,9 +202,10 @@ int AllocChunk(u64 phys, u64 size) {
         RegisterChunk(chunks[i]);
     }
     const u64 total = chunk_bytes.fetch_add(size) + size;
-    std::printf("Guest memory: direct memory %#llx+%llu MiB in GPU-visible memory (dma-buf), "
-                "%llu MiB so far\n",
+    std::printf("Guest memory: direct memory %#llx+%llu MiB in GPU-visible memory (dma-buf%s, memory "
+                "type %u), %llu MiB so far\n",
                 (unsigned long long)phys, (unsigned long long)(size >> 20),
+                unified_mode ? ", UNIFIED MEMORY: shared with the CPU, no GPU copy" : "", type,
                 (unsigned long long)(total >> 20));
     return fd;
 }
@@ -536,6 +571,61 @@ bool PcModelGpu(const Vulkan::Instance& instance) {
     return ok;
 }
 
+bool UnifiedRequested() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_UNIFIED");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+bool UnifiedEligible(const Vulkan::Instance& instance) {
+    static const bool eligible = [&] {
+        if (!UnifiedRequested()) {
+            return false;
+        }
+        constexpr std::uint32_t ArmVendor = 0x13b5;
+        const char* why = nullptr;
+        const char* layer = std::getenv("BB_LAYER_MEMORY");
+        if (instance.GetVendorID() == ArmVendor ||
+            instance.GetDriverID() == vk::DriverId::eMesaPanvk ||
+            instance.GetDriverID() == vk::DriverId::eArmProprietary) {
+            why = "Mali/PanVK always stays on copies";
+        } else if (!instance.IsIntegrated()) {
+            why = "the GPU is not integrated (its memory is not the CPU's)";
+        } else if (layer && layer[0] == '0') {
+            why = "BB_LAYER_MEMORY=0 (it needs the layer's memory module)";
+        } else if (!instance.IsGuestMemoryExportSupported()) {
+            why = "the driver cannot export memory as a dma-buf";
+        }
+        if (why) {
+            fallback_reason = why;
+            std::printf("Guest memory: unified memory (BB_UNIFIED=1) is NOT used: %s; the GPU uses "
+                        "copies\n",
+                        why);
+            return false;
+        }
+        return true;
+    }();
+    return eligible;
+}
+
+bool Unified() {
+    return unified_mode;
+}
+
+bool UnifiedNeedsSync() {
+    return unified_mode && unified_noncoherent;
+}
+
+const char* FallbackReason() {
+    return fallback_reason.c_str();
+}
+
+std::uint64_t ChunkBytes() {
+    return chunk_bytes.load(std::memory_order_relaxed);
+}
+
 bool HostImported() {
     return mode == Mode::HostImport;
 }
@@ -548,10 +638,169 @@ bool LayerMemory() {
         if (env && *env) {
             return env[0] == '1';
         }
+        if (UnifiedRequested()) {
+            return true; // unified memory is the layer's memory module
+        }
         return layer_default.load(std::memory_order_relaxed) == 1;
     }();
     return on;
 }
+
+namespace {
+bool ProbesForced() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_GUEST_PROBES");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+bool bind_ok(vk::Device dev, vk::Buffer buffer, vk::DeviceMemory memory) {
+    if (!memory) {
+        return false;
+    }
+    if (const auto result = dev.bindBufferMemory(buffer, memory, 0); result != vk::Result::eSuccess) {
+        fallback_reason = "binding the probe buffer failed (" + vk::to_string(result) + ")";
+        return false;
+    }
+    return true;
+}
+
+void ProbeLine(const char* name, bool pass, const char* detail = "") {
+    std::printf("Guest memory probe: %-26s %s%s%s\n", name, pass ? "pass" : "FAIL",
+                *detail ? " - " : "", detail);
+    if (!pass && fallback_reason.empty()) {
+        fallback_reason = std::string("probe '") + name + "' failed" + (*detail ? ": " : "") + detail;
+    }
+}
+
+/// Write protection on a dma-buf mapping, the game's write tracking (BB_WRITE_TRACKING): a write to a
+/// PROT_READ page must raise SIGSEGV. Done in a forked child that sets SIGSEGV/SIGBUS to the default
+/// action first (the runtime's and FEX's handlers are untouched in this process: the child has its own
+/// copy) and uses system calls only; the parent reads how it ended. Skipped (not a failure) where
+/// fork is not allowed or the child cannot be waited for. BB_GUEST_PROBE_MPROTECT=0 skips it.
+bool ProbeWriteProtect(void* mapping, const char*& detail) {
+    const char* env = std::getenv("BB_GUEST_PROBE_MPROTECT");
+    if (env && env[0] == '0') {
+        detail = "skipped (BB_GUEST_PROBE_MPROTECT=0)";
+        return true;
+    }
+    std::fflush(stdout);
+    std::fflush(stderr);
+    const pid_t pid = fork();
+    if (pid < 0) {
+        detail = "skipped (fork not allowed)";
+        return true;
+    }
+    if (pid == 0) {
+        struct sigaction sa{};
+        sa.sa_handler = SIG_DFL;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, nullptr);
+        sigaction(SIGBUS, &sa, nullptr);
+        const rlimit no_core{0, 0};
+        setrlimit(RLIMIT_CORE, &no_core);
+        auto* word = static_cast<volatile std::uint32_t*>(mapping);
+        if (mprotect(mapping, 4096, PROT_READ) != 0) {
+            _exit(10);
+        }
+        const std::uint32_t read = *word; // reads stay allowed
+        (void)read;
+        if (mprotect(mapping, 4096, PROT_READ | PROT_WRITE) != 0) {
+            _exit(11);
+        }
+        *word = 1; // allowed again: must not fault
+        if (mprotect(mapping, 4096, PROT_READ) != 0) {
+            _exit(13);
+        }
+        *word = 2; // must raise SIGSEGV
+        _exit(12);
+    }
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != pid) {
+        detail = "skipped (child could not be waited for)";
+        return true;
+    }
+    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV) {
+        detail = "write to a PROT_READ page raised SIGSEGV; re-enabling write works";
+        return true;
+    }
+    static std::string text;
+    text = WIFSIGNALED(status) ? "child died with signal " + std::to_string(WTERMSIG(status))
+           : WEXITSTATUS(status) == 12 ? "write to a PROT_READ page did not fault"
+                                       : "mprotect failed (child exit " +
+                                             std::to_string(WEXITSTATUS(status)) + ")";
+    detail = text.c_str();
+    return false;
+}
+
+/// The probes of unified memory on the exported buffer `buffer` (2 MiB, `whole` its CPU mapping):
+/// 1 MiB halves, CPU lines dirty in the destination before the GPU writes it (a non-coherent mapping
+/// shows stale or lost data). Logs one pass/fail line each.
+bool RunGuestProbes(const Vulkan::Instance& instance, vk::Buffer buffer, void* whole, u64 size,
+                    bool coherent) {
+    const u64 half = size / 2;
+    const u64 words = half / 4;
+    auto* w = static_cast<volatile std::uint32_t*>(whole);
+    bool all = true;
+
+    // GPU write -> CPU read.
+    for (u64 i = 0; i < words; ++i) {
+        w[words + i] = 0xdeadbeefu;
+    }
+    bool ran = RunOnce(instance, [&](vk::CommandBuffer cmd) {
+        cmd.fillBuffer(buffer, half, half, 0x600dcafeu);
+    });
+    u64 bad = 0;
+    if (ran) {
+        for (u64 i = 0; i < words; ++i) {
+            bad += w[words + i] != 0x600dcafeu;
+        }
+    }
+    bool pass = ran && bad == 0;
+    ProbeLine("GPU write -> CPU read", pass,
+              !ran ? "the GPU work failed" : bad ? "the CPU saw stale data (no coherence?)" : "");
+    all &= pass;
+
+    // CPU write -> GPU read (a GPU copy of what the CPU wrote, read back by the CPU).
+    for (u64 i = 0; i < words; ++i) {
+        w[i] = 0xa5000000u + std::uint32_t(i);
+        w[words + i] = 0;
+    }
+    ran = RunOnce(instance, [&](vk::CommandBuffer cmd) {
+        cmd.copyBuffer(buffer, buffer, vk::BufferCopy{0, half, half});
+    });
+    bad = 0;
+    if (ran) {
+        for (u64 i = 0; i < words; ++i) {
+            bad += w[words + i] != 0xa5000000u + std::uint32_t(i);
+        }
+    }
+    pass = ran && bad == 0;
+    ProbeLine("CPU write -> GPU read", pass,
+              !ran ? "the GPU work failed" : bad ? "the GPU read stale data (no coherence?)" : "");
+    all &= pass;
+
+    const char* detail = "";
+    pass = ProbeWriteProtect(whole, detail);
+    ProbeLine("mprotect + write -> SIGSEGV", pass, detail);
+    all &= pass;
+
+    if (!coherent && all) {
+        std::printf("Guest memory probe: the chosen memory type is cached but NOT coherent: the "
+                    "roundtrips above passed, but no explicit flush/invalidate (or "
+                    "DMA_BUF_IOCTL_SYNC) is done at CPU/GPU handoffs yet\n");
+    }
+    // Not probed: LSE/exclusive atomics through the mapping (FEX runs the game's locked
+    // instructions on it), DMA_BUF_IOCTL_SYNC need, cached vs write-combined bandwidth beyond the
+    // read-speed check.
+    return all;
+}
+} // namespace
 
 namespace {
 /// dma-buf chunks: exported cached system memory the runtime maps at the game's addresses.
@@ -559,6 +808,7 @@ bool DmaBufWorks(const Vulkan::Instance& instance) {
     {
         if (!instance.IsGuestMemoryExportSupported()) {
             std::printf("Guest memory: the driver cannot export system memory as a dma-buf\n");
+            fallback_reason = "the driver cannot export memory as a dma-buf";
             return false;
         }
         const vk::Device dev = instance.GetDevice();
@@ -570,21 +820,38 @@ bool DmaBufWorks(const Vulkan::Instance& instance) {
         const auto [buffer_result, buffer] = dev.createBuffer({
             .pNext = &external,
             .size = Size,
-            .usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
+            .usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+                     vk::BufferUsageFlagBits::eStorageBuffer,
             .sharingMode = vk::SharingMode::eExclusive,
         });
         if (buffer_result != vk::Result::eSuccess) {
+            fallback_reason = "dma-buf buffer creation failed (" + vk::to_string(buffer_result) + ")";
             return false;
         }
         const auto requirements = dev.getBufferMemoryRequirements(buffer);
         std::uint32_t type = ~0u;
-        const auto want = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached;
-        for (std::uint32_t i = 0; i < props.memoryTypeCount && type == ~0u; ++i) {
-            const auto flags = props.memoryTypes[i].propertyFlags;
-            if ((requirements.memoryTypeBits & (1u << i)) && (flags & want) == want &&
-                !(flags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
-                type = i;
+        bool coherent = true;
+        if (unified_mode) {
+            type = PickUnifiedType(props, requirements.memoryTypeBits, &coherent);
+        } else {
+            const auto want = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached;
+            for (std::uint32_t i = 0; i < props.memoryTypeCount && type == ~0u; ++i) {
+                const auto flags = props.memoryTypes[i].propertyFlags;
+                if ((requirements.memoryTypeBits & (1u << i)) && (flags & want) == want &&
+                    !(flags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                    type = i;
+                }
             }
+        }
+        if (type == ~0u) {
+            fallback_reason = unified_mode ? "no host-visible CPU-cached memory type the dma-buf allows "
+                                             "(only write-combined or device-only types: the game would "
+                                             "crawl on them)"
+                                           : "no exportable cached system memory";
+        } else if (unified_mode) {
+            std::printf("Guest memory: unified memory type %u: %s (%s)\n", type,
+                        vk::to_string(props.memoryTypes[type].propertyFlags).c_str(),
+                        coherent ? "coherent" : "NOT coherent");
         }
         bool ok = false;
         vk::DeviceMemory memory{};
@@ -600,6 +867,12 @@ bool DmaBufWorks(const Vulkan::Instance& instance) {
                 const auto [fd_result, exported] = dev.getMemoryFdKHR(
                     {.memory = memory, .handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT});
                 fd = fd_result == vk::Result::eSuccess ? exported : -1;
+                if (fd < 0) {
+                    fallback_reason = "dma-buf export failed (" + vk::to_string(fd_result) + ")";
+                }
+            } else {
+                fallback_reason = "allocating exportable memory failed (" +
+                                  vk::to_string(memory_result) + ")";
             }
         }
         if (fd >= 0) {
@@ -624,6 +897,9 @@ bool DmaBufWorks(const Vulkan::Instance& instance) {
                     munmap(again, 4096);
                 }
             }
+            if (!ok && fallback_reason.empty()) {
+                fallback_reason = "the dma-buf cannot be mapped (or CPU writes are not seen through a second mapping)";
+            }
             // The game's code works on this memory: an uncached CPU mapping would crawl.
             if (ok) {
                 const double speed =
@@ -636,6 +912,19 @@ bool DmaBufWorks(const Vulkan::Instance& instance) {
                                 speed);
                     ok = false;
                     whole_only = false;
+                    fallback_reason = "CPU reads of the dma-buf are too slow (uncached mapping)";
+                }
+            }
+            // Unified memory (or BB_GUEST_PROBES=1): CPU/GPU roundtrips and write protection.
+            if (ok && whole != MAP_FAILED && (unified_mode || ProbesForced())) {
+                ok = bind_ok(dev, buffer, memory) &&
+                     RunGuestProbes(instance, buffer, whole, Size, coherent);
+                if (!ok && fallback_reason.empty()) {
+                    fallback_reason = "probe failed (see the lines above)";
+                }
+                if (ok && unified_mode) {
+                    unified_noncoherent = !coherent;
+                    unified_type = type;
                 }
             }
             if (whole != MAP_FAILED) {
@@ -672,8 +961,10 @@ bool Usable(const Vulkan::Instance& instance) {
         const char* forced = std::getenv("BB_GUEST_MEMORY");
         const bool force_host = forced && std::string_view{forced} == "host";
         const bool force_dmabuf = forced && std::string_view{forced} == "dmabuf";
+        // Unified memory is dma-buf chunks (Turnip's host import cannot share device memory).
+        unified_mode = !force_host && UnifiedEligible(instance);
         const bool host_first =
-            force_host || (!force_dmabuf && instance.GetVendorID() != 0x1002);
+            force_host || (!force_dmabuf && !unified_mode && instance.GetVendorID() != 0x1002);
         const char* why = "";
         if (host_first && HostImportWorks(instance, why)) {
             mode = Mode::HostImport;
@@ -689,7 +980,19 @@ bool Usable(const Vulkan::Instance& instance) {
             }
         }
         mode = Mode::DmaBuf;
-        return DmaBufWorks(instance);
+        const bool requested = unified_mode;
+        const bool ok = DmaBufWorks(instance);
+        if (requested && !ok) {
+            unified_mode = false;
+            std::printf("Guest memory: unified memory (BB_UNIFIED=1) is NOT used: %s; the GPU uses "
+                        "copies\n",
+                        fallback_reason.empty() ? "the dma-buf probes failed" : fallback_reason.c_str());
+        } else if (ok && unified_mode) {
+            fallback_reason.clear();
+            std::printf("Guest memory: UNIFIED MEMORY: all probes passed (memory type %u%s)\n",
+                        unified_type, unified_noncoherent ? ", not coherent" : "");
+        }
+        return ok;
     }();
     return usable;
 }
@@ -699,9 +1002,33 @@ vk::ExternalMemoryHandleTypeFlagBits HandleType() {
                                     : vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT;
 }
 
+namespace {
+/// Phase 1 measurement: the Vulkan memory types and heaps, once.
+void LogMemoryTypes(const Vulkan::Instance& instance) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        const auto props = instance.GetPhysicalDevice().getMemoryProperties();
+        std::printf("Vulkan memory: %u heaps, %u types (%s, %s)\n", props.memoryHeapCount,
+                    props.memoryTypeCount, std::string(instance.GetModelName()).c_str(),
+                    instance.IsIntegrated() ? "integrated" : "not integrated");
+        for (std::uint32_t i = 0; i < props.memoryTypeCount; ++i) {
+            const auto& type = props.memoryTypes[i];
+            const auto& heap = props.memoryHeaps[type.heapIndex];
+            std::printf("Vulkan memory type %2u: %-60s heap %u (%llu MiB, %s)\n", i,
+                        vk::to_string(type.propertyFlags).c_str(), type.heapIndex,
+                        (unsigned long long)(heap.size >> 20), vk::to_string(heap.flags).c_str());
+        }
+    });
+}
+} // namespace
+
 void Install(const Vulkan::Instance& instance) {
-    // The buffer cache has no sparse arena to bind guest memory chunks into (NonSparseArenas).
-    if (VideoCore::NonSparseArenas()) {
+    LogMemoryTypes(instance);
+    // The buffer cache has no sparse arena to bind guest memory chunks into (NonSparseArenas): only
+    // unified memory goes on, with the layer's memory module (no arena for the chunks), and only when
+    // the buffer cache kept the in-place model (it checked the driver: UnifiedEligible, Usable).
+    if (VideoCore::NonSparseArenas() &&
+        !(UnifiedRequested() && VideoCore::GuestInPlace() && LayerMemory())) {
         return;
     }
     // BB_GUEST_IN_PLACE (the GPU uses this memory in place) needs it too.
@@ -719,7 +1046,10 @@ void Install(const Vulkan::Instance& instance) {
     // layer's memory module (a mapping then lies whole in one chunk buffer).
     runtime_memory_set_guest_chunk_whole(LayerMemory() || (!host && whole_only) ? 1 : 0);
     runtime_memory_set_guest_chunk_allocator(host ? &AllocImported : &AllocChunk);
-    std::printf("Guest memory: direct memory chunks come from Vulkan (BB_GUEST_GPU_MEMORY=1)\n");
+    std::printf("Guest memory: direct memory chunks come from Vulkan (BB_GUEST_GPU_MEMORY=1)%s\n",
+                Unified() ? "; UNIFIED MEMORY is active (BB_UNIFIED=1): the game's direct memory is "
+                            "shared with the GPU, in place"
+                          : "");
 }
 
 const Chunk* Find(std::uint64_t phys) {

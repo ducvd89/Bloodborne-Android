@@ -167,6 +167,20 @@ void StagingBufferPool::TickFrame() {
     for (auto& cache : large_caches) {
         TrimLarge(cache);
     }
+    if (BbStats::enabled) {
+        u64 bytes = 0;
+        for (const Ring& ring : rings) {
+            for (const Block& block : ring.blocks) {
+                bytes += block.buffer->SizeBytes();
+            }
+        }
+        for (const auto& cache : large_caches) {
+            for (const LargeBuffer& entry : cache) {
+                bytes += entry.buffer->SizeBytes();
+            }
+        }
+        BbStats::staging_bytes.store(bytes, std::memory_order_relaxed);
+    }
     PublishStats();
 }
 

@@ -45,6 +45,22 @@ bool LayerMemory();
 /// The external memory handle type of the chunks (dma-buf or imported host memory): buffers bound
 /// to them (the arena, chunk buffers) are created with it. Valid after Usable().
 vk::ExternalMemoryHandleTypeFlagBits HandleType();
+/// BB_UNIFIED=1 (Android, opt-in): the game's direct memory is dma-buf chunks of CPU-cached,
+/// host-visible device memory (an integrated GPU: the phone's one RAM) the GPU uses in place through
+/// the layer's memory module, no sparse buffers needed. Whether it was asked for.
+bool UnifiedRequested();
+/// Whether it may run on this GPU (requested, integrated, not Mali/PanVK, the layer's memory module
+/// on, dma-buf export); logs the reason once when it may not. The probes of Usable() come on top.
+bool UnifiedEligible(const Vulkan::Instance& instance);
+/// Unified memory is active: valid after Usable() (false when a probe failed: copies).
+bool Unified();
+/// The chosen chunk memory type is cached but not coherent: CPU/GPU handoffs would need explicit
+/// cache maintenance (not implemented: such a type is only used when the roundtrip probes pass).
+bool UnifiedNeedsSync();
+/// Why Usable() said no (empty before it ran or when it said yes), for the fallback message.
+const char* FallbackReason();
+/// Bytes of direct memory in chunks so far.
+std::uint64_t ChunkBytes();
 /// Hands the runtime direct memory chunks from now on (when enabled and supported).
 void Install(const Vulkan::Instance& instance);
 /// The chunk holding direct memory address `phys`, or null.

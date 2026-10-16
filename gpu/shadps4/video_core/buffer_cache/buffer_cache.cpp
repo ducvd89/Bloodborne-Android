@@ -575,7 +575,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     integrated_gpu = instance.IsIntegrated();
     non_sparse_arenas = WantNonSparseArenas(instance);
     Detail::non_sparse_arenas.store(non_sparse_arenas, std::memory_order_relaxed);
-    if (non_sparse_arenas) {
+    if (non_sparse_arenas && BbGuestMemory::UnifiedEligible(instance)) {
+        // bbport BB_UNIFIED=1: the chunks are bound by the layer's memory module, not into a sparse
+        // arena; ranges outside the chunks keep the arenas that own their memory (Backed).
+        std::printf("Guest memory: BB_UNIFIED=1: arenas without sparse binding stay for ranges outside "
+                    "the direct memory chunks; the chunks are used in place through the layer\n");
+    } else if (non_sparse_arenas) {
         // bbport: the in-place modes bind guest memory chunks into a sparse arena (LayerMode and
         // FixedArena need GuestInPlace): off before anything reads GuestInPlace().
         if (const char* in_place = std::getenv("BB_GUEST_IN_PLACE"); in_place && in_place[0] == '1') {
@@ -589,8 +594,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     if (GuestInPlace() &&
         (!BbGuestMemory::PcModelGpu(instance) || !BbGuestMemory::Usable(instance))) {
         DisableGuestInPlace();
-        std::printf("Guest memory: the PC memory model is off with this driver; the GPU uses copies "
-                    "in VRAM (as BB_GUEST_IN_PLACE=0)\n");
+        std::printf("Guest memory: the PC memory model is off with this driver%s%s; the GPU uses "
+                    "copies in VRAM (as BB_GUEST_IN_PLACE=0)\n",
+                    *BbGuestMemory::FallbackReason() ? ": " : "", BbGuestMemory::FallbackReason());
     }
     // Hooks in the game's own code, from its profile (games/). BB_GUEST_HOOKS=0: none, as for a
     // game the port knows nothing about.
@@ -2092,8 +2098,10 @@ void BufferCache::EvictVramBlock(u64 block) {
 
 void BufferCache::ProcessIdleBlocks() {
     const u32 now = BbStats::coarse_second.load(std::memory_order_relaxed);
+    // The layer's maintenance (write traps, retired mirrors, its statistics) has no sparse
+    // binding in it: it runs with arenas that own their memory too (unified memory).
     if (now == idle_scan_second || !GuestInPlace() || VramIdleSeconds() == 0 ||
-        non_sparse_arenas) {
+        (non_sparse_arenas && !LayerMode())) {
         return;
     }
     idle_scan_second = now;
@@ -3252,7 +3260,7 @@ void BufferCache::Maintain() {
 }
 
 void BufferCache::ProcessPendingUnmaps() {
-    if (!unmaps_pending.load(std::memory_order_acquire) || non_sparse_arenas) {
+    if (!unmaps_pending.load(std::memory_order_acquire) || (non_sparse_arenas && !LayerMode())) {
         return;
     }
     std::vector<std::pair<VAddr, u64>> unmaps;
@@ -3277,7 +3285,8 @@ void BufferCache::ProcessPendingUnmaps() {
         copy_back_blocks.Subtract(first, end);
         promote_candidates.Subtract(first, end);
         idle_demoted.Subtract(first, end);
-        in_place_blocks.ForEachInRange(first, end, [&](const Interval& iv) {
+        // Arenas that own their memory (unified memory) have no chunk bindings to undo.
+        if (!non_sparse_arenas) in_place_blocks.ForEachInRange(first, end, [&](const Interval& iv) {
             unbind.Add({std::max(first, iv.start), std::min(end, iv.end)});
         });
         for (const auto& range : unbind) {
