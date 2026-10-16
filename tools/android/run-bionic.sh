@@ -24,19 +24,49 @@ export FEX_APP_DATA_LOCATION="$HOME/.fex-emu/"
 export FEX_APP_CACHE_LOCATION="$HOME/.cache/fex-emu/"
 mkdir -p "$HOME/.fex-emu" "$HOME/.cache/fex-emu" "$TMPDIR" "$base/user" "$base/logs" "$base/logs/failed-shaders"
 
-# ---- DEBUG BUILD for issue #15 (Mali-G720 device lost): not for release ----
-# Extra diagnostics on by default, and a player-editable override file: debug.env in the Bloodborne folder of
-# shared storage (the game folder's parent: /storage/emulated/0/Bloodborne/debug.env; the app has legacy
-# external storage access). Lines NAME=value only, NAME one of BB_*, PANVK_*, PAN_*, MESA_* (capitals, digits,
-# underscore), the value letters, digits and _ . / : , = + @ % - only. The file is read, never sourced.
-echo "Debug build for issue #15 (0.9.2-debug15)"
+# ---- FULL DEBUG BUILD for issue #15 (Mali-G720 device lost): not for release ----
+# Every useful diagnostic is on by default and the game runs slowly. Each default can be replaced from a
+# player-editable override file: debug.env in the Bloodborne folder of shared storage (the game folder's parent:
+# /storage/emulated/0/Bloodborne/debug.env; the app has legacy external storage access). Lines NAME=value only,
+# NAME one of BB_*, PANVK_*, PAN_*, MESA_* (capitals, digits, underscore), the value letters, digits and
+# _ . / : , = + @ % - only. The file is read, never sourced. NAME= (empty) removes the variable (turns off a
+# trace the code only looks for by name, such as BB_IMAGE_SYNC_LOG); NAME=0 turns off a check that reads its value.
+echo "Full debug build for issue #15: all diagnostics on, the game runs slowly (0.9.2-debug15-full)"
 for prop in ro.product.manufacturer ro.product.model ro.board.platform ro.hardware.vulkan ro.hardware.egl \
             ro.build.version.release ro.build.version.sdk ro.soc.model; do
     echo "  $prop=$(getprop "$prop" 2>/dev/null || true)"
 done
+# libbbgpu's own log (vk_instance: GPU, driver, extensions and features; pipeline and shader compiles; warnings),
+# with a budget in the log sink (log.cpp): 20000 debug/info lines, 40000 warnings, then one in 1000.
+export BB_GPU_LOG=${BB_GPU_LOG:-debug}
+# Breadcrumbs (timestamp markers polled so they survive a device loss; the device-lost report lists the newest
+# commands per stream), the first 400 submissions as they go out, the HLE copy shader's pipeline and first batches.
 export BB_BREADCRUMBS=${BB_BREADCRUMBS:-1}
 export BB_SUBMIT_TRACE=${BB_SUBMIT_TRACE:-1}
 export BB_COPY_SHADER_TRACE=${BB_COPY_SHADER_TRACE:-1}
+# The command processor's reads of GPU-written memory (first 300: drain, finish, read).
+export BB_SYNC_TRACE=${BB_SYNC_TRACE:-1}
+# Images: GPU writes over images and refreshes from memory (first 200 / 100 lines, top 5 every 5 s), the compute
+# copies recognised as image copies (first 40), tiling back into guest memory (first 400), large layer writes (64).
+export BB_IMAGE_SYNC_LOG=${BB_IMAGE_SYNC_LOG:-1}
+export BB_IMAGE_COPY_LOG=${BB_IMAGE_COPY_LOG:-1}
+export BB_TILE_BACK_LOG=${BB_TILE_BACK_LOG:-1}
+export BB_LAYER_WRITE_LOG=${BB_LAYER_WRITE_LOG:-1}
+# Present path steps (first 160 lines).
+export BB_PRESENT_TRACE=${BB_PRESENT_TRACE:-1}
+# Checks: two threads recording into one scheduler (first 8 reports), the draw pipe's resource tables read again
+# on every 16th packet (a change after the GPU thread read them; first 32 reports), the GPU's own check of
+# indirect dispatch counts (skipped dispatches are reported every 5 s), GPU-written data in VRAM copies.
+export BB_PRODUCER_CHECK=${BB_PRODUCER_CHECK:-1}
+export BB_PIPE_VERIFY=${BB_PIPE_VERIFY:-16}
+export BB_INDIRECT_GUARD=${BB_INDIRECT_GUARD:-1}
+export BB_GPU_DATA_CHECK=${BB_GPU_DATA_CHECK:-1}
+# The Mali driver (Mesa PanVK): startup = what it found and enabled, sync = wait for the GPU after every submit (the
+# hanging submit is then the one the process is in). Its log goes to stderr (this log) and to Android's logcat.
+# No trace / dump (pandecode: huge files), no abort on device loss (it would kill the process before our report).
+export PANVK_DEBUG=${PANVK_DEBUG:-startup,sync}
+export MESA_LOG=${MESA_LOG:-file,android}
+export MESA_LOG_LEVEL=${MESA_LOG_LEVEL:-info}
 debug_env=/storage/emulated/0/Bloodborne/debug.env
 debug_cr=$(printf '\r')
 apply_debug_env() { # $1 = 1: say what is applied (the second pass is silent)
@@ -66,6 +96,11 @@ apply_debug_env() { # $1 = 1: say what is applied (the second pass is silent)
         case $debug_value in
             *[!A-Za-z0-9_./:,=+@%-]*) [ "$1" = 1 ] && echo "debug.env line $debug_n ignored (the value may only have letters, digits and _ . / : , = + @ % -): $debug_line"; continue ;;
         esac
+        if [ -z "$debug_value" ]; then
+            unset "$debug_name"
+            [ "$1" = 1 ] && echo "debug.env applied: $debug_name removed"
+            continue
+        fi
         export "$debug_name=$debug_value"
         [ "$1" = 1 ] && echo "debug.env applied: $debug_name=$debug_value"
     done < "$debug_env"
@@ -157,9 +192,7 @@ if [ -n "$lsfg" ]; then
 else
     echo "Lossless Scaling frame generation: off at start (the app's Frame generation menu turns it on while you play)"
 fi
-# The GPU's check of indirect dispatch counts (vk_indirect_guard.h) is off; BB_INDIRECT_GUARD=1 in
-# bionic-local.sh turns it on.
-export BB_INDIRECT_GUARD=${BB_INDIRECT_GUARD:-0}
+# The GPU's check of indirect dispatch counts (vk_indirect_guard.h): on in this debug build (set above).
 # The two-stage draw pipeline (bb:DrawRec) frees the GPU command thread: 31 -> 34 FPS on the Thor
 # with all cores. BB_DRAW_PIPE=0 in bionic-local.sh turns it off.
 export BB_DRAW_PIPE=${BB_DRAW_PIPE:-1}
@@ -237,7 +270,7 @@ export BB_FAILED_SHADER_DIR="$base/logs/failed-shaders"
 cp "$base/fex-compatible.json" "$HOME/.fex-emu/Config.json"
 # Local overrides for this device (experiments, tuning): sourced last, not part of the runtime.
 [ -f "$base/bionic-local.sh" ] && . "$base/bionic-local.sh"
-# Debug build for issue #15: the player's overrides (before the frame rate logic below reads BB_FRAME_HOOKS, and
+# Full debug build for issue #15: the player's overrides (before the frame rate logic below reads BB_FRAME_HOOKS, and
 # once more, silently, before the launch so that nothing computed in between replaces them).
 apply_debug_env 1
 # FPS limit (fps_limit: 30, 40, 45, 60 or 0 for none) and the game's frame rate. Hooks in the game's code
@@ -273,7 +306,7 @@ case $speed_floor in 20|30) ;; *) speed_floor=20 ;; esac
 export BB_FRAME_DT_MAX_FPS=$speed_floor
 echo "Frame rate: limit $fps_limit, hooks $([ "$frame_hooks" = 1 ] && echo on || echo 'off (BB_FRAME_HOOKS=0)'), game speed kept down to $speed_floor FPS"
 apply_debug_env 0
-echo "Debug build for issue #15: the effective environment of the game process:"
+echo "Full debug build for issue #15: the effective environment of the game process:"
 env | grep -E '^(BB|PANVK|PAN|MESA|VK|FEX|LD)_' | sort | sed 's/^/  /' || true
 cd "$base"
 [ -x "$bionic/bin/bb-probe" ] || { echo "The Bionic runtime is missing: $bionic" >&2; exit 2; }

@@ -76,8 +76,14 @@ final class LogReport {
             zip.setLevel(6);
             // The logs first (they are the part that can fail), the report last (it counts what was left out).
             String logcatNote=logcat(zip,removed);
-            tail(zip,new File(base,"logs/android-game.log"),"android-game.log",LOG_CAP,removed);
-            tail(zip,new File(base,"logs/android-game.prev.log"),"android-game.prev.log",LOG_CAP,removed);
+            // Full debug build for issue #15: the game log is android-game.log (the first 10 MB of the run) and
+            // android-game.tail.old.log + android-game.tail.log (the last 8-16 MB); the previous run's the same, 6 MB each.
+            tail(zip,new File(base,"logs/android-game.log"),"android-game.log",11L<<20,removed);
+            tail(zip,new File(base,"logs/android-game.tail.old.log"),"android-game.tail.old.log",8L<<20,removed);
+            tail(zip,new File(base,"logs/android-game.tail.log"),"android-game.tail.log",8L<<20,removed);
+            tail(zip,new File(base,"logs/android-game.prev.log"),"android-game.prev.log",6L<<20,removed);
+            tail(zip,new File(base,"logs/android-game.prev.tail.old.log"),"android-game.prev.tail.old.log",6L<<20,removed);
+            tail(zip,new File(base,"logs/android-game.prev.tail.log"),"android-game.prev.tail.log",6L<<20,removed);
             String settings=settings(zip,new File(base,"bbport.ini"));
             String shaders=shaders(zip,new File(base,"logs/failed-shaders"));
             summary.append(deviceLines(activity,facts,chip));

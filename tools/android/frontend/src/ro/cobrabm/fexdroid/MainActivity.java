@@ -1127,22 +1127,46 @@ public final class MainActivity extends Activity {
             // The last run's log stays as android-game.prev.log (one generation): a crash log survives the restart.
             File gameLog=new File(BASE,"logs/android-game.log"), previous=new File(BASE,"logs/android-game.prev.log");
             gameLog.getParentFile().mkdirs();
+            // Full debug build for issue #15: the log is bounded on disk. android-game.log keeps the first 10 MB of the
+            // run; after that the lines go to android-game.tail.log, which at 8 MB becomes android-game.tail.old.log
+            // (the one before it is deleted): the last 8-16 MB are always there. Each generation has its .prev copy.
+            File tailLog=new File(BASE,"logs/android-game.tail.log"), tailOld=new File(BASE,"logs/android-game.tail.old.log");
+            File prevTail=new File(BASE,"logs/android-game.prev.tail.log"), prevTailOld=new File(BASE,"logs/android-game.prev.tail.old.log");
+            prevTail.delete(); prevTailOld.delete();
+            tailLog.renameTo(prevTail); tailOld.renameTo(prevTailOld);
+            tailLog.delete(); tailOld.delete();
             if (gameLog.length()>0) { previous.delete(); gameLog.renameTo(previous); }
             final Process launched=launchScript(extra.toArray(new String[0]));
             game=launched;
             Thread log=new Thread(() -> {
-                try (BufferedReader r=new BufferedReader(new InputStreamReader(launched.getInputStream()));
-                     PrintWriter out=new PrintWriter(gameLog)) {
+                final long headCap=10L<<20, tailCap=8L<<20;
+                PrintWriter out=null;
+                try (BufferedReader r=new BufferedReader(new InputStreamReader(launched.getInputStream()))) {
+                    out=new PrintWriter(gameLog);
+                    long written=0; boolean inTail=false;
                     for (String line:modsLog) out.println(line);
                     out.flush();
-                    String line; while ((line=r.readLine())!=null) { out.println(line); out.flush(); }
+                    String line; while ((line=r.readLine())!=null) {
+                        out.println(line); out.flush();
+                        written+=line.length()+1;
+                        if (!inTail && written>=headCap) {
+                            out.println("[This file keeps the first 10 MB of the run; the log goes on in android-game.tail.log]");
+                            out.close(); inTail=true; written=0;
+                            out=new PrintWriter(tailLog);
+                            out.println("[Continued from android-game.log; this file and android-game.tail.old.log keep the last 8-16 MB]");
+                        } else if (inTail && written>=tailCap) {
+                            out.close(); tailOld.delete(); tailLog.renameTo(tailOld); written=0;
+                            out=new PrintWriter(tailLog);
+                            out.println("[Continued from android-game.tail.old.log]");
+                        }
+                    }
                     int code=launched.waitFor();
                     if (game==launched) { game=null; error("Game stopped ("+code+"). Open the menu to restart."); }
                 } catch (Exception ex) {
                     // A restart (settings, cheats) kills this process on purpose: its reader is
                     // interrupted then, after the next game started. Only the current game's errors show.
                     if (!destroyed && game==launched) error(ex.toString());
-                }
+                } finally { if (out!=null) out.close(); }
             },"Bloodborne-log"); log.setDaemon(true); log.start();
         } catch (Exception ex) { error(ex.toString()); }
     }

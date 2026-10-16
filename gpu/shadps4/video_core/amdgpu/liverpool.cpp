@@ -1312,7 +1312,12 @@ void Liverpool::SyncForCpuRead(VAddr address, u64 size) {
     }
     // The command processor reads memory when it reaches the packet; the GPU work recorded before
     // it may still be queued or running here (this thread decodes ahead of it).
-    static const bool trace = std::getenv("BB_SYNC_TRACE") != nullptr;
+    // Full debug build for issue #15: only the first 300 calls are traced (4 lines each), the rest are counted.
+    static const bool trace_on = std::getenv("BB_SYNC_TRACE") != nullptr;
+    static std::atomic<u32> traced{0};
+    const u32 trace_n = trace_on ? traced.fetch_add(1) : 0;
+    const bool trace = trace_on && trace_n < 300;
+    if (trace_on && trace_n == 300) std::printf("SyncForCpuRead trace: first 300 calls shown, no more\n");
     if (trace) std::printf("SyncForCpuRead %#llx: drain\n", (unsigned long long)address);
     rasterizer->DrainDrawPipe();
     if (trace) std::printf("SyncForCpuRead: finish\n");
