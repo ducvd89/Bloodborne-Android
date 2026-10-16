@@ -174,7 +174,21 @@ export BB_DRAW_PIPE=${BB_DRAW_PIPE:-1}
 export BB_WINDOW_SIZE=$output
 export BB_OUTPUT_RES=$output BB_LIVE_RES=0
 if [ -n "$render" ]; then export BB_RENDER_RES=$render; else unset BB_RENDER_RES; fi
-export BB_DMEM_MB=$dmem_mb BB_PREUPLOAD=0 BB_GUEST_IN_PLACE=0 BB_UFFD=0
+# Unified memory (experimental, off by default; Debug options -> Unified memory, bbport.ini unified_memory=1,
+# or BB_UNIFIED=1 in the environment): the game's direct memory is Vulkan dma-buf chunks
+# the GPU uses in place (the PC memory model through the layer's memory module, no sparse buffers needed)
+# instead of copies. libbbgpu probes the driver and falls back to copies by itself, with one logged reason
+# (Mali/PanVK always, a driver without cached CPU-visible device memory, failed CPU/GPU roundtrips...).
+# Writes by the game are caught by page protection (BB_WRITE_TRACKING); no userfaultfd, no preupload.
+if [ -z "${BB_UNIFIED:-}" ] && [ "$(setting unified_memory)" = 1 ]; then BB_UNIFIED=1; fi
+if [ "${BB_UNIFIED:-0}" = 1 ]; then
+    export BB_UNIFIED=1 BB_GUEST_IN_PLACE=1 BB_LAYER_MEMORY=1 BB_WRITE_TRACKING=1
+    echo "Unified memory: requested (the driver is probed at start; falls back to copies with a logged reason)"
+else
+    unset BB_UNIFIED BB_LAYER_MEMORY BB_WRITE_TRACKING
+    export BB_GUEST_IN_PLACE=0
+fi
+export BB_DMEM_MB=$dmem_mb BB_PREUPLOAD=0 BB_UFFD=0
 export BB_COPY_GPU_BUFFERS=1 BB_GPU_WRITE_TWINS=1 BB_GPU_WRITE_TWINS_MAX=65536
 # GPU memory is the phone's system RAM, shared with the game's direct memory ($dmem_mb, taken right
 # after launch) and Android: the texture collector works to a budget instead of the driver's heap

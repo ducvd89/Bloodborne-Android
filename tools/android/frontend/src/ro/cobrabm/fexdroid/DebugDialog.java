@@ -21,6 +21,9 @@ final class DebugDialog {
         {"debug_fault_smart_drain","Wait for the GPU only when needed","Off: wait for the GPU on every caught write.","1"},
         {"debug_fault_sleep_lock","Sleeping lock in the fault handler","Off: a spinning lock instead.","1"},
     };
+    private static final String[][] EXPERIMENTAL={
+        {"unified_memory","Unified memory (experimental)","The game's memory is shared with the GPU instead of copied: less RAM. Adreno only; other GPUs and drivers that fail the start-up checks keep copies (see the log).","0"},
+    };
     private static final String[][] DIAGNOSTICS={
         {"debug_frame_stats","Frame statistics in the log","Timing and counters per second.","0"},
         {"debug_gpu_profile","GPU time per pass in the log (costs FPS)","Each pass is timed: the game runs slower.","0"},
@@ -66,12 +69,14 @@ final class DebugDialog {
         heading(box,"Write-fault tracking");
         note(box,"How the game's writes to GPU memory are tracked.");
         add(box,FAULT,ini,switches);
+        heading(box,"Experimental");
+        add(box,EXPERIMENTAL,ini,switches);
         heading(box,"Diagnostics");
         add(box,DIAGNOSTICS,ini,switches);
 
         Button reset=new Button(activity); reset.setText("Reset to defaults"); reset.setAllCaps(false);
         reset.setOnClickListener(v -> {
-            for (String[][] group:new String[][][]{FAULT,DIAGNOSTICS})
+            for (String[][] group:new String[][][]{FAULT,EXPERIMENTAL,DIAGNOSTICS})
                 for (String[] item:group) switches.get(item[0]).setChecked(item[3].equals("1"));
         });
         LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-2,-2); lp.topMargin=dp(16);
@@ -97,7 +102,7 @@ final class DebugDialog {
     }
 
     private static String[] find(String key) {
-        for (String[][] group:new String[][][]{FAULT,DIAGNOSTICS})
+        for (String[][] group:new String[][][]{FAULT,EXPERIMENTAL,DIAGNOSTICS})
             for (String[] item:group) if (item[0].equals(key)) return item;
         throw new IllegalArgumentException(key);
     }
