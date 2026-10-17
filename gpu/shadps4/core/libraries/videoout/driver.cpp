@@ -20,6 +20,7 @@
 #include "bbport_heap_sites.h"
 #include "bbport_wait_trace.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "common/debug.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -369,6 +370,9 @@ static void PrintMemory() {
                 (unsigned long long)(BbStats::gc_trigger_bytes.load() >> 20),
                 (unsigned long long)BbStats::gc_freed_images.exchange(0),
                 (unsigned long long)BbStats::gc_kept_images.exchange(0));
+    // bbport: what holds the Vulkan memory that is not images (the texture collector's usage
+    // counts all of it).
+    std::printf("Vulkan buffers: %s\n", VideoCore::DescribeBufferKinds().c_str());
 }
 
 /// bbport: where the memory goes, every ~10 s with BB_FRAME_STATS (phase 1 of the unified memory plan):

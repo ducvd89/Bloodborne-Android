@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -90,6 +91,13 @@ constexpr vk::BufferUsageFlags ReadFlags =
 constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+/// bbport: the device memory of buffers by what they are for (their debug name without its
+/// address, or their memory type), for the frame statistics: what holds the GPU memory that is
+/// not images. Kind 0 is "other".
+u32 BufferKind(std::string_view name);
+/// The kinds holding at least 1 MiB, largest first: "name N MiB (count), ...".
+std::string DescribeBufferKinds();
+
 struct UniqueBuffer {
     explicit UniqueBuffer(vk::Device device, VmaAllocator allocator);
     ~UniqueBuffer();
@@ -103,7 +111,8 @@ struct UniqueBuffer {
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
           memory{std::exchange(other.memory, VK_NULL_HANDLE)},
-          memory_size{std::exchange(other.memory_size, 0)} {}
+          memory_size{std::exchange(other.memory_size, 0)},
+          stats_kind{other.stats_kind}, stats_bytes{std::exchange(other.stats_bytes, 0)} {}
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -115,6 +124,8 @@ struct UniqueBuffer {
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
             memory = std::exchange(other.memory, VK_NULL_HANDLE);
             memory_size = std::exchange(other.memory_size, 0);
+            stats_kind = other.stats_kind;
+            stats_bytes = std::exchange(other.stats_bytes, 0);
         }
         return *this;
     }
@@ -129,6 +140,9 @@ struct UniqueBuffer {
     vk::DeviceAddress bda_addr{};
     VmaAllocator allocator;
     VmaAllocation allocation{};
+    /// bbport: what the buffer is for (BufferKind), and the bytes counted for it there.
+    u32 stats_kind = 0;
+    u64 stats_bytes = 0;
     /// MemoryType::Backed: the buffer's own device memory (freed with it), and its size.
     vk::DeviceMemory memory{};
     u64 memory_size{};
