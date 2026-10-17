@@ -1,7 +1,7 @@
 <h1 align="center">Bloodborne-Android</h1>
 
 <p align="center">
-  <b>Bloodborne on Android.</b> Yharnam on Snapdragon (Adreno) phones and handhelds.<br><b>Mali GPUs are not supported:</b> the Mali driver is in the app for testing only and does not run the game yet.
+  <b>Bloodborne on Android</b>, for Snapdragon (Adreno) phones and handhelds.<br><b>Mali GPUs are not supported:</b> the Mali driver is in the app for testing only and does not run the game yet.
 </p>
 
 <p align="center">
@@ -19,180 +19,105 @@
   </tr>
 </table>
 
-Port of Bloodborne (PS4, **v1.09**, every retail release). The runtime and renderer run natively on ARM64, FEXCore translates the game's x86-64 code, and Mesa's Vulkan drivers drive the GPU (Turnip on Adreno; PanVK on Mali for testing only). Experimental.
-
-## How it works
-
-This is a port, not an emulator. No PS4 hardware, firmware or operating system is emulated, and no PS4 BIOS is needed. It works like Wine + DXVK for one game: the game's own `eboot.bin` runs on the phone, its calls to PS4 system libraries land in native replacements, and its graphics are translated to Vulkan. Because the PS4 has an x86-64 CPU and the phone an ARM64 one, the game's machine code needs one more layer.
-
-Since 0.9.0 everything is a plain Android (NDK) program: no Linux system, X server or Python is installed on the phone.
-
-```mermaid
-flowchart LR
-  subgraph app["Android app (Java + JNI)"]
-    menu["Menu, settings,<br>mods, PKG install"]
-    present["Screen<br>(SurfaceControl)"]
-    audio["Sound<br>(AudioTrack)"]
-    pad["Controller &<br>touch input"]
-  end
-  subgraph game["Game process (native ARM64, bb-probe)"]
-    eboot["eboot.bin, libc.prx,<br>libSceFios2.prx (x86-64)"] --> fex["FEXCore<br>x86-64 → ARM64"]
-    fex --> rt["Runtime:<br>PS4 system libraries"]
-    rt --> gpu["Renderer:<br>PM4/GCN → Vulkan, FSR 3.1"]
-    gpu --> drv["Vulkan driver<br>(Turnip / PanVK, loaded directly)"]
-  end
-  menu -- "starts, settings files" --> game
-  gpu -- "frames: AHardwareBuffers + sync fences" --> present
-  rt -- "PCM audio" --> audio
-  pad -- "pad state" --> rt
-```
-
-**Translated while the game runs:**
-
-| What | From | To | By |
-|---|---|---|---|
-| The game's CPU code: `eboot.bin` and the two PS4 modules the game ships (`sce_module/libc.prx`, `libSceFios2.prx`), linked into one image by `bb-prepare` | x86-64 (AVX, BMI) | ARM64 | [FEXCore](https://github.com/FEX-Emu/FEX), built into the game process as a library: only the game's code goes through it, no Wine, Box64 or x86 system libraries |
-| GPU commands the game writes itself (it links libGnm statically) | AMD GCN command buffers (PM4) | Vulkan commands | the renderer |
-| Shaders | AMD GCN | SPIR-V | the renderer's shader recompiler |
-| Lossless Scaling's shaders (only with frame generation on) | DXBC (full precision) or SPIR-V (half precision), read from your own `Lossless.dll` | SPIR-V | Bloodframe, once when frame generation starts: lsfg-vk's translator for DXBC, the half-precision set as the dll has it |
-
-**Native ARM64 code, no translation:**
-
-- **Runtime**: replaces the PS4 system libraries the game imports: threads, mutexes, semaphores, memory, time, files, save data, controller input, audio with ATRAC9 decoding, video output, movie playback. A call from the game goes straight to this code.
-- **Renderer**: shadPS4's renderer ([shadPS4](https://github.com/shadps4-emu/shadPS4)) as [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) tailored it to this one game, built for Android: command processing, texture and buffer caches, FSR 3.1. Lossless Scaling frame generation is a separate library, [Bloodframe](https://github.com/ducvd89/bloodframe), that the renderer loads when it is on, on the same Vulkan driver.
-- **Vulkan driver**: the game process opens the driver library itself, without Android's Vulkan loader, so it can use a Mesa driver that ships inside the APK and is picked for your GPU (see [GPU drivers](#gpu-drivers)), or the phone's own driver through the system loader.
-- **The Android app**: menu, settings, on-screen controller, mods, PKG installers and game preparation (`bb-prepare` checks the game files and builds the image the game runs from; the settings' game patches are compiled at build time and chosen at each start).
+A port of Bloodborne (PS4, **v1.09**), not an emulator. Experimental. You need your own copy of the game.
 
 ## Features
 
-- **Real game speed when the frame rate drops** — new in 0.9.1: frame-rate hooks from bloodborne_pc replace the 60 FPS patches, and the game keeps its speed down to 20 FPS instead of slowing below 30 ([Game speed](#default-settings-and-performance))
-- **Native Android program** — new in 0.9.0: no Linux system on the phone any more; the APK is about 37 MB and frames go straight to the screen
-- **GPU driver picked for you** — new in 0.9.0: Turnip for Adreno 6xx/7xx and 8xx ships inside the APK ([GPU drivers](#gpu-drivers))
-- **Any aspect ratio and output resolution** — new in 0.9.3: Auto (your screen's own shape), 4:3, 16:10, 16:9, 21:9 or 32:9, and **Display native** output (your screen's own size) or a fixed 360p–1440p; **FSR 3.1** upscaling presets relative to it, and a **VSync** option ([Aspect ratio and resolution](#aspect-ratio-and-resolution))
-- **Bloodframe frame generation** — new in 0.10.0: Lossless Scaling frame generation (2×–4×, needs your own Lossless.dll) with half-precision (FP16) shaders and much less input lag, changed while you play from the **Bloodframe** menu page ([Bloodframe](#bloodframe-frame-generation)); also **FSR 3.1 frame generation** (poor image quality for now)
-- **GPU memory stays bounded** — new in 0.9.5: old GPU copies of the game's memory are freed once they pass a cap (512 MB), so the frame rate no longer collapses on long sessions
-- **Report a problem** — new in 0.9.0: saves a logs zip for a GitHub issue ([Reporting problems](#reporting-problems))
-- **Mods**: install .zip, .7z or PS4 .pkg mods for 1.09, switch them on and off and set their load order
-- **Cheats**: infinite health and infinite blood vials/items, switched on and off while you play
-- **Game settings** in the app's menu: skip the online/offline screen (straight to the main menu), skip intros, free camera, debug menu
-- **On-screen PlayStation controller** with an editable layout; physical controllers work too
-- **Updates from the app**: menu → **Check for updates** downloads and installs the newest release
-- Wider or taller screens show more of the scene, with the HUD at the screen's edges; foldables' inner and outer screens each keep their own touch controller layout
+- **Snapdragon GSR 2 upscaling** (default since 0.11.0): Qualcomm's upscaler made for Adreno, about 1.1 ms per frame on the Thor. FSR 3.1 is also available.
+- **Bloodframe frame generation**: Lossless Scaling frame generation (2×–4×) with FP16 and low input lag. Needs your own `Lossless.dll`.
+- **Any screen shape and resolution**: aspect ratio Auto, 4:3 to 32:9, and output from 360p up to your screen's own size.
+- **Real game speed** down to 20 FPS, instead of slow motion below 30.
+- **GPU driver included**: Turnip for Adreno 6xx/7xx and 8xx, picked for you.
+- **Mods** (.zip, .7z, .pkg), **cheats** (infinite health and items), **on-screen controller**, physical controllers.
+- **Updates and bug reports from the app's menu.**
 
 ## Devices
 
-| Tested | SoC | GPU | Driver (Automatic) |
-|---|---|---|---|
-| AYN Thor | Snapdragon 8 Gen 2 | Adreno 740 | Turnip 26.3.0 |
-| Oppo Find N5 | Snapdragon 8 Elite | Adreno 830 | Turnip Gen8 V37 (0.8.x was tested with the Linux turnip/gen8 build) |
+| Tested | SoC | GPU |
+|---|---|---|
+| AYN Thor | Snapdragon 8 Gen 2 | Adreno 740 |
+| Oppo Find N5 | Snapdragon 8 Elite | Adreno 830 |
 
-Other Adreno 6xx/7xx/8xx devices are untested. **Mali GPUs are not supported.** The app carries a Mali driver (PanVK) only for testing; the game does not run on Mali phones yet, so please don't report Mali problems as bugs. Requires Android 9+ and 4 KB memory pages; tested with 16 GB RAM.
+Other Adreno 6xx/7xx/8xx devices are untested. **Mali is not supported** (PanVK is included for testing only; please don't report Mali bugs). Needs Android 9+; tested with 16 GB RAM.
 
 ## Install
 
-1. Download the APK from [Releases](https://github.com/ducvd89/Bloodborne-Android/releases/latest) and install it.
-2. Copy your own extracted dump of Bloodborne with the **1.09 update** merged into it to the phone (any release below).
-3. Open the app, select the folder containing `eboot.bin` (or the folder that holds it), and allow storage access. The first launch takes a few minutes. The GPU driver for your phone is set up on its own.
+1. Install the APK from [Releases](https://github.com/ducvd89/Bloodborne-Android/releases/latest).
+2. Copy your extracted Bloodborne dump, with the **1.09 update** merged in, to the phone. Every region works (CUSA00900, 03179, 00207, 03173, 00208, 00299, 03014, 01363, 03023).
+3. Open the app and pick the folder with `eboot.bin`. The first start takes a few minutes.
 
-Every retail release runs the same 1.09 executable, so all of them work:
+Use the original 1.09 `eboot.bin`: pre-patched 60 FPS ones crash in the gestures menu. Updates keep your saves, settings, mods and game folder. Later updates install from the menu (**Check for updates**).
 
-| Region | Bloodborne | Game of the Year / The Old Hunters |
-|---|---|---|
-| US | CUSA00900 | CUSA03179 |
-| EU | CUSA00207 | CUSA03173 |
-| UK | CUSA00208 | |
-| Japan | CUSA00299 | CUSA03014 |
-| Asia | CUSA01363 | CUSA03023 |
+On ColorOS / OxygenOS a "Security warning" may appear at launch: tap **Got it**.
 
-Use the original 1.09 `eboot.bin`. Some dumps ship one with a 60 fps patch already applied; that one crashes in the gestures menu.
+## Menu
 
-The APK contains no game files. Updates keep saves, settings, mods and the game folder, except once: updating from 0.7.x or older to 0.8.0 or later sets the new [default settings](#default-settings-and-performance). Updating from 0.8.x to 0.9.0 deletes the old Linux runtime from the app's storage on the first start (several hundred MB) and removes the 0.8.x Linux GPU drivers, which no longer load. Later releases install from the menu (**Check for updates**); Android asks once to allow the app to install apps. The updater skips betas: if you installed 0.9.0 Beta 1, install 0.9.0 by hand.
+Swipe in from the left edge or press Back.
 
-On ColorOS / OxygenOS (Oppo, OnePlus) a "Security warning" about a malicious app may appear at launch. Tap **Got it**; the game keeps running. ColorOS showed it for 0.8.x and other apps that run Linux programs, such as Termux and Winlator.
+- **Game**: Game settings (skip intros and the online screen, free camera, debug menu), Cheats, Mods.
+- **Graphics**: aspect ratio, resolution, upscaler, FPS limit, effects; **Bloodframe**; GPU driver.
+- **Controls**: on-screen controller and its layout. Drag outside the buttons to turn the camera.
+- **Storage**: game folder, back up and restore saves.
+- **App**: Report a problem, Check for updates.
 
-## The menu
+## Settings and performance
 
-Swipe in from the left edge (or press Back) to open the menu. Its sections:
+The defaults are tuned on the AYN Thor: **GSR 2 Performance** at 1080p output (a 960×540 scene), costly effects off, lowest model detail, 60 FPS limit. Updating from 0.10.x or older switches the upscaler to GSR 2 once; you can change it back in Graphics settings.
 
-- **Game:** resume, Game settings, Cheats, Mods, restart.
-- **Graphics:** graphics settings (aspect ratio, output resolution, upscaler and preset, VSync, FPS limit, keeping the game's speed when the frame rate drops, model detail, effects), Bloodframe (frame generation, applies at once) and the GPU driver.
-- **Controls:** turn the on-screen controller on or off; edit its layout (move, resize or reset the buttons). With the controller on, drag anywhere outside the buttons to turn the camera.
-- **Storage:** choose the game folder, back up and restore saves, quit.
-- **App:** report a problem, check for updates (installing one closes the game, so save first).
+- **Upscaler presets** set the scene size relative to the output: Quality 67%, Balanced 59%, Performance 50%, Ultra Performance 33%.
+- **Model detail** matters more than resolution on the Thor: the GPU spends most of its time on geometry.
+- **Above 1080p** uses much more memory: stay at 1080p or below with less than 12 GB of RAM.
+- **Keep game speed when FPS drops** (on): the game keeps its speed down to 20 FPS. Turn it off if physics misbehave.
 
-Each entry shows its current setting underneath.
+## Bloodframe
 
-## Default settings and performance
+Bloodframe is this port's frame generation engine ([ducvd89/bloodframe](https://github.com/ducvd89/bloodframe), based on lsfg-vk 1.0, MIT). It runs Lossless Scaling's LSFG 3.1 with the shaders from your own `Lossless.dll`; the Bloodframe page can download it through Steam sign-in.
 
-The defaults are tuned on the AYN Thor: aspect ratio Auto, 1080p output (the width follows the aspect ratio) with FSR 3.1 Performance (a 960×540 scene at 16:9), the costly effects (SSAO, SSR, dynamic shadows, depth of field, motion blur, the game's anti-aliasing) off, **lowest model detail** and a 60 FPS limit. Cheats start off. They apply on a first install and once when updating from 0.7.x or older; your controller mapping, GPU driver and mods choice are kept.
-
-On the Thor most of the GPU's time goes to geometry, not pixels: a smaller render size barely changes the frame rate, the model detail setting does (lowest: about +10%).
-
-### Aspect ratio and resolution
-
-**Aspect ratio** (Settings → Graphics): **Auto** uses your screen's own shape (for example 20:9 on most phones, or a foldable's inner screen); 4:3, 16:10, 16:9, 21:9 and 32:9 are fixed. On a wider screen the camera shows more at the sides, on a taller one more above and below; the HUD moves to the screen's edges, menus and fades cover the whole screen.
-
-**Output resolution** is the size of the final picture and the game's interface. **Display native** is your screen's own size; the other choices are 360p to 1440p at the chosen aspect ratio (the width follows it), up to your screen's size. The upscaler preset sets the scene size relative to the output. At 16:9:
-
-| Output | Native | Quality | Balanced | Performance | Ultra Perf. |
-|---|---|---|---|---|---|
-| 1080p | 1920×1080 | 1280×720 | 1130×636 | 960×540 | 640×360 |
-| 720p | 1280×720 | 854×480 | 752×424 | 640×360 | 426×240 |
-| 480p | 854×480 | 570×320 | 502×282 | 428×240 | 284×160 |
-
-Wider ratios add width at the same height (e.g. 1080p at 20:9 is 2400×1080). Both settings apply at the next game start. FSR 3.1 runs at the output size, so a higher output costs more GPU time; outputs above 1080p (including Display native on most phones) also use much more memory, so on phones with less than 12 GB of RAM keep 1080p or below. **VSync** (off by default) shows every frame for at least one screen refresh, in order: smoother pacing for a little more latency (best on Android 12+; pick an FPS limit that divides the refresh rate).
-
-**Game speed.** The game steps its world by a fixed 1/30 s and runs in slow motion below 30 FPS. Hooks in its code (ported from [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc), set at load; every spot is checked, and the community Uncap FPS++ patch is the fallback if one differs) give it each frame's real time instead, so it keeps its speed at any FPS limit. **Keep game speed when FPS drops** (on by default) extends that down to 20 FPS (a step of up to 50 ms); off, the game slows down below 30 FPS. Turn it off if physics or animations misbehave in a heavy scene.
+Recommended: **2×, performance mode on, FP16 on** (the defaults). Works best at 30 FPS or more. It works with any upscaler, and changes apply while you play. Details: [docs/ANDROID_LSFG.md](docs/ANDROID_LSFG.md).
 
 ## GPU drivers
 
-The app carries three Android builds of Mesa's open-source Vulkan drivers and uses the one for your GPU when the GPU driver menu is on **Automatic** (the default):
+On **Automatic** the app uses its bundled driver for your GPU:
 
 | GPU | Driver |
 |---|---|
-| Adreno 6xx / 7xx | Turnip, Mesa 26.3.0 ([release](https://github.com/ducvd89/Bloodborne-Android/releases/tag/turnip-android-main-26.3.0-35b085c)) |
-| Adreno 8xx | Turnip Gen8 V37 by StevenMXZ ([original](https://github.com/StevenMXZ/Adreno-Tools-Drivers/releases/tag/v37), [our mirror](https://github.com/ducvd89/Bloodborne-Android/releases/tag/turnip-android-gen8-26.3.0-9c7e022)) |
-| Mali G610 and newer (Android 15+) | PanVK V3.2 for mali_kbase, the Bachata S4 series ([release](https://github.com/ducvd89/Bloodborne-Android/releases/tag/panvk-android-v3.2-2a9358a)); **for testing only: Mali is not supported and the game does not run on it yet** |
+| Adreno 6xx / 7xx | Turnip, Mesa 26.3.0 |
+| Adreno 8xx | Turnip Gen8 V37 by StevenMXZ |
+| Mali G610+ (Android 15+) | PanVK V3.2, **testing only** |
 
-Other GPUs, and Mali on Android below 15, use the phone's own driver, which does not run the game yet on Adreno (black screen). A driver you chose yourself is kept. **Download** in the menu lists the 10 newest Android driver builds from this project's releases (Turnip and PanVK), marked for your GPU; **Install a zip** takes any adrenotools-style driver zip built for Android.
+The phone's own Adreno driver does not run the game yet (black screen). You can also download other drivers or install any adrenotools driver zip from the menu.
 
 ## Reporting problems
 
-Menu → **Report a problem** saves `Bloodborne-logs-<date>.zip` to the Download folder: a device summary (phone, SoC, Android version, GPU, driver), your settings, the logs of the last two game runs and the app's log. No saves, game files, Lossless.dll or accounts. It can share the zip, or open a GitHub issue with the summary filled in: the app uploads the zip to a file host (gofile.io, with catbox.moe and 0x0.st as fallbacks) and puts the link into the issue.
+Menu → **Report a problem** saves a logs zip (device, settings, logs; no saves or game files) and can open a GitHub issue with it attached.
 
-## Game settings and cheats
+## How it works
 
-**Game settings** are patches to the game, applied when it starts (Apply restarts it): skip the online/offline screen (on by default; there is no PSN here), skip the startup intros, the free camera (Cross + L3) and the game's debug menu (needs its font files).
+The game's own `eboot.bin` runs on the phone. [FEXCore](https://github.com/FEX-Emu/FEX) translates its x86-64 code to ARM64. Its calls to PS4 system libraries go to native replacements, and its GPU commands and shaders are translated to Vulkan by shadPS4's renderer as [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) tailored it. Everything is a plain Android (NDK) program: no Linux system, Wine or Box64.
 
-**Cheats** switch at once, while you play:
-
-- **Infinite health:** your HP refills to full every frame.
-- **Infinite blood vials and items:** using a blood vial, bullet or other item leaves its count as it was. Items you move to storage or give away stay in your inventory too.
-
-They are code hooks in the 1.09 executable (the same places as Shiningami's GoldHEN cheats), so they work on every release. They are always in place and switched by flags the game process reads from the app.
-
-## Bloodframe frame generation
-
-**Bloodframe** is this port's frame generation engine: it runs Lossless Scaling's frame generation (LSFG 3.1) with the shaders from your own `Lossless.dll` and adds generated frames between the game's own, for smoother motion. It is based on lsfg-vk 1.0 (MIT) and lives in its own repository: [ducvd89/bloodframe](https://github.com/ducvd89/bloodframe).
-
-**Recommended settings:** 2×, **performance mode on** and **half precision (FP16) on** (the defaults). Bloodframe also fixed the ghosting of generated frames on Adreno 8xx (tested on the Oppo Find N5): the picture no longer doubles or shifts in generated frames, with FP16 on (since 0.10.0) or off (next release) ([details](docs/ANDROID_LSFG.md#adreno-8xx-ghosting-fixed-in-0100)). Frame generation adds a little input lag; it works best when the game already runs at 30 FPS or more.
-
-In the menu's **Bloodframe** page (it applies at once, no restart): 2×, 3× or 4× frames, flow scale, performance mode and half precision (FP16, on by default: faster, with a fall back to full precision where the GPU, the driver or your Lossless.dll cannot). It needs `Lossless.dll` from your own copy of Lossless Scaling (Steam): the same page signs in to Steam to download just that file, or copies one you choose. It replaces FSR 3.1 frame generation and raises the screen's refresh rate to the FPS limit times the multiplier. Since 0.10.0 the game hands each frame to Bloodframe without waiting for the GPU and keeps only one frame in flight, which removed most of the added input lag. How it works, and what is and is not verified: [docs/ANDROID_LSFG.md](docs/ANDROID_LSFG.md).
+```mermaid
+flowchart LR
+  app["Android app<br>menu, screen, sound, input"] --> game
+  subgraph game["Game process (ARM64)"]
+    eboot["eboot.bin (x86-64)"] --> fex["FEXCore"] --> rt["PS4 libraries<br>(native)"] --> gpu["Renderer → Vulkan<br>GSR 2 / FSR 3.1, Bloodframe"] --> drv["Turnip driver"]
+  end
+  gpu -- "frames" --> app
+```
 
 ## Build
 
 ```bash
 git clone --recursive https://github.com/ducvd89/Bloodborne-Android.git
 cd Bloodborne-Android
-bash tools/android/build_bionic_deps.sh      # once: the NDK and the native libraries
-bash tools/android/build_bionic.sh           # the game process, bb-prepare, ps4-pkg-tool, libbloodframe.so
-bash tools/android/build_release_apk.sh      # the runtime archive and the APK (fetches the bundled GPU drivers)
+bash tools/android/build_bionic_deps.sh      # once: NDK and native libraries
+bash tools/android/build_bionic.sh           # the game process and tools
+bash tools/android/build_release_apk.sh      # the APK
 ```
 
-Build inputs (SDK, signing key, game icon) and the app's layout are in [docs/ANDROID_THOR.md](docs/ANDROID_THOR.md). The bundled drivers are pinned by checksum in `tools/android/fetch_bundled_drivers.sh`. Turnip for Android builds: `tools/android/build_turnip_android.sh` and `release_turnip_android.py`. The Linux PC build is documented in [README.linux.md](README.linux.md).
+More in [docs/ANDROID_THOR.md](docs/ANDROID_THOR.md). The Linux PC build: [README.linux.md](README.linux.md).
 
 ## Credits
 
-[bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) (the PC port this project started from), [shadPS4](https://github.com/shadps4-emu/shadPS4), [ARM_bloodborne_pc](https://github.com/MaSieS4Fun/ARM_bloodborne_pc), [FEX](https://github.com/FEX-Emu/FEX), [fexdroid](https://github.com/cobrabm12/fexdroid), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), [mesa-unified turnip/gen8](https://github.com/whitebelyash/mesa-unified), [StevenMXZ's Turnip builds](https://github.com/StevenMXZ/Adreno-Tools-Drivers) (Turnip Gen8 V37), [panvk-kbase-android](https://github.com/JICA98/panvk-kbase-android) (PanVK for Mali, Bachata V3 series), [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), [Bloodframe](https://github.com/ducvd89/bloodframe), this port's Lossless Scaling frame generation engine, which is based on [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) 1.0 by PancakeTAS (MIT) via [GameNative's Android fork of it](https://github.com/Ragnarok93/lsfg-vk-android), and [GoldHEN cheats](https://github.com/GoldHEN/GoldHEN_Cheat_Repository) (Shiningami).
+[bloodborne_pc](https://github.com/deadinside28/bloodborne_pc), [shadPS4](https://github.com/shadps4-emu/shadPS4), [ARM_bloodborne_pc](https://github.com/MaSieS4Fun/ARM_bloodborne_pc), [FEX](https://github.com/FEX-Emu/FEX), [fexdroid](https://github.com/cobrabm12/fexdroid), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), [mesa-unified](https://github.com/whitebelyash/mesa-unified), [StevenMXZ's Turnip builds](https://github.com/StevenMXZ/Adreno-Tools-Drivers), [panvk-kbase-android](https://github.com/JICA98/panvk-kbase-android), [Snapdragon GSR](https://github.com/SnapdragonStudios/snapdragon-gsr) (Qualcomm, BSD-3-Clause), [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) by PancakeTAS and [GameNative's fork](https://github.com/Ragnarok93/lsfg-vk-android), [GoldHEN cheats](https://github.com/GoldHEN/GoldHEN_Cheat_Repository) (Shiningami).
 
-Licensed under [GPL-2.0](LICENSE); third-party notices in [THIRD_PARTY_LICENSES.txt](tools/android/frontend/THIRD_PARTY_LICENSES.txt) (the APK's copy also covers the bundled GPU drivers: Mesa's MIT licence, and GPL-3.0 for StevenMXZ's build of Turnip Gen8 V37). Not affiliated with Sony Interactive Entertainment, FromSoftware, Valve or the developers of Lossless Scaling.
+Licensed under [GPL-2.0](LICENSE); third-party notices in [THIRD_PARTY_LICENSES.txt](tools/android/frontend/THIRD_PARTY_LICENSES.txt). Not affiliated with Sony Interactive Entertainment, FromSoftware, Qualcomm, Valve or the developers of Lossless Scaling.
