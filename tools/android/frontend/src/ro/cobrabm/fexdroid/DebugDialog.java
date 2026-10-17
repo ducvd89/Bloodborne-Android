@@ -3,8 +3,11 @@ package ro.cobrabm.fexdroid;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.graphics.Typeface;
+import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -21,6 +24,14 @@ final class DebugDialog {
         {"debug_fault_smart_drain","Wait for the GPU only when needed","Off: wait for the GPU on every caught write.","1"},
         {"debug_fault_sleep_lock","Sleeping lock in the fault handler","Off: a spinning lock instead.","1"},
     };
+    private static final String[][] MEMORY={
+        {"debug_vram_copy_queue","Free old GPU memory (FIFO, experimental)","Keeps GPU copies of game memory under a cap: once it is reached, throws away the oldest copies not used for 20 s, so memory stops growing on long sessions. May cause missing geometry or stutter.","0"},
+    };
+    /** The cap of the FIFO above, in MB: a single choice, used only while that switch is on. */
+    private static final String CAP_KEY="debug_vram_copy_cap_mb", CAP_SWITCH="debug_vram_copy_queue", CAP_DEFAULT="1024";
+    private static final String[] CAP_VALUES={"512","768","1024","1536","2048","3072"};
+    private static final String CAP_TITLE="GPU memory cap (FIFO)";
+    private static final String CAP_NOTE="Only with Free old GPU memory on. Lower = less RAM but more re-copying (stutter).";
     private static final String[][] DIAGNOSTICS={
         {"debug_frame_stats","Frame statistics in the log","Timing and counters per second.","0"},
         {"debug_gpu_profile","GPU time per pass in the log (costs FPS)","Each pass is timed: the game runs slower.","0"},
@@ -38,6 +49,40 @@ final class DebugDialog {
     private static boolean on(Map<String,String> ini,String[] item) {
         String v=ini.get(item[0]);
         return (v==null || v.isEmpty() ? item[3] : v).equals("1");
+    }
+    private static String capValue(Map<String,String> ini) {
+        String v=ini.get(CAP_KEY);
+        for (String c:CAP_VALUES) if (c.equals(v)) return c;
+        return CAP_DEFAULT;
+    }
+    private static int capIndex(String value) {
+        for (int i=0;i<CAP_VALUES.length;++i) if (CAP_VALUES[i].equals(value)) return i;
+        return 2;
+    }
+    /** The cap choice, greyed out while the FIFO switch is off. */
+    private RadioGroup addCap(LinearLayout box,Map<String,String> ini,final Switch fifo) {
+        TextView title=new TextView(activity); title.setText(CAP_TITLE); title.setTextSize(15);
+        title.setPadding(0,dp(6),0,dp(2)); box.addView(title);
+        final RadioGroup g=new RadioGroup(activity);
+        for (int i=0;i<CAP_VALUES.length;++i) {
+            RadioButton b=new RadioButton(activity); b.setId(View.generateViewId());
+            b.setText(CAP_VALUES[i]+" MB"); b.setTextSize(15); g.addView(b);
+            if (i==capIndex(capValue(ini))) g.check(b.getId());
+        }
+        box.addView(g);
+        final TextView hint=note(box,CAP_NOTE);
+        final Runnable grey=() -> {
+            boolean enabled=fifo.isChecked();
+            for (int i=0;i<g.getChildCount();++i) g.getChildAt(i).setEnabled(enabled);
+            g.setAlpha(enabled ? 1f : 0.4f); hint.setAlpha(enabled ? 0.7f : 0.4f);
+        };
+        fifo.setOnCheckedChangeListener((b,c) -> grey.run());
+        grey.run();
+        return g;
+    }
+    private static String capChosen(RadioGroup g) {
+        for (int i=0;i<g.getChildCount();++i) if (((RadioButton)g.getChildAt(i)).isChecked()) return CAP_VALUES[i];
+        return CAP_DEFAULT;
     }
     private TextView heading(LinearLayout box,String title) {
         TextView t=new TextView(activity); t.setText(title); t.setTextSize(15);
@@ -66,13 +111,17 @@ final class DebugDialog {
         heading(box,"Write-fault tracking");
         note(box,"How the game's writes to GPU memory are tracked.");
         add(box,FAULT,ini,switches);
+        heading(box,"GPU memory");
+        add(box,MEMORY,ini,switches);
+        final RadioGroup cap=addCap(box,ini,switches.get(CAP_SWITCH));
         heading(box,"Diagnostics");
         add(box,DIAGNOSTICS,ini,switches);
 
         Button reset=new Button(activity); reset.setText("Reset to defaults"); reset.setAllCaps(false);
         reset.setOnClickListener(v -> {
-            for (String[][] group:new String[][][]{FAULT,DIAGNOSTICS})
+            for (String[][] group:new String[][][]{FAULT,MEMORY,DIAGNOSTICS})
                 for (String[] item:group) switches.get(item[0]).setChecked(item[3].equals("1"));
+            ((RadioButton)cap.getChildAt(capIndex(CAP_DEFAULT))).setChecked(true);
         });
         LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-2,-2); lp.topMargin=dp(16);
         box.addView(reset,lp);
@@ -89,6 +138,9 @@ final class DebugDialog {
                     String[] item=find(e.getKey());
                     if (!(on(ini,item) ? "1" : "0").equals(value)) same=false;
                 }
+                String chosen=capChosen(cap);
+                changed.put(CAP_KEY,chosen);
+                if (!capValue(ini).equals(chosen)) same=false;
                 if (same) return;
                 if (settings.setAll(changed)) restart.run();
                 else new AlertDialog.Builder(activity).setMessage("The settings could not be saved.")
@@ -97,7 +149,7 @@ final class DebugDialog {
     }
 
     private static String[] find(String key) {
-        for (String[][] group:new String[][][]{FAULT,DIAGNOSTICS})
+        for (String[][] group:new String[][][]{FAULT,MEMORY,DIAGNOSTICS})
             for (String[] item:group) if (item[0].equals(key)) return item;
         throw new IllegalArgumentException(key);
     }

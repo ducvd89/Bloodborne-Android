@@ -274,10 +274,23 @@ dbg_prepare=on; dbg_drain=on; dbg_lock=on; dbg_stats=off; dbg_profile=off
 if [ "$(setting debug_fault_prepare)" = 0 ]; then export BB_FAULT_PREPARE=0; dbg_prepare=off; fi
 if [ "$(setting debug_fault_smart_drain)" = 0 ]; then export BB_FAULT_DRAIN=always; dbg_drain=off; fi
 if [ "$(setting debug_fault_sleep_lock)" = 0 ]; then export BB_FAULT_SPINLOCK=1; dbg_lock=off; fi
+# Free old GPU memory (FIFO, experimental; off by default; copy mode only: unified memory keeps its own memory):
+# BB_VRAM_COPY_QUEUE=1, with the cap (MB) of debug_vram_copy_cap_mb when it is a positive integer (else the native default, 1024).
+dbg_fifo=off
+if [ "$(setting debug_vram_copy_queue)" = 1 ]; then
+    export BB_VRAM_COPY_QUEUE=1; dbg_fifo=on
+    fifo_cap="$(setting debug_vram_copy_cap_mb)"
+    case "$fifo_cap" in
+        ''|*[!0-9]*|0*) ;;
+        *) export BB_VRAM_COPY_CAP_MB="$fifo_cap"; dbg_fifo="on (cap $fifo_cap MB)" ;;
+    esac
+else
+    unset BB_VRAM_COPY_QUEUE BB_VRAM_COPY_CAP_MB
+fi
 # Diagnostics (off by default).
 if [ "$(setting debug_frame_stats)" = 1 ]; then export BB_FRAME_STATS=1; dbg_stats=on; fi
 if [ "$(setting debug_gpu_profile)" = 1 ]; then export BB_GPU_PROFILE=1; dbg_profile=on; fi
-echo "Debug: fault prepare $dbg_prepare, smart drain $dbg_drain, sleeping lock $dbg_lock, frame stats $dbg_stats, GPU profile $dbg_profile"
+echo "Debug: fault prepare $dbg_prepare, smart drain $dbg_drain, sleeping lock $dbg_lock, FIFO VRAM copies $dbg_fifo, frame stats $dbg_stats, GPU profile $dbg_profile"
 # Local overrides for this device (experiments, tuning): sourced last, not part of the runtime.
 [ -f "$base/bionic-local.sh" ] && . "$base/bionic-local.sh"
 # FPS limit (fps_limit: 30, 40, 45, 60 or 0 for none) and the game's frame rate. Hooks in the game's code
