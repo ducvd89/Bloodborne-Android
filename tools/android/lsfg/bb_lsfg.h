@@ -31,8 +31,10 @@ typedef struct BbLsfgConfig {
     int32_t generation_count;        ///< generated frames per real one: multiplier - 1 (1 .. 3)
     int32_t shared_format;           ///< VkFormat of the shared images (37 RGBA8, 97 RGBA16F)
     int32_t hdr;                     ///< the frames are HDR (the host has SDR frames: 0)
-    int32_t fp16;                    ///< 1: half-precision shaders when the Lossless.dll and the GPU have
-                                     ///< them (else full precision, bb_lsfg_precision says why); 0: full
+    int32_t fp16;                    ///< 1: the half-precision SPIR-V set of the Lossless.dll when it and the
+                                     ///< GPU have it; else (and for 0) its full-precision SPIR-V set; the
+                                     ///< DXBC set translated only as the last resort. bb_lsfg_shader_set
+                                     ///< says which runs and why.
 } BbLsfgConfig;
 
 typedef struct BbLsfgInfo {
@@ -74,10 +76,17 @@ BB_LSFG_API void bb_lsfg_destroy_context(int ctx);
 /// Ends the runtime (after the last context).
 BB_LSFG_API void bb_lsfg_shutdown(void);
 
-/// The precision the session runs: 1 half (FP16), 0 full (FP32). `reason` (when not NULL) gets a short
-/// text for the log: why half precision is off, or what it uses. It can change at the first
-/// bb_lsfg_create_context: the shaders are compiled there, and a driver that rejects a half-precision
-/// one makes the library fall back to full precision for the rest of the process.
+/// The shader set the session runs: BB_LSFG_SET_*. `reason` (when not NULL) gets a short text for the
+/// log: why the sets before this one are not used, or what this one is. It can change at the first
+/// bb_lsfg_create_context: the shaders are compiled there, and a driver that rejects a set makes the
+/// library use the next one for the rest of the process. Returns -1 before bb_lsfg_init.
+BB_LSFG_API int bb_lsfg_shader_set(char* reason, size_t len);
+#define BB_LSFG_SET_FP16_SPIRV 0 ///< the Lossless.dll's half-precision SPIR-V (needs shaderFloat16)
+#define BB_LSFG_SET_FP32_SPIRV 1 ///< the Lossless.dll's full-precision SPIR-V
+#define BB_LSFG_SET_FP32_DXBC 2  ///< the dll's DXBC translated to SPIR-V by the library (the last resort)
+
+/// The precision the session runs: 1 half (FP16 SPIR-V), 0 full (either full-precision set); `reason`
+/// as for bb_lsfg_shader_set. Kept for hosts that only ask for the precision.
 BB_LSFG_API int bb_lsfg_precision(char* reason, size_t len);
 
 /// One line about the backend (driver, AHB transport mode, sync path, capabilities) for the log.

@@ -8,26 +8,34 @@ The game runs as a native Android (Bionic) process, so Lossless Scaling's frame 
 2. **Sign in with Steam** downloads just `Lossless.dll` from your own copy (QR code or name/password; nothing but the file is kept), or **Choose Lossless.dll…** copies one from your storage (a PC copy is `steamapps/common/Lossless Scaling/Lossless.dll`). The file lives in `files/bbport/Lossless.dll`; `/sdcard/Bloodborne/Lossless.dll` is used when there is no such copy.
 3. Apply: it takes effect at once, while you play (no restart). Without a Lossless.dll the game logs one line (`Lossless Scaling frame generation: no Lossless.dll`) and runs without it.
 
-It replaces FSR 3.1 frame generation (FSR 3.1 frame generation stays in Graphics settings, which needs a restart; the two menus lock each other while one is on). It sees only finished frames, without the game's motion vectors, so expect more artifacts around fast motion and the HUD than with FSR 3.1 frame generation. Messages are in `files/bbport/logs/android-game.log` (`LSFG: ...` for the state, `Bloodframe: ...` for the engine); `BB_LSFG_STATS=1` in `bbport/bionic-local.sh` logs real and generated frames a second, with the precision in use (`FP16` or `FP32`).
+It replaces FSR 3.1 frame generation (FSR 3.1 frame generation stays in Graphics settings, which needs a restart; the two menus lock each other while one is on). It sees only finished frames, without the game's motion vectors, so expect more artifacts around fast motion and the HUD than with FSR 3.1 frame generation. Messages are in `files/bbport/logs/android-game.log` (`LSFG: ...` for the state, `Bloodframe: ...` for the engine); `BB_LSFG_STATS=1` in `bbport/bionic-local.sh` logs real and generated frames a second, with the shader set in use (`FP16`, `FP32` or `FP32-DXBC`).
 
-## Half precision (FP16)
+## Half precision (FP16) and the shader sets
 
-A recent Lossless.dll carries every frame generation shader three times, as resources of its RCDATA: the DXBC set (resource id N, the one the fork translates to SPIR-V), a half-precision SPIR-V set (N + 49) and a full-precision SPIR-V set (N + 98). With the setting on, Bloodframe reads the half-precision set (it is SPIR-V already: only the bindings are renumbered, from the dll's per-class numbers 0, 16, 32, 48 to consecutive ones, the order the framegen's descriptor layouts use) and the framegen device enables `shaderFloat16`; without it, or when it cannot, the DXBC set is translated as before. The modules use only the `Float16` capability beyond what the framegen's device already requires (no 16-bit storage, no `Int16`, no extensions); a module that needs more, or a missing one, keeps the session on full precision.
+A recent Lossless.dll carries every frame generation shader three times, as resources of its RCDATA: the DXBC set (resource id N), a half-precision SPIR-V set (N + 49) and a full-precision SPIR-V set (N + 98). Bloodframe runs the dll's own SPIR-V whenever it can and translates the DXBC set (the fork's DXBC to SPIR-V translation) only as the last resort. The three sets, in the order they are tried:
 
-Each of these turns it off, for the whole run of the game, with one log line `Bloodframe: FP16 off (reason)` (`FP16 on (...)` when it runs):
+1. **FP16 SPIR-V** (N + 49): the setting is on, the dll has the set and the GPU driver has `shaderFloat16` (the framegen device then enables it).
+2. **FP32 SPIR-V** (N + 98): the setting is off, or anything above fails.
+3. **DXBC (translated)**: an old Lossless.dll without the SPIR-V sets, a module the build was not checked against, or a driver that rejects the SPIR-V sets.
 
-- the setting is off;
-- the Lossless.dll has no half-precision set (an old version) or a module the build was not checked against;
-- the GPU driver has no `shaderFloat16`;
-- the driver rejects a half-precision shader or pipeline when the context is built (the first frames): the same call builds everything again at full precision.
+Both SPIR-V sets are used as the dll has them; only the bindings are renumbered, from the dll's per-class numbers 0, 16, 32, 48 to consecutive ones, the order the framegen's descriptor layouts use. The modules may use only these capabilities beyond what the framegen device already requires: `Float16` for the FP16 set alone (the FP32 set must not need it), no 16-bit storage, no `Int16`, no extensions; a module that needs more, or a missing one, drops that set. Checked on the PC against a real dll: all 52 modules of each SPIR-V set (26 shaders in each of the two models) are there, pass `spirv-val`, match the framegen's descriptor layouts exactly after the renumbering and build as compute pipelines (RADV, NVIDIA). The FP32 set uses `Shader`, `StorageImageExtendedFormats`, `ImageQuery` and `StorageImageWriteWithoutFormat`; the FP16 set the same plus `Float16`.
 
-The setting is live like the others: a change starts frame generation again (a moment of the game paused, as for the flow scale). The state file has a fourth line, `fp16=1|0`.
+A set is dropped for the whole run of the game, with a log line `Bloodframe: shaders FP16 SPIR-V | FP32 SPIR-V | DXBC (translated) (reason)` whenever the set in use changes (the engine's own line goes to logcat as `Bloodframe: shaders ...`). The reasons:
+
+- FP16 is off in the setting (the FP32 SPIR-V runs);
+- the Lossless.dll has no such set (an old version), or a module the build was not checked against;
+- the GPU driver has no `shaderFloat16` (for FP16);
+- the driver rejects a shader or pipeline of the set when the context is built (the first frames): the same call builds everything again with the next set.
+
+The setting is live like the others: a change starts frame generation again (a moment of the game paused, as for the flow scale). The state file has a fourth line, `fp16=1|0`. The stats line prints `FP16`, `FP32` (the FP32 SPIR-V) or `FP32-DXBC`.
 
 ## Adreno 8xx ghosting: fixed in 0.10.0
 
 Up to 0.9.5, on Adreno 8xx (Oppo Find N5, Adreno 830) about 10-40% of the generated frames showed the picture doubled and shifted by ~50 px, as if a bogus smooth motion field warped the whole frame. Real frames, frame generation off, and the AYN Thor's Adreno 740 were clean. A host harness that ran the framegen on one static frame reproduced it (151 of 198 frames wrong on the N5), and the investigation (paused on 2026-10-10) ruled out: live config reloads, flow scale, performance mode, UBWC, intra-device sync (`TU_DEBUG=syncdraw`, `flushall`), ir3 optimisations, the gen8 vs main Turnip, early sync-file exports, the NaN/inf behaviour of the translated min/max/log2/exp2/fma, and the display scaling.
 
-With Bloodframe in 0.10.0 the ghosting is gone on the Find N5 (user report, 2026-10-17, with the defaults: 2x, performance mode, FP16 on). The most likely reason: with FP16 on, the shaders are Lossless Scaling's own SPIR-V from the dll, not our DXBC to SPIR-V translation, which the earlier passes (mipmaps, beta[4]: 1024-thread workgroups with shared memory) went through. Not yet checked: whether the ghosting comes back with FP16 off (the full-precision path still translates the DXBC set), which would confirm that, or whether the 0.10.0 presentation changes (no CPU waits, one game frame out) played a part. If it does come back with FP16 off, the next step is to read the full-precision SPIR-V set (N + 98) for FP32 too, instead of translating.
+With Bloodframe in 0.10.0 the ghosting is gone on the Find N5 (user report, 2026-10-17, with the defaults: 2x, performance mode, FP16 on). Turning FP16 **off** there (user report, 2026-10-17) brought the ghosting back: with FP16 on the shaders are Lossless Scaling's own SPIR-V from the dll, with it off 0.10.0 still ran our DXBC to SPIR-V translation, which the earlier passes (mipmaps, beta[4]: 1024-thread workgroups with shared memory) went through. So the translation was the cause, not the 0.10.0 presentation changes.
+
+Bloodframe c290275 therefore runs the dll's own full-precision SPIR-V (N + 98) for FP32 too, and translates DXBC only as the last resort (section above). **Tested on the Find N5** (user report, 2026-10-17, 2x, performance mode, FP16 off; the log said `Bloodframe: shaders FP32 SPIR-V`): no ghosting. Both precisions are clean there now; only an old Lossless.dll without the SPIR-V sets would still go through the translation.
 
 ## How a frame goes (gpu/shadps4/video_core/renderer_vulkan/vk_lsfg.cpp, vk_presenter.cpp)
 
@@ -87,4 +95,4 @@ The fork's layer, adaptive scheduler and config parser are not built. `tools/and
 
 ## Not verified on a device
 
-Verified on devices since: half precision runs on Turnip on the AYN Thor (Adreno 740) and the Oppo Find N5 (Adreno 830), and fixed the Find N5's ghosting (above); the 0.10.0 latency changes were measured on the Thor (section Latency). Still unverified: Adreno 6xx and Mali, the picture with FP16 on vs off side by side, and whether the full-precision path still ghosts on Adreno 8xx.
+Verified on devices since: half precision runs on Turnip on the AYN Thor (Adreno 740) and the Oppo Find N5 (Adreno 830), and fixed the Find N5's ghosting (above); the 0.10.0 latency changes were measured on the Thor (section Latency). Still unverified: Adreno 6xx and Mali, the picture with FP16 on vs off side by side, and the FP32 SPIR-V set on a device at all (the translated DXBC FP32 path ghosted on Adreno 8xx; the new one runs only on the PC so far, where it builds and validates).

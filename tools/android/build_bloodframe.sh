@@ -14,7 +14,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 BLOODFRAME_REPO=https://github.com/ducvd89/bloodframe.git
-BLOODFRAME_COMMIT=b8b9d7986722bb5f0ea17948ee1d79831436654f
+BLOODFRAME_COMMIT=c29027555cfa8c9fc73c20f03816230becb9f469
 root=$PWD/.local-deps/android
 src=$root/src/bloodframe
 ndk=${BB_NDK:-$root/sdk/ndk/29.0.14206865}

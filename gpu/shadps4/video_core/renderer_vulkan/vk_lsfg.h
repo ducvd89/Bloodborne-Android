@@ -24,8 +24,8 @@
 // on and the game goes on with its own frames.
 //
 // Settings: multiplier (2, 3, 4), flow scale (0.25 .. 1.0, default 0.75), performance (1: the light
-// model, default) and fp16 (1, default: half-precision shaders when Lossless.dll and the GPU have them,
-// else full precision) come from bb_lsfg_state.h (the app's live lsfg.state file; the presenter makes a
+// model, default) and fp16 (1, default: half-precision SPIR-V when Lossless.dll and the GPU have it,
+// else the full-precision SPIR-V of the dll, the translated DXBC as the last resort) come from bb_lsfg_state.h (the app's live lsfg.state file; the presenter makes a
 // new Lsfg when they change). Environment: BB_LSFG_DLL (the player's Lossless.dll, else bbport/ or shared
 // storage), BB_LSFG_FORMAT (rgba16f, default, like the layer; rgba8),
 // BB_LSFG_SYNC (fd, default; host), BB_LSFG_PACE (1, default: the presenter spaces the frames),
@@ -124,8 +124,8 @@ private:
     u32 shared_format = 0; ///< VkFormat of the shared images
     bool pace = true;
     u32 frames_cap = 1;
-    bool fp16_active = false;  ///< the framegen runs the half-precision shaders
-    int precision_logged = -1; ///< what LogPrecision last said (-1: nothing yet)
+    const char* shader_set_name = "FP32"; ///< FP16, FP32 or FP32-DXBC (the stats line)
+    int precision_logged = -1; ///< the shader set LogPrecision last said (-1: nothing yet)
     std::string reason_logged;
     bool sync_host = false; ///< no sync files: wait on the CPU
     bool failed = false;
