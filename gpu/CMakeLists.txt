@@ -195,8 +195,8 @@ if (ANDROID)
     # platform defines (the dispatcher's layout depends on them).
     target_compile_definitions(bbgpu PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
     target_include_directories(bbgpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tools/android/present)
-    # Lossless Scaling frame generation: the C API of liblsfg-bb.so (dlopen'ed only when it is on,
-    # tools/android/build_lsfg_android.sh); no link-time dependency.
+    # Lossless Scaling frame generation: the C API of libbloodframe.so (dlopen'ed only when it is on,
+    # tools/android/build_bloodframe.sh); no link-time dependency.
     target_include_directories(bbgpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tools/android/lsfg)
     target_link_libraries(bbgpu PRIVATE nativewindow)
     # FFmpeg's arm64 assembly addresses its tables with adrp/add: its symbols must not be

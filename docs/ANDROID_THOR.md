@@ -16,7 +16,7 @@ archive as an asset. At the first start `RuntimeInstaller` unpacks it into the a
 bbport/bionic/bin/    bb-probe (the game process)  bb-prepare (game preparation)
                       kgsl-chip-id (GPU family)    ps4-pkg-tool (PKG installs)
 bbport/bionic/lib/    libbbgpu.so  libbbcpu.so (FEXCore)  libc++_shared.so
-                      liblsfg-bb.so (Lossless Scaling frame generation; libbbgpu loads it only when it is on)
+                      libbloodframe.so (Lossless Scaling frame generation; libbbgpu loads it only when it is on)
 bbport/patch-parts/   the settings' game patches (effects, model detail, resolutions, cheats, ...)
 bbport/run-bionic.sh  the launch script (Android's own sh; toybox tools only)
 bbport/fex-compatible.json, bbport/bbport.default.ini, bbport/licenses/
@@ -73,7 +73,7 @@ compared with; they are not shipped).
 Turnip for Android builds (not part of the APK): `build_turnip_android.sh`, `release_turnip_android.py`. The glibc
 Turnip and Lossless Scaling layer build tools (`build_turnip.sh`, `release_turnip.py`, `mesa-patches/`, `build_lsfg.sh`,
 `lsfg-patches/`) are kept for reference; the app no longer uses them. Lossless Scaling frame generation is
-`liblsfg-bb.so` (`build_lsfg_android.sh`, run by `build_bionic.sh`; [ANDROID_LSFG.md](ANDROID_LSFG.md)).
+`libbloodframe.so` (`build_bloodframe.sh`, run by `build_bionic.sh`; [ANDROID_LSFG.md](ANDROID_LSFG.md)).
 
 ---
 

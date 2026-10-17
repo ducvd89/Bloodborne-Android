@@ -117,16 +117,16 @@ echo "Scene ${render:-1920x1080} for $output at preset $preset$([ "$big_scene" =
 export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
 [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
-# Lossless Scaling frame generation (lsfg_multiplier 2-4): libbbgpu loads liblsfg-bb.so (tools/android/lsfg:
-# the framegen of GameNative's lsfg-vk fork, on the game's own Vulkan driver) which reads its shaders from
+# Lossless Scaling frame generation (lsfg_multiplier 2-4): libbbgpu loads libbloodframe.so (tools/android/lsfg:
+# Bloodframe, the framegen of GameNative's lsfg-vk fork, on the game's own Vulkan driver) which reads its shaders from
 # the player's own Lossless.dll: bbport/Lossless.dll (the app's Steam sign-in or file picker), else the
 # Bloodborne folder of shared storage. It replaces FSR 3.1 frame generation. Generated frames only look
 # right when each is shown for one refresh: while it runs libbbgpu asks the app for its FIFO (VSync), and
 # the app sets the display to FPS limit x multiplier (MainActivity.pickRefreshRate).
 # It is LIVE: the app's Frame generation menu rewrites bbport/lsfg.state (BB_LSFG_STATE_FILE) while the
 # game runs and libbbgpu follows it (turns it on, off, or to another multiplier / flow scale / model with
-# no restart). That file is the one source of truth for the three settings; here is only its start,
-# written from bbport.ini (like cheats.state), so no BB_LSFG_MULTIPLIER/FLOW_SCALE/PERFORMANCE are exported.
+# no restart). That file is the one source of truth for the four settings; here is only its start,
+# written from bbport.ini (like cheats.state), so no BB_LSFG_MULTIPLIER/FLOW_SCALE/PERFORMANCE/FP16 are exported.
 # BB_LSFG_DLL is exported when a Lossless.dll is found; libbbgpu looks again when frame generation is
 # turned on (the player may sign in to Steam meanwhile).
 # What cannot follow it live is decided here, from the multiplier at start: that FSR 3.1 frame
@@ -143,24 +143,25 @@ if [ ! -f "$lsfg_dll" ]; then
         [ -f "$dll" ] && { lsfg_dll=$dll; break; }
     done
 fi
-unset BB_LSFG_DLL BB_LSFG_MULTIPLIER BB_LSFG_FLOW_SCALE BB_LSFG_PERFORMANCE
+unset BB_LSFG_DLL BB_LSFG_MULTIPLIER BB_LSFG_FLOW_SCALE BB_LSFG_PERFORMANCE BB_LSFG_FP16
 [ -n "$lsfg_dll" ] && export BB_LSFG_DLL=$lsfg_dll
 flow=$(setting lsfg_flow_scale)
 case $flow in 0.25|0.[3-9]|0.[3-9]0|0.[3-9]5|1.00|1.0|1) ;; *) flow=0.75 ;; esac
 performance=1; [ "$(setting lsfg_performance)" = 0 ] && performance=0
+fp16=1; [ "$(setting lsfg_fp16)" = 0 ] && fp16=0
 export BB_LSFG_STATE_FILE="$base/lsfg.state"
-printf 'multiplier=%s\nflow=%s\nperformance=%s\n' "$lsfg_requested" "$flow" "$performance" \
+printf 'multiplier=%s\nflow=%s\nperformance=%s\nfp16=%s\n' "$lsfg_requested" "$flow" "$performance" "$fp16" \
     > "$BB_LSFG_STATE_FILE.tmp" && mv "$BB_LSFG_STATE_FILE.tmp" "$BB_LSFG_STATE_FILE"
 if [ -n "$lsfg" ]; then
     if [ -z "$lsfg_dll" ]; then
         echo "Lossless Scaling frame generation: no Lossless.dll ($base/Lossless.dll or /storage/emulated/0/Bloodborne/Lossless.dll): off"
         lsfg=
-    elif [ ! -f "$bionic/lib/liblsfg-bb.so" ]; then
-        echo "Lossless Scaling frame generation: $bionic/lib/liblsfg-bb.so is missing: off"
+    elif [ ! -f "$bionic/lib/libbloodframe.so" ]; then
+        echo "Lossless Scaling frame generation: $bionic/lib/libbloodframe.so is missing: off"
         lsfg=
     else
         unset BB_FRAME_GEN
-        echo "Lossless Scaling frame generation: x$lsfg, flow scale $flow, performance mode $performance, $lsfg_dll (live: $BB_LSFG_STATE_FILE)"
+        echo "Lossless Scaling frame generation (Bloodframe): x$lsfg, flow scale $flow, performance mode $performance, half precision $fp16, $lsfg_dll (live: $BB_LSFG_STATE_FILE)"
     fi
 else
     echo "Lossless Scaling frame generation: off at start (the app's Frame generation menu turns it on while you play)"

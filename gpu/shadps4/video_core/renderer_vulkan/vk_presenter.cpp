@@ -16,6 +16,7 @@
 #include "bbport_overlay.h"
 #include "bbport_timeline.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/vk_frame_latency.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
@@ -165,6 +166,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         free_queue.push(&frame);
     }
 
+#ifdef __ANDROID__
+    ApplyFramesCap();
+#endif
     fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
     fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
     fsr_settings.rcas_attenuation =
@@ -352,7 +356,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         texture_cache.UpdateImage(image_id);
     }
 
-    Frame* frame = GetRenderFrame();
+    Frame* frame = GetRenderFrame(true);
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -664,6 +668,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // bbport: a change of the app's Lossless Scaling settings applies here, between two frames.
     PollLsfgState();
 #endif
+    // bbport: BB_LSFG_LATENCY (vk_frame_latency.h): a game frame's steps from here on.
+    const u64 latency_id = is_game_frame && !is_reusing_frame ? frame->latency_id : 0;
+    frame->latency_id = 0;
+    if (latency_id) {
+        FrameLatency::Mark(latency_id, FrameLatency::Stage::PresentStart);
+        FrameLatency::WatchTimeline(latency_id, FrameLatency::Stage::GpuDone, instance.GetDevice(),
+                                    frame->ready_semaphore, frame->ready_tick);
+    }
     // Recreate the swapchain if the window was resized (or was minimised at the last try).
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight() ||
         !swapchain.IsPresentable()) {
@@ -682,7 +694,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         const vk::Extent2D extent = swapchain.GetExtent();
         SetExpectedGameSize(s32(extent.width), s32(extent.height));
         if (frame->width == expected_frame_width && frame->height == expected_frame_height &&
-            PresentWithLsfg(frame)) {
+            PresentWithLsfg(frame, latency_id)) {
+            FrameLatency::Finish(latency_id, lsfg ? lsfg->Multiplier() : 0);
             free_frame();
             DebugState.IncFlipFrameNum();
             return;
@@ -697,10 +710,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                             .width = frame->width,
                             .height = frame->height,
                             .frame = frame})) {
+        FrameLatency::Finish(latency_id, 0);
         free_frame();
         return;
     }
+    FrameLatency::WatchTimeline(latency_id, FrameLatency::Stage::RealReady, instance.GetDevice(),
+                                present_scheduler.GetWorkSemaphore()->Handle(), last_present_tick);
     SendToApp();
+    FrameLatency::Mark(latency_id, FrameLatency::Stage::RealHanded);
+    FrameLatency::Finish(latency_id, 0);
     PresentTrace("presented");
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
@@ -725,9 +743,11 @@ bool Presenter::SubmitToSwapchain(const PresentSource& source) {
     PresentTrace("acquired");
     Frame* const frame = source.frame;
     const vk::Fence done = frame ? frame->present_done : source.done;
-    const auto reset_result = instance.GetDevice().resetFences(done);
-    ASSERT_MSG(reset_result == vk::Result::eSuccess,
-               "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
+    if (done) { // bbport: a generated frame of chained frame generation has none (vk_lsfg.h)
+        const auto reset_result = instance.GetDevice().resetFences(done);
+        ASSERT_MSG(reset_result == vk::Result::eSuccess,
+                   "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
+    }
 
     // bbport: the game frame is blitted (letterboxed) straight into the swapchain image.
     const vk::Image swapchain_image = swapchain.Image();
@@ -872,8 +892,11 @@ bool Presenter::SubmitToSwapchain(const PresentSource& source) {
         info.AddWait(source.wait);
     }
     info.AddSignal(swapchain.GetPresentReadySemaphore());
-    info.AddSignal(done);
+    if (done) {
+        info.AddSignal(done);
+    }
     scheduler.Flush(info);
+    last_present_tick = scheduler.CurrentTick() - 1;
     // bbport: a Vulkan layer in vkQueuePresentKHR (Lossless Scaling frame generation, BB_LSFG)
     // waits there for the present-ready semaphore of that submission. Sent by a recording thread
     // (BB_ASYNC_SUBMIT), it needs submit_mutex, held below for the present: a deadlock unless
@@ -935,8 +958,8 @@ void Presenter::ApplyLsfgState(const BbLsfgState::State& next) {
     // FIFO (frame generation needs every frame shown for a refresh) only while it is on.
     ApplyLsfgOutputMode();
     if (lsfg) {
-        std::printf("LSFG: now x%u, flow %.2f, performance %d\n", next.multiplier,
-                    static_cast<double>(next.flow), next.performance ? 1 : 0);
+        std::printf("LSFG: now x%u, flow %.2f, performance %d, fp16 %d\n", next.multiplier,
+                    static_cast<double>(next.flow), next.performance ? 1 : 0, next.fp16 ? 1 : 0);
     } else {
         std::printf("LSFG: off\n");
     }
@@ -945,9 +968,18 @@ void Presenter::ApplyLsfgState(const BbLsfgState::State& next) {
 
 void Presenter::ApplyLsfgOutputMode() {
     swapchain.SetFrameGeneration(lsfg ? lsfg->Multiplier() : 0);
+    ApplyFramesCap();
 }
 
-bool Presenter::PresentWithLsfg(Frame* frame) {
+void Presenter::ApplyFramesCap() {
+    {
+        std::scoped_lock lock{free_mutex};
+        frames_cap.store(lsfg ? lsfg->FramesCap() : 0, std::memory_order_relaxed);
+    }
+    free_cv.notify_all();
+}
+
+bool Presenter::PresentWithLsfg(Frame* frame, u64 latency_id) {
     using Clock = std::chrono::steady_clock;
     // The frame's own submission may go out from a recording thread: it must be queued before the
     // copy of the frame (on this queue) waits for it.
@@ -955,7 +987,7 @@ bool Presenter::PresentWithLsfg(Frame* frame) {
         draw_scheduler.WaitSubmitted(frame->ready_tick);
     }
     const int generated = lsfg->ProcessFrame(present_scheduler, frame->image, frame->width, frame->height,
-                                             frame->ready_semaphore, frame->ready_tick);
+                                             frame->ready_semaphore, frame->ready_tick, latency_id);
     if (generated < 0) {
         lsfg.reset(); // off for the rest of the run (said in the log): this frame goes the usual way
         return false;
@@ -975,6 +1007,11 @@ bool Presenter::PresentWithLsfg(Frame* frame) {
                                 .done = output.done})) {
             break; // no buffer: the rest of the cycle's generated frames are not shown
         }
+        lsfg->OutputSubmitted(u32(i), last_present_tick);
+        if (i == 0) {
+            FrameLatency::WatchTimeline(latency_id, FrameLatency::Stage::GenReady, instance.GetDevice(),
+                                        present_scheduler.GetWorkSemaphore()->Handle(), last_present_tick);
+        }
         held[held_count++] = swapchain.CurrentIndex();
     }
     const bool real_queued = SubmitToSwapchain({.image = frame->image,
@@ -983,6 +1020,8 @@ bool Presenter::PresentWithLsfg(Frame* frame) {
                                                 .frame = frame});
     if (real_queued) {
         held[held_count++] = swapchain.CurrentIndex();
+        FrameLatency::WatchTimeline(latency_id, FrameLatency::Stage::RealReady, instance.GetDevice(),
+                                    present_scheduler.GetWorkSemaphore()->Handle(), last_present_tick);
     }
     if (swapchain.Generation() != buffer_set) {
         return true; // the buffers were made again meanwhile: the held ones are gone with them
@@ -996,6 +1035,10 @@ bool Presenter::PresentWithLsfg(Frame* frame) {
         }
         swapchain.SelectImage(held[k]);
         SendToApp(); // (it makes the buffers again when it must: the held rest is void then)
+        if (latency_id && (k == 0 || k + 1 == held_count)) {
+            FrameLatency::Mark(latency_id, real_queued && k + 1 == held_count ? FrameLatency::Stage::RealHanded
+                                                                               : FrameLatency::Stage::GenHanded);
+        }
         if (swapchain.Generation() != buffer_set) {
             break;
         }
@@ -1005,12 +1048,17 @@ bool Presenter::PresentWithLsfg(Frame* frame) {
 #endif
 
 
-Frame* Presenter::GetRenderFrame() {
+Frame* Presenter::GetRenderFrame(bool capped) {
     // Wait for free presentation frames
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
-        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        // bbport: with frame generation on, a game frame also waits while frames_cap are out: the
+        // present thread does more per frame then, and frames queued for it are frames of latency.
+        free_cv.wait(lock, [this, capped] {
+            const u32 cap = capped ? frames_cap.load(std::memory_order_relaxed) : 0;
+            return !free_queue.empty() && (cap == 0 || present_frames.size() - free_queue.size() < cap);
+        });
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue

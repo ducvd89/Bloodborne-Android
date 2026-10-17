@@ -220,7 +220,7 @@ public final class MainActivity extends Activity {
             new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).show();
         });
         // Lossless Scaling frame generation: applies at once, no restart (bbport/lsfg.state, which libbbgpu follows).
-        frameGenItem=menuItem("ic_layers","Frame generation","",() -> {
+        frameGenItem=menuItem("ic_layers","Bloodframe","",() -> {
             closeDrawer();
             SettingsDialog ini=new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame);
             new FrameGenDialog(this,ini,new File(BASE,"lsfg.state"),lossless,this::pickRefreshRate).show();
@@ -584,7 +584,7 @@ public final class MainActivity extends Activity {
         status.setText("Starting Bloodborne…");
         if (changed && game!=null) restartGame(); else startPending();
     }
-    // ---- Lossless.dll for Lossless Scaling frame generation (liblsfg-bb.so reads its shaders) ----
+    // ---- Lossless.dll for Lossless Scaling frame generation (libbloodframe.so reads its shaders) ----
     /** The Lossless.dll run-bionic.sh uses: the app's own copy (bbport/, from Steam or the picker), else one
      *  in the Bloodborne folder of shared storage. Null when there is none. */
     private File losslessDll() {

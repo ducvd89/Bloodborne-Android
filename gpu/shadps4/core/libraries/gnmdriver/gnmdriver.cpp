@@ -26,6 +26,7 @@
 #include "bbport_heap_sites.h"
 #include "bbport_gnm_hooks.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/renderer_vulkan/vk_frame_latency.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -2255,6 +2256,7 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
                "Invalid flip packet");
     ASSERT_MSG(buf_idx != 0xffff'ffffu, "Invalid VO buffer index");
 
+    Vulkan::FrameLatency::NoteGameSubmit(); // bbport: BB_LSFG_LATENCY
     const s32 flip_result = VideoOut::sceVideoOutSubmitEopFlip(vo_handle, buf_idx, flip_mode,
                                                                flip_arg, nullptr /*unk*/);
     if (flip_result != 0) {
