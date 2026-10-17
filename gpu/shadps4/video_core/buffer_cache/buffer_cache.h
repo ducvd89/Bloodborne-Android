@@ -13,6 +13,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
@@ -364,8 +365,22 @@ private:
     void ProcessIdleBlocks();
     /// A VRAM slot of a block that left it: reused by the next move to VRAM.
     void ReleaseResidencySlot(vk::DeviceMemory memory, u64 offset);
-    /// Unbinds a VRAM block of memory the game unmapped (uploaded again if mapped and used).
-    void EvictVramBlock(u64 block);
+    /// Unbinds a VRAM block of memory the game unmapped, or an idle copy (`idle`): uploaded again
+    /// if mapped and used. False when the block had no VRAM slot.
+    bool EvictVramBlock(u64 block, bool idle = false);
+    /// bbport: copy mode (not GuestInPlace): returns the VRAM copies not bound for
+    /// BB_VRAM_IDLE_SECONDS, without GPU-written data.
+    void ReturnIdleCopies(u32 now);
+    /// bbport: copy mode: empties the emptiest residency chunk for the driver (its copies go).
+    void CompactResidency(u32 now);
+    /// bbport: EvictVramBlock(idle) for each, their BDA page table entries cleared; how many went.
+    u64 ReturnCopies(std::span<const u64> blocks);
+    /// bbport: the block's VRAM copy holds data only the GPU has (it cannot be uploaded again).
+    bool CopyHasGpuData(u64 block);
+    /// bbport: a binding took the block's 2 MiB in the submission being recorded.
+    [[nodiscard]] bool BoundThisTick(u64 block) const;
+    /// bbport: chunks without blocks for 5 s go back to the driver.
+    void FreeEmptyResidencyChunks(u32 now);
     [[nodiscard]] static u32 VramIdleSeconds();
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
@@ -476,6 +491,15 @@ private:
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
+    /// bbport: the page table as a sparse buffer, its pages bound when first written (copy mode
+    /// with strict non-resident reads; see the constructor).
+    bool sparse_bda_table = false;
+    u64 bda_table_page = 0;
+    u32 bda_table_type = 0;
+    u64 bda_table_pages = 0;
+    std::vector<u8> bda_table_bound;
+    /// Binds (and clears) the pages of the sparse page table holding [offset, offset + size).
+    void EnsureBdaTablePages(u64 offset, u64 size);
 
     std::vector<const Buffer*> address_space; ///< num_arena_pages entries
     std::deque<Buffer> arenas;
@@ -609,6 +633,9 @@ private:
     std::optional<u32> arena_fallback_type_index;
     u32 arena_memory_type_bits = 0; ///< memory types the arena's blocks can be bound to
     vk::DeviceMemory residency_memory{}; ///< bbport: the 64 MiB block arena residency comes from
+    /// bbport: one block of memory every evicted block is bound to instead of being unbound
+    /// (EvictVramBlock); allocated the first time, never freed (as residency_memory).
+    vk::DeviceMemory evicted_memory{};
     u64 residency_size = 0, residency_used = 0;
     std::future<vk::DeviceMemory> spare_residency; ///< the next block, allocated in the background
     /// bbport: VRAM blocks no longer needed. Per 2 MiB of guest addresses, the second
@@ -617,6 +644,9 @@ private:
     /// go back to the driver (ProcessIdleBlocks). Blocks of unmapped memory leave VRAM too.
     static constexpr u64 USE_GROUP_BITS = 21;
     std::vector<u32> group_use;
+    /// Per 2 MiB, as group_use: the submission (low 32 bits) a binding last took it in.
+    std::vector<u32> group_tick;
+    u64 compact_scan_tick = 0; ///< CompactResidency: the submission it last looked in
     /// Groups with blocks moved in place for idleness, and those blocks: bound again, they get a
     /// VRAM copy again (QueuePromotions). Else the GPU kept reading them over PCIe (FPS 90 -> 55).
     std::vector<u8> group_demoted;

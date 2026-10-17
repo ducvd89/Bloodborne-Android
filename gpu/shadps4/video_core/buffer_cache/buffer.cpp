@@ -3,6 +3,10 @@
 
 #include <array>
 #include <numeric>
+#include <algorithm>
+#include <functional>
+#include <mutex>
+#include <fmt/format.h>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -68,6 +72,68 @@ std::string_view BufferTypeName(MemoryType type) {
     }
 }
 
+namespace {
+constexpr u32 MaxBufferKinds = 64;
+std::mutex buffer_kinds_mutex;
+std::vector<std::string> buffer_kind_names{"other"};
+std::array<std::atomic<u64>, MaxBufferKinds> buffer_kind_bytes{};
+std::array<std::atomic<u32>, MaxBufferKinds> buffer_kind_count{};
+
+void CountBuffer(u32 kind, u64 bytes, bool add) {
+    if (add) {
+        buffer_kind_bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
+        buffer_kind_count[kind].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        buffer_kind_bytes[kind].fetch_sub(bytes, std::memory_order_relaxed);
+        buffer_kind_count[kind].fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+} // namespace
+
+u32 BufferKind(std::string_view name) {
+    // "Buffer 0x...:0x..." and "StreamBuffer(...):0x...": the part before the address.
+    if (const auto at = name.find(":0x"); at != std::string_view::npos) {
+        name = name.substr(0, at);
+    }
+    if (const auto at = name.find(" 0x"); at != std::string_view::npos) {
+        name = name.substr(0, at);
+    }
+    std::scoped_lock lk{buffer_kinds_mutex};
+    for (u32 i = 0; i < buffer_kind_names.size(); ++i) {
+        if (buffer_kind_names[i] == name) {
+            return i;
+        }
+    }
+    if (buffer_kind_names.size() == MaxBufferKinds) {
+        return 0;
+    }
+    buffer_kind_names.emplace_back(name);
+    return static_cast<u32>(buffer_kind_names.size() - 1);
+}
+
+std::string DescribeBufferKinds() {
+    std::vector<std::pair<u64, u32>> kinds;
+    {
+        std::scoped_lock lk{buffer_kinds_mutex};
+        for (u32 i = 0; i < buffer_kind_names.size(); ++i) {
+            const u64 bytes = buffer_kind_bytes[i].load(std::memory_order_relaxed);
+            if (bytes >= (1ull << 20)) {
+                kinds.emplace_back(bytes, i);
+            }
+        }
+    }
+    std::sort(kinds.begin(), kinds.end(), std::greater<>{});
+    std::string out;
+    u64 total = 0;
+    for (const auto& [bytes, kind] : kinds) {
+        total += bytes;
+        std::scoped_lock lk{buffer_kinds_mutex};
+        out += fmt::format("{}{} {} MiB ({})", out.empty() ? "" : ", ", buffer_kind_names[kind],
+                           bytes >> 20, buffer_kind_count[kind].load(std::memory_order_relaxed));
+    }
+    return fmt::format("{} MiB: {}", total >> 20, out);
+}
+
 UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
     : device{device_}, allocator{allocator_} {}
 
@@ -76,6 +142,10 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() {
+    if (stats_bytes) {
+        CountBuffer(stats_kind, stats_bytes, false);
+        stats_bytes = 0;
+    }
     if (allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {
@@ -116,6 +186,10 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(allocator, allocation, &info);
+        stats_bytes = info.size;
+        CountBuffer(stats_kind, stats_bytes, true);
     } else if (mem_type == MemoryType::Backed) {
         // bbport: an arena without sparse binding (BufferCache::NonSparseArenas): a plain buffer
         // with one dedicated memory of its full size, allocated and bound here. Device-local
@@ -275,6 +349,8 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         buffer_ci.pQueueFamilyIndices = families.data();
     }
     VmaAllocationInfo alloc_info{};
+    buffer.stats_kind = BufferKind(
+        debug_name.empty() ? fmt::format("unnamed {}", BufferTypeName(mem_type)) : debug_name);
     buffer.Create(buffer_ci, mem_type, &alloc_info);
 
     const auto device = instance.GetDevice();

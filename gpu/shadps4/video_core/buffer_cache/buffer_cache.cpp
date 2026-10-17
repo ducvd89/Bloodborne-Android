@@ -735,6 +735,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     BbLayer::GpuMemory::Get().SetBlockShift(static_cast<u32>(block_shift));
     group_use.assign(u64{1} << (ADDRESS_SPACE_BITS - USE_GROUP_BITS), 0);
     group_demoted.assign(group_use.size(), 0);
+    group_tick.assign(group_use.size(), 0);
     layer_group_use.assign(group_use.size(), 0);
     if (non_sparse_arenas) {
         // The type the arena's memory is allocated from (Buffer, MemoryType::Backed): device-local
@@ -768,9 +769,79 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         (LayerActive() ? 2 : 1);
     fault_manager = std::make_unique<FaultManager>(instance, scheduler, *this, block_shift,
                                                    blocks_per_arena_page * num_arena_pages);
+    // bbport: the page table has an entry for every block of the 40-bit address space: 512 MiB,
+    // all of it allocated and cleared, while the game's blocks fill a few MiB of it (on a 12 GB
+    // phone, where GPU memory is the system's RAM). In copy mode (the phones) with sparse
+    // residency that reads unbound memory as zero (Turnip: residencyNonResidentStrict), it is a
+    // sparse buffer instead: a page of it is bound when an entry in it is first written
+    // (EnsureBdaTablePages), and an unbound entry reads 0, "not resident", as a cleared one did.
+    // BB_SPARSE_BDA_TABLE=0: the full table as before.
+    const char* sparse_env = std::getenv("BB_SPARSE_BDA_TABLE");
+    sparse_bda_table =
+        !non_sparse_arenas && !GuestInPlace() && !LayerActive() &&
+        !(sparse_env && sparse_env[0] == '0') &&
+        instance.GetPhysicalDevice().getProperties().sparseProperties.residencyNonResidentStrict;
     bda_pagetable_buffer = std::make_unique<Buffer>(
-        instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
-    runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+        instance, 0, bda_pagetable_size,
+        sparse_bda_table ? MemoryType::Sparse : MemoryType::DeviceLocal, "BDA Page Table Buffer");
+    if (sparse_bda_table) {
+        const auto reqs =
+            instance.GetDevice().getBufferMemoryRequirements(bda_pagetable_buffer->Handle());
+        bda_table_page = std::max<u64>(reqs.alignment, 4_KB);
+        const auto& types = instance.GetMemoryProperties();
+        bda_table_type = ~0u;
+        for (u32 i = 0; i < types.memoryTypeCount; ++i) {
+            if (!((reqs.memoryTypeBits >> i) & 1)) {
+                continue;
+            }
+            if (bda_table_type == ~0u || (types.memoryTypes[i].propertyFlags &
+                                          vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+                bda_table_type = i;
+                if (types.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) {
+                    break;
+                }
+            }
+        }
+        bda_table_bound.assign((bda_pagetable_size + bda_table_page - 1) / bda_table_page, 0);
+        std::printf("Buffer cache: BDA page table sparse (%llu MiB of entries, pages of %llu KiB "
+                    "bound when written; BB_SPARSE_BDA_TABLE=0: all of it)\n",
+                    (unsigned long long)(bda_pagetable_size >> 20),
+                    (unsigned long long)(bda_table_page >> 10));
+    } else {
+        runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+    }
+}
+
+void BufferCache::EnsureBdaTablePages(u64 offset, u64 size) {
+    if (!sparse_bda_table || size == 0) {
+        return;
+    }
+    const u64 last = (offset + size - 1) / bda_table_page;
+    for (u64 page = offset / bda_table_page; page <= last; ++page) {
+        if (bda_table_bound[page]) {
+            continue;
+        }
+        const auto memory = Vulkan::Check(instance.GetDevice().allocateMemory(
+            {.allocationSize = bda_table_page, .memoryTypeIndex = bda_table_type}));
+        BbStats::device_alloc_bytes.fetch_add(bda_table_page, std::memory_order_relaxed);
+        // Bound before this submission runs (SubmitPendingArenaBinds), then cleared: new
+        // memory holds whatever it held. The entries' copy is recorded after the clear.
+        BindsForArena(bda_pagetable_buffer.get())
+            ->binds.emplace_back(vk::SparseMemoryBind{
+                .resourceOffset = page * bda_table_page,
+                .size = bda_table_page,
+                .memory = memory,
+                .memoryOffset = 0,
+            });
+        runtime.FillBuffer(bda_pagetable_buffer.get(), page * bda_table_page, bda_table_page, 0u);
+        bda_table_bound[page] = 1;
+        ++bda_table_pages;
+        if ((bda_table_pages & (bda_table_pages - 1)) == 0) {
+            std::printf("Buffer cache: BDA page table: %llu pages bound (%llu KiB)\n",
+                        (unsigned long long)bda_table_pages,
+                        (unsigned long long)((bda_table_pages * bda_table_page) >> 10));
+        }
+    }
 }
 
 BufferCache::~BufferCache() = default;
@@ -1814,6 +1885,9 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     }
 
     staging.Flush();
+    for (const auto& copy : copies) {
+        EnsureBdaTablePages(copy.dstOffset, copy.size);
+    }
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
@@ -2027,11 +2101,13 @@ void BufferCache::NoteResidencyMix(u64 first_block, u64 last_block, u64 size, bo
 
 void BufferCache::NoteUse(VAddr address, u64 size) {
     const u32 now = BbStats::coarse_second.load(std::memory_order_relaxed);
+    const u32 tick = static_cast<u32>(scheduler.CurrentTick());
     const u64 last = std::min<u64>((address + size - 1) >> USE_GROUP_BITS, group_use.size() - 1);
     for (u64 group = address >> USE_GROUP_BITS; group <= last; ++group) {
         if (group_use[group] != now) {
             group_use[group] = now;
         }
+        group_tick[group] = tick;
         if (group_demoted[group]) [[unlikely]] {
             group_demoted[group] = 0;
             const u64 first = (group << USE_GROUP_BITS) >> block_shift;
@@ -2058,24 +2134,40 @@ void BufferCache::ReleaseResidencySlot(vk::DeviceMemory memory, u64 offset) {
     NoteResidencyUnused();
 }
 
-void BufferCache::EvictVramBlock(u64 block) {
+bool BufferCache::EvictVramBlock(u64 block, bool idle) {
     if (non_sparse_arenas) {
-        return; // an arena's memory is its own: no block leaves it
+        return false; // an arena's memory is its own: no block leaves it
     }
     const auto old = resident_ranges.Find(block);
     if (old == resident_ranges.end() || in_place_blocks.Contains(block) ||
         !residency_chunks.contains(static_cast<VkDeviceMemory>(old->memory))) {
-        return;
+        return false;
     }
     const vk::DeviceMemory memory = old->memory;
     const u64 offset = (old->offset + (block - old->start)) << block_shift;
     const VAddr address = block << block_shift;
+    // bbport: the block is bound to a block of spare memory instead of being unbound. Unbinding
+    // (memory = null) on Adreno's KGSL kernel driver unbinds every whole range the block lies in
+    // (kgsl_vbo.c, kgsl_memdesc_remove_range with no child: it does not split a range, binding
+    // does): the cache binds runs of blocks as one range, so the neighbours of a returned block
+    // read the zero page while the cache thinks they are bound. On a Poco F7 Pro (Adreno 750) 5
+    // idle blocks returned at boot lost the device when the save loaded. Any driver: the block's
+    // slot is free all the same, and nothing that may still read the block faults.
+    if (!evicted_memory) {
+        auto spare = instance.GetDevice().allocateMemory(
+            {.allocationSize = block_size, .memoryTypeIndex = arena_memory_type_index});
+        if (spare.result != vk::Result::eSuccess) {
+            return false; // stays in VRAM
+        }
+        evicted_memory = spare.value;
+        BbStats::device_alloc_bytes.fetch_add(block_size, std::memory_order_relaxed);
+    }
     for (const auto& arena : arenas) {
         if (arena.cpu_addr <= address && address - arena.cpu_addr < arena.size_bytes) {
             BindsForArena(&arena)->binds.emplace_back(vk::SparseMemoryBind{
                 .resourceOffset = address - arena.cpu_addr,
                 .size = block_size,
-                .memory = {},
+                .memory = evicted_memory,
                 .memoryOffset = 0,
             });
         }
@@ -2087,13 +2179,175 @@ void BufferCache::EvictVramBlock(u64 block) {
     ReleaseResidencySlot(memory, offset);
     // After the work submitted so far: it may still read the block.
     bind_wait_tick = std::max(bind_wait_tick, scheduler.CurrentTick() - 1);
-    BbStats::vram_unmapped_bytes.fetch_add(block_size, std::memory_order_relaxed);
+    (idle ? BbStats::vram_idle_bytes : BbStats::vram_unmapped_bytes)
+        .fetch_add(block_size, std::memory_order_relaxed);
+    return true;
+}
+
+bool BufferCache::CopyHasGpuData(u64 block) {
+    const VAddr address = block << block_shift;
+    return IsRegionGpuModified(address, block_size) ||
+           gpu_modified_ranges.Intersects(address, block_size);
+}
+
+bool BufferCache::BoundThisTick(u64 block) const {
+    return group_tick[(block << block_shift) >> USE_GROUP_BITS] ==
+           static_cast<u32>(scheduler.CurrentTick());
+}
+
+u64 BufferCache::ReturnCopies(std::span<const u64> blocks) {
+    // Their entries in the BDA page table go back to 0: a shader that reaches them through a
+    // pointer faults (FaultManager) and the block is bound and uploaded again, as the first time.
+    // A run of blocks is one fill.
+    u64 run_start = 0, run_end = 0, returned = 0;
+    const auto clear_run = [&] {
+        if (run_end != run_start) {
+            runtime.FillBuffer(bda_pagetable_buffer.get(), run_start * sizeof(vk::DeviceAddress),
+                               (run_end - run_start) * sizeof(vk::DeviceAddress), 0u);
+        }
+    };
+    for (const u64 block : blocks) {
+        if (!EvictVramBlock(block, true)) {
+            continue;
+        }
+        ++returned;
+        if (block != run_end) {
+            clear_run();
+            run_start = block;
+        }
+        run_end = block + 1;
+    }
+    clear_run();
+    return returned;
+}
+
+void BufferCache::ReturnIdleCopies(u32 now) {
+    // Copies not bound for the idle time, without data only the GPU has (it would be lost), and
+    // not bound by work already recorded in this submission (their rebind goes in before it).
+    // At most 128 MiB a second.
+    const u64 max_blocks = std::max<u64>(1, 128_MB >> block_shift);
+    std::vector<u64> blocks;
+    for (const auto& range : resident_ranges) {
+        if (!residency_chunks.contains(static_cast<VkDeviceMemory>(range.memory))) {
+            continue;
+        }
+        for (u64 block = range.start; block < range.end && blocks.size() < max_blocks; ++block) {
+            if (now - group_use[(block << block_shift) >> USE_GROUP_BITS] >= VramIdleSeconds() &&
+                !BoundThisTick(block) && !CopyHasGpuData(block)) {
+                blocks.push_back(block);
+            }
+        }
+    }
+    if (const u64 returned = ReturnCopies(blocks)) {
+        std::printf("Guest memory: %llu idle VRAM copies returned (%llu KiB, tick %llu), %llu chunks\n",
+                    (unsigned long long)returned, (unsigned long long)((returned << block_shift) >> 10),
+                    (unsigned long long)scheduler.CurrentTick(),
+                    (unsigned long long)residency_chunks.size());
+        std::fflush(stdout);
+    }
+}
+
+void BufferCache::CompactResidency(u32 now) {
+    // Returned copies leave free slots spread over every chunk: 210 MiB of them in 11 chunks after
+    // 15 minutes of Central Yharnam, none empty, so none went back to the driver. With over
+    // 128 MiB of free slots, every 10 s, the emptiest chunk the free slots of the others can take,
+    // whose copies all hold no data only the GPU has and were all last bound 2 s ago or more,
+    // gives them all back: bound again, they are uploaded again into fuller chunks
+    // (AllocateResidency), and the empty chunk is freed (FreeEmptyResidencyChunks).
+    // Not copies bound less than 2 s ago: the draw pipe binds a packet's buffers (BindResources,
+    // stage A) ahead of recording it (stage B), possibly in the submission before, so "not bound
+    // in this submission" did not mean "not about to be read". A Poco F7 Pro lost the device when
+    // an indirect dispatch read its arguments from a copy returned that way (the spare memory:
+    // 1043118191x1064429451x1046607728 groups).
+    constexpr u32 RecentSeconds = 2;
+    if (free_slot_count * block_size < 128_MB || now - last_evacuation < 10) {
+        return;
+    }
+    struct Count {
+        u64 blocks = 0;
+        bool gpu_data = false;
+        bool recent = false;
+    };
+    std::unordered_map<VkDeviceMemory, Count> counts;
+    for (const auto& range : resident_ranges) {
+        const auto memory = static_cast<VkDeviceMemory>(range.memory);
+        if (!residency_chunks.contains(memory)) {
+            continue;
+        }
+        Count& count = counts[memory];
+        count.blocks += range.end - range.start;
+        for (u64 block = range.start;
+             block < range.end && !count.gpu_data && !count.recent; ++block) {
+            count.recent =
+                now - group_use[(block << block_shift) >> USE_GROUP_BITS] < RecentSeconds ||
+                BoundThisTick(block);
+            count.gpu_data = !count.recent && CopyHasGpuData(block);
+        }
+    }
+    last_evacuation = now;
+    auto emptiest = counts.end();
+    for (auto it = counts.begin(); it != counts.end(); ++it) {
+        const auto chunk = residency_chunks.find(it->first);
+        if (it->first == static_cast<VkDeviceMemory>(residency_memory) || it->second.gpu_data ||
+            it->second.recent || it->second.blocks == 0 ||
+            it->second.blocks > free_slot_count - chunk->second.free_offsets.size()) {
+            continue;
+        }
+        if (emptiest == counts.end() || it->second.blocks < emptiest->second.blocks) {
+            emptiest = it;
+        }
+    }
+    if (emptiest == counts.end()) {
+        return;
+    }
+    std::vector<u64> blocks;
+    u64 left = 0;
+    for (const auto& range : resident_ranges) {
+        if (static_cast<VkDeviceMemory>(range.memory) != emptiest->first) {
+            continue;
+        }
+        for (u64 block = range.start; block < range.end; ++block) {
+            if (now - group_use[(block << block_shift) >> USE_GROUP_BITS] < RecentSeconds ||
+                BoundThisTick(block)) {
+                ++left;
+            } else {
+                blocks.push_back(block);
+            }
+        }
+    }
+    const u64 returned = ReturnCopies(blocks);
+    residency_chunks[emptiest->first].evacuated_second = now;
+    BbStats::evacuations.fetch_add(1, std::memory_order_relaxed);
+    std::printf("Guest memory: a VRAM chunk emptied for the driver: %llu copies returned "
+                "(%llu KiB), %llu bound since stay, %llu chunks\n",
+                (unsigned long long)returned, (unsigned long long)((returned << block_shift) >> 10),
+                (unsigned long long)left, (unsigned long long)residency_chunks.size());
+    std::fflush(stdout);
 }
 
 void BufferCache::ProcessIdleBlocks() {
     const u32 now = BbStats::coarse_second.load(std::memory_order_relaxed);
-    if (now == idle_scan_second || !GuestInPlace() || VramIdleSeconds() == 0 ||
-        non_sparse_arenas) {
+    if (VramIdleSeconds() == 0 || non_sparse_arenas) {
+        return;
+    }
+    if (!GuestInPlace()) {
+        // bbport: copies of the game's memory (BB_GUEST_IN_PLACE=0, the phones): returned when
+        // idle, the chunks compacted, and emptied chunks freed. They were never returned: the
+        // chunks grew to the VRAM limit while the world was walked (2 GiB in 8 minutes of
+        // Central Yharnam on a 12 GB phone, where VRAM is the system's RAM) and Android swapped
+        // the game out.
+        if (const u64 tick = scheduler.CurrentTick(); tick != compact_scan_tick) {
+            compact_scan_tick = tick;
+            CompactResidency(now);
+        }
+        if (now != idle_scan_second) {
+            idle_scan_second = now;
+            ReturnIdleCopies(now);
+            FreeEmptyResidencyChunks(now);
+        }
+        return;
+    }
+    if (now == idle_scan_second) {
         return;
     }
     idle_scan_second = now;
@@ -2150,12 +2404,19 @@ void BufferCache::ProcessIdleBlocks() {
             }
         }
     }
+    FreeEmptyResidencyChunks(now);
+}
+
+void BufferCache::FreeEmptyResidencyChunks(u32 now) {
     // Chunks without blocks for 5 s, the rebinds away from them long done: back to the driver.
+    // The rebinds went with the submission recorded when the chunk emptied (empty_tick), before
+    // the next one; that one done, they are. (Waiting for no pending binds at all as well kept
+    // every chunk: in copy mode nearly every submission binds something.)
     for (auto it = residency_chunks.begin(); it != residency_chunks.end();) {
         const ResidencyChunk& chunk = it->second;
         const VkDeviceMemory memory = it->first;
         if (chunk.used != 0 || memory == static_cast<VkDeviceMemory>(residency_memory) ||
-            now - chunk.empty_second < 5 || !pending_binds.empty() ||
+            now - chunk.empty_second < 5 ||
             !scheduler.GetWorkSemaphore()->IsFree(chunk.empty_tick + 1)) {
             ++it;
             continue;
