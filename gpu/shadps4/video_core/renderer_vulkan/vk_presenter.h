@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <deque>
 
 #include <condition_variable>
@@ -41,7 +42,7 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
-
+    u64 latency_id{}; ///< bbport: BB_LSFG_LATENCY record of the game frame (vk_frame_latency.h), 0: none
 };
 
 enum SchedulerType {
@@ -137,7 +138,7 @@ private:
     /// Lossless Scaling frame generation for one real frame: queues it and its generated frames and
     /// hands them to the app in order, spaced. False: not done (frame generation failed), present
     /// the frame as usual.
-    bool PresentWithLsfg(Frame* frame);
+    bool PresentWithLsfg(Frame* frame, u64 latency_id);
     /// Follows the app's live Lossless Scaling settings (bb_lsfg_state.h): called at the start of
     /// every present, between two frames, it looks at the state file at most every 250 ms and applies
     /// a change there and then (ApplyLsfgState).
@@ -148,8 +149,12 @@ private:
     void ApplyLsfgState(const BbLsfgState::State& next);
     /// Tells the swapchain the multiplier that runs now (0: none): the buffer count and FIFO follow.
     void ApplyLsfgOutputMode();
+    /// The game-frame bound (frames_cap) for what runs now.
+    void ApplyFramesCap();
 #endif
-    Frame* GetRenderFrame();
+    /// `capped`: a game frame (PrepareFrame, the GPU command thread): with frame generation on it also
+    /// waits while frames_cap frames are out (taken, not yet presented).
+    Frame* GetRenderFrame(bool capped = false);
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
@@ -192,6 +197,10 @@ private:
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+    u64 last_present_tick{}; ///< bbport: present_scheduler tick of the last SubmitToSwapchain
+    /// bbport: with Lossless Scaling frame generation, the most game frames out at once (taken by
+    /// PrepareFrame, not yet presented); 0: no bound but the pool (BB_LSFG_FRAMES, Lsfg::FramesCap).
+    std::atomic<u32> frames_cap{0};
 };
 
 } // namespace Vulkan

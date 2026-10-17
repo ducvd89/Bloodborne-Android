@@ -33,6 +33,26 @@ For every real game frame, on the presenter's thread:
 
 Buffers change devices with queue-family ownership transfers to `VK_QUEUE_FAMILY_EXTERNAL`, as the fork's layer does. If a sync file cannot be exported or imported the call waits on the CPU (`BB_LSFG_SYNC=host` forces that); any other failure turns frame generation off and the game goes on with its own frames. The first four frames only fill the framegen's history.
 
+## Latency
+
+Nothing on the present thread waits for the GPU (`BB_LSFG_CHAIN=1`, the default): the copy of frame N waits on the GPU for the framegen's "done with the inputs" of frame N − 1, and its own signal, the sync file the framegen waits on before batch N, also covers (by submission order on the game's one queue) the presents of cycle N − 1 that read the output buffers batch N writes again. Each kind of semaphore is a ring of four, reused only once the submission that used it completed (a tick of the present scheduler; it never waits in practice). Until 0.9.5 the present thread waited at every frame for the last cycle's presents and copy: once the GPU was behind (a heavy scene, a large flow scale or the quality model) that wait plus the pacing sleep took the whole frame interval, the present thread became the bottleneck and up to 7 finished frames queued for it (the presenter's pool), ~200 ms late on screen. `BB_LSFG_CHAIN=0` brings those waits back.
+
+While frame generation runs, the GPU command thread also waits while a game frame is out (`BB_LSFG_FRAMES`, 1 by default; 0: only the presenter's pool of 9 bounds them): the next frame's display buffer is made only once the last one was handed to the app, so the game is held back instead of queueing finished frames. It matters where the FPS limit holds the game back (the title screen at 60: the real frame complete 28 ms after its flip with 1, 44 ms with 2, 34 ms with frame generation off, where the present-side limiter keeps two frames waiting); where the GPU is the limit it changes nothing (27.4–30.2 FPS and the same latency with 1 or 2).
+
+`BB_LSFG_LATENCY=1` (in `bionic-local.sh`) logs every 5 s, per mode, the mean and 95th percentile of each step of a game frame in ms after its flip reached the video out driver: the game's submission (negative), the present thread's start, the GPU done with the frame, the copy into the framegen's input (recorded, done), the framegen done, the first generated frame handed to the app and complete, the real frame handed to the app and complete, and how many frames waited for the present thread (`vk_frame_latency.h`). A file `lsfg.state.tune` next to the state file (`chain=0|1 pace=0|1 frames=N`) overrides those switches for every new frame generation (every change of the state file makes one), for comparisons in one place of the game.
+
+Measured on the AYN Thor (Adreno 740, Turnip 26.3), standing still in Cathedral Ward, x2, ms after the flip (mean):
+
+| | real FPS | present thread queue | GPU done | real frame complete |
+|---|---|---|---|---|
+| off | 34.6 | 0 | 21.7 | 23.0 |
+| performance, flow 0.75, FP16, before | 30.4 | 0 | 22.5 | 30.6 |
+| performance, flow 0.75, FP16, now | 30.2 | 0 | 22.5 | 30.8 |
+| quality, flow 1.0, FP32, before | 28.0 | 5–7 frames | 183–222 | 235–274 |
+| quality, flow 1.0, FP32, now | 27.8 | 0 | 45 | 61 |
+
+What frame generation still adds is its own: the copy (~1.5 ms), the framegen on the GPU (5 ms in performance mode at flow 0.75 with FP16, 12 ms in the quality model at 1.0 with FP32), and the real frame shown after the generated one (at least one refresh); its GPU time also lowers the real frame rate (34.6 → 30 FPS there), and the framegen of frame N − 1 runs on the GPU before frame N.
+
 ## Pacing
 
 Generated frames only look right when each is shown for one refresh. With frame generation on, libbbgpu asks the app for FIFO presentation whatever the VSync setting says, and the app picks the display mode of FPS limit × multiplier when the panel has it (30 × 2: 60 Hz; 30 × 4, 40 × 3 or 60 × 2: 120 Hz), else the fastest one. The presentation needs the multiplier plus three swapchain buffers.

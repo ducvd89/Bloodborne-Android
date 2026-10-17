@@ -36,6 +36,7 @@ extern "C" void runtime_wait_report(double frames);
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_frame_latency.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -93,6 +94,9 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
         std::scoped_lock lock{swap_mutex};
         if (if_idle && (swap_busy || !swap_queue.empty())) {
             return; // a redraw of the last frame is pointless while frames are queued
+        }
+        if (!if_idle) {
+            Vulkan::FrameLatency::NoteQueueDepth(static_cast<u32>(swap_queue.size()) + (swap_busy ? 1 : 0));
         }
         swap_queue.push_back(std::move(work));
     }
@@ -868,6 +872,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
     // bbport: a frame is submitted: its CPU work duration goes to the performance hint session.
     BbAdpf::FrameSubmitted();
+    const u64 latency_id = index == -1 ? 0 : Vulkan::FrameLatency::Begin(); // BB_LSFG_LATENCY
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -876,6 +881,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+        frame->latency_id = latency_id;
     }
     Vulkan::Frame* const generated = presenter->TakeGeneratedFrame();
 

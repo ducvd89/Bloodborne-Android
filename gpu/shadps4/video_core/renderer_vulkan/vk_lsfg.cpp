@@ -15,6 +15,7 @@
 #include "bb_lsfg_state.h"
 #include "common/logging/log.h"
 #include "vk_driver_loader.h"
+#include "video_core/renderer_vulkan/vk_frame_latency.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_lsfg.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -87,6 +88,7 @@ struct Lsfg::Stats {
     u32 real{0};
     u32 generated{0};
     u32 host_waits{0};
+    u32 ring_waits{0}; ///< chained: a semaphore's last use had not completed (should stay 0)
     double process_ms{0.0};
     double present_ms{0.0};
 };
@@ -132,12 +134,16 @@ Lsfg::~Lsfg() {
         api->shutdown();
     }
     if (device) {
-        device.destroySemaphore(input_ready);
-        for (const auto semaphore : batch_wait) {
-            device.destroySemaphore(semaphore);
+        for (const auto& entry : input_ready) {
+            device.destroySemaphore(entry.semaphore);
         }
-        for (const auto semaphore : output_wait) {
-            device.destroySemaphore(semaphore);
+        for (const auto& entry : batch_wait) {
+            device.destroySemaphore(entry.semaphore);
+        }
+        for (const auto& ring : output_wait) {
+            for (const auto& entry : ring) {
+                device.destroySemaphore(entry.semaphore);
+            }
         }
         for (const auto fence : output_done) {
             device.destroyFence(fence);
@@ -208,6 +214,30 @@ bool Lsfg::Initialize() {
     config.shared_format = static_cast<int32_t>(shared_format);
     config.hdr = 0;
     pace = EnvFlag("BB_LSFG_PACE", true);
+    chain = EnvFlag("BB_LSFG_CHAIN", true);
+    if (const char* value = std::getenv("BB_LSFG_FRAMES"); value && *value) {
+        frames_cap = static_cast<u32>(std::clamp(int(std::strtol(value, nullptr, 10)), 0, 8));
+    }
+    // Comparisons while the game runs: "<state file>.tune" (chain=, pace=, frames=) overrides the
+    // environment for every new Lsfg (a change of the state file makes one).
+    if (const char* state_path = BbLsfgState::FilePath()) {
+        if (FILE* tune = std::fopen((std::string{state_path} + ".tune").c_str(), "r")) {
+            char key[32];
+            int value = 0;
+            while (std::fscanf(tune, " %31[a-z]=%d", key, &value) == 2) {
+                const std::string name{key};
+                if (name == "chain") {
+                    chain = value != 0;
+                } else if (name == "pace") {
+                    pace = value != 0;
+                } else if (name == "frames") {
+                    frames_cap = static_cast<u32>(std::clamp(value, 0, 8));
+                }
+            }
+            std::fclose(tune);
+            std::printf("LSFG: tuning file: chain %d, pace %d, frames %u\n", chain ? 1 : 0, pace ? 1 : 0, frames_cap);
+        }
+    }
     sync_host = EnvString("BB_LSFG_SYNC") == "host";
 
     const auto start = std::chrono::steady_clock::now();
@@ -247,12 +277,17 @@ bool Lsfg::Initialize() {
         out = fence;
         return result == vk::Result::eSuccess;
     };
-    bool ok = make_semaphore(input_ready, &export_info) && make_fence(copy_done, true);
-    for (auto& semaphore : batch_wait) {
-        ok = ok && make_semaphore(semaphore, nullptr);
+    bool ok = make_fence(copy_done, true);
+    for (auto& entry : input_ready) {
+        ok = ok && make_semaphore(entry.semaphore, &export_info);
     }
-    for (auto& semaphore : output_wait) {
-        ok = ok && make_semaphore(semaphore, nullptr);
+    for (auto& entry : batch_wait) {
+        ok = ok && make_semaphore(entry.semaphore, nullptr);
+    }
+    for (auto& ring : output_wait) {
+        for (auto& entry : ring) {
+            ok = ok && make_semaphore(entry.semaphore, nullptr);
+        }
     }
     for (auto& fence : output_done) {
         ok = ok && make_fence(fence, true);
@@ -437,12 +472,27 @@ bool Lsfg::EnsureContext(u32 width, u32 height) {
         DestroyContext(*context);
     }
     context = std::move(next);
-    batch_wait_valid = false;
+    batch_pending = -1;
     LogPrecision();
     std::printf("LSFG: context %ux%u created in %.0f ms\n", width, height,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     std::fflush(stdout);
     return true;
+}
+
+vk::Semaphore Lsfg::Reuse(RingSemaphore& entry) {
+    if (entry.tick != 0 && scheduler_used && !scheduler_used->IsFree(entry.tick)) {
+        ++stats->ring_waits;
+        scheduler_used->Wait(entry.tick);
+    }
+    entry.tick = 0;
+    return entry.semaphore;
+}
+
+void Lsfg::OutputSubmitted(u32 index, u64 tick) {
+    if (index < output_wait.size()) {
+        output_wait[index][output_slot[index]].tick = tick;
+    }
 }
 
 bool Lsfg::ImportSyncFile(vk::Semaphore semaphore, int fd) {
@@ -460,7 +510,7 @@ bool Lsfg::ImportSyncFile(vk::Semaphore semaphore, int fd) {
 }
 
 int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 height, vk::Semaphore ready,
-                       u64 ready_tick) {
+                       u64 ready_tick, u64 latency_id) {
     if (failed) {
         return -1;
     }
@@ -481,9 +531,12 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
     Context& ctx = *context;
     const u32 count = ctx.frame < WarmupFrames ? 0 : multiplier - 1;
 
-    // The presents of the last cycle have finished reading the output buffers (the framegen device
-    // writes them again), and the last copy has finished (the fence below is reset).
-    {
+    scheduler_used = &scheduler;
+    const bool chained = Chained();
+    // Not chained: the presents of the last cycle have finished reading the output buffers (the
+    // framegen device writes them again), and the last copy has finished (the fence below is
+    // reset). Chained: nothing to wait for here (vk_lsfg.h).
+    if (!chained) {
         std::array<vk::Fence, 4> fences{copy_done};
         u32 fence_count = 1;
         for (u32 i = 0; i < multiplier - 1; ++i) {
@@ -496,6 +549,7 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
         static_cast<void>(device.resetFences(copy_done));
     }
 
+    FrameLatency::Mark(latency_id, FrameLatency::Stage::CopyStart);
     // 1. Copy the real frame into the input buffer of this parity, in a submission of its own.
     SharedImage& input = ctx.input[ctx.frame & 1];
     const vk::ImageSubresourceRange color_range{
@@ -567,29 +621,41 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
         input.used = true;
     }
+    RingSemaphore& input_entry = input_ready[cycle % RingSize];
+    const vk::Semaphore input_semaphore = Reuse(input_entry);
     {
         SubmitInfo info{};
         info.AddWait(ready, ready_tick);
         // The framegen device must be done with the input buffers (the last batch) before this copy.
-        if (batch_wait_valid) {
-            info.AddWait(batch_wait[batch_slot ^ 1]);
+        RingSemaphore* batch_entry = batch_pending >= 0 ? &batch_wait[batch_pending] : nullptr;
+        if (batch_entry) {
+            info.AddWait(batch_entry->semaphore);
         }
         if (!sync_host) {
-            info.AddSignal(input_ready);
+            info.AddSignal(input_semaphore);
         }
-        info.AddSignal(copy_done);
+        if (!chained) {
+            info.AddSignal(copy_done);
+        }
         scheduler.Flush(info);
+        const u64 copy_tick = scheduler.CurrentTick() - 1;
+        input_entry.tick = copy_tick;
+        if (batch_entry) {
+            batch_entry->tick = copy_tick;
+        }
         // The sync file of the semaphore can only be exported once its signal is submitted (the
         // submission may go out from a recording thread).
-        scheduler.WaitSubmitted(scheduler.CurrentTick() - 1);
+        scheduler.WaitSubmitted(copy_tick);
+        FrameLatency::WatchTimeline(latency_id, FrameLatency::Stage::CopyDone, device,
+                                    scheduler.GetWorkSemaphore()->Handle(), copy_tick);
     }
-    batch_wait_valid = false;
+    batch_pending = -1;
 
     // 2. The sync file of that copy goes to the framegen device.
     int input_fd = -1;
     if (!sync_host) {
         const auto [result, fd] = device.getSemaphoreFdKHR({
-            .semaphore = input_ready,
+            .semaphore = input_semaphore,
             .handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eSyncFd,
         });
         if (result == vk::Result::eSuccess) {
@@ -601,7 +667,10 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
         }
     }
     if (sync_host) {
-        if (device.waitForFences(copy_done, VK_TRUE, WaitNs) != vk::Result::eSuccess) {
+        if (chained) {
+            // Fell back to the CPU in this call: the copy had no fence to wait on.
+            scheduler.Wait(scheduler.CurrentTick() - 1);
+        } else if (device.waitForFences(copy_done, VK_TRUE, WaitNs) != vk::Result::eSuccess) {
             Disable("the copy of a frame did not finish in 2 s");
             return -1;
         }
@@ -615,6 +684,10 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
         return -1;
     }
     ++ctx.frame;
+    ++cycle;
+    if (latency_id && count > 0 && out.out_ready_fd[0] >= 0) {
+        FrameLatency::WatchFd(latency_id, FrameLatency::Stage::FramegenDone, dup(out.out_ready_fd[0]));
+    }
 
     // 3. What the framegen device hands back: a sync file per generated frame, one for the batch.
     bool host_wait = !out.gpu_synced || sync_host;
@@ -635,12 +708,17 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
         return true;
     };
     std::array<bool, 3> output_waits{};
+    std::array<vk::Semaphore, 3> output_semaphores{};
     for (u32 i = 0; i < count; ++i) {
-        output_waits[i] = take(out.out_ready_fd[i], output_wait[i]);
+        output_slot[i] = static_cast<u32>(cycle % RingSize);
+        output_semaphores[i] = Reuse(output_wait[i][output_slot[i]]);
+        output_waits[i] = take(out.out_ready_fd[i], output_semaphores[i]);
     }
     if (out.batch_complete_fd >= 0) {
-        batch_wait_valid = take(out.batch_complete_fd, batch_wait[batch_slot]);
-        batch_slot ^= 1;
+        const u32 slot = static_cast<u32>(cycle % RingSize);
+        if (take(out.batch_complete_fd, Reuse(batch_wait[slot]))) {
+            batch_pending = static_cast<int>(slot);
+        }
     }
     if (host_wait) {
         // Some dependency is not a GPU one: the batch is complete once this returns.
@@ -649,11 +727,12 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
             return -1;
         }
         ++stats->host_waits;
-        batch_wait_valid = false;
+        batch_pending = -1;
     }
     for (u32 i = 0; i < count; ++i) {
-        outputs[i] = {ctx.output[i].image, output_waits[i] && !host_wait ? output_wait[i] : vk::Semaphore{},
-                      output_done[i]};
+        // Chained: no fence; what reads the output is ordered before the next copy (vk_lsfg.h).
+        outputs[i] = {ctx.output[i].image, output_waits[i] && !host_wait ? output_semaphores[i] : vk::Semaphore{},
+                      chained ? vk::Fence{} : output_done[i]};
     }
 
     // Statistics.
@@ -665,9 +744,11 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
     const double window = std::chrono::duration<double>(Clock::now() - stats->window_start).count();
     if (print_stats && window >= 5.0 && stats->real) {
         std::printf("LSFG: %.1f real + %.1f generated frames/s (x%u, %s); per real frame %.2f ms in the "
-                    "copy and framegen call (%.2f ms of it the framegen call), %u CPU waits\n",
+                    "copy and framegen call (%.2f ms of it the framegen call), %u CPU waits, %s%s\n",
                     stats->real / window, stats->generated / window, multiplier, fp16_active ? "FP16" : "FP32",
-                    stats->process_ms / stats->real, stats->present_ms / stats->real, stats->host_waits);
+                    stats->process_ms / stats->real, stats->present_ms / stats->real, stats->host_waits,
+                    chained ? "chained" : "fence waits",
+                    stats->ring_waits ? (", " + std::to_string(stats->ring_waits) + " ring waits").c_str() : "");
         std::fflush(stdout);
         *stats = Stats{};
     }
