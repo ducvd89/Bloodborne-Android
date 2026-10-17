@@ -192,10 +192,17 @@ public final class MainActivity extends Activity {
         body.addView(edge,new LinearLayout.LayoutParams(dp(1),-1));
         drawer.addView(body,new LinearLayout.LayoutParams(-1,0,1));
 
-        TextView title=text("BLOODBORNE",24,0xffe8dfc9); title.setTypeface(Typeface.SERIF,Typeface.BOLD);
-        title.setLetterSpacing(0.12f); title.setPadding(dp(10),0,0,0);
-        drawerItems.addView(title,new LinearLayout.LayoutParams(-1,-2));
-        TextView hint=text("Swipe left or press A to return",12,0xff8e9097);
+        // The game's weathered serif look: IM Fell English (OFL, res/font), the plain serif if it cannot load.
+        TextView title=text("Bloodborne",30,0xffe8dfc9); title.setTypeface(Typeface.SERIF,Typeface.BOLD);
+        try { title.setTypeface(getResources().getFont(getResources().getIdentifier("im_fell_english","font",getPackageName()))); }
+        catch (Exception ex) { android.util.Log.w("Bloodborne","title font: "+ex); }
+        title.setLetterSpacing(0.02f); title.setPadding(dp(10),0,0,0); title.setSingleLine(true);
+        LinearLayout titleRow=new LinearLayout(this); titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        titleRow.addView(title,new LinearLayout.LayoutParams(0,-2,1)); // the pill sits at the right edge
+        LinearLayout.LayoutParams bp=new LinearLayout.LayoutParams(-2,-2); bp.leftMargin=dp(6);
+        titleRow.addView(donateBadge(),bp);
+        drawerItems.addView(titleRow,new LinearLayout.LayoutParams(-1,-2));
+        TextView hint=text("Swipe left or press ○ to return",12,0xff8e9097);
         hint.setPadding(dp(10),dp(2),0,dp(6));
         drawerItems.addView(hint,new LinearLayout.LayoutParams(-1,-2));
 
@@ -278,6 +285,41 @@ public final class MainActivity extends Activity {
         t.setLetterSpacing(0.15f); t.setTypeface(Typeface.DEFAULT_BOLD);
         t.setPadding(dp(10),dp(16),0,dp(6));
         drawerItems.addView(t,new LinearLayout.LayoutParams(-1,-2));
+    }
+
+    /** The "Buy me a Claude token" pill beside the title: the coin and two lines of script on yellow,
+     *  opens PayPal.Me in the browser. Focusable for the gamepad, with a gold edge when focused. */
+    private View donateBadge() {
+        LinearLayout pill=new LinearLayout(this); pill.setGravity(Gravity.CENTER_VERTICAL);
+        pill.setPadding(dp(4),dp(3),dp(5),dp(3));
+        pill.setContentDescription("Buy me a Claude token");
+        pill.setFocusable(true); pill.setClickable(true);
+        pill.setOnClickListener(v -> {
+            try { startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse("https://paypal.me/Ducvd89"))); }
+            catch (Exception ex) { android.util.Log.w("Bloodborne","donate link: "+ex); }
+        });
+        android.graphics.drawable.StateListDrawable states=new android.graphics.drawable.StateListDrawable();
+        GradientDrawable lit=new GradientDrawable(); lit.setColor(0xffffdd00); lit.setCornerRadius(dp(8));
+        lit.setStroke(dp(2),0xffc6ad76);
+        GradientDrawable pressed=new GradientDrawable(); pressed.setColor(0xffe6c700); pressed.setCornerRadius(dp(8));
+        GradientDrawable idle=new GradientDrawable(); idle.setColor(0xffffdd00); idle.setCornerRadius(dp(8));
+        states.addState(new int[]{android.R.attr.state_pressed},pressed);
+        states.addState(new int[]{android.R.attr.state_focused},lit);
+        states.addState(new int[]{},idle);
+        pill.setBackground(states);
+        android.widget.ImageView coin=new android.widget.ImageView(this);
+        coin.setImageResource(getResources().getIdentifier("ic_claude_token","drawable",getPackageName()));
+        LinearLayout.LayoutParams cp=new LinearLayout.LayoutParams(dp(16),dp(16)); cp.rightMargin=dp(3);
+        pill.addView(coin,cp);
+        // Handwritten, like the coffee badge: Android's cursive family (Dancing Script), "Claude token" larger in clay.
+        android.text.SpannableString words=new android.text.SpannableString("Buy me a\nClaude token");
+        words.setSpan(new android.text.style.RelativeSizeSpan(0.85f),0,8,0);
+        words.setSpan(new android.text.style.ForegroundColorSpan(0xff9b4428),9,words.length(),0);
+        TextView label=text("",11,0xff1a1a1a); label.setText(words);
+        label.setTypeface(Typeface.create("cursive",Typeface.BOLD));
+        label.setIncludeFontPadding(false); label.setLineSpacing(0,0.8f);
+        pill.addView(label);
+        return pill;
     }
 
     /** A menu row: icon, title and an optional second line (null: none; "" filled by refreshDrawer).
