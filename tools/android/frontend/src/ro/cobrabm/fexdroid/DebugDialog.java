@@ -25,10 +25,10 @@ final class DebugDialog {
         {"debug_fault_sleep_lock","Sleeping lock in the fault handler","Off: a spinning lock instead.","1"},
     };
     private static final String[][] MEMORY={
-        {"debug_vram_copy_queue","Free old GPU memory (FIFO, experimental)","Keeps GPU copies of game memory under a cap: once it is reached, throws away the oldest copies not used for 20 s, so memory stops growing on long sessions. May cause missing geometry or stutter.","0"},
+        {"debug_vram_copy_queue","Free old GPU memory (FIFO)","Keeps GPU copies of game memory under a cap: once it is reached, throws away the oldest copies not used for 20 s, so memory stops growing on long sessions. Turn off if you see missing geometry or stutter.","1"},
     };
     /** The cap of the FIFO above, in MB: a single choice, used only while that switch is on. */
-    private static final String CAP_KEY="debug_vram_copy_cap_mb", CAP_SWITCH="debug_vram_copy_queue", CAP_DEFAULT="1024";
+    private static final String CAP_KEY="debug_vram_copy_cap_mb", CAP_SWITCH="debug_vram_copy_queue", CAP_DEFAULT="512";
     private static final String[] CAP_VALUES={"512","768","1024","1536","2048","3072"};
     private static final String CAP_TITLE="GPU memory cap (FIFO)";
     private static final String CAP_NOTE="Only with Free old GPU memory on. Lower = less RAM but more re-copying (stutter).";
