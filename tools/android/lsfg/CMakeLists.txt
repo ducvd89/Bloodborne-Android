@@ -1,6 +1,7 @@
 # libbloodframe.so (Bloodframe, based on lsfg-vk 1.0 by PancakeTAS, MIT, via GameNative's Android fork):
 # the Lossless Scaling frame generation of the fork (framegen backend, Lossless.dll shader extraction,
-# DXBC -> SPIR-V) behind the small C API of bb_lsfg.h, for the Bionic game process. Not the Vulkan layer: libbbgpu calls it directly (build_bloodframe.sh).
+# DXBC -> SPIR-V, plus the half-precision SPIR-V set, bb_half.cpp) behind the small C API of bb_lsfg.h, for
+# the Bionic game process. Not the Vulkan layer: libbbgpu calls it directly (build_bloodframe.sh).
 # -DLSFG_SRC=<the fork's source tree, with our patches applied>
 cmake_minimum_required(VERSION 3.18)
 project(bloodframe LANGUAGES C CXX)
@@ -30,6 +31,7 @@ target_compile_options(lsfg-vk-framegen PRIVATE -include unistd.h)
 
 add_library(bloodframe SHARED
   bb_lsfg.cpp
+  bb_half.cpp
   ${LSFG_SRC}/src/extract/extract.cpp
   ${LSFG_SRC}/src/extract/trans.cpp)
 set_target_properties(bloodframe PROPERTIES

@@ -10,6 +10,19 @@ The game runs as a native Android (Bionic) process, so Lossless Scaling's frame 
 
 It replaces FSR 3.1 frame generation (FSR 3.1 frame generation stays in Graphics settings, which needs a restart; the two menus lock each other while one is on). It sees only finished frames, without the game's motion vectors, so expect more artifacts around fast motion and the HUD than with FSR 3.1 frame generation. Messages are in `files/bbport/logs/android-game.log` (`LSFG: ...`); `BB_LSFG_STATS=1` in `bbport/bionic-local.sh` logs real and generated frames a second.
 
+## Half precision (FP16)
+
+A recent Lossless.dll carries every frame generation shader three times, as resources of its RCDATA: the DXBC set (resource id N, the one the fork translates to SPIR-V), a half-precision SPIR-V set (N + 49) and a full-precision SPIR-V set (N + 98). With the setting on, Bloodframe reads the half-precision set (it is SPIR-V already: only the bindings are renumbered, from the dll's per-class numbers 0, 16, 32, 48 to consecutive ones, the order the framegen's descriptor layouts use) and the framegen device enables `shaderFloat16`; without it, or when it cannot, the DXBC set is translated as before. The modules use only the `Float16` capability beyond what the framegen's device already requires (no 16-bit storage, no `Int16`, no extensions); a module that needs more, or a missing one, keeps the session on full precision.
+
+Each of these turns it off, for the whole run of the game, with one log line `Bloodframe: FP16 off (reason)` (`FP16 on (...)` when it runs):
+
+- the setting is off;
+- the Lossless.dll has no half-precision set (an old version) or a module the build was not checked against;
+- the GPU driver has no `shaderFloat16`;
+- the driver rejects a half-precision shader or pipeline when the context is built (the first frames): the same call builds everything again at full precision.
+
+The setting is live like the others: a change starts frame generation again (a moment of the game paused, as for the flow scale). The state file has a fourth line, `fp16=1|0`.
+
 ## How a frame goes (gpu/shadps4/video_core/renderer_vulkan/vk_lsfg.cpp, vk_presenter.cpp)
 
 For every real game frame, on the presenter's thread:
@@ -40,9 +53,12 @@ The game's frame rate no longer depends on frame generation: hooks in the game's
 
 - `0001`: the framegen's Vulkan instance comes from the entry point the game process gives (`volkInitializeCustom`), not volk's own loader (the process loads its driver directly: no Android loader, no layers).
 - `0002`: the shaders are read from the one Lossless.dll the host names, not from a search of Steam folders (that removes the fork's config-file dependency).
+- `0003`: the extractor hands out the dll's resources and the shader names (for the half-precision set, `tools/android/lsfg/bb_half.cpp`).
+- `0004`: the framegen takes SPIR-V 1.0 modules unchanged (the half-precision modules are 1.0; the fork's compatibility check wanted 1.4 and up).
+- `0005`: the framegen device enables `shaderFloat16` only when the host asks and the GPU has it.
 
 The fork's layer, adaptive scheduler and config parser are not built. `tools/android/build_lsfg.sh` and `tools/android/lsfg-patches` are the old glibc layer build, kept for reference.
 
 ## Not verified on a device
 
-Written and built without a device: the AHardwareBuffer transport mode the fork picks on Turnip/Adreno (`ahb_transport=` in the log line at start), whether both devices agree on the buffers' tiling, sync-file export and import between the two devices, the context creation time (the framegen's pipelines are compiled at the first frame) and the frame pacing.
+Written and built without a device: the AHardwareBuffer transport mode the fork picks on Turnip/Adreno (`ahb_transport=` in the log line at start), whether both devices agree on the buffers' tiling, sync-file export and import between the two devices, the context creation time (the framegen's pipelines are compiled at the first frame) and the frame pacing, and half precision: the 52 shader modules were checked on a PC (validated with `spirv-val`, built into compute pipelines with `shaderFloat16` on RADV and NVIDIA) but never run on Adreno or Mali, so whether Turnip is faster with them, and the picture the same as at full precision, is for a device to show.

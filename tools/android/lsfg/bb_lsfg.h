@@ -31,6 +31,8 @@ typedef struct BbLsfgConfig {
     int32_t generation_count;        ///< generated frames per real one: multiplier - 1 (1 .. 3)
     int32_t shared_format;           ///< VkFormat of the shared images (37 RGBA8, 97 RGBA16F)
     int32_t hdr;                     ///< the frames are HDR (never for this game)
+    int32_t fp16;                    ///< 1: half-precision shaders when the Lossless.dll and the GPU have
+                                     ///< them (else full precision, bb_lsfg_precision says why); 0: full
 } BbLsfgConfig;
 
 typedef struct BbLsfgInfo {
@@ -71,6 +73,12 @@ BB_LSFG_API int bb_lsfg_wait(int ctx, uint64_t timeout_ns);
 BB_LSFG_API void bb_lsfg_destroy_context(int ctx);
 /// Ends the runtime (after the last context).
 BB_LSFG_API void bb_lsfg_shutdown(void);
+
+/// The precision the session runs: 1 half (FP16), 0 full (FP32). `reason` (when not NULL) gets a short
+/// text for the log: why half precision is off, or what it uses. It can change at the first
+/// bb_lsfg_create_context: the shaders are compiled there, and a driver that rejects a half-precision
+/// one makes the library fall back to full precision for the rest of the process.
+BB_LSFG_API int bb_lsfg_precision(char* reason, size_t len);
 
 /// One line about the backend (driver, AHB transport mode, sync path, capabilities) for the log.
 BB_LSFG_API int bb_lsfg_diagnostics(char* buf, size_t len);

@@ -37,7 +37,7 @@ extra=$("$llvm/llvm-nm" -D --defined-only "$out/lib/libbloodframe.so" | awk '{pr
 if [[ -n $extra ]]; then echo "== libbloodframe.so exports more than bb_lsfg_*:"; echo "$extra" | sed 's/^/    /'; fail=1; fi
 # ... and all of it (vk_lsfg.cpp looks these up with dlsym).
 exported=$("$llvm/llvm-nm" -D --defined-only "$out/lib/libbloodframe.so" | awk '{print $3}')
-for name in bb_lsfg_init bb_lsfg_create_context bb_lsfg_present bb_lsfg_wait bb_lsfg_destroy_context bb_lsfg_shutdown bb_lsfg_diagnostics; do
+for name in bb_lsfg_init bb_lsfg_create_context bb_lsfg_present bb_lsfg_wait bb_lsfg_destroy_context bb_lsfg_shutdown bb_lsfg_precision bb_lsfg_diagnostics; do
     grep -qx "$name" <<<"$exported" || { echo "== libbloodframe.so does not export $name"; fail=1; }
 done
 exit $fail

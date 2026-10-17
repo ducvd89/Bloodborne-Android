@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "bb_half.hpp"
 #include "extract/extract.hpp"
 #include "extract/trans.hpp"
 #include "lsfg_3_1.hpp"
@@ -35,6 +36,12 @@ bool g_performance = false;
 BbLsfgConfig g_config{};
 std::string g_dll_path;
 LSFG::BackendDiagnostics g_diag{};
+// Precision: what the host asked for, what the session runs and why (one reason for the log).
+bool g_fp16_requested = false;
+bool g_fp16 = false;
+std::string g_fp16_reason;
+// A driver that cannot do half precision cannot later in this process either: said once, kept.
+std::string g_fp16_driver_failure;
 
 void set_error(char* err, size_t len, const std::string& message) {
     __android_log_print(ANDROID_LOG_WARN, "bb_lsfg", "%s", message.c_str());
@@ -50,11 +57,40 @@ LSFG::DeviceIdentity identity_of(const BbLsfgConfig& config) {
     return identity;
 }
 
-// (Re)starts the framegen runtime. A no-op while it runs with the same settings; after the last
-// context was deleted the runtime is gone and this builds it again (instance, device, pools).
-void start_runtime() {
+// Whether the session can run the half-precision shaders: asked for, and the Lossless.dll has the set.
+// The GPU's side (shaderFloat16) is known once the device exists: start_runtime().
+void choose_precision() {
+    g_fp16 = false;
+    if (!g_fp16_requested) {
+        g_fp16_reason = "turned off in the settings";
+        return;
+    }
+    if (!g_fp16_driver_failure.empty()) {
+        g_fp16_reason = g_fp16_driver_failure;
+        return;
+    }
+    const std::string why = BbHalf::Prepare();
+    if (!why.empty()) {
+        g_fp16_reason = why;
+        return;
+    }
+    g_fp16 = true;
+    g_fp16_reason = "half-precision shaders of the Lossless.dll";
+}
+
+// Full precision for the rest of the process, said once (the host logs the reason it gets from
+// bb_lsfg_precision; this is the library's own line).
+void fall_back_to_fp32(const std::string& why) {
+    g_fp16 = false;
+    g_fp16_reason = why;
+    g_fp16_driver_failure = why;
+    __android_log_print(ANDROID_LOG_WARN, "bb_lsfg", "Bloodframe: FP16 off (%s)", why.c_str());
+}
+
+void initialize_runtime() {
+    // The shaders: half precision is SPIR-V as the dll has it, full precision is the DXBC translated.
     const auto loader = [](const std::string& name) {
-        return Extract::translateShader(Extract::getShader(name));
+        return g_fp16 ? BbHalf::Get(name) : Extract::translateShader(Extract::getShader(name));
     };
     const auto identity = identity_of(g_config);
     const auto format = static_cast<VkFormat>(g_config.shared_format);
@@ -62,12 +98,35 @@ void start_runtime() {
     // The framegen takes the flow scale as the factor the images are divided by.
     const float inverse_scale = 1.0F / g_config.flow_scale;
     const auto count = static_cast<uint64_t>(g_config.generation_count);
+    // The device enables shaderFloat16 only when the half-precision shaders are going to use it.
+    LSFG::setShaderFloat16Requested(g_fp16);
     if (g_performance) {
         LSFG_3_1P::initialize(identity, format, hdr, inverse_scale, count, loader);
         g_diag = LSFG_3_1P::getBackendDiagnostics();
     } else {
         LSFG_3_1::initialize(identity, format, hdr, inverse_scale, count, loader);
         g_diag = LSFG_3_1::getBackendDiagnostics();
+    }
+}
+
+void finalize_runtime() {
+    if (g_performance) {
+        LSFG_3_1P::finalize();
+    } else {
+        LSFG_3_1::finalize();
+    }
+}
+
+// (Re)starts the framegen runtime. A no-op while it runs with the same settings; after the last
+// context was deleted the runtime is gone and this builds it again (instance, device, pools).
+void start_runtime() {
+    initialize_runtime();
+    if (g_fp16 && !g_diag.supportDecision.fp16) {
+        // The shaders are chosen before the device exists: this GPU or driver has no shaderFloat16, so
+        // the same runtime again with the full-precision set (the shader pool keeps what it loaded).
+        finalize_runtime();
+        fall_back_to_fp32("the GPU driver does not support shaderFloat16");
+        initialize_runtime();
     }
 }
 
@@ -102,21 +161,19 @@ int bb_lsfg_init(const BbLsfgConfig* config, BbLsfgInfo* info, char* err, size_t
         g_dll_path = config->dll_path;
         g_config.dll_path = g_dll_path.c_str();
         g_performance = config->performance != 0;
+        g_fp16_requested = config->fp16 != 0;
         LSFG::setInstanceProcAddr(reinterpret_cast<PFN_vkGetInstanceProcAddr>(config->vk_get_instance_proc_addr));
         Extract::setDllPath(g_dll_path);
         // The shaders first: a missing or old Lossless.dll is the likeliest failure and costs no GPU
         // work to find out.
         Extract::extractShaders();
+        choose_precision();
         start_runtime();
         if (g_diag.ahbTransportMode == LSFG::AhbTransportMode::Unsupported) {
             const std::string reason = g_diag.supportDecision.rejectionReason.empty()
                                            ? "the Vulkan driver supports no AHardwareBuffer transport for the frame format"
                                            : g_diag.supportDecision.rejectionReason;
-            if (g_performance) {
-                LSFG_3_1P::finalize();
-            } else {
-                LSFG_3_1::finalize();
-            }
+            finalize_runtime();
             set_error(err, err_len, reason);
             return -1;
         }
@@ -157,8 +214,23 @@ int bb_lsfg_create_context(struct AHardwareBuffer* in0, struct AHardwareBuffer* 
         const std::vector<AHardwareBuffer*> outputs(outs, outs + out_count);
         const VkExtent2D extent{width, height};
         const auto vk_format = static_cast<VkFormat>(format);
-        return g_performance ? LSFG_3_1P::createContextFromAHB(in0, in1, outputs, extent, vk_format)
-                             : LSFG_3_1::createContextFromAHB(in0, in1, outputs, extent, vk_format);
+        const auto make = [&]() {
+            return g_performance ? LSFG_3_1P::createContextFromAHB(in0, in1, outputs, extent, vk_format)
+                                 : LSFG_3_1::createContextFromAHB(in0, in1, outputs, extent, vk_format);
+        };
+        if (!g_fp16) {
+            return make();
+        }
+        try {
+            return make();
+        } catch (const std::exception& e) {
+            // The shaders are compiled with the context: the driver may refuse a half-precision one.
+            // Full precision from here on.
+            fall_back_to_fp32(std::string("the context failed to build with half-precision shaders: ") + e.what());
+        }
+        finalize_runtime();
+        start_runtime();
+        return make();
     } catch (const std::exception& e) {
         set_error(err, err_len, e.what());
     } catch (...) {
@@ -231,15 +303,19 @@ void bb_lsfg_shutdown(void) {
     std::scoped_lock lock{g_mutex};
     try {
         if (g_initialized) {
-            if (g_performance) {
-                LSFG_3_1P::finalize();
-            } else {
-                LSFG_3_1::finalize();
-            }
+            finalize_runtime();
         }
     } catch (...) {
     }
     g_initialized = false;
+}
+
+int bb_lsfg_precision(char* reason, size_t len) {
+    std::scoped_lock lock{g_mutex};
+    if (reason != nullptr && len > 0) {
+        std::snprintf(reason, len, "%s", g_fp16_reason.c_str());
+    }
+    return g_initialized && g_fp16 ? 1 : 0;
 }
 
 int bb_lsfg_diagnostics(char* buf, size_t len) {
@@ -255,7 +331,7 @@ int bb_lsfg_diagnostics(char* buf, size_t len) {
     std::snprintf(buf, len,
                   "model=%s driver=\"%s\" (id %u, %s) api=%u.%u.%u ahb_transport=%s "
                   "input_copy=%d output_copy=%d vulkan_path=%s sync_path=%s spirv=0x%x sync_fd=%d "
-                  "opaque_fd=%d fp16=%d null_descriptor=%d",
+                  "opaque_fd=%d precision=%s null_descriptor=%d",
                   g_performance ? "performance" : "quality", d.driverName.c_str(),
                   static_cast<unsigned>(d.driverId), d.driverInfo.c_str(), VK_API_VERSION_MAJOR(d.apiVersion),
                   VK_API_VERSION_MINOR(d.apiVersion), VK_API_VERSION_PATCH(d.apiVersion),
@@ -263,7 +339,7 @@ int bb_lsfg_diagnostics(char* buf, size_t len) {
                   LSFG::ahbInputCopyRequired(d.ahbTransportMode) ? 1 : 0,
                   LSFG::ahbOutputCopyRequired(d.ahbTransportMode) ? 1 : 0, d.vulkanPath.c_str(),
                   d.synchronizationPath.c_str(), d.spirvTargetVersion, d.externalSemaphoreSyncFd ? 1 : 0,
-                  d.externalSemaphoreOpaqueFd ? 1 : 0, d.supportDecision.fp16 ? 1 : 0,
+                  d.externalSemaphoreOpaqueFd ? 1 : 0, g_fp16 ? "fp16" : "fp32",
                   d.supportDecision.nullDescriptor ? 1 : 0);
     return 0;
 }
