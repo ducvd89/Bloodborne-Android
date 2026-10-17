@@ -273,7 +273,7 @@ void Menu() {
     const char* upscalers[] = {
         BbSettings::MenuText("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1",
         BbSettings::MenuText("TAA (native anti-aliasing)", "TAA (нативное сглаживание)"),
-        "DLSS (NVIDIA RTX)"};
+        "DLSS (NVIDIA RTX)", "Snapdragon GSR 2"};
     static_assert(sizeof(upscalers) / sizeof(upscalers[0]) == BbSettings::UpscalerCount);
     static const char* later[] = {"XeSS"};
     int upscaler = s.upscaler;
@@ -310,6 +310,13 @@ void Menu() {
             "and NVIDIA's library next to the game; otherwise FSR 3.1 is used.",
             "NVIDIA DLSS Super Resolution (видеокарты RTX; Native AA — это DLAA). Нужны мост DLSS "
             "и библиотека NVIDIA рядом с игрой; без них используется FSR 3.1."));
+    }
+    if (s.upscaler == BbSettings::UpscalerGsr2) {
+        Hint(BbSettings::MenuText(
+            "Qualcomm Snapdragon Game Super Resolution 2: a light temporal upscaler made for "
+            "Adreno GPUs. Sharpening is a separate pass after it.",
+            "Qualcomm Snapdragon Game Super Resolution 2: лёгкий временной апскейлер для GPU "
+            "Adreno. Резкость - отдельный проход после него."));
     }
     const auto problem_text = [](const char* text) {
         ImGui::PushTextWrapPos();
@@ -652,6 +659,7 @@ void FpsCounter() {
                 : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
                 : s.upscaler == BbSettings::UpscalerTaa    ? "TAA"
                 : s.upscaler == BbSettings::UpscalerDlss   ? "DLSS"
+                : s.upscaler == BbSettings::UpscalerGsr2   ? "GSR 2"
                                                            : "");
     ImGui::End();
 }
