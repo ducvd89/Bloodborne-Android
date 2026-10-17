@@ -23,6 +23,12 @@ Each of these turns it off, for the whole run of the game, with one log line `Bl
 
 The setting is live like the others: a change starts frame generation again (a moment of the game paused, as for the flow scale). The state file has a fourth line, `fp16=1|0`.
 
+## Adreno 8xx ghosting: fixed in 0.10.0
+
+Up to 0.9.5, on Adreno 8xx (Oppo Find N5, Adreno 830) about 10-40% of the generated frames showed the picture doubled and shifted by ~50 px, as if a bogus smooth motion field warped the whole frame. Real frames, frame generation off, and the AYN Thor's Adreno 740 were clean. A host harness that ran the framegen on one static frame reproduced it (151 of 198 frames wrong on the N5), and the investigation (paused on 2026-10-10) ruled out: live config reloads, flow scale, performance mode, UBWC, intra-device sync (`TU_DEBUG=syncdraw`, `flushall`), ir3 optimisations, the gen8 vs main Turnip, early sync-file exports, the NaN/inf behaviour of the translated min/max/log2/exp2/fma, and the display scaling.
+
+With Bloodframe in 0.10.0 the ghosting is gone on the Find N5 (user report, 2026-10-17, with the defaults: 2x, performance mode, FP16 on). The most likely reason: with FP16 on, the shaders are Lossless Scaling's own SPIR-V from the dll, not our DXBC to SPIR-V translation, which the earlier passes (mipmaps, beta[4]: 1024-thread workgroups with shared memory) went through. Not yet checked: whether the ghosting comes back with FP16 off (the full-precision path still translates the DXBC set), which would confirm that, or whether the 0.10.0 presentation changes (no CPU waits, one game frame out) played a part. If it does come back with FP16 off, the next step is to read the full-precision SPIR-V set (N + 98) for FP32 too, instead of translating.
+
 ## How a frame goes (gpu/shadps4/video_core/renderer_vulkan/vk_lsfg.cpp, vk_presenter.cpp)
 
 For every real game frame, on the presenter's thread:
@@ -81,4 +87,4 @@ The fork's layer, adaptive scheduler and config parser are not built. `tools/and
 
 ## Not verified on a device
 
-Written and built without a device: the AHardwareBuffer transport mode the fork picks on Turnip/Adreno (`ahb_transport=` in the log line at start), whether both devices agree on the buffers' tiling, sync-file export and import between the two devices, the context creation time (the framegen's pipelines are compiled at the first frame) and the frame pacing, and half precision: the 52 shader modules were checked on a PC (validated with `spirv-val`, built into compute pipelines with `shaderFloat16` on RADV and NVIDIA) but never run on Adreno or Mali, so whether Turnip is faster with them, and the picture the same as at full precision, is for a device to show.
+Verified on devices since: half precision runs on Turnip on the AYN Thor (Adreno 740) and the Oppo Find N5 (Adreno 830), and fixed the Find N5's ghosting (above); the 0.10.0 latency changes were measured on the Thor (section Latency). Still unverified: Adreno 6xx and Mali, the picture with FP16 on vs off side by side, and whether the full-precision path still ghosts on Adreno 8xx.
