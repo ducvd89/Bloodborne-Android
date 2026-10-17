@@ -1212,9 +1212,19 @@ public final class MainActivity extends Activity {
                      PrintWriter out=new PrintWriter(gameLog)) {
                     for (String line:modsLog) out.println(line);
                     out.flush();
-                    String line; while ((line=r.readLine())!=null) { out.println(line); out.flush(); }
+                    boolean driverTrouble=false;
+                    String line; while ((line=r.readLine())!=null) {
+                        out.println(line); out.flush();
+                        if (!driverTrouble && driverTrouble(line)) driverTrouble=true;
+                    }
                     int code=launched.waitFor();
-                    if (game==launched) { game=null; error("Game stopped ("+code+"). Open the menu to restart."); }
+                    if (game==launched) {
+                        game=null;
+                        error("Game stopped ("+code+")."+(driverTrouble
+                            ? " It looks like a GPU driver problem: Menu \u2192 GPU driver, pick another driver package"
+                              +" (Download lists more), then restart."
+                            : " Open the menu to restart."));
+                    }
                 } catch (Exception ex) {
                     // A restart (settings, cheats) kills this process on purpose: its reader is
                     // interrupted then, after the next game started. Only the current game's errors show.
@@ -1222,6 +1232,17 @@ public final class MainActivity extends Activity {
                 }
             },"Bloodborne-log"); log.setDaemon(true); log.start();
         } catch (Exception ex) { error(ex.toString()); }
+    }
+    /** Whether a game log line points at the GPU driver: the GPU lost the device (a hang or a driver fault), the
+     *  driver did not load or start (vk_driver_loader, vk_instance), or a native crash inside the Vulkan driver
+     *  library (probe.c's fault lines name it). The error screen then suggests another driver package. */
+    static boolean driverTrouble(String line) {
+        return line.contains("Device lost") || line.contains("DeviceLost")
+            || line.startsWith("Vulkan: cannot load driver") || line.startsWith("Vulkan: no system loader")
+            || line.startsWith("Vulkan: driver ")
+            || line.contains("Failed to create device") || line.contains("ErrorInitializationFailed")
+            || line.contains("ErrorIncompatibleDriver")
+            || ((line.startsWith("Host fault") || line.startsWith("  return address")) && line.contains("libvulkan"));
     }
     private void error(String message) {
         hadError=true;
