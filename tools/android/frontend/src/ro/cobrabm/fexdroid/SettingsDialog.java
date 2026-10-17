@@ -299,7 +299,7 @@ final class SettingsDialog {
         };
         box.addView(outputNote);
         heading(box,"Upscaling");
-        final RadioGroup upscalers=choices(box,UPSCALER_NAMES,indexOf(UPSCALER_VALUES,get("upscaler","fsr3"),1));
+        final RadioGroup upscalers=choices(box,UPSCALER_NAMES,indexOf(UPSCALER_VALUES,get("upscaler","gsr2"),1));
         heading(box,"Render resolution");
         int preset=0;
         try { preset=Math.max(0,Math.min(4,Integer.parseInt(get("preset","3")))); } catch (NumberFormatException ignored) { preset=3; }

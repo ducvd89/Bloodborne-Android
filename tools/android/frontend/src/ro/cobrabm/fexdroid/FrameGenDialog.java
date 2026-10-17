@@ -73,7 +73,7 @@ final class FrameGenDialog {
 
     void show() {
         final Map<String,String> ini=settings.read();
-        final boolean fsr=fsrOn(get(ini,"frame_generation","0"),get(ini,"upscaler","fsr3"),get(ini,"lsfg_multiplier","0"));
+        final boolean fsr=fsrOn(get(ini,"frame_generation","0"),get(ini,"upscaler","gsr2"),get(ini,"lsfg_multiplier","0"));
         LinearLayout box=new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(24),dp(4),dp(24),dp(8));
 

@@ -331,7 +331,7 @@ public final class MainActivity extends Activity {
         setDetail(cheatsItem,cheats.isEmpty() ? "Off" : String.join(" · ",cheats));
         mods.summary(text -> setDetail(modsItem,text));
         String upscaler="off".equals(setting("upscaler")) ? "No upscaling"
-            : "gsr2".equals(setting("upscaler")) ? "Snapdragon GSR 2" : "FSR 3.1";
+            : setting("upscaler")==null || "gsr2".equals(setting("upscaler")) ? "Snapdragon GSR 2" : "FSR 3.1";
         String limit=setting("fps_limit");
         setDetail(graphicsItem,upscaler+" · "+("0".equals(limit) ? "no FPS limit"
             : (limit==null || !limit.matches("40|45|60") ? "30" : limit)+" FPS limit"));

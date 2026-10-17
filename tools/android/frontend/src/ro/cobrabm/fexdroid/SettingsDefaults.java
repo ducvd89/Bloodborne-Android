@@ -97,11 +97,36 @@ final class SettingsDefaults {
         write(marker,mark);
     }
 
+    /** 0.11.0: Snapdragon GSR 2 is the default upscaler. Once, every bbport.ini from before it switches
+     *  to upscaler=gsr2; FSR 3.1 frame generation (frame_generation=1) goes off with it, as it works with
+     *  FSR 3.1 only. Bloodframe (lsfg_*) stays as it is. The marker holds 1. */
+    private static final String GSR2_MARKER="upscaler_gsr2_default";
+    static void switchToGsr2(File base) throws IOException {
+        File marker=new File(base,GSR2_MARKER), ini=new File(base,"bbport.ini");
+        if (revision(marker)>=1) return;
+        if (ini.isFile()) {
+            List<String> out=new ArrayList<>();
+            boolean upscaler=false;
+            for (String line:lines(ini)) {
+                String key=keyOf(line);
+                if ("upscaler".equals(key)) { if (!upscaler) out.add("upscaler=gsr2"); upscaler=true; continue; }
+                if ("frame_generation".equals(key)) { out.add("frame_generation=0"); continue; }
+                out.add(line);
+            }
+            if (!upscaler) out.add("upscaler=gsr2");
+            write(ini,out);
+            android.util.Log.i("Bloodborne","upscaler set to Snapdragon GSR 2 (0.11.0 default)");
+        }
+        List<String> mark=new ArrayList<>(); mark.add("1");
+        write(marker,mark);
+    }
+
     /** Applies the defaults in base (the bbport directory) when this revision has not been yet. Does
      *  nothing, and writes no marker, while the defaults file is missing. Throws when the files cannot
      *  be written; the marker is last, so the next start tries again. */
     static void apply(File base) throws IOException {
         resetFaultSwitches(base);
+        switchToGsr2(base);
         File marker=new File(base,MARKER), ini=new File(base,"bbport.ini"), defaults=new File(base,"bbport.default.ini");
         if (revision(marker)>=REVISION || !defaults.isFile()) return;
         List<String> wantedLines=lines(defaults);
