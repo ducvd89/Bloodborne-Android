@@ -4,11 +4,11 @@ The game runs as a native Android (Bionic) process, so Lossless Scaling's frame 
 
 ## Using it
 
-1. Menu → **Frame generation** (right under Graphics settings): 2×, 3× or 4×, flow scale (0.25–1.0: lower is faster and the motion coarser) and performance mode (the light model).
+1. Menu → **Frame generation** (right under Graphics settings): 2×, 3× or 4×, flow scale (0.25–1.0: lower is faster and the motion coarser), performance mode (the light model) and **Half precision (FP16, faster)** (on by default, see below).
 2. **Sign in with Steam** downloads just `Lossless.dll` from your own copy (QR code or name/password; nothing but the file is kept), or **Choose Lossless.dll…** copies one from your storage (a PC copy is `steamapps/common/Lossless Scaling/Lossless.dll`). The file lives in `files/bbport/Lossless.dll`; `/sdcard/Bloodborne/Lossless.dll` is used when there is no such copy.
 3. Apply: it takes effect at once, while you play (no restart). Without a Lossless.dll the game logs one line (`Lossless Scaling frame generation: no Lossless.dll`) and runs without it.
 
-It replaces FSR 3.1 frame generation (FSR 3.1 frame generation stays in Graphics settings, which needs a restart; the two menus lock each other while one is on). It sees only finished frames, without the game's motion vectors, so expect more artifacts around fast motion and the HUD than with FSR 3.1 frame generation. Messages are in `files/bbport/logs/android-game.log` (`LSFG: ...`); `BB_LSFG_STATS=1` in `bbport/bionic-local.sh` logs real and generated frames a second.
+It replaces FSR 3.1 frame generation (FSR 3.1 frame generation stays in Graphics settings, which needs a restart; the two menus lock each other while one is on). It sees only finished frames, without the game's motion vectors, so expect more artifacts around fast motion and the HUD than with FSR 3.1 frame generation. Messages are in `files/bbport/logs/android-game.log` (`LSFG: ...` for the state, `Bloodframe: ...` for the engine); `BB_LSFG_STATS=1` in `bbport/bionic-local.sh` logs real and generated frames a second, with the precision in use (`FP16` or `FP32`).
 
 ## Half precision (FP16)
 
@@ -39,9 +39,9 @@ Generated frames only look right when each is shown for one refresh. With frame 
 
 ### Live changes
 
-The Frame generation menu writes `bbport/lsfg.state` (`multiplier=`, `flow=`, `performance=`; whole file, then a rename) next to `bbport.ini`; `run-bionic.sh` writes the same file at start from `bbport.ini` and names it in `BB_LSFG_STATE_FILE`. It is the one source of truth (`BB_LSFG_MULTIPLIER` and friends are only read when there is no state file, for harnesses). The presenter looks at it at most every 250 ms, between two frames, and applies a change there and then:
+The Frame generation menu writes `bbport/lsfg.state` (`multiplier=`, `flow=`, `performance=`, `fp16=`; whole file, then a rename) next to `bbport.ini`; `run-bionic.sh` writes the same file at start from `bbport.ini` and names it in `BB_LSFG_STATE_FILE`. It is the one source of truth (`BB_LSFG_MULTIPLIER` and friends (`BB_LSFG_FP16` too) are only read when there is no state file, for harnesses). The presenter looks at it at most every 250 ms, between two frames, and applies a change there and then:
 
-- The framegen fixes its flow scale, model and generated-frame count when it starts, so every change of an on state is a new `Lsfg`: the old one waits for its last batch and the game device, destroys its context, buffers and runtime (`libbloodframe.so` stays loaded), the new one starts and makes its context with the next real frame (the first four frames only fill the history). Starting takes about as long as at launch (reading the shaders from Lossless.dll): the game pauses for that moment.
+- The framegen fixes its flow scale, model, precision and generated-frame count when it starts, so every change of an on state is a new `Lsfg`: the old one waits for its last batch and the game device, destroys its context, buffers and runtime (`libbloodframe.so` stays loaded), the new one starts and makes its context with the next real frame (the first four frames only fill the history). Starting takes about as long as at launch (reading the shaders from Lossless.dll): the game pauses for that moment.
 - Off: the same teardown, then normal presents.
 - The swapchain buffers follow what runs (multiplier + 3, else 3) with a RESET and new BUFFERs, as for a resize.
 - The presentation mode is FIFO while frame generation runs or VSync is on. The game tells the app with a `BB_PRESENT_MODE` message (protocol version 3); the app, going FIFO → newest-wins, shows the newest queued frame and releases the older ones unseen with their acquire fences.

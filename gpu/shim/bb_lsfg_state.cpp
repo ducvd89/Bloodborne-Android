@@ -66,6 +66,11 @@ bool Read(const char* path, State& state) {
             if (stop != value) {
                 parsed.performance = p != 0;
             }
+        } else if (key == "fp16") {
+            const long h = std::strtol(value, &stop, 10);
+            if (stop != value) {
+                parsed.fp16 = h != 0;
+            }
         }
     }
     if (!has_multiplier) {
@@ -89,6 +94,9 @@ State FromEnvironment() {
     }
     if (const char* performance = std::getenv("BB_LSFG_PERFORMANCE"); performance && *performance) {
         state.performance = std::strtol(performance, nullptr, 10) != 0;
+    }
+    if (const char* fp16 = std::getenv("BB_LSFG_FP16"); fp16 && *fp16) {
+        state.fp16 = std::strtol(fp16, nullptr, 10) != 0;
     }
     return state;
 }

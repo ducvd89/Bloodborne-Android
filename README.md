@@ -54,7 +54,7 @@ flowchart LR
 | The game's CPU code: `eboot.bin` and the two PS4 modules the game ships (`sce_module/libc.prx`, `libSceFios2.prx`), linked into one image by `bb-prepare` | x86-64 (AVX, BMI) | ARM64 | [FEXCore](https://github.com/FEX-Emu/FEX), built into the game process as a library: only the game's code goes through it, no Wine, Box64 or x86 system libraries |
 | GPU commands the game writes itself (it links libGnm statically) | AMD GCN command buffers (PM4) | Vulkan commands | the renderer |
 | Shaders | AMD GCN | SPIR-V | the renderer's shader recompiler |
-| Lossless Scaling's shaders (only with frame generation on) | DXBC, read from your own `Lossless.dll` | SPIR-V | lsfg-vk's translator, once when frame generation starts |
+| Lossless Scaling's shaders (only with frame generation on) | DXBC (full precision) or SPIR-V (half precision), read from your own `Lossless.dll` | SPIR-V | Bloodframe, once when frame generation starts: lsfg-vk's translator for DXBC, the half-precision set as the dll has it |
 
 **Native ARM64 code, no translation:**
 
@@ -172,7 +172,7 @@ They are code hooks in the 1.09 executable (the same places as Shiningami's Gold
 
 ## Lossless Scaling frame generation
 
-In the menu's Frame generation page (it applies at once, no restart): 2×, 3× or 4× frames, flow scale and performance mode. It needs `Lossless.dll` from your own copy of Lossless Scaling (Steam): the same page signs in to Steam to download just that file, or copies one you choose. It replaces FSR 3.1 frame generation and raises the screen's refresh rate to the FPS limit times the multiplier. The engine is Bloodframe. How it works, and what is and is not verified: [docs/ANDROID_LSFG.md](docs/ANDROID_LSFG.md).
+In the menu's Frame generation page (it applies at once, no restart): 2×, 3× or 4× frames, flow scale, performance mode and half precision (FP16, on by default: faster, with a fall back to full precision where the GPU, the driver or your Lossless.dll cannot). It needs `Lossless.dll` from your own copy of Lossless Scaling (Steam): the same page signs in to Steam to download just that file, or copies one you choose. It replaces FSR 3.1 frame generation and raises the screen's refresh rate to the FPS limit times the multiplier. The engine is Bloodframe. How it works, and what is and is not verified: [docs/ANDROID_LSFG.md](docs/ANDROID_LSFG.md).
 
 ## Build
 

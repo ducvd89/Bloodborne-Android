@@ -110,6 +110,12 @@ final class FrameGenDialog {
         final Switch performance=new Switch(activity); performance.setText("Performance mode"); performance.setTextSize(15);
         performance.setChecked("1".equals(get(ini,"lsfg_performance","1"))); performance.setPadding(0,dp(6),0,dp(6));
         box.addView(performance);
+        final Switch half=new Switch(activity); half.setText("Half precision (FP16, faster)"); half.setTextSize(15);
+        half.setChecked("1".equals(get(ini,"lsfg_fp16","1"))); half.setPadding(0,dp(6),0,dp(6));
+        box.addView(half);
+        final TextView halfNote=note(box,"Faster on most phones. Falls back to full precision if the GPU or driver can't. "
+            +"A change restarts frame generation for a moment, while you play.",0.7f);
+        halfNote.setPadding(0,0,0,dp(4));
 
         final TextView dllStatus=new TextView(activity); dllStatus.setTextSize(13); dllStatus.setPadding(0,dp(6),0,dp(2));
         box.addView(dllStatus);
@@ -136,11 +142,11 @@ final class FrameGenDialog {
         if (fsr) {
             multiplier.setEnabled(false);
             for (int i=0;i<multiplier.getChildCount();++i) multiplier.getChildAt(i).setEnabled(false);
-            flow.setEnabled(false); performance.setEnabled(false);
+            flow.setEnabled(false); performance.setEnabled(false); half.setEnabled(false);
         } else {
             final Runnable enable=() -> {
                 boolean on=checked(multiplier)>0;
-                flow.setEnabled(on); performance.setEnabled(on);
+                flow.setEnabled(on); performance.setEnabled(on); half.setEnabled(on);
             };
             multiplier.setOnCheckedChangeListener((g,id) -> enable.run());
             enable.run();
@@ -155,12 +161,14 @@ final class FrameGenDialog {
                 int m=Integer.parseInt(VALUES[Math.max(0,checked(multiplier))]); // 0 (off) or 2-4
                 String flowScale=String.format(Locale.ROOT,"%.2f",0.25f+flow.getProgress()*0.05f);
                 boolean fast=performance.isChecked();
+                boolean fp16=half.isChecked();
                 Map<String,String> changed=new LinkedHashMap<>();
                 changed.put("lsfg_multiplier",String.valueOf(m));
                 changed.put("lsfg_flow_scale",flowScale);
                 changed.put("lsfg_performance",fast ? "1" : "0");
+                changed.put("lsfg_fp16",fp16 ? "1" : "0");
                 // The running game follows lsfg.state (libbbgpu reads it): no restart.
-                boolean ok=settings.setAll(changed) && writeState(state,m,flowScale,fast);
+                boolean ok=settings.setAll(changed) && writeState(state,m,flowScale,fast,fp16);
                 Toast.makeText(activity,!ok ? "Frame generation could not be saved"
                     : m>0 && lossless.dll()==null ? "Lossless Scaling stays off until Lossless.dll is found"
                     : m>0 ? "Lossless Scaling "+m+"× applied" : "Frame generation off",Toast.LENGTH_SHORT).show();
@@ -175,12 +183,13 @@ final class FrameGenDialog {
         return -1;
     }
 
-    /** "multiplier=2\nflow=0.75\nperformance=1\n" (multiplier 0: off), written whole then renamed so the game
-     *  never reads half of it. */
-    private static boolean writeState(File state,int multiplier,String flow,boolean performance) {
+    /** "multiplier=2\nflow=0.75\nperformance=1\nfp16=1\n" (multiplier 0: off), written whole then renamed so the
+     *  game never reads half of it. */
+    private static boolean writeState(File state,int multiplier,String flow,boolean performance,boolean fp16) {
         File temporary=new File(state.getPath()+".tmp");
         try (Writer w=new OutputStreamWriter(new FileOutputStream(temporary),"UTF-8")) {
-            w.write("multiplier="+multiplier+"\nflow="+flow+"\nperformance="+(performance ? 1 : 0)+"\n");
+            w.write("multiplier="+multiplier+"\nflow="+flow+"\nperformance="+(performance ? 1 : 0)
+                +"\nfp16="+(fp16 ? 1 : 0)+"\n");
         } catch (Exception ex) { android.util.Log.e("Bloodborne","lsfg state: "+ex); return false; }
         return temporary.renameTo(state);
     }

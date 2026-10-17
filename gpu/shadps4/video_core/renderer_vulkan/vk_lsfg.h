@@ -20,9 +20,10 @@
 // instead (BB_LSFG_SYNC=host forces that); if anything else fails, frame generation is off from then
 // on and the game goes on with its own frames.
 //
-// Settings: multiplier (2, 3, 4), flow scale (0.25 .. 1.0, default 0.75) and performance (1: the light
-// model, default) come from bb_lsfg_state.h (the app's live lsfg.state file; the presenter makes a new
-// Lsfg when they change). Environment: BB_LSFG_DLL (the player's Lossless.dll, else bbport/ or shared
+// Settings: multiplier (2, 3, 4), flow scale (0.25 .. 1.0, default 0.75), performance (1: the light
+// model, default) and fp16 (1, default: half-precision shaders when Lossless.dll and the GPU have them,
+// else full precision) come from bb_lsfg_state.h (the app's live lsfg.state file; the presenter makes a
+// new Lsfg when they change). Environment: BB_LSFG_DLL (the player's Lossless.dll, else bbport/ or shared
 // storage), BB_LSFG_FORMAT (rgba16f, default, like the layer; rgba8),
 // BB_LSFG_SYNC (fd, default; host), BB_LSFG_PACE (1, default: the presenter spaces the frames),
 // BB_LSFG_STATS (1: real/generated presents per second in the log), BB_LSFG_LIB (path of the library).
@@ -32,6 +33,7 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <string>
 #include "bb_lsfg_state.h"
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -92,6 +94,7 @@ private:
 
     explicit Lsfg(const Instance& instance);
     bool Initialize();
+    void LogPrecision();
     bool EnsureContext(u32 width, u32 height);
     void DestroyContext(Context& context);
     bool CreateSharedImage(SharedImage& image, u32 width, u32 height, u64 ahb_usage, bool output);
@@ -107,6 +110,9 @@ private:
     u32 multiplier = 0;
     u32 shared_format = 0; ///< VkFormat of the shared images
     bool pace = true;
+    bool fp16_active = false;  ///< the framegen runs the half-precision shaders
+    int precision_logged = -1; ///< what LogPrecision last said (-1: nothing yet)
+    std::string reason_logged;
     bool sync_host = false; ///< no sync files: wait on the CPU
     bool failed = false;
     double interval_ms = 33.3;

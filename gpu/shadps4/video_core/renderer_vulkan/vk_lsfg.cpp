@@ -60,6 +60,7 @@ struct Lsfg::Api {
     decltype(&bb_lsfg_wait) wait{};
     decltype(&bb_lsfg_destroy_context) destroy_context{};
     decltype(&bb_lsfg_shutdown) shutdown{};
+    decltype(&bb_lsfg_precision) precision{};
     decltype(&bb_lsfg_diagnostics) diagnostics{};
     BbLsfgInfo info{};
     bool started{false};
@@ -186,7 +187,8 @@ bool Lsfg::Initialize() {
     if (!load(api->init, "bb_lsfg_init") || !load(api->create_context, "bb_lsfg_create_context") ||
         !load(api->present, "bb_lsfg_present") || !load(api->wait, "bb_lsfg_wait") ||
         !load(api->destroy_context, "bb_lsfg_destroy_context") ||
-        !load(api->shutdown, "bb_lsfg_shutdown") || !load(api->diagnostics, "bb_lsfg_diagnostics")) {
+        !load(api->shutdown, "bb_lsfg_shutdown") || !load(api->precision, "bb_lsfg_precision") ||
+        !load(api->diagnostics, "bb_lsfg_diagnostics")) {
         return fail(lib_path + " lacks the bb_lsfg API");
     }
 
@@ -200,6 +202,7 @@ bool Lsfg::Initialize() {
     std::memcpy(config.driver_uuid, ids.driverUUID.data(), 16);
     config.flow_scale = std::clamp(settings.flow, 0.25f, 1.0f);
     config.performance = settings.performance ? 1 : 0;
+    config.fp16 = settings.fp16 ? 1 : 0;
     config.generation_count = static_cast<int32_t>(multiplier - 1);
     shared_format = EnvString("BB_LSFG_FORMAT") == "rgba8" ? FormatRgba8 : FormatRgba16f;
     config.shared_format = static_cast<int32_t>(shared_format);
@@ -219,13 +222,14 @@ bool Lsfg::Initialize() {
     }
     char diagnostics[768] = {};
     api->diagnostics(diagnostics, sizeof diagnostics);
-    std::printf("LSFG: x%u, flow scale %.2f, %s model, %s images, %s sync, started in %.0f ms; %s\n",
+    std::printf("Bloodframe: x%u, flow scale %.2f, %s model, %s images, %s sync, started in %.0f ms; %s\n",
                 multiplier, static_cast<double>(config.flow_scale),
                 config.performance ? "performance" : "quality",
                 shared_format == FormatRgba8 ? "RGBA8" : "RGBA16F", sync_host ? "CPU" : "sync-file",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
                 diagnostics);
     std::fflush(stdout);
+    LogPrecision();
 
     // The game device's synchronization objects.
     const vk::Device device = instance.GetDevice();
@@ -257,6 +261,21 @@ bool Lsfg::Initialize() {
         return fail("the Vulkan semaphores and fences could not be created");
     }
     return true;
+}
+
+void Lsfg::LogPrecision() {
+    char reason[256] = {};
+    const bool half = api->precision(reason, sizeof reason) != 0;
+    // Said when it starts and again if the first context changes it (a driver that rejects a
+    // half-precision shader makes the framegen fall back to full precision).
+    if (precision_logged == static_cast<int>(half) && reason_logged == reason) {
+        return;
+    }
+    precision_logged = static_cast<int>(half);
+    reason_logged = reason;
+    fp16_active = half;
+    std::printf("Bloodframe: FP16 %s (%s)\n", half ? "on" : "off", reason);
+    std::fflush(stdout);
 }
 
 bool Lsfg::CreateSharedImage(SharedImage& image, u32 width, u32 height, u64 ahb_usage, bool output) {
@@ -419,6 +438,7 @@ bool Lsfg::EnsureContext(u32 width, u32 height) {
     }
     context = std::move(next);
     batch_wait_valid = false;
+    LogPrecision();
     std::printf("LSFG: context %ux%u created in %.0f ms\n", width, height,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     std::fflush(stdout);
@@ -644,9 +664,9 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
     static const bool print_stats = EnvFlag("BB_LSFG_STATS", false);
     const double window = std::chrono::duration<double>(Clock::now() - stats->window_start).count();
     if (print_stats && window >= 5.0 && stats->real) {
-        std::printf("LSFG: %.1f real + %.1f generated frames/s (x%u); per real frame %.2f ms in the "
+        std::printf("LSFG: %.1f real + %.1f generated frames/s (x%u, %s); per real frame %.2f ms in the "
                     "copy and framegen call (%.2f ms of it the framegen call), %u CPU waits\n",
-                    stats->real / window, stats->generated / window, multiplier,
+                    stats->real / window, stats->generated / window, multiplier, fp16_active ? "FP16" : "FP32",
                     stats->process_ms / stats->real, stats->present_ms / stats->real, stats->host_waits);
         std::fflush(stdout);
         *stats = Stats{};

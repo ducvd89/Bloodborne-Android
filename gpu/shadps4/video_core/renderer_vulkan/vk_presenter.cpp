@@ -935,8 +935,8 @@ void Presenter::ApplyLsfgState(const BbLsfgState::State& next) {
     // FIFO (frame generation needs every frame shown for a refresh) only while it is on.
     ApplyLsfgOutputMode();
     if (lsfg) {
-        std::printf("LSFG: now x%u, flow %.2f, performance %d\n", next.multiplier,
-                    static_cast<double>(next.flow), next.performance ? 1 : 0);
+        std::printf("LSFG: now x%u, flow %.2f, performance %d, fp16 %d\n", next.multiplier,
+                    static_cast<double>(next.flow), next.performance ? 1 : 0, next.fp16 ? 1 : 0);
     } else {
         std::printf("LSFG: off\n");
     }

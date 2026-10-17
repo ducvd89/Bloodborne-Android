@@ -7,9 +7,10 @@
 //     multiplier=3      0 or missing: off; 2, 3, 4: frames shown per game frame
 //     flow=0.75         flow scale, 0.25 .. 1.0
 //     performance=1     1: the light model, 0: the quality model
+//     fp16=1            1 (default): half-precision shaders when Lossless.dll and the GPU have them
 //
-// Without BB_LSFG_STATE_FILE (a harness, a desktop run) the same three settings come from the
-// environment once, at start: BB_LSFG_MULTIPLIER, BB_LSFG_FLOW_SCALE, BB_LSFG_PERFORMANCE.
+// Without BB_LSFG_STATE_FILE (a harness, a desktop run) the same four settings come from the
+// environment once, at start: BB_LSFG_MULTIPLIER, BB_LSFG_FLOW_SCALE, BB_LSFG_PERFORMANCE, BB_LSFG_FP16.
 #pragma once
 #ifdef __ANDROID__
 #include <chrono>
@@ -22,12 +23,14 @@ struct State {
     u32 multiplier = 0; ///< 0: off, else 2-4
     float flow = 0.75f;
     bool performance = true;
+    bool fp16 = true; ///< half precision wanted (Bloodframe falls back to full precision when it cannot)
 
     bool On() const {
         return multiplier >= 2;
     }
     bool operator==(const State& other) const {
-        return multiplier == other.multiplier && flow == other.flow && performance == other.performance;
+        return multiplier == other.multiplier && flow == other.flow && performance == other.performance &&
+               fp16 == other.fp16;
     }
 };
 
@@ -39,7 +42,7 @@ const char* FilePath();
 /// is ignored.
 bool Read(const char* path, State& state);
 
-/// The environment's settings (BB_LSFG_MULTIPLIER, BB_LSFG_FLOW_SCALE, BB_LSFG_PERFORMANCE).
+/// The environment's settings (BB_LSFG_MULTIPLIER, BB_LSFG_FLOW_SCALE, BB_LSFG_PERFORMANCE, BB_LSFG_FP16).
 State FromEnvironment();
 
 /// The state at start: the file when there is one and it reads, else the environment.
