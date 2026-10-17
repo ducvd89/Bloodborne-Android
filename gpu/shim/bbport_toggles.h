@@ -203,6 +203,9 @@ inline std::atomic<std::uint32_t> coarse_second{0};
 inline std::atomic<std::uint64_t> vram_idle_bytes{0}, vram_unmapped_bytes{0}, vram_chunks_freed_bytes{0};
 /// Residency chunks, chunks sent away (ProcessIdleBlocks), and their blocks that had to stay.
 inline std::atomic<std::uint64_t> residency_chunk_count{0}, evacuations{0}, evac_kept_gpu{0}, evac_kept_other{0};
+/// BB_VRAM_COPY_QUEUE (FIFO of VRAM copies): on, queue length, bytes of copies, copies returned.
+inline std::atomic<std::uint64_t> vram_copy_queue{0}, vram_copy_queue_length{0}, vram_copy_bytes{0},
+    vram_copies_returned{0};
 /// Images the collector passed over (GPU-written, not evictable without memory pressure).
 inline std::atomic<std::uint64_t> gc_kept_images{0};
 struct WaitTimer {

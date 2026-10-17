@@ -736,6 +736,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     group_use.assign(u64{1} << (ADDRESS_SPACE_BITS - USE_GROUP_BITS), 0);
     group_demoted.assign(group_use.size(), 0);
     group_tick.assign(group_use.size(), 0);
+    if (CopyQueueEnabled()) {
+        copy_fifo_seq.assign(u64{1} << (ADDRESS_SPACE_BITS - block_shift), 0);
+    }
     layer_group_use.assign(group_use.size(), 0);
     if (non_sparse_arenas) {
         // The type the arena's memory is allocated from (Buffer, MemoryType::Backed): device-local
@@ -775,11 +778,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // residency that reads unbound memory as zero (Turnip: residencyNonResidentStrict), it is a
     // sparse buffer instead: a page of it is bound when an entry in it is first written
     // (EnsureBdaTablePages), and an unbound entry reads 0, "not resident", as a cleared one did.
-    // BB_SPARSE_BDA_TABLE=0: the full table as before.
+    // BB_SPARSE_BDA_TABLE=0: the full table as before. Off unless BB_VRAM_COPY_QUEUE=1 (it comes
+    // with the queue); BB_SPARSE_BDA_TABLE=1 turns it on without it.
     const char* sparse_env = std::getenv("BB_SPARSE_BDA_TABLE");
+    const bool sparse_wanted =
+        sparse_env && sparse_env[0] ? sparse_env[0] != '0' : CopyQueueEnabled();
     sparse_bda_table =
-        !non_sparse_arenas && !GuestInPlace() && !LayerActive() &&
-        !(sparse_env && sparse_env[0] == '0') &&
+        !non_sparse_arenas && !GuestInPlace() && !LayerActive() && sparse_wanted &&
         instance.GetPhysicalDevice().getProperties().sparseProperties.residencyNonResidentStrict;
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size,
@@ -844,7 +849,12 @@ void BufferCache::EnsureBdaTablePages(u64 offset, u64 size) {
     }
 }
 
-BufferCache::~BufferCache() = default;
+BufferCache::~BufferCache() {
+    if (evicted_memory) {
+        instance.GetDevice().freeMemory(evicted_memory);
+        BbStats::device_free_bytes.fetch_add(block_size, std::memory_order_relaxed);
+    }
+}
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
     if (LayerMode()) {
@@ -1272,7 +1282,8 @@ void PrintBufferStats() {
 } // namespace
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
-                                                        bool is_written, bool is_texel_buffer) {
+                                                        bool is_written, bool is_texel_buffer,
+                                                        bool force_resident) {
     BB_SECTION(ObtainBuffer);
     const bool stats = BufferStatsEnabled();
     if (stats) {
@@ -1368,7 +1379,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (!force_resident && !is_written && size <= STREAM_THRESHOLD &&
+        !IsRegionGpuModified(device_addr, size)) {
         BB_SECTION(ObtainStream);
         if (stats) {
             auto& region = Stats().regions[RegionKey(device_addr)];
@@ -1609,6 +1621,9 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    // A shader of this submission reaches memory by address (the BDA page table): the copies
+    // are not returned in it (ReturnQueuedCopies, CompactResidency).
+    dma_tick = scheduler.CurrentTick();
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (arena_page_bits - block_shift);
         const VAddr device_addr = range.start << block_shift;
@@ -1865,6 +1880,9 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.memory = bind.memory;
         backing.offset = bind.offset >> block_shift;
         resident_ranges.Add(backing);
+        if (CopyQueueActive() && residency_chunks.contains(static_cast<VkDeviceMemory>(bind.memory))) {
+            QueueCopies(bind.start, bind.end);
+        }
 
         const u64 resource_offset = (bind.start << block_shift) - arena->cpu_addr;
         const u64 bind_size = (bind.end - bind.start) << block_shift;
@@ -2146,28 +2164,33 @@ bool BufferCache::EvictVramBlock(u64 block, bool idle) {
     const vk::DeviceMemory memory = old->memory;
     const u64 offset = (old->offset + (block - old->start)) << block_shift;
     const VAddr address = block << block_shift;
-    // bbport: the block is bound to a block of spare memory instead of being unbound. Unbinding
+    // bbport BB_VRAM_COPY_QUEUE: the block is bound to a block of spare memory instead of being
+    // unbound (without the switch: unbound, as in 0.9.4). Unbinding
     // (memory = null) on Adreno's KGSL kernel driver unbinds every whole range the block lies in
     // (kgsl_vbo.c, kgsl_memdesc_remove_range with no child: it does not split a range, binding
     // does): the cache binds runs of blocks as one range, so the neighbours of a returned block
     // read the zero page while the cache thinks they are bound. On a Poco F7 Pro (Adreno 750) 5
     // idle blocks returned at boot lost the device when the save loaded. Any driver: the block's
     // slot is free all the same, and nothing that may still read the block faults.
-    if (!evicted_memory) {
-        auto spare = instance.GetDevice().allocateMemory(
-            {.allocationSize = block_size, .memoryTypeIndex = arena_memory_type_index});
-        if (spare.result != vk::Result::eSuccess) {
-            return false; // stays in VRAM
+    vk::DeviceMemory bind_memory{};
+    if (CopyQueueEnabled()) {
+        if (!evicted_memory) {
+            auto spare = instance.GetDevice().allocateMemory(
+                {.allocationSize = block_size, .memoryTypeIndex = arena_memory_type_index});
+            if (spare.result != vk::Result::eSuccess) {
+                return false; // stays in VRAM
+            }
+            evicted_memory = spare.value;
+            BbStats::device_alloc_bytes.fetch_add(block_size, std::memory_order_relaxed);
         }
-        evicted_memory = spare.value;
-        BbStats::device_alloc_bytes.fetch_add(block_size, std::memory_order_relaxed);
+        bind_memory = evicted_memory;
     }
     for (const auto& arena : arenas) {
         if (arena.cpu_addr <= address && address - arena.cpu_addr < arena.size_bytes) {
             BindsForArena(&arena)->binds.emplace_back(vk::SparseMemoryBind{
                 .resourceOffset = address - arena.cpu_addr,
                 .size = block_size,
-                .memory = evicted_memory,
+                .memory = bind_memory,
                 .memoryOffset = 0,
             });
         }
@@ -2190,9 +2213,64 @@ bool BufferCache::CopyHasGpuData(u64 block) {
            gpu_modified_ranges.Intersects(address, block_size);
 }
 
-bool BufferCache::BoundThisTick(u64 block) const {
-    return group_tick[(block << block_shift) >> USE_GROUP_BITS] ==
-           static_cast<u32>(scheduler.CurrentTick());
+bool BufferCache::BoundRecently(u64 block) const {
+    // The current submission or the one before (not under it by more than 1; u32 wraps alike).
+    return static_cast<u32>(scheduler.CurrentTick()) -
+               group_tick[(block << block_shift) >> USE_GROUP_BITS] <=
+           1;
+}
+
+bool BufferCache::RecentCopy(u64 block, u32 now) const {
+    // CompactResidency gives back whole chunks, idle or not: not copies used in the last 2 s
+    // (PR #37's margin) either.
+    return BoundRecently(block) ||
+           now - group_use[(block << block_shift) >> USE_GROUP_BITS] < 2;
+}
+
+bool BufferCache::CopyQueueEnabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_VRAM_COPY_QUEUE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+bool BufferCache::CopyQueueActive() const {
+    return CopyQueueEnabled() && !GuestInPlace() && !non_sparse_arenas && !copy_fifo_seq.empty();
+}
+
+u64 BufferCache::CopyCapBytes() {
+    // BB_VRAM_COPY_CAP_MB: the VRAM copies the FIFO keeps (default 1024; at least 128).
+    static const u64 cap = [] {
+        const char* env = std::getenv("BB_VRAM_COPY_CAP_MB");
+        const u64 mib = env && env[0] ? std::strtoull(env, nullptr, 10) : 0;
+        return std::max<u64>(mib ? mib : 1024, 128) << 20;
+    }();
+    return cap;
+}
+
+bool BufferCache::HasVramCopy(u64 block) const {
+    const auto old = resident_ranges.Find(block);
+    return old != resident_ranges.end() && !in_place_blocks.Contains(block) &&
+           residency_chunks.contains(static_cast<VkDeviceMemory>(old->memory));
+}
+
+u64 BufferCache::CopyBytes() const {
+    u64 bytes = 0;
+    for (const auto& [memory, chunk] : residency_chunks) {
+        bytes += chunk.used;
+    }
+    return bytes;
+}
+
+void BufferCache::QueueCopies(u64 first_block, u64 end_block) {
+    for (u64 block = first_block; block < end_block && block < copy_fifo_seq.size(); ++block) {
+        if (++copy_fifo_next == 0) {
+            ++copy_fifo_next; // 0 is "not queued"
+        }
+        copy_fifo_seq[block] = copy_fifo_next;
+        copy_fifo.push_back({block, copy_fifo_next});
+    }
 }
 
 u64 BufferCache::ReturnCopies(std::span<const u64> blocks) {
@@ -2221,30 +2299,121 @@ u64 BufferCache::ReturnCopies(std::span<const u64> blocks) {
     return returned;
 }
 
-void BufferCache::ReturnIdleCopies(u32 now) {
-    // Copies not bound for the idle time, without data only the GPU has (it would be lost), and
-    // not bound by work already recorded in this submission (their rebind goes in before it).
-    // At most 128 MiB a second.
-    const u64 max_blocks = std::max<u64>(1, 128_MB >> block_shift);
-    std::vector<u64> blocks;
-    for (const auto& range : resident_ranges) {
-        if (!residency_chunks.contains(static_cast<VkDeviceMemory>(range.memory))) {
+void BufferCache::ReturnQueuedCopies(u32 now) {
+    // BB_VRAM_COPY_QUEUE: the copies are in a FIFO in the order they were made. Over the cap
+    // (BB_VRAM_COPY_CAP_MB) the queue is walked from the front, oldest first, and the copies not
+    // bound for BB_VRAM_IDLE_SECONDS (the idle test of group_use) are returned, down to 10%
+    // under the cap, at most 128 MiB a second. A copy that is not idle, or was bound in this
+    // submission or the one before, or holds data only the GPU has (it cannot be uploaded
+    // again), is not returned and goes to the back of the queue (a second chance), so the walk
+    // does not meet it again at once; one walk looks at no more entries than the queue holds
+    // (8192 at most). Being used again does not move a copy by itself. If nothing is idle the
+    // copies stay over the cap. Once per submission, and none in one that recorded a pointer
+    // access (SynchronizeDmaBuffers): a block read through its page table entry by work recorded
+    // before this point would be read from the spare memory once the rebinds ran, ahead of it.
+    const u64 tick = scheduler.CurrentTick();
+    if (tick == copy_fifo_scan_tick) {
+        return;
+    }
+    copy_fifo_scan_tick = tick;
+    const u32 idle_seconds = VramIdleSeconds(); // 0: no idle test (the oldest go whatever their use)
+    if (!copy_fifo_logged) {
+        copy_fifo_logged = true;
+        std::printf("VRAM copies: FIFO queue, cap %llu MiB, idle >= %u s\n",
+                    (unsigned long long)(CopyCapBytes() >> 20), idle_seconds);
+        std::fflush(stdout);
+        BbStats::vram_copy_queue.store(1, std::memory_order_relaxed);
+    }
+    if (dma_tick == tick) {
+        return;
+    }
+    const u64 bytes = CopyBytes();
+    BbStats::vram_copy_bytes.store(bytes, std::memory_order_relaxed);
+    BbStats::vram_copy_queue_length.store(copy_fifo.size(), std::memory_order_relaxed);
+    const u64 cap = CopyCapBytes(), low = cap - cap / 10;
+    if (bytes > cap) {
+        copy_fifo_draining = true;
+    } else if (bytes <= low) {
+        copy_fifo_draining = false;
+    }
+    if (!copy_fifo_draining || copy_fifo.empty() || copy_fifo_miss_second == now) {
+        return;
+    }
+    if (copy_budget_second != now) {
+        copy_budget_second = now;
+        copy_budget_blocks = std::max<u64>(1, 128_MB >> block_shift);
+    }
+    if (copy_budget_blocks == 0) {
+        return;
+    }
+    const u64 wanted = std::min<u64>(copy_budget_blocks, (bytes - low + block_size - 1) >> block_shift);
+    std::vector<u64> take;
+    std::vector<CopyEntry> second_chance;
+    const size_t limit = std::min<size_t>(copy_fifo.size(), 8192);
+    size_t scanned = 0;
+    for (; scanned < limit && take.size() < wanted; ++scanned) {
+        const CopyEntry entry = copy_fifo[scanned];
+        if (copy_fifo_seq[entry.block] != entry.seq || !HasVramCopy(entry.block)) {
+            continue; // stale: bound again since (a newer entry), or gone another way
+        }
+        const bool idle = idle_seconds == 0 ||
+                          now - group_use[(entry.block << block_shift) >> USE_GROUP_BITS] >=
+                              idle_seconds;
+        if (!idle || BoundRecently(entry.block) || CopyHasGpuData(entry.block)) {
+            second_chance.push_back(entry);
             continue;
         }
-        for (u64 block = range.start; block < range.end && blocks.size() < max_blocks; ++block) {
-            if (now - group_use[(block << block_shift) >> USE_GROUP_BITS] >= VramIdleSeconds() &&
-                !BoundThisTick(block) && !CopyHasGpuData(block)) {
-                blocks.push_back(block);
+        copy_fifo_seq[entry.block] = 0;
+        take.push_back(entry.block);
+    }
+    copy_fifo.erase(copy_fifo.begin(), copy_fifo.begin() + scanned);
+    for (CopyEntry& entry : second_chance) {
+        // Back of the queue, as a new entry (the old one was removed with the others scanned).
+        if (++copy_fifo_next == 0) {
+            ++copy_fifo_next;
+        }
+        entry.seq = copy_fifo_next;
+        copy_fifo_seq[entry.block] = entry.seq;
+        copy_fifo.push_back(entry);
+    }
+    if (take.empty()) {
+        // Nothing to return: not looked for again in this second.
+        copy_fifo_miss_second = now;
+        if (now - copy_fifo_over_log_second >= 10) {
+            copy_fifo_over_log_second = now;
+            std::printf("VRAM copies over cap (%llu of %llu MiB), nothing idle for %u s\n",
+                        (unsigned long long)(bytes >> 20), (unsigned long long)(cap >> 20),
+                        idle_seconds);
+            std::fflush(stdout);
+        }
+    } else {
+        std::sort(take.begin(), take.end()); // runs of blocks: one page table fill each
+        const u64 returned = ReturnCopies(take);
+        copy_budget_blocks -= std::min<u64>(copy_budget_blocks, take.size());
+        copy_returned_total += returned;
+        BbStats::vram_copies_returned.fetch_add(returned, std::memory_order_relaxed);
+        for (const u64 block : take) {
+            if (HasVramCopy(block)) {
+                QueueCopies(block, block + 1); // could not go (no spare memory): back of the queue
             }
         }
-    }
-    if (const u64 returned = ReturnCopies(blocks)) {
-        std::printf("Guest memory: %llu idle VRAM copies returned (%llu KiB, tick %llu), %llu chunks\n",
-                    (unsigned long long)returned, (unsigned long long)((returned << block_shift) >> 10),
-                    (unsigned long long)scheduler.CurrentTick(),
-                    (unsigned long long)residency_chunks.size());
+        const u64 now_bytes = CopyBytes();
+        BbStats::vram_copy_bytes.store(now_bytes, std::memory_order_relaxed);
+        std::printf("Guest memory: %llu VRAM copies returned (FIFO), %llu MiB in use\n",
+                    (unsigned long long)returned, (unsigned long long)(now_bytes >> 20));
         std::fflush(stdout);
     }
+    // Entries of copies that left another way pile up: drop them now and then.
+    if (copy_fifo.size() > 4 * (CopyBytes() >> block_shift) + 4096) {
+        std::deque<CopyEntry> live;
+        for (const CopyEntry& entry : copy_fifo) {
+            if (copy_fifo_seq[entry.block] == entry.seq && HasVramCopy(entry.block)) {
+                live.push_back(entry);
+            }
+        }
+        copy_fifo = std::move(live);
+    }
+    BbStats::vram_copy_queue_length.store(copy_fifo.size(), std::memory_order_relaxed);
 }
 
 void BufferCache::CompactResidency(u32 now) {
@@ -2254,13 +2423,14 @@ void BufferCache::CompactResidency(u32 now) {
     // whose copies all hold no data only the GPU has and were all last bound 2 s ago or more,
     // gives them all back: bound again, they are uploaded again into fuller chunks
     // (AllocateResidency), and the empty chunk is freed (FreeEmptyResidencyChunks).
-    // Not copies bound less than 2 s ago: the draw pipe binds a packet's buffers (BindResources,
-    // stage A) ahead of recording it (stage B), possibly in the submission before, so "not bound
-    // in this submission" did not mean "not about to be read". A Poco F7 Pro lost the device when
-    // an indirect dispatch read its arguments from a copy returned that way (the spare memory:
-    // 1043118191x1064429451x1046607728 groups).
-    constexpr u32 RecentSeconds = 2;
-    if (free_slot_count * block_size < 128_MB || now - last_evacuation < 10) {
+    // Not copies bound in this submission or the one before (BoundRecently): the draw pipe binds
+    // a packet's buffers (BindResources, stage A) ahead of recording it (stage B), possibly in
+    // the submission before, so "not bound in this submission" did not mean "not about to be
+    // read". A Poco F7 Pro lost the device when an indirect dispatch read its arguments from a
+    // copy returned that way (the spare memory: 1043118191x1064429451x1046607728 groups). None in
+    // a submission that recorded a pointer access either (ReturnQueuedCopies).
+    if (free_slot_count * block_size < 128_MB || now - last_evacuation < 10 ||
+        dma_tick == scheduler.CurrentTick()) {
         return;
     }
     struct Count {
@@ -2278,9 +2448,7 @@ void BufferCache::CompactResidency(u32 now) {
         count.blocks += range.end - range.start;
         for (u64 block = range.start;
              block < range.end && !count.gpu_data && !count.recent; ++block) {
-            count.recent =
-                now - group_use[(block << block_shift) >> USE_GROUP_BITS] < RecentSeconds ||
-                BoundThisTick(block);
+            count.recent = RecentCopy(block, now);
             count.gpu_data = !count.recent && CopyHasGpuData(block);
         }
     }
@@ -2307,8 +2475,7 @@ void BufferCache::CompactResidency(u32 now) {
             continue;
         }
         for (u64 block = range.start; block < range.end; ++block) {
-            if (now - group_use[(block << block_shift) >> USE_GROUP_BITS] < RecentSeconds ||
-                BoundThisTick(block)) {
+            if (RecentCopy(block, now)) {
                 ++left;
             } else {
                 blocks.push_back(block);
@@ -2316,6 +2483,8 @@ void BufferCache::CompactResidency(u32 now) {
         }
     }
     const u64 returned = ReturnCopies(blocks);
+    copy_returned_total += returned;
+    BbStats::vram_copies_returned.fetch_add(returned, std::memory_order_relaxed);
     residency_chunks[emptiest->first].evacuated_second = now;
     BbStats::evacuations.fetch_add(1, std::memory_order_relaxed);
     std::printf("Guest memory: a VRAM chunk emptied for the driver: %llu copies returned "
@@ -2327,27 +2496,26 @@ void BufferCache::CompactResidency(u32 now) {
 
 void BufferCache::ProcessIdleBlocks() {
     const u32 now = BbStats::coarse_second.load(std::memory_order_relaxed);
-    if (VramIdleSeconds() == 0 || non_sparse_arenas) {
-        return;
-    }
-    if (!GuestInPlace()) {
-        // bbport: copies of the game's memory (BB_GUEST_IN_PLACE=0, the phones): returned when
-        // idle, the chunks compacted, and emptied chunks freed. They were never returned: the
-        // chunks grew to the VRAM limit while the world was walked (2 GiB in 8 minutes of
-        // Central Yharnam on a 12 GB phone, where VRAM is the system's RAM) and Android swapped
-        // the game out.
+    if (CopyQueueActive()) {
+        // bbport BB_VRAM_COPY_QUEUE: copies of the game's memory (BB_GUEST_IN_PLACE=0, the
+        // phones) are returned oldest first over the cap, when idle for BB_VRAM_IDLE_SECONDS
+        // (ReturnQueuedCopies), the chunks compacted, and emptied chunks freed.
+        // Without the switch they were never returned (0.9.4): the chunks grew to the VRAM
+        // limit while the world was walked (2 GiB in 8 minutes of Central Yharnam on a 12 GB
+        // phone, where VRAM is the system's RAM) and Android swapped the game out.
         if (const u64 tick = scheduler.CurrentTick(); tick != compact_scan_tick) {
             compact_scan_tick = tick;
             CompactResidency(now);
         }
+        ReturnQueuedCopies(now);
         if (now != idle_scan_second) {
             idle_scan_second = now;
-            ReturnIdleCopies(now);
             FreeEmptyResidencyChunks(now);
         }
         return;
     }
-    if (now == idle_scan_second) {
+    if (now == idle_scan_second || !GuestInPlace() || VramIdleSeconds() == 0 ||
+        non_sparse_arenas) {
         return;
     }
     idle_scan_second = now;
@@ -2411,12 +2579,14 @@ void BufferCache::FreeEmptyResidencyChunks(u32 now) {
     // Chunks without blocks for 5 s, the rebinds away from them long done: back to the driver.
     // The rebinds went with the submission recorded when the chunk emptied (empty_tick), before
     // the next one; that one done, they are. (Waiting for no pending binds at all as well kept
-    // every chunk: in copy mode nearly every submission binds something.)
+    // every chunk: in copy mode nearly every submission binds something. Without
+    // BB_VRAM_COPY_QUEUE it still waits for them, as in 0.9.4.)
     for (auto it = residency_chunks.begin(); it != residency_chunks.end();) {
         const ResidencyChunk& chunk = it->second;
         const VkDeviceMemory memory = it->first;
         if (chunk.used != 0 || memory == static_cast<VkDeviceMemory>(residency_memory) ||
             now - chunk.empty_second < 5 ||
+            (!CopyQueueActive() && !pending_binds.empty()) ||
             !scheduler.GetWorkSemaphore()->IsFree(chunk.empty_tick + 1)) {
             ++it;
             continue;
