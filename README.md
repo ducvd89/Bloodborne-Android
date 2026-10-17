@@ -1,3 +1,5 @@
+<p align="center"><a href="https://www.paypal.com/donate/?business=ducvd89%40gmail.com&currency_code=USD"><img src="docs/donate/buy-me-a-claude-token.svg" alt="Buy me a Claude token" height="48"></a></p>
+
 <h1 align="center">Bloodborne-Android</h1>
 
 <p align="center">
@@ -114,7 +116,7 @@ bash tools/android/build_bionic.sh           # the game process and tools
 bash tools/android/build_release_apk.sh      # the APK
 ```
 
-More in [docs/ANDROID_THOR.md](docs/ANDROID_THOR.md). The Linux PC build: [README.linux.md](README.linux.md).
+More in [docs/ANDROID_THOR.md](docs/ANDROID_THOR.md). The Linux PC build: [bbport's README](https://github.com/deadinside28/bloodborne_pc).
 
 ## Credits
 
