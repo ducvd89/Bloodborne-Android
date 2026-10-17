@@ -1,0 +1,107 @@
+#version 450
+
+//============================================================================================================
+//
+//
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+//
+//============================================================================================================
+
+// bbport: derived from Snapdragon GSR 2, glsl_2_pass_cs/sgsr2_convert.comp (upstream commit
+// d926f074, gpu/third_party/snapdragon-gsr2). Changes:
+//  - Vulkan binding numbers that do not overlap, parameters as push constants (no UBO);
+//  - the motion comes from the port's motion image (render pixels, previous - current: camera and
+//    objects together) converted to GSR's clip-space units, current - previous, +y down. The
+//    static clipToPrevClip reconstruction and the velocity decode are gone;
+//  - the depth gathers are scaled by the depth texture's own size and clamped to the scene's
+//    render size (the game's targets can be a few pixels larger than the scene);
+//  - bounds check for the dispatch's edge groups.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D InputColor;
+layout(binding = 1) uniform sampler2D InputDepth;
+layout(binding = 2) uniform sampler2D InputMotion;
+layout(binding = 3, rgba16f) uniform writeonly image2D MotionDepthClipAlphaBuffer;
+layout(binding = 4, r32ui) uniform writeonly uimage2D YCoCgColor;
+
+layout(push_constant) uniform Params
+{
+    uvec2 renderSize;
+    uvec2 displaySize;
+    vec2  renderSizeRcp;
+    vec2  displaySizeRcp;
+    vec2  jitterOffset;
+    float preExposure;
+    float cameraFovAngleHor;
+    float minLerpContribution;
+    uint  bSameCamera;
+    uint  reset;
+} params;
+
+void main()
+{
+    ivec2 InputPos = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(InputPos), params.renderSize))) return;
+    float Exposure_co_rcp = params.preExposure;
+
+    // textureGather at a texel corner: the quad of texels (pos-1 .. pos). The depth texture can
+    // be larger than the scene: its own texel size, corners clamped to the scene's edge.
+    vec2 depthRcp = 1.0 / vec2(textureSize(InputDepth, 0));
+    vec2 sceneSize = vec2(params.renderSize);
+    vec2 corner = vec2(InputPos);
+    vec4 topleft = textureGather(InputDepth, corner * depthRcp, 0);
+    vec4 topRight = textureGather(InputDepth, min(corner + vec2(2.0, 0.0), sceneSize) * depthRcp, 0);
+    vec4 bottomLeft = textureGather(InputDepth, min(corner + vec2(0.0, 2.0), sceneSize) * depthRcp, 0);
+    vec4 bottomRight = textureGather(InputDepth, min(corner + vec2(2.0, 2.0), sceneSize) * depthRcp, 0);
+    float maxC = min(min(min(topleft.y,topRight.x),bottomLeft.z),bottomRight.w);
+    float topleft4 = min(min(min(topleft.y,topleft.x),topleft.z),topleft.w);
+
+    float depthclip = 0.0;
+    if (maxC < 1.0 - 1.0e-05f)
+    {
+        float topRight4 = min(min(min(topRight.y,topRight.x),topRight.z),topRight.w);
+        float bottomLeft4 = min(min(min(bottomLeft.y,bottomLeft.x),bottomLeft.z),bottomLeft.w);
+        float bottomRight4 = min(min(min(bottomRight.y,bottomRight.x),bottomRight.z),bottomRight.w);
+
+        float Wdepth = 0.0;
+        float Ksep = 1.37e-05f;
+        float Kfov = params.cameraFovAngleHor;
+        float diagonal_length = length(vec2(params.renderSize));
+        float Ksep_Kfov_diagonal = Ksep * Kfov * diagonal_length;
+
+        float Depthsep = Ksep_Kfov_diagonal * (1.0 - maxC);
+        float EPSILON = 1.19e-07f;
+        Wdepth += clamp((Depthsep / (abs(maxC - topleft4) + EPSILON)), 0.0, 1.0);
+        Wdepth += clamp((Depthsep / (abs(maxC - topRight4) + EPSILON)), 0.0, 1.0);
+        Wdepth += clamp((Depthsep / (abs(maxC - bottomLeft4) + EPSILON)), 0.0, 1.0);
+        Wdepth += clamp((Depthsep / (abs(maxC - bottomRight4) + EPSILON)), 0.0, 1.0);
+        depthclip = clamp(1.0f - Wdepth*0.25, 0.0, 1.0);
+    }
+
+    // Render pixels, previous - current  ->  clip units (2 per render size), current - previous.
+    vec2 motion = -texelFetch(InputMotion, InputPos, 0).xy * 2.0 * params.renderSizeRcp;
+
+    ////////////compute luma
+    vec3 Colorrgb = texelFetch(InputColor, InputPos, 0).xyz;
+
+    ///simple tonemap
+    float ColorMax = max(max(Colorrgb.x, Colorrgb.y), Colorrgb.z) + Exposure_co_rcp;
+    Colorrgb /= vec3(ColorMax);
+
+    vec3 Colorycocg;
+    Colorycocg.x = 0.25 * (Colorrgb.x + 2.0 * Colorrgb.y + Colorrgb.z);
+    Colorycocg.y = clamp(0.5 * Colorrgb.x + 0.5 - 0.5 * Colorrgb.z, 0.0, 1.0);
+    Colorycocg.z = clamp(Colorycocg.x + Colorycocg.y - Colorrgb.x, 0.0, 1.0);
+
+    //now color YCoCG all in the range of [0,1]
+    uint x11 = uint(Colorycocg.x * 2047.5);
+    uint y11 = uint(Colorycocg.y * 2047.5);
+    uint z10 = uint(Colorycocg.z * 1023.5);
+
+    imageStore(YCoCgColor, InputPos, uvec4(((x11 << 21u) | (y11 << 10u)) | z10));
+
+    vec4 v29 = vec4(motion, depthclip, ColorMax);
+    imageStore(MotionDepthClipAlphaBuffer, InputPos, v29);
+}

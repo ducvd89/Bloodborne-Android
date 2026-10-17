@@ -258,7 +258,7 @@ bool TemporalUpscaler::ReactiveOn() const {
     // FSR 4 takes no reactive mask itself: the mask blends its output afterwards
     // (RecordFsr4Reactive).
     // DLSS takes no reactive mask.
-    return BbSettings::Get().reactive && !BbToggle::Disabled(1u << 27) && !UseDlss() &&
+    return BbSettings::Get().reactive && !BbToggle::Disabled(1u << 27) && !UseDlss() && !UseGsr2() &&
            BbSettings::Get().upscaler != BbSettings::UpscalerTaa;
 }
 
@@ -371,9 +371,10 @@ bool TemporalUpscaler::OnFrameStart() {
         // A failed provider keeps a fatal flag internally; a user retry gets a fresh context.
         scheduler.Finish();
         fsr4 = std::make_unique<Fsr4Upscaler>(instance, scheduler);
+        gsr2.reset(); // a fresh history when GSR 2 is selected again
         if (BbSettings::IsExternalUpscaler(upscaler)) BbSettings::Get().fsr4_problem = nullptr;
     }
-    if (applied_upscaler != upscaler) fsr4_failed = false; // retry after a menu change
+    if (applied_upscaler != upscaler) fsr4_failed = gsr2_failed = false; // retry after a menu change
     // Dynamic scene resolution scaling (live preset switching) works on all GPUs.
     // On GPUs without D32S8 blit support, UI depth is cleared instead of copied from scene.
     if (!scaled_session) {
@@ -443,7 +444,8 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
 
 bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
     // DLSS, like FSR 4, has its own context: no portable FSR 3 context is made.
-    const bool use_fsr4 = UseExternalUpscaler() || UseDlss();
+    const bool use_gsr2 = UseGsr2();
+    const bool use_fsr4 = UseExternalUpscaler() || UseDlss() || use_gsr2;
     const bool use_taa = BbSettings::Get().upscaler == BbSettings::UpscalerTaa;
     if (use_taa && (w != ow || h != oh)) {
         std::printf("TAA: remove BB_RENDER_RES to use native-resolution TAA\n");
@@ -584,7 +586,7 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
     fsr4_linear_view.reset();
     fsr4_linear_image = VideoCore::UniqueImage{};
-    if (use_fsr4) {
+    if (use_fsr4 && !use_gsr2) {
         make_image(fsr4_linear_image, fsr4_linear_view, vk::Format::eR16G16B16A16Sfloat,
                    vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
     }
@@ -610,7 +612,7 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                     hdr ? "HDR scene color" : "tonemapped frame");
         return true;
     }
-    if (use_fsr4) {
+    if (use_fsr4) { // (GSR 2 prints its own line when it makes its images)
         std::printf("Upscaler: %s inputs %ux%u -> %ux%u\n",
                     BbSettings::UpscalerName(BbSettings::Get().upscaler), w, h, ow, oh);
         return true;
@@ -853,7 +855,9 @@ void TemporalUpscaler::RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color,
 
 void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
     const auto& settings = BbSettings::Get();
-    const float extra = std::clamp(settings.sharpness.load(), 0.0f, 2.0f) - 1.0f;
+    // FSR's own RCAS covers 0..1; GSR 2 has no sharpening of its own: this pass does all of it.
+    const float own = BbSettings::IsGsr2(settings.upscaler) ? 0.0f : 1.0f;
+    const float extra = std::clamp(settings.sharpness.load(), 0.0f, 2.0f) - own;
     if (!settings.sharpen || extra <= 0.0f) {
         return;
     }
@@ -1129,7 +1133,9 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
 void TemporalUpscaler::Run() {
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::Get().upscaler == BbSettings::UpscalerTaa
-            ? "upscaler Run (TAA)" : "upscaler Run (FSR)";
+            ? "upscaler Run (TAA)"
+            : BbSettings::IsGsr2(BbSettings::Get().upscaler) ? "upscaler Run (GSR2)"
+                                                              : "upscaler Run (FSR)";
         profiler->Mark(0xF5A0'0000ull ^ std::hash<std::string_view>{}(label),
                        [label] { return std::string{label}; });
     }
@@ -1225,6 +1231,8 @@ void TemporalUpscaler::Run() {
         if (dispatched && has_reactive) {
             RecordFsr4Reactive(cmdbuf, input_color_view, w, h, ow, oh);
         }
+    } else if (UseGsr2()) {
+        dispatched = RecordGsr2(cmdbuf, input_color_view, input_depth_view, w, h, ow, oh);
     } else if (UseDlss()) {
         dispatched = RecordDlss(
             cmdbuf,
@@ -1740,7 +1748,9 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
 void TemporalUpscaler::RunScaled() {
     if (auto* profiler = GpuProfiler::Get()) {
         const char* label = BbSettings::Get().upscaler == BbSettings::UpscalerTaa
-            ? "upscaler RunScaled (TAA)" : "upscaler RunScaled (FSR)";
+            ? "upscaler RunScaled (TAA)"
+            : BbSettings::IsGsr2(BbSettings::Get().upscaler) ? "upscaler RunScaled (GSR2)"
+                                                              : "upscaler RunScaled (FSR)";
         profiler->Mark(0xF5A0'0000ull ^ std::hash<std::string_view>{}(label),
                        [label] { return std::string{label}; });
     }
@@ -1832,7 +1842,8 @@ void TemporalUpscaler::RunScaled() {
     last_frame = now;
 
     // bbport: FSR 4 writes its HDR-format output, copied into the output-size UI image.
-    if (UseExternalUpscaler() || UseDlss() || BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
+    if (UseExternalUpscaler() || UseDlss() || UseGsr2() ||
+        BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
         const auto cmdbuf = scheduler.CommandBuffer(); // after the commands recorded above
         barrier(vk::Image(output_image), vk::ImageAspectFlagBits::eColor,
                 vk::ImageLayout::eUndefined, all, vk::AccessFlagBits2::eNone,
@@ -1840,6 +1851,11 @@ void TemporalUpscaler::RunScaled() {
         bool ok4 = true;
         if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
             RecordTaa(cmdbuf, color_view, depth_view);
+        } else if (UseGsr2()) {
+            // The game's tonemapped frame as it is, like FSR 3.1 gets it (GSR 2 is made for
+            // display-referred color too); the blit below writes it to the UI image.
+            fsr4_linear_frame = false;
+            ok4 = RecordGsr2(cmdbuf, color_view, depth_view, w, h, ow, oh);
         } else if (UseDlss()) {
             fsr4_linear_frame = false;
             ok4 = RecordDlss(cmdbuf,
@@ -2307,6 +2323,41 @@ bool TemporalUpscaler::RecordExternalUpscaler(vk::CommandBuffer cmdbuf, Fsr4Upsc
         std::printf("Upscaler: falling back to FSR 3.1\n");
         BbSettings::Get().upscaler = BbSettings::UpscalerFsr3;
         fsr4_failed = true; // EnsureResources creates the FSR 3 context next frame
+        reset = true;
+    }
+    return ok;
+}
+
+bool TemporalUpscaler::UseGsr2() const {
+    return BbSettings::IsGsr2(BbSettings::Get().upscaler) && !gsr2_failed;
+}
+
+bool TemporalUpscaler::RecordGsr2(vk::CommandBuffer cmdbuf, vk::ImageView color, vk::ImageView depth,
+                                  u32 w, u32 h, u32 ow, u32 oh) {
+    if (!gsr2) {
+        gsr2 = std::make_unique<GsrUpscaler>(instance, scheduler);
+    }
+    // Same jitter convention as FSR 3; toggle 1 << 26 flips it for tests.
+    const float sign = BbToggle::Disabled(1u << 26) ? -1.0f : 1.0f;
+    const bool ok = gsr2->Record({
+        .cmdbuf = cmdbuf,
+        .color = color,
+        .depth = depth,
+        .motion = *motion_view,
+        .output = *output_view,
+        .render_width = w,
+        .render_height = h,
+        .output_width = ow,
+        .output_height = oh,
+        .jitter = {sign * jitter[0], sign * jitter[1]},
+        .vertical_fov = camera_motion.VerticalFov(),
+        .camera_still = camera_motion.CameraStill(),
+        .reset = reset,
+    });
+    if (!ok) {
+        std::printf("Upscaler: GSR 2 failed; falling back to FSR 3.1\n");
+        BbSettings::Get().upscaler = BbSettings::UpscalerFsr3;
+        gsr2_failed = true; // EnsureResources creates the FSR 3 context next frame
         reset = true;
     }
     return ok;

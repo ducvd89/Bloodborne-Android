@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <vector>
 
 #include "common/types.h"
@@ -61,6 +62,21 @@ public:
     /// Vertical field of view and near/far planes of the current camera.
     [[nodiscard]] float VerticalFov() const noexcept;
     [[nodiscard]] float Near() const noexcept;
+    /// The camera (view and projection) did not change since the previous frame. False before
+    /// both cameras are known.
+    [[nodiscard]] bool CameraStill() const noexcept {
+        if (!current.valid || !previous.valid) {
+            return false;
+        }
+        float diff = 0.0f;
+        for (size_t i = 0; i < current.view.size(); ++i) {
+            diff += std::abs(current.view[i] - previous.view[i]);
+        }
+        for (size_t i = 0; i < current.proj.size(); ++i) {
+            diff += std::abs(current.proj[i] - previous.proj[i]);
+        }
+        return diff < 1e-5f;
+    }
     // Current projection, previous projection, and row Z of previous-view * inverse-view.
     [[nodiscard]] std::array<std::array<float, 4>, 3> TaaDepthParameters() const noexcept;
     /// bbport: the matrices and jitter of the motion of this frame, printed with an upscaler dump

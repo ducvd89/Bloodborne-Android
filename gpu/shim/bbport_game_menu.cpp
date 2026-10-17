@@ -221,7 +221,7 @@ void DefineTexts() {
     row(Upscaler, "Upscaler", "Апскейлер", "Temporal upscaler and anti-aliasing",
         "Временной апскейлер и сглаживание",
         {off, AddText("FSR 3.1", "FSR 3.1"), AddText("FSR 4", "FSR 4"), AddText("FSR 4.1.1", "FSR 4.1.1"),
-         AddText("TAA", "TAA"), AddText("DLSS", "DLSS")});
+         AddText("TAA", "TAA"), AddText("DLSS", "DLSS"), AddText("Snapdragon GSR 2", "Snapdragon GSR 2")});
 
     page("Effects", "Эффекты", "The game's effects (bbport; after a restart)",
          "Эффекты игры (bbport; после перезапуска)");

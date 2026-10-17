@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
+#include "video_core/renderer_vulkan/vk_gsr2.h"
 #include "video_core/texture_cache/image.h"
 
 struct FfxVkFsr3_3_1_6FrameGenerationContext;
@@ -190,8 +191,13 @@ private:
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
     bool RecordExternalUpscaler(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
                     u32 w, u32 h, u32 ow, u32 oh, float frame_ms);
+    /// bbport: Snapdragon GSR 2 selected and not failed (vk_gsr2).
+    [[nodiscard]] bool UseGsr2() const;
+    /// Records GSR 2 into output_image (General); false (and FSR 3.1 takes over) if it cannot run.
+    bool RecordGsr2(vk::CommandBuffer cmdbuf, vk::ImageView color, vk::ImageView depth, u32 w, u32 h,
+                    u32 ow, u32 oh);
     void RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color, vk::ImageView depth);
-    /// Sharpness above 1 for FSR 3/4 (their RCAS stops at 1): one more RCAS pass over the target
+    /// Sharpness above 1 for FSR 3/4 (their RCAS stops at 1; for GSR 2, which has none, all of it): one more RCAS pass over the target
     /// (output_image, or the 8-bit UI image with ldr) in General layout after the upscaler.
     void ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h);
 
@@ -297,6 +303,8 @@ private:
     bool resources_taa = false;
     std::unique_ptr<Fsr4Upscaler> fsr4;
     bool fsr4_failed = false;
+    std::unique_ptr<GsrUpscaler> gsr2;
+    bool gsr2_failed = false;
     bool dlss_failed = false;
     VideoCore::UniqueImage motion_image;
     VideoCore::UniqueImage output_image;

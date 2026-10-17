@@ -110,8 +110,9 @@ final class SettingsDialog {
         {"cheat_items","Infinite blood vials and items","Using a blood vial, bullet or other item leaves its count as it was "
             +"(items moved to storage or given away stay too)","0"},
     };
-    private static final String[] UPSCALER_VALUES={"off","fsr3"};
-    private static final String[] UPSCALER_NAMES={"Off","FSR 3.1"};
+    private static final String[] UPSCALER_VALUES={"off","fsr3","gsr2"};
+    private static final String[] UPSCALER_NAMES={"Off","FSR 3.1",
+        "Snapdragon GSR 2\nQualcomm's upscaler made for Adreno; lighter than FSR 3.1"};
     private static final int FSR3=1;
     private static final String[] FPS_VALUES={"30","40","45","60","0"};
     private static final String[] FPS_NAMES={"30","40","45","60","Unlimited"};
@@ -298,7 +299,7 @@ final class SettingsDialog {
         };
         box.addView(outputNote);
         heading(box,"Upscaling");
-        final RadioGroup upscalers=choices(box,UPSCALER_NAMES,indexOf(UPSCALER_VALUES,get("upscaler","fsr3"),1));
+        final RadioGroup upscalers=choices(box,UPSCALER_NAMES,indexOf(UPSCALER_VALUES,get("upscaler","gsr2"),1));
         heading(box,"Render resolution");
         int preset=0;
         try { preset=Math.max(0,Math.min(4,Integer.parseInt(get("preset","3")))); } catch (NumberFormatException ignored) { preset=3; }
@@ -394,7 +395,7 @@ final class SettingsDialog {
                 changed.put("output_res",outIndex==0 ? "native" : out[0]+"x"+out[1]);
                 changed.put("upscaler",UPSCALER_VALUES[Math.max(0,checkedIndex(upscalers))]);
                 changed.put("fps_limit",FPS_VALUES[Math.max(0,checkedIndex(fpsLimit))]);
-                changed.put("frame_generation",frameGen.isChecked() && checkedIndex(upscalers)!=0 && !lossless ? "1" : "0");
+                changed.put("frame_generation",frameGen.isChecked() && checkedIndex(upscalers)==FSR3 && !lossless ? "1" : "0");
                 changed.put("speed_floor",speedFloor.isChecked() ? "20" : "30");
                 changed.put("vsync",vsync.isChecked() ? "1" : "0");
                 changed.put("thor_cpus",cpuList(cores));
