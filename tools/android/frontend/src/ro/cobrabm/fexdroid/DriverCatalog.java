@@ -101,9 +101,11 @@ final class DriverCatalog {
         return rest.startsWith("android-") ? rest.substring(8) : rest;
     }
     /** The GPU variant of an asset: "main" or "gen8" for Turnip-android-<variant>-..., "gen8" for Turnip_Gen8_V37.zip
-     *  (the token after the prefix, lower case), "mali" for PanVK-*.zip. "" when there is none. */
+     *  (the token after the prefix, lower case), "main" for another mirrored Turnip_ build (Turnip_v26.3.0-R6-Oneui.zip,
+     *  Adreno 6xx/7xx), "mali" for PanVK-*.zip. "" when there is none. */
     static String variantOf(String asset) {
         if (asset.startsWith("PanVK")) return "mali";
+        if (asset.startsWith("Turnip_") && !asset.toLowerCase(Locale.ROOT).startsWith("turnip_gen8")) return "main";
         String rest=rest(asset);
         int end=0;
         while (end<rest.length() && rest.charAt(end)!='-' && rest.charAt(end)!='_') ++end;
