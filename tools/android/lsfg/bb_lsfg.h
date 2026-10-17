@@ -1,11 +1,11 @@
-// Bloodframe: the C API of libbloodframe.so, Lossless Scaling frame generation for the Bionic game process
-// (tools/android/lsfg/bb_lsfg.cpp over GameNative's lsfg-vk fork, see build_bloodframe.sh). Bloodframe is
-// based on lsfg-vk 1.0 by PancakeTAS (MIT) via GameNative's Android fork of it.
+// Bloodframe: the C API of libbloodframe.so, Lossless Scaling frame generation for a native Android (Bionic)
+// process (android/bb_lsfg.cpp over the framegen backend of lsfg-vk-android). Bloodframe is based on
+// lsfg-vk 1.0 by PancakeTAS (MIT) via GameNative's Android fork of it.
 //
-// libbbgpu dlopen()s the library only when frame generation is on (BB_LSFG_MULTIPLIER >= 2), so there
-// is no link-time dependency. The library makes its own VkInstance/VkDevice on the same physical
-// device as the game's, through the game's own vkGetInstanceProcAddr (the Vulkan driver the process
-// loaded, e.g. a Turnip zip), and shares images with the game's device as AHardwareBuffers.
+// A host can dlopen() the library only when frame generation is on, so there is no link-time
+// dependency. The library makes its own VkInstance/VkDevice on the same physical device as the host's,
+// through the host's own vkGetInstanceProcAddr (the Vulkan driver the process loaded, e.g. a Turnip
+// zip), and shares images with the host's device as AHardwareBuffers.
 // Nothing here throws; failures return -1 (or NULL) and write a message into `err`.
 // One initialized runtime at a time; every call is serialized inside the library.
 #pragma once
@@ -22,15 +22,15 @@ struct AHardwareBuffer;
 #define BB_LSFG_API __attribute__((visibility("default")))
 
 typedef struct BbLsfgConfig {
-    void* vk_get_instance_proc_addr; ///< PFN_vkGetInstanceProcAddr of the game's driver
+    void* vk_get_instance_proc_addr; ///< PFN_vkGetInstanceProcAddr of the host's driver
     const char* dll_path;            ///< the player's Lossless.dll
-    uint8_t device_uuid[16];         ///< VkPhysicalDeviceIDProperties of the game's device
+    uint8_t device_uuid[16];         ///< VkPhysicalDeviceIDProperties of the host's device
     uint8_t driver_uuid[16];
     float flow_scale;                ///< user-visible, 0.25 .. 1.0 (lower: faster, coarser motion)
     int32_t performance;             ///< 1: the light model (LSFG_3_1P), 0: the quality model
     int32_t generation_count;        ///< generated frames per real one: multiplier - 1 (1 .. 3)
     int32_t shared_format;           ///< VkFormat of the shared images (37 RGBA8, 97 RGBA16F)
-    int32_t hdr;                     ///< the frames are HDR (never for this game)
+    int32_t hdr;                     ///< the frames are HDR (the host has SDR frames: 0)
     int32_t fp16;                    ///< 1: half-precision shaders when the Lossless.dll and the GPU have
                                      ///< them (else full precision, bb_lsfg_precision says why); 0: full
 } BbLsfgConfig;
@@ -60,7 +60,7 @@ BB_LSFG_API int bb_lsfg_create_context(struct AHardwareBuffer* in0, struct AHard
                                        uint32_t width, uint32_t height, int32_t format, char* err,
                                        size_t err_len);
 
-/// Hands the next real frame to the context. `in_sem_fd` is the sync file of the game's copy of the
+/// Hands the next real frame to the context. `in_sem_fd` is the sync file of the host's copy of the
 /// frame into the input buffer (ownership passes to the library; -1: already complete).
 /// `count` generated frames (0: only the temporal history advances). The sync files in `out` are
 /// owned by the caller. Returns 0 or -1.

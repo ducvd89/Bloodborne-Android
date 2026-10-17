@@ -1,6 +1,6 @@
 # Lossless Scaling frame generation on Android
 
-The game runs as a native Android (Bionic) process, so Lossless Scaling's frame generation is no longer a Vulkan layer: this port's engine is **Bloodframe**, `libbloodframe.so`. Bloodframe is based on lsfg-vk 1.0 by PancakeTAS (MIT) via [GameNative's Android fork of it](https://github.com/Ragnarok93/lsfg-vk-android) (MIT; pinned commit, `tools/android/build_bloodframe.sh`; the fork's licence ships with the app as `bloodframe-lsfg-vk.LICENSE.md`) and has a small C API (`tools/android/lsfg/bb_lsfg.h`). libbbgpu loads it with `dlopen` only when the multiplier is 2 or more. Lossless Scaling itself is not included: it needs your own copy (Steam, app 993090).
+The game runs as a native Android (Bionic) process, so Lossless Scaling's frame generation is no longer a Vulkan layer: this port's engine is **Bloodframe**, `libbloodframe.so`. Bloodframe is based on lsfg-vk 1.0 by PancakeTAS (MIT) via [GameNative's Android fork of it](https://github.com/Ragnarok93/lsfg-vk-android) (MIT). It lives in its own repository, [ducvd89/bloodframe](https://github.com/ducvd89/bloodframe) (private for now), which continues the fork's history; the game build fetches it at a pinned commit (`tools/android/build_bloodframe.sh`; the fork's licence ships with the app as `bloodframe-lsfg-vk.LICENSE.md`). Its small C API is `tools/android/lsfg/bb_lsfg.h` (the game's copy, checked against the pinned commit's). libbbgpu loads it with `dlopen` only when the multiplier is 2 or more. Lossless Scaling itself is not included: it needs your own copy (Steam, app 993090).
 
 ## Using it
 
@@ -49,13 +49,13 @@ The Frame generation menu writes `bbport/lsfg.state` (`multiplier=`, `flow=`, `p
 
 The game's frame rate no longer depends on frame generation: hooks in the game's code (installed when it loads) give it each frame's real time at every FPS limit, 30 included, and the present thread limits the rate, so Lossless Scaling can be turned on and off live at any limit. With `BB_FRAME_HOOKS=0` (in `bionic-local.sh`) the old behaviour returns: at the 30 limit the delta-time patch loads only when frame generation is on at start.
 
-## What the fork's patches do (tools/android/bloodframe-patches)
+## What Bloodframe changes from the fork (the bloodframe repository's commits after the fork's)
 
-- `0001`: the framegen's Vulkan instance comes from the entry point the game process gives (`volkInitializeCustom`), not volk's own loader (the process loads its driver directly: no Android loader, no layers).
-- `0002`: the shaders are read from the one Lossless.dll the host names, not from a search of Steam folders (that removes the fork's config-file dependency).
-- `0003`: the extractor hands out the dll's resources and the shader names (for the half-precision set, `tools/android/lsfg/bb_half.cpp`).
-- `0004`: the framegen takes SPIR-V 1.0 modules unchanged (the half-precision modules are 1.0; the fork's compatibility check wanted 1.4 and up).
-- `0005`: the framegen device enables `shaderFloat16` only when the host asks and the GPU has it.
+- the framegen's Vulkan instance comes from the entry point the game process gives (`volkInitializeCustom`), not volk's own loader (the process loads its driver directly: no Android loader, no layers).
+- the shaders are read from the one Lossless.dll the host names, not from a search of Steam folders (that removes the fork's config-file dependency).
+- the extractor hands out the dll's resources and the shader names (for the half-precision set, `android/bb_half.cpp` in the bloodframe repository).
+- the framegen takes SPIR-V 1.0 modules unchanged (the half-precision modules are 1.0; the fork's compatibility check wanted 1.4 and up).
+- the framegen device enables `shaderFloat16` only when the host asks and the GPU has it.
 
 The fork's layer, adaptive scheduler and config parser are not built. `tools/android/build_lsfg.sh` and `tools/android/lsfg-patches` are the old glibc layer build, kept for reference.
 

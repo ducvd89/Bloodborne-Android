@@ -87,7 +87,8 @@ links=(-L"$out/lib" -lbbgpu -lbbcpu -Wl,-rpath,'$ORIGIN/../lib' -rdynamic -pie)
 # bb-prepare: the game-preparation step (port of prepare_game.py), no Python or rootfs on the device.
 tools/android/build_prepare.sh android
 # libbloodframe.so: Lossless Scaling frame generation (GameNative's lsfg-vk fork's framegen), which libbbgpu
-# loads with dlopen only when it is on. Cloned at a pinned commit into .local-deps/android/src.
+# loads with dlopen only when it is on. The ducvd89/bloodframe repository, cloned at a pinned commit into
+# .local-deps/android/src.
 tools/android/build_bloodframe.sh
 # ps4-pkg-tool: unpacks PKGs for the app's game and mod installers (the app runs it from the runtime).
 tools/android/build_pkg_tool.sh android

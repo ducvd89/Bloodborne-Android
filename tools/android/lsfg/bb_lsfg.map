@@ -1,6 +1,0 @@
-{
-  global:
-    bb_lsfg_*;
-  local:
-    *;
-};

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: Lossless Scaling frame generation for the Bionic build (BB_LSFG_MULTIPLIER 2-4).
 //
-// The frame generation itself is Bloodframe, libbloodframe.so (tools/android/lsfg, based on GameNative's lsfg-vk fork's
-// framegen backend; build_bloodframe.sh), loaded with dlopen the first time frame generation turns on. It
+// The frame generation itself is Bloodframe, libbloodframe.so (the ducvd89/bloodframe repository, based on GameNative's lsfg-vk
+// fork's framegen backend; tools/android/build_bloodframe.sh; its C API header is tools/android/lsfg/bb_lsfg.h), loaded with dlopen the first time frame generation turns on. It
 // runs on its own VkDevice of the same driver and physical device as the game's and exchanges images
 // with this device as AHardwareBuffers: this class owns the game's side of that hand-over.
 //
