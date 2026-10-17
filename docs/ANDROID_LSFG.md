@@ -35,7 +35,7 @@ Up to 0.9.5, on Adreno 8xx (Oppo Find N5, Adreno 830) about 10-40% of the genera
 
 With Bloodframe in 0.10.0 the ghosting is gone on the Find N5 (user report, 2026-10-17, with the defaults: 2x, performance mode, FP16 on). Turning FP16 **off** there (user report, 2026-10-17) brought the ghosting back: with FP16 on the shaders are Lossless Scaling's own SPIR-V from the dll, with it off 0.10.0 still ran our DXBC to SPIR-V translation, which the earlier passes (mipmaps, beta[4]: 1024-thread workgroups with shared memory) went through. So the translation was the cause, not the 0.10.0 presentation changes.
 
-The next version therefore runs the dll's own full-precision SPIR-V (N + 98) for FP32 too, and translates DXBC only as the last resort (section above). **Not yet tested on the Find N5**: whether FP32 with the dll's SPIR-V is clean there still needs a run with FP16 off, 2x, both models if possible.
+Bloodframe c290275 therefore runs the dll's own full-precision SPIR-V (N + 98) for FP32 too, and translates DXBC only as the last resort (section above). **Tested on the Find N5** (user report, 2026-10-17, 2x, performance mode, FP16 off; the log said `Bloodframe: shaders FP32 SPIR-V`): no ghosting. Both precisions are clean there now; only an old Lossless.dll without the SPIR-V sets would still go through the translation.
 
 ## How a frame goes (gpu/shadps4/video_core/renderer_vulkan/vk_lsfg.cpp, vk_presenter.cpp)
 
