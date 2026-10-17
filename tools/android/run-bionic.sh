@@ -288,16 +288,16 @@ dbg_prepare=on; dbg_drain=on; dbg_lock=on; dbg_stats=off; dbg_profile=off
 if [ "$(setting debug_fault_prepare)" = 0 ]; then export BB_FAULT_PREPARE=0; dbg_prepare=off; fi
 if [ "$(setting debug_fault_smart_drain)" = 0 ]; then export BB_FAULT_DRAIN=always; dbg_drain=off; fi
 if [ "$(setting debug_fault_sleep_lock)" = 0 ]; then export BB_FAULT_SPINLOCK=1; dbg_lock=off; fi
-# Free old GPU memory (FIFO, experimental; off by default; copy mode only: unified memory keeps its own memory):
-# BB_VRAM_COPY_QUEUE=1, with the cap (MB) of debug_vram_copy_cap_mb when it is a positive integer (else the native default, 1024).
+# Free old GPU memory (FIFO; on by default, debug_vram_copy_queue=0 turns it off; copy mode only: unified memory
+# keeps its own memory): BB_VRAM_COPY_QUEUE=1, with the cap (MB) of debug_vram_copy_cap_mb when it is a positive
+# integer, else 512 (tested on the AYN Thor: copies held ~480 MiB, 33-39 FPS in Central Yharnam).
 dbg_fifo=off
-if [ "$(setting debug_vram_copy_queue)" = 1 ]; then
-    export BB_VRAM_COPY_QUEUE=1; dbg_fifo=on
+if [ "$(setting debug_vram_copy_queue)" != 0 ]; then
     fifo_cap="$(setting debug_vram_copy_cap_mb)"
     case "$fifo_cap" in
-        ''|*[!0-9]*|0*) ;;
-        *) export BB_VRAM_COPY_CAP_MB="$fifo_cap"; dbg_fifo="on (cap $fifo_cap MB)" ;;
+        ''|*[!0-9]*|0*) fifo_cap=512 ;;
     esac
+    export BB_VRAM_COPY_QUEUE=1 BB_VRAM_COPY_CAP_MB="$fifo_cap"; dbg_fifo="on (cap $fifo_cap MB)"
 else
     unset BB_VRAM_COPY_QUEUE BB_VRAM_COPY_CAP_MB
 fi
