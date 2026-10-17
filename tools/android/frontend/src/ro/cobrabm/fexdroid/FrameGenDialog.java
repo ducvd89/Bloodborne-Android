@@ -57,7 +57,7 @@ final class FrameGenDialog {
     }
     /** FSR 3.1 frame generation is on at the next start (and, unless Lossless Scaling was on at start, now). */
     private static boolean fsrOn(String frameGeneration,String upscaler,String lsfg) {
-        return "1".equals(frameGeneration) && !"off".equals(upscaler) && (lsfg==null || !lsfg.matches("[234]"));
+        return "1".equals(frameGeneration) && !"off".equals(upscaler) && !"gsr2".equals(upscaler) && (lsfg==null || !lsfg.matches("[234]"));
     }
     private TextView note(LinearLayout box,String text,float alpha) {
         TextView t=new TextView(activity); t.setTextSize(13); t.setAlpha(alpha); t.setText(text);

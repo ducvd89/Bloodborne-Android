@@ -92,7 +92,7 @@ output=${output_w}x${output_h}
 echo "Display: aspect ratio $aspect_setting ($an:$ad), output $output (surface ${BB_SCREEN_W:-?}x${BB_SCREEN_H:-?}, display $display_setting)"
 # FSR 4 (INT8 models) is not offered: on the Adreno 740 it took ~3 min to compile in Turnip, then ran
 # at 2.4 FPS with a black scene. Any value but off means FSR 3.1.
-case $upscaler in off) ;; *) upscaler=fsr3 ;; esac
+case $upscaler in off|gsr2) ;; *) upscaler=fsr3 ;; esac
 echo "Upscaler setting: $upscaler"
 case $preset in 0|1|2|3|4) ;; *) preset=3 ;; esac
 # The scene size: the output / the preset's scale (1, 1.5, 1.7, 2, 3), each side rounded to even, as
