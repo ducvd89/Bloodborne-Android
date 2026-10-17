@@ -347,10 +347,18 @@ static void PrintMemory() {
     const u64 device = BbStats::device_alloc_bytes.load() - BbStats::device_free_bytes.load();
     u64 vma_blocks = 0, vma_used = 0;
     Vulkan::VmaDeviceUsage(vma_blocks, vma_used);
+    char fifo_text[160] = "";
+    if (BbStats::vram_copy_queue.load()) {
+        std::snprintf(fifo_text, sizeof(fifo_text),
+                      "; VRAM copy FIFO: %llu queued, %llu MiB of copies, %llu returned",
+                      (unsigned long long)BbStats::vram_copy_queue_length.load(),
+                      (unsigned long long)(BbStats::vram_copy_bytes.load() >> 20),
+                      (unsigned long long)BbStats::vram_copies_returned.load());
+    }
     std::printf("Memory: VRAM %llu MiB, GTT %llu MiB, RSS %llu MiB; Vulkan memory %llu MiB "
                 "allocated (VMA blocks %llu MiB, %llu MiB of them used); Vulkan images %llu MiB; "
                 "cached images %llu MiB in %llu; guest blocks in VRAM %llu MiB allocated, "
-                "%llu MiB of it unused (%llu MiB moved back idle, %llu MiB unmapped, %llu MiB freed; %llu chunks, %llu emptied, blocks kept: %llu GPU-written, %llu not direct memory); texture collector: usage %llu MiB, starts at %llu MiB, %llu images freed, %llu GPU-written kept\n",
+                "%llu MiB of it unused (%llu MiB moved back idle, %llu MiB unmapped, %llu MiB freed; %llu chunks, %llu emptied, blocks kept: %llu GPU-written, %llu not direct memory); texture collector: usage %llu MiB, starts at %llu MiB, %llu images freed, %llu GPU-written kept%s\n",
                 (unsigned long long)(vram_kib >> 10), (unsigned long long)(gtt_kib >> 10),
                 (unsigned long long)(rss >> 20), (unsigned long long)(device >> 20),
                 (unsigned long long)(vma_blocks >> 20), (unsigned long long)(vma_used >> 20),
@@ -369,7 +377,7 @@ static void PrintMemory() {
                 (unsigned long long)(BbStats::gc_used_bytes.load() >> 20),
                 (unsigned long long)(BbStats::gc_trigger_bytes.load() >> 20),
                 (unsigned long long)BbStats::gc_freed_images.exchange(0),
-                (unsigned long long)BbStats::gc_kept_images.exchange(0));
+                (unsigned long long)BbStats::gc_kept_images.exchange(0), fifo_text);
     // bbport: what holds the Vulkan memory that is not images (the texture collector's usage
     // counts all of it).
     std::printf("Vulkan buffers: %s\n", VideoCore::DescribeBufferKinds().c_str());

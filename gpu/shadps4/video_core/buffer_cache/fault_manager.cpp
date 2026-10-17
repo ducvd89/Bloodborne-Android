@@ -176,7 +176,11 @@ void FaultManager::ProcessFaultBuffer() {
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
                        "Buffer size is too large");
-            (void)buffer_cache.ObtainBuffer(start, end - start, false);
+            // bbport BB_VRAM_COPY_QUEUE: a copy returned by the FIFO is bound and uploaded again
+            // here whatever the size (a small read took the stream buffer and left the page
+            // table entry 0 for good); the block goes to the back of the queue.
+            (void)buffer_cache.ObtainBuffer(start, end - start, false, false,
+                                            buffer_cache.CopyQueueActive());
         });
         fault_areas[area] = 0;
     });

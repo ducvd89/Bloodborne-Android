@@ -134,9 +134,20 @@ public:
     bool force_writes_in_place = false;
 
     /// Finds a buffer for the specified region.
+    /// `force_resident`: a small read-only range does not take the stream buffer (a copy that
+    /// leaves no VRAM block behind) but gets its block bound and uploaded: the page-fault
+    /// re-fetch (FaultManager), whose block must have its page table entry written.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
-                                                             bool is_texel_buffer = false);
+                                                             bool is_texel_buffer = false,
+                                                             bool force_resident = false);
+
+    /// bbport BB_VRAM_COPY_QUEUE=1 (off by default, Debug options): the VRAM copies of the game's
+    /// memory (copy mode, the phones) are kept under a cap (BB_VRAM_COPY_CAP_MB, 1024) by returning
+    /// the oldest first (FIFO) that were not used for BB_VRAM_IDLE_SECONDS.
+    [[nodiscard]] static bool CopyQueueEnabled();
+    /// The FIFO is in use: switched on, copy mode (not GuestInPlace), arenas bound sparsely.
+    [[nodiscard]] bool CopyQueueActive() const;
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -368,17 +379,29 @@ private:
     /// Unbinds a VRAM block of memory the game unmapped, or an idle copy (`idle`): uploaded again
     /// if mapped and used. False when the block had no VRAM slot.
     bool EvictVramBlock(u64 block, bool idle = false);
-    /// bbport: copy mode (not GuestInPlace): returns the VRAM copies not bound for
-    /// BB_VRAM_IDLE_SECONDS, without GPU-written data.
-    void ReturnIdleCopies(u32 now);
+    /// bbport BB_VRAM_COPY_QUEUE: copy mode: over the cap, returns the oldest VRAM copies (the
+    /// front of copy_fifo) that were not bound for BB_VRAM_IDLE_SECONDS; the others (in use, GPU
+    /// data) go to the back of the queue.
+    void ReturnQueuedCopies(u32 now);
+    /// bbport BB_VRAM_COPY_QUEUE: blocks [first, end) were just bound to VRAM slots: the back of
+    /// the queue (each a new entry; an older entry of the same block becomes stale).
+    void QueueCopies(u64 first_block, u64 end_block);
+    /// bbport: the block still has its VRAM copy (a slot of a residency chunk).
+    [[nodiscard]] bool HasVramCopy(u64 block) const;
+    /// bbport: bytes of VRAM copies in the residency chunks.
+    [[nodiscard]] u64 CopyBytes() const;
+    [[nodiscard]] static u64 CopyCapBytes();
     /// bbport: copy mode: empties the emptiest residency chunk for the driver (its copies go).
     void CompactResidency(u32 now);
     /// bbport: EvictVramBlock(idle) for each, their BDA page table entries cleared; how many went.
     u64 ReturnCopies(std::span<const u64> blocks);
     /// bbport: the block's VRAM copy holds data only the GPU has (it cannot be uploaded again).
     bool CopyHasGpuData(u64 block);
-    /// bbport: a binding took the block's 2 MiB in the submission being recorded.
-    [[nodiscard]] bool BoundThisTick(u64 block) const;
+    /// bbport: a binding took the block's 2 MiB in the submission being recorded or the one
+    /// before (the draw pipe binds ahead of recording, possibly a submission earlier).
+    [[nodiscard]] bool BoundRecently(u64 block) const;
+    /// bbport: BoundRecently, or used in the last 2 s (CompactResidency).
+    [[nodiscard]] bool RecentCopy(u64 block, u32 now) const;
     /// bbport: chunks without blocks for 5 s go back to the driver.
     void FreeEmptyResidencyChunks(u32 now);
     [[nodiscard]] static u32 VramIdleSeconds();
@@ -634,8 +657,28 @@ private:
     u32 arena_memory_type_bits = 0; ///< memory types the arena's blocks can be bound to
     vk::DeviceMemory residency_memory{}; ///< bbport: the 64 MiB block arena residency comes from
     /// bbport: one block of memory every evicted block is bound to instead of being unbound
-    /// (EvictVramBlock); allocated the first time, never freed (as residency_memory).
+    /// (EvictVramBlock, BB_VRAM_COPY_QUEUE); allocated the first time, freed with the cache.
     vk::DeviceMemory evicted_memory{};
+    /// bbport BB_VRAM_COPY_QUEUE: the VRAM copies in the order they were made (bound to a slot).
+    /// An entry is live while copy_fifo_seq[block] == seq and the block still has its copy; an
+    /// entry left by a block that went by another path (unmap, compaction) or was bound again
+    /// (a newer entry) is dropped when the scan reaches it.
+    struct CopyEntry {
+        u64 block;
+        u32 seq;
+    };
+    std::deque<CopyEntry> copy_fifo;
+    std::vector<u32> copy_fifo_seq; ///< per block: seq of its live entry, 0 none
+    u32 copy_fifo_next = 0;
+    bool copy_fifo_draining = false;    ///< over the cap: returning down to the low-water mark
+    bool copy_fifo_logged = false;
+    u64 copy_fifo_scan_tick = ~0ULL;    ///< the submission ReturnQueuedCopies last looked in
+    u32 copy_budget_second = 0;         ///< the second copy_budget_blocks is for
+    u64 copy_budget_blocks = 0;         ///< blocks that may still be returned in that second
+    u64 dma_tick = ~0ULL;               ///< the submission that last recorded a pointer access
+    u32 copy_fifo_miss_second = 0;      ///< a walk found nothing idle in this second
+    u32 copy_fifo_over_log_second = 0;  ///< "over the cap, nothing idle" last logged
+    u64 copy_returned_total = 0;
     u64 residency_size = 0, residency_used = 0;
     std::future<vk::DeviceMemory> spare_residency; ///< the next block, allocated in the background
     /// bbport: VRAM blocks no longer needed. Per 2 MiB of guest addresses, the second
