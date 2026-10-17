@@ -1,4 +1,5 @@
-// bbport: C API over the framegen backend of GameNative's lsfg-vk fork (bb_lsfg.h).
+// Bloodframe: C API over the framegen backend of GameNative's lsfg-vk fork (bb_lsfg.h).
+// Bloodframe is based on lsfg-vk 1.0 by PancakeTAS (MIT) via GameNative's Android fork of it.
 //
 // This is the part of the fork's Vulkan layer (src/context.cpp) that does not need to be a layer: it
 // starts the framegen runtime (its own VkInstance/VkDevice, made through the game's vkGetInstanceProcAddr),

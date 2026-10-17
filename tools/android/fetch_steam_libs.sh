@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Libraries for the app's Steam sign-in, which downloads Lossless.dll from the player's own Lossless
 # Scaling (Steam app 993090) for Lossless Scaling frame generation (SteamDllDialog.java, Graphics
-# settings; frame generation itself is liblsfg-bb.so, build_lsfg_android.sh):
+# settings; frame generation itself is libbloodframe.so, build_bloodframe.sh):
 # JavaSteam (MIT, a Java port of SteamKit2) with its dependencies, xz and zstd-jni (Android build:
 # its arm64 library) to unpack depot chunks, Spongy Castle (Bouncy Castle licence: the crypto provider
 # JavaSteam uses on Android, as Android's own "BC" provider lacks AES/ECB) to decrypt manifests, and

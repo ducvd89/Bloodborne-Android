@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Lossless Scaling frame generation for the Bionic game process: liblsfg-bb.so, built from GameNative's
-# Android fork of lsfg-vk 1.0 (https://github.com/Ragnarok93/lsfg-vk-android, MIT, branch release) at a
-# pinned commit with lsfg-android-patches/*.patch applied. Not the fork's Vulkan layer: its framegen
-# backend (framegen/), the Lossless.dll shader extraction (src/extract/) and dxbc/pe-parse/volk are
-# linked into ONE shared library with the small C API of tools/android/lsfg/bb_lsfg.h; libbbgpu
-# dlopen()s it only when frame generation is on (gpu/shadps4/video_core/renderer_vulkan/vk_lsfg.cpp).
+# Bloodframe, this port's Lossless Scaling frame generation engine for the Bionic game process:
+# libbloodframe.so. It is based on lsfg-vk 1.0 by PancakeTAS (MIT) via GameNative's Android fork of it
+# (https://github.com/Ragnarok93/lsfg-vk-android, MIT, branch release), built at a pinned commit with
+# bloodframe-patches/*.patch applied. Not the fork's Vulkan layer: its framegen backend (framegen/), the
+# Lossless.dll shader extraction (src/extract/) and dxbc/pe-parse/volk are linked into ONE shared library
+# with the small C API of tools/android/lsfg/bb_lsfg.h; libbbgpu dlopen()s it only when frame generation
+# is on (gpu/shadps4/video_core/renderer_vulkan/vk_lsfg.cpp).
 # The patches make the framegen's own Vulkan instance come from the game's vkGetInstanceProcAddr (the
-# driver the process loaded itself, e.g. a Turnip zip) and the DLL path a call, not a folder search.
-# The fork's toml11 (config file) and its layer are not built.
+# driver the process loaded itself, e.g. a Turnip zip) and the DLL path a call, not a folder search. The
+# fork's toml11 (config file) and its layer are not built.
 # Lossless Scaling's shaders come from the player's own Lossless.dll at run time, never the APK.
-# Output: out/bionic/lib/liblsfg-bb.so and out/bionic/licenses/lsfg-*.LICENSE; build_bionic.sh runs
+# Output: out/bionic/lib/libbloodframe.so and out/bionic/licenses/bloodframe-*.LICENSE; build_bionic.sh runs
 # this, build_release_runtime.py packages both.
 # Prerequisite: tools/android/build_bionic_deps.sh (the NDK).
 set -euo pipefail
@@ -23,7 +24,7 @@ ndk=${BB_NDK:-$root/sdk/ndk/29.0.14206865}
 api=${BB_ANDROID_API:-30}
 llvm=$ndk/toolchains/llvm/prebuilt/linux-x86_64
 J=${BB_JOBS:-22}
-build=$PWD/out/bionic/lsfg-build
+build=$PWD/out/bionic/bloodframe-build
 out=$PWD/out/bionic
 run() { taskset -c 2-23 nice -n 19 "$@"; }
 [[ -f $ndk/build/cmake/android.toolchain.cmake ]] || { echo "No NDK: $ndk (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
@@ -42,7 +43,7 @@ git -C "$src" submodule update -q --init --recursive
 reset_source() { git -C "$src" checkout -q -- . && git -C "$src" clean -qfd; }
 reset_source
 trap reset_source EXIT
-for patch in tools/android/lsfg-android-patches/*.patch; do
+for patch in tools/android/bloodframe-patches/*.patch; do
     git -C "$src" apply --whitespace=nowarn "$PWD/$patch"
 done
 mkdir -p "$out/lib" "$out/licenses"
@@ -53,15 +54,15 @@ if [[ ! -f $build/build.ninja ]]; then
         -DANDROID_PLATFORM=android-$api -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
         > "$build.log" 2>&1 || { tail -30 "$build.log" >&2; rm -rf "$build"; exit 1; }
 fi
-run cmake --build "$build" -j "$J" --target lsfg-bb >> "$build.log" 2>&1 ||
+run cmake --build "$build" -j "$J" --target bloodframe >> "$build.log" 2>&1 ||
     { grep -E "error|FAILED" "$build.log" | tail -40 >&2; exit 1; }
-"$llvm/bin/llvm-strip" --strip-debug -o "$out/lib/liblsfg-bb.so" "$build/liblsfg-bb.so"
+"$llvm/bin/llvm-strip" --strip-debug -o "$out/lib/libbloodframe.so" "$build/libbloodframe.so"
 # The licences of what is linked in (the fork's toml11 is not).
-cp "$src/LICENSE.md" "$out/licenses/lsfg-vk-android.LICENSE.md"
-cp "$src/thirdparty/dxbc/LICENSE.md" "$out/licenses/lsfg-dxbc.LICENSE"
-cp "$src/thirdparty/pe-parse/LICENSE" "$out/licenses/lsfg-pe-parse.LICENSE"
-cp "$src/thirdparty/volk/LICENSE.md" "$out/licenses/lsfg-volk.LICENSE.md"
-printf 'lsfg-vk-android %s (%s) + tools/android/lsfg-android-patches\n' "$LSFG_COMMIT" "$LSFG_BRANCH" \
-    > "$out/licenses/lsfg-source.txt"
-exported=$("$llvm/bin/llvm-nm" -D --defined-only "$out/lib/liblsfg-bb.so" | awk '{print $3}' | grep -v '^_' | sort | tr '\n' ' ')
-echo "lsfg-vk-android ${LSFG_COMMIT:0:7} + patches: $out/lib/liblsfg-bb.so (exports: $exported)"
+cp "$src/LICENSE.md" "$out/licenses/bloodframe-lsfg-vk.LICENSE.md"
+cp "$src/thirdparty/dxbc/LICENSE.md" "$out/licenses/bloodframe-dxbc.LICENSE"
+cp "$src/thirdparty/pe-parse/LICENSE" "$out/licenses/bloodframe-pe-parse.LICENSE"
+cp "$src/thirdparty/volk/LICENSE.md" "$out/licenses/bloodframe-volk.LICENSE.md"
+printf 'Bloodframe: lsfg-vk 1.0 by PancakeTAS (MIT) via lsfg-vk-android %s (%s) + tools/android/bloodframe-patches\n' "$LSFG_COMMIT" "$LSFG_BRANCH" \
+    > "$out/licenses/bloodframe-source.txt"
+exported=$("$llvm/bin/llvm-nm" -D --defined-only "$out/lib/libbloodframe.so" | awk '{print $3}' | grep -v '^_' | sort | tr '\n' ' ')
+echo "Bloodframe (lsfg-vk-android ${LSFG_COMMIT:0:7} + patches): $out/lib/libbloodframe.so (exports: $exported)"

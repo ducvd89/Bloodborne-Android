@@ -1,6 +1,6 @@
 # Lossless Scaling frame generation on Android
 
-The game runs as a native Android (Bionic) process, so Lossless Scaling's frame generation is no longer a Vulkan layer: `liblsfg-bb.so` is the framegen backend of [GameNative's Android fork of lsfg-vk 1.0](https://github.com/Ragnarok93/lsfg-vk-android) (MIT; pinned commit, `tools/android/build_lsfg_android.sh`) behind a small C API (`tools/android/lsfg/bb_lsfg.h`). libbbgpu loads it with `dlopen` only when the multiplier is 2 or more. Lossless Scaling itself is not included: it needs your own copy (Steam, app 993090).
+The game runs as a native Android (Bionic) process, so Lossless Scaling's frame generation is no longer a Vulkan layer: this port's engine is **Bloodframe**, `libbloodframe.so`. Bloodframe is based on lsfg-vk 1.0 by PancakeTAS (MIT) via [GameNative's Android fork of it](https://github.com/Ragnarok93/lsfg-vk-android) (MIT; pinned commit, `tools/android/build_bloodframe.sh`; the fork's licence ships with the app as `bloodframe-lsfg-vk.LICENSE.md`) and has a small C API (`tools/android/lsfg/bb_lsfg.h`). libbbgpu loads it with `dlopen` only when the multiplier is 2 or more. Lossless Scaling itself is not included: it needs your own copy (Steam, app 993090).
 
 ## Using it
 
@@ -28,7 +28,7 @@ Generated frames only look right when each is shown for one refresh. With frame 
 
 The Frame generation menu writes `bbport/lsfg.state` (`multiplier=`, `flow=`, `performance=`; whole file, then a rename) next to `bbport.ini`; `run-bionic.sh` writes the same file at start from `bbport.ini` and names it in `BB_LSFG_STATE_FILE`. It is the one source of truth (`BB_LSFG_MULTIPLIER` and friends are only read when there is no state file, for harnesses). The presenter looks at it at most every 250 ms, between two frames, and applies a change there and then:
 
-- The framegen fixes its flow scale, model and generated-frame count when it starts, so every change of an on state is a new `Lsfg`: the old one waits for its last batch and the game device, destroys its context, buffers and runtime (`liblsfg-bb.so` stays loaded), the new one starts and makes its context with the next real frame (the first four frames only fill the history). Starting takes about as long as at launch (reading the shaders from Lossless.dll): the game pauses for that moment.
+- The framegen fixes its flow scale, model and generated-frame count when it starts, so every change of an on state is a new `Lsfg`: the old one waits for its last batch and the game device, destroys its context, buffers and runtime (`libbloodframe.so` stays loaded), the new one starts and makes its context with the next real frame (the first four frames only fill the history). Starting takes about as long as at launch (reading the shaders from Lossless.dll): the game pauses for that moment.
 - Off: the same teardown, then normal presents.
 - The swapchain buffers follow what runs (multiplier + 3, else 3) with a RESET and new BUFFERs, as for a resize.
 - The presentation mode is FIFO while frame generation runs or VSync is on. The game tells the app with a `BB_PRESENT_MODE` message (protocol version 3); the app, going FIFO → newest-wins, shows the newest queued frame and releases the older ones unseen with their acquire fences.
@@ -36,7 +36,7 @@ The Frame generation menu writes `bbport/lsfg.state` (`multiplier=`, `flow=`, `p
 
 The game's frame rate no longer depends on frame generation: hooks in the game's code (installed when it loads) give it each frame's real time at every FPS limit, 30 included, and the present thread limits the rate, so Lossless Scaling can be turned on and off live at any limit. With `BB_FRAME_HOOKS=0` (in `bionic-local.sh`) the old behaviour returns: at the 30 limit the delta-time patch loads only when frame generation is on at start.
 
-## What the fork's patches do (tools/android/lsfg-android-patches)
+## What the fork's patches do (tools/android/bloodframe-patches)
 
 - `0001`: the framegen's Vulkan instance comes from the entry point the game process gives (`volkInitializeCustom`), not volk's own loader (the process loads its driver directly: no Android loader, no layers).
 - `0002`: the shaders are read from the one Lossless.dll the host names, not from a search of Steam folders (that removes the fork's config-file dependency).

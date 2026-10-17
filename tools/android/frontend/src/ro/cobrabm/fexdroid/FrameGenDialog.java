@@ -21,7 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 
-/** Frame generation: Lossless Scaling (liblsfg-bb.so in the game process, on the player's own Lossless.dll).
+/** Frame generation: Lossless Scaling (libbloodframe.so in the game process, on the player's own Lossless.dll).
  *  Unlike the graphics settings it applies at once, while the game runs: Apply writes bbport.ini (the next
  *  start) and bbport/lsfg.state (run-bionic.sh writes it at start; libbbgpu follows it, see
  *  gpu/shim/bb_lsfg_state.h), then the display mode follows (MainActivity.pickRefreshRate). FSR 3.1 frame
@@ -129,7 +129,7 @@ final class FrameGenDialog {
         note(box,"Needs Lossless.dll from your own Lossless Scaling on Steam: sign in to download just that file, "
             +"or choose a copy. Shows 2-4 frames per game frame and raises the screen's refresh rate to the FPS limit times "
             +"that (every frame is shown for one refresh, as with VSync). Replaces FSR 3.1 frame generation. "
-            +"Performance mode is the lighter model.",0.7f);
+            +"Performance mode is the lighter model. The engine is Bloodframe, based on lsfg-vk 1.0 by PancakeTAS (MIT).",0.7f);
         note(box,"Changes apply at once while you play. At the 30 FPS limit, the smoother frame timing for Lossless "
             +"Scaling applies after the next start of the game; until then the game keeps its own timing.",0.7f);
 

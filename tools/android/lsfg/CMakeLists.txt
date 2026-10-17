@@ -1,9 +1,9 @@
-# liblsfg-bb.so: the Lossless Scaling frame generation of GameNative's lsfg-vk fork (framegen backend,
-# Lossless.dll shader extraction, DXBC -> SPIR-V) behind the small C API of bb_lsfg.h, for the Bionic
-# game process. Not the Vulkan layer: libbbgpu calls it directly (build_lsfg_android.sh).
+# libbloodframe.so (Bloodframe, based on lsfg-vk 1.0 by PancakeTAS, MIT, via GameNative's Android fork):
+# the Lossless Scaling frame generation of the fork (framegen backend, Lossless.dll shader extraction,
+# DXBC -> SPIR-V) behind the small C API of bb_lsfg.h, for the Bionic game process. Not the Vulkan layer: libbbgpu calls it directly (build_bloodframe.sh).
 # -DLSFG_SRC=<the fork's source tree, with our patches applied>
 cmake_minimum_required(VERSION 3.18)
-project(lsfg-bb LANGUAGES C CXX)
+project(bloodframe LANGUAGES C CXX)
 if(NOT LSFG_SRC OR NOT EXISTS "${LSFG_SRC}/framegen/CMakeLists.txt")
   message(FATAL_ERROR "LSFG_SRC is not the lsfg-vk-android source tree")
 endif()
@@ -28,19 +28,19 @@ add_subdirectory(${LSFG_SRC}/framegen framegen EXCLUDE_FROM_ALL)
 # bring it in.
 target_compile_options(lsfg-vk-framegen PRIVATE -include unistd.h)
 
-add_library(lsfg-bb SHARED
+add_library(bloodframe SHARED
   bb_lsfg.cpp
   ${LSFG_SRC}/src/extract/extract.cpp
   ${LSFG_SRC}/src/extract/trans.cpp)
-set_target_properties(lsfg-bb PROPERTIES
-  OUTPUT_NAME lsfg-bb
+set_target_properties(bloodframe PROPERTIES
+  OUTPUT_NAME bloodframe
   CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON)
-target_include_directories(lsfg-bb PRIVATE ${LSFG_SRC}/include)
+target_include_directories(bloodframe PRIVATE ${LSFG_SRC}/include)
 # nativewindow: AHardwareBuffer (not libandroid.so, which pulls in the framework); log: logcat.
-target_link_libraries(lsfg-bb PRIVATE lsfg-vk-framegen pe-parse dxbc volk nativewindow log)
+target_link_libraries(bloodframe PRIVATE lsfg-vk-framegen pe-parse dxbc volk nativewindow log)
 # Only the C API leaves the library; the static archives' symbols stay inside (volk's global
 # vkCreateInstance etc. must not interpose on anything).
-target_link_options(lsfg-bb PRIVATE
+target_link_options(bloodframe PRIVATE
   -Wl,--exclude-libs,ALL
   -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/bb_lsfg.map)

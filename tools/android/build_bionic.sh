@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bionic (Android NDK) build of the native game process, the Android app's only runtime: libbbcpu.so
-# (FEXCore), libbbgpu.so (GPU/HLE), liblsfg-bb.so (Lossless Scaling frame generation, build_lsfg_android.sh),
+# (FEXCore), libbbgpu.so (GPU/HLE), libbloodframe.so (Lossless Scaling frame generation, build_bloodframe.sh),
 # bb-probe (runtime executable), kgsl-chip-id, bb-prepare (game preparation) and ps4-pkg-tool (PKG
 # installs). Output: out/bionic/{bin,lib,licenses}; build_release_runtime.py packages them.
 # Prerequisite: tools/android/build_bionic_deps.sh (NDK + third-party libraries).
@@ -86,9 +86,9 @@ links=(-L"$out/lib" -lbbgpu -lbbcpu -Wl,-rpath,'$ORIGIN/../lib' -rdynamic -pie)
 "${cc[@]}" -std=c11 -O2 -Wall -Wextra -Werror tools/android/kgsl_chip_id.c -pie -o "$out/bin/kgsl-chip-id"
 # bb-prepare: the game-preparation step (port of prepare_game.py), no Python or rootfs on the device.
 tools/android/build_prepare.sh android
-# liblsfg-bb.so: Lossless Scaling frame generation (GameNative's lsfg-vk fork's framegen), which libbbgpu
+# libbloodframe.so: Lossless Scaling frame generation (GameNative's lsfg-vk fork's framegen), which libbbgpu
 # loads with dlopen only when it is on. Cloned at a pinned commit into .local-deps/android/src.
-tools/android/build_lsfg_android.sh
+tools/android/build_bloodframe.sh
 # ps4-pkg-tool: unpacks PKGs for the app's game and mod installers (the app runs it from the runtime).
 tools/android/build_pkg_tool.sh android
 echo "Built $out/bin/bb-probe, $out/lib/libbbgpu.so, $out/lib/libbbcpu.so (Bionic, API $api)"

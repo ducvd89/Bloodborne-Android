@@ -117,8 +117,8 @@ echo "Scene ${render:-1920x1080} for $output at preset $preset$([ "$big_scene" =
 export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
 [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
-# Lossless Scaling frame generation (lsfg_multiplier 2-4): libbbgpu loads liblsfg-bb.so (tools/android/lsfg:
-# the framegen of GameNative's lsfg-vk fork, on the game's own Vulkan driver) which reads its shaders from
+# Lossless Scaling frame generation (lsfg_multiplier 2-4): libbbgpu loads libbloodframe.so (tools/android/lsfg:
+# Bloodframe, the framegen of GameNative's lsfg-vk fork, on the game's own Vulkan driver) which reads its shaders from
 # the player's own Lossless.dll: bbport/Lossless.dll (the app's Steam sign-in or file picker), else the
 # Bloodborne folder of shared storage. It replaces FSR 3.1 frame generation. Generated frames only look
 # right when each is shown for one refresh: while it runs libbbgpu asks the app for its FIFO (VSync), and
@@ -155,8 +155,8 @@ if [ -n "$lsfg" ]; then
     if [ -z "$lsfg_dll" ]; then
         echo "Lossless Scaling frame generation: no Lossless.dll ($base/Lossless.dll or /storage/emulated/0/Bloodborne/Lossless.dll): off"
         lsfg=
-    elif [ ! -f "$bionic/lib/liblsfg-bb.so" ]; then
-        echo "Lossless Scaling frame generation: $bionic/lib/liblsfg-bb.so is missing: off"
+    elif [ ! -f "$bionic/lib/libbloodframe.so" ]; then
+        echo "Lossless Scaling frame generation: $bionic/lib/libbloodframe.so is missing: off"
         lsfg=
     else
         unset BB_FRAME_GEN

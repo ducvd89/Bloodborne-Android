@@ -174,7 +174,7 @@ bool Lsfg::Initialize() {
     if (dll.empty()) {
         return fail("no Lossless.dll: bbport/Lossless.dll or Bloodborne/Lossless.dll of shared storage");
     }
-    const std::string lib_path = EnvString("BB_LSFG_LIB").empty() ? "liblsfg-bb.so" : EnvString("BB_LSFG_LIB");
+    const std::string lib_path = EnvString("BB_LSFG_LIB").empty() ? "libbloodframe.so" : EnvString("BB_LSFG_LIB");
     api->library = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!api->library) {
         return fail(std::string{"cannot load "} + lib_path + ": " + dlerror());

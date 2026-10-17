@@ -584,7 +584,7 @@ public final class MainActivity extends Activity {
         status.setText("Starting Bloodborne…");
         if (changed && game!=null) restartGame(); else startPending();
     }
-    // ---- Lossless.dll for Lossless Scaling frame generation (liblsfg-bb.so reads its shaders) ----
+    // ---- Lossless.dll for Lossless Scaling frame generation (libbloodframe.so reads its shaders) ----
     /** The Lossless.dll run-bionic.sh uses: the app's own copy (bbport/, from Steam or the picker), else one
      *  in the Bloodborne folder of shared storage. Null when there is none. */
     private File losslessDll() {

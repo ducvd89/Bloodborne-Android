@@ -10,12 +10,13 @@ Mesa (MIT, https://gitlab.freedesktop.org/mesa/mesa; the Adreno 8xx variant from
 https://github.com/whitebelyash/mesa-unified, turnip/gen8, MIT), with this
 project's patches (tools/android/mesa-patches in the source).
 
-Lossless Scaling frame generation (bbport/bionic/lib/liblsfg-bb.so): the framegen
-backend and Lossless.dll shader extraction of GameNative's Android fork of lsfg-vk
-1.0, https://github.com/Ragnarok93/lsfg-vk-android (branch release, commit
+Lossless Scaling frame generation, Bloodframe (bbport/bionic/lib/libbloodframe.so):
+based on lsfg-vk 1.0 by PancakeTAS via GameNative's Android fork of it; the framegen
+backend and Lossless.dll shader extraction of that fork,
+https://github.com/Ragnarok93/lsfg-vk-android (branch release, commit
 0802cd33319c101e4c41f6828153d3331d8a3258; lsfg-vk by PancakeTAS), MIT License,
-Copyright (c) 2025 lsfg-vk (bbport/licenses/lsfg-vk-android.LICENSE.md), with this
-port's changes (tools/android/lsfg-android-patches). It includes dxbc from DXVK
+Copyright (c) 2025 lsfg-vk (bbport/licenses/bloodframe-lsfg-vk.LICENSE.md), with this
+port's changes (tools/android/bloodframe-patches, tools/android/lsfg). It includes dxbc from DXVK
 (zlib/libpng license; Copyright (c) 2017 Philip Rebohle, 2019 Joshua Ashton, 2019
 Robin Kertels, 2023 Jeffrey Ellison), pe-parse (MIT, Copyright (c) 2013 Andrew Ruef)
 and volk (MIT, Copyright (c) 2018-2025 Arseny Kapoulkine); the licenses are in

@@ -1,5 +1,6 @@
-// bbport: the C API of liblsfg-bb.so, Lossless Scaling frame generation for the Bionic game process
-// (tools/android/lsfg/bb_lsfg.cpp over GameNative's lsfg-vk fork, see build_lsfg_android.sh).
+// Bloodframe: the C API of libbloodframe.so, Lossless Scaling frame generation for the Bionic game process
+// (tools/android/lsfg/bb_lsfg.cpp over GameNative's lsfg-vk fork, see build_bloodframe.sh). Bloodframe is
+// based on lsfg-vk 1.0 by PancakeTAS (MIT) via GameNative's Android fork of it.
 //
 // libbbgpu dlopen()s the library only when frame generation is on (BB_LSFG_MULTIPLIER >= 2), so there
 // is no link-time dependency. The library makes its own VkInstance/VkDevice on the same physical

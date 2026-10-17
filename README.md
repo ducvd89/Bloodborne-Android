@@ -172,7 +172,7 @@ They are code hooks in the 1.09 executable (the same places as Shiningami's Gold
 
 ## Lossless Scaling frame generation
 
-In the menu's Frame generation page (it applies at once, no restart): 2×, 3× or 4× frames, flow scale and performance mode. It needs `Lossless.dll` from your own copy of Lossless Scaling (Steam): the same page signs in to Steam to download just that file, or copies one you choose. It replaces FSR 3.1 frame generation and raises the screen's refresh rate to the FPS limit times the multiplier. How it works, and what is and is not verified: [docs/ANDROID_LSFG.md](docs/ANDROID_LSFG.md).
+In the menu's Frame generation page (it applies at once, no restart): 2×, 3× or 4× frames, flow scale and performance mode. It needs `Lossless.dll` from your own copy of Lossless Scaling (Steam): the same page signs in to Steam to download just that file, or copies one you choose. It replaces FSR 3.1 frame generation and raises the screen's refresh rate to the FPS limit times the multiplier. The engine is Bloodframe. How it works, and what is and is not verified: [docs/ANDROID_LSFG.md](docs/ANDROID_LSFG.md).
 
 ## Build
 
@@ -180,7 +180,7 @@ In the menu's Frame generation page (it applies at once, no restart): 2×, 3× o
 git clone --recursive https://github.com/ducvd89/Bloodborne-Android.git
 cd Bloodborne-Android
 bash tools/android/build_bionic_deps.sh      # once: the NDK and the native libraries
-bash tools/android/build_bionic.sh           # the game process, bb-prepare, ps4-pkg-tool, liblsfg-bb.so
+bash tools/android/build_bionic.sh           # the game process, bb-prepare, ps4-pkg-tool, libbloodframe.so
 bash tools/android/build_release_apk.sh      # the runtime archive and the APK (fetches the bundled GPU drivers)
 ```
 
@@ -188,6 +188,6 @@ Build inputs (SDK, signing key, game icon) and the app's layout are in [docs/AND
 
 ## Credits
 
-[bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) (the PC port this project started from), [shadPS4](https://github.com/shadps4-emu/shadPS4), [ARM_bloodborne_pc](https://github.com/MaSieS4Fun/ARM_bloodborne_pc), [FEX](https://github.com/FEX-Emu/FEX), [fexdroid](https://github.com/cobrabm12/fexdroid), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), [mesa-unified turnip/gen8](https://github.com/whitebelyash/mesa-unified), [StevenMXZ's Turnip builds](https://github.com/StevenMXZ/Adreno-Tools-Drivers) (Turnip Gen8 V37), [panvk-kbase-android](https://github.com/JICA98/panvk-kbase-android) (PanVK for Mali, Bachata V3 series), [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) and [GameNative's Android fork of it](https://github.com/Ragnarok93/lsfg-vk-android) (Lossless Scaling frame generation), and [GoldHEN cheats](https://github.com/GoldHEN/GoldHEN_Cheat_Repository) (Shiningami).
+[bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) (the PC port this project started from), [shadPS4](https://github.com/shadps4-emu/shadPS4), [ARM_bloodborne_pc](https://github.com/MaSieS4Fun/ARM_bloodborne_pc), [FEX](https://github.com/FEX-Emu/FEX), [fexdroid](https://github.com/cobrabm12/fexdroid), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), [mesa-unified turnip/gen8](https://github.com/whitebelyash/mesa-unified), [StevenMXZ's Turnip builds](https://github.com/StevenMXZ/Adreno-Tools-Drivers) (Turnip Gen8 V37), [panvk-kbase-android](https://github.com/JICA98/panvk-kbase-android) (PanVK for Mali, Bachata V3 series), [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), Bloodframe, this port's Lossless Scaling frame generation engine, which is based on [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) 1.0 by PancakeTAS (MIT) via [GameNative's Android fork of it](https://github.com/Ragnarok93/lsfg-vk-android), and [GoldHEN cheats](https://github.com/GoldHEN/GoldHEN_Cheat_Repository) (Shiningami).
 
 Licensed under [GPL-2.0](LICENSE); third-party notices in [THIRD_PARTY_LICENSES.txt](tools/android/frontend/THIRD_PARTY_LICENSES.txt) (the APK's copy also covers the bundled GPU drivers: Mesa's MIT licence, and GPL-3.0 for StevenMXZ's build of Turnip Gen8 V37). Not affiliated with Sony Interactive Entertainment, FromSoftware, Valve or the developers of Lossless Scaling.
