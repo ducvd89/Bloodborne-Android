@@ -1,4 +1,4 @@
-<p align="center"><a href="https://www.paypal.com/donate/?business=ducvd89%40gmail.com&currency_code=USD"><img src="docs/donate/buy-me-a-claude-token.svg" alt="Buy me a Claude token" height="48"></a></p>
+<p align="center"><a href="https://paypal.me/Ducvd89"><img src="docs/donate/buy-me-a-claude-token.svg" alt="Buy me a Claude token" height="48"></a></p>
 
 <h1 align="center">Bloodborne-Android</h1>
 
