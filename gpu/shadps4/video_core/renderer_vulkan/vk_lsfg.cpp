@@ -61,7 +61,7 @@ struct Lsfg::Api {
     decltype(&bb_lsfg_wait) wait{};
     decltype(&bb_lsfg_destroy_context) destroy_context{};
     decltype(&bb_lsfg_shutdown) shutdown{};
-    decltype(&bb_lsfg_precision) precision{};
+    decltype(&bb_lsfg_shader_set) shader_set{};
     decltype(&bb_lsfg_diagnostics) diagnostics{};
     BbLsfgInfo info{};
     bool started{false};
@@ -193,7 +193,7 @@ bool Lsfg::Initialize() {
     if (!load(api->init, "bb_lsfg_init") || !load(api->create_context, "bb_lsfg_create_context") ||
         !load(api->present, "bb_lsfg_present") || !load(api->wait, "bb_lsfg_wait") ||
         !load(api->destroy_context, "bb_lsfg_destroy_context") ||
-        !load(api->shutdown, "bb_lsfg_shutdown") || !load(api->precision, "bb_lsfg_precision") ||
+        !load(api->shutdown, "bb_lsfg_shutdown") || !load(api->shader_set, "bb_lsfg_shader_set") ||
         !load(api->diagnostics, "bb_lsfg_diagnostics")) {
         return fail(lib_path + " lacks the bb_lsfg API");
     }
@@ -300,16 +300,28 @@ bool Lsfg::Initialize() {
 
 void Lsfg::LogPrecision() {
     char reason[256] = {};
-    const bool half = api->precision(reason, sizeof reason) != 0;
-    // Said when it starts and again if the first context changes it (a driver that rejects a
-    // half-precision shader makes the framegen fall back to full precision).
-    if (precision_logged == static_cast<int>(half) && reason_logged == reason) {
+    const int set = api->shader_set(reason, sizeof reason);
+    // Said when it starts and again if the first context changes it (a driver that rejects a set
+    // makes the framegen use the next one).
+    if (precision_logged == set && reason_logged == reason) {
         return;
     }
-    precision_logged = static_cast<int>(half);
+    precision_logged = set;
     reason_logged = reason;
-    fp16_active = half;
-    std::printf("Bloodframe: FP16 %s (%s)\n", half ? "on" : "off", reason);
+    switch (set) {
+    case BB_LSFG_SET_FP16_SPIRV:
+        shader_set_name = "FP16";
+        std::printf("Bloodframe: shaders FP16 SPIR-V (%s)\n", reason);
+        break;
+    case BB_LSFG_SET_FP32_SPIRV:
+        shader_set_name = "FP32";
+        std::printf("Bloodframe: shaders FP32 SPIR-V (%s)\n", reason);
+        break;
+    default:
+        shader_set_name = "FP32-DXBC";
+        std::printf("Bloodframe: shaders DXBC (translated) (%s)\n", reason);
+        break;
+    }
     std::fflush(stdout);
 }
 
@@ -745,7 +757,7 @@ int Lsfg::ProcessFrame(Scheduler& scheduler, vk::Image image, u32 width, u32 hei
     if (print_stats && window >= 5.0 && stats->real) {
         std::printf("LSFG: %.1f real + %.1f generated frames/s (x%u, %s); per real frame %.2f ms in the "
                     "copy and framegen call (%.2f ms of it the framegen call), %u CPU waits, %s%s\n",
-                    stats->real / window, stats->generated / window, multiplier, fp16_active ? "FP16" : "FP32",
+                    stats->real / window, stats->generated / window, multiplier, shader_set_name,
                     stats->process_ms / stats->real, stats->present_ms / stats->real, stats->host_waits,
                     chained ? "chained" : "fence waits",
                     stats->ring_waits ? (", " + std::to_string(stats->ring_waits) + " ring waits").c_str() : "");
