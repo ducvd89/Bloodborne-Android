@@ -220,7 +220,7 @@ public final class MainActivity extends Activity {
             new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).show();
         });
         // Lossless Scaling frame generation: applies at once, no restart (bbport/lsfg.state, which libbbgpu follows).
-        frameGenItem=menuItem("ic_layers","Frame generation","",() -> {
+        frameGenItem=menuItem("ic_layers","Bloodframe","",() -> {
             closeDrawer();
             SettingsDialog ini=new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame);
             new FrameGenDialog(this,ini,new File(BASE,"lsfg.state"),lossless,this::pickRefreshRate).show();

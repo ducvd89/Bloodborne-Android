@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Bloodframe, this port's Lossless Scaling frame generation engine for the Bionic game process:
-# libbloodframe.so. It lives in its own repository, https://github.com/ducvd89/bloodframe (PRIVATE for now:
-# git needs your GitHub credentials, e.g. `gh auth login` + `gh auth setup-git`; that repository carries
+# libbloodframe.so. It lives in its own repository, https://github.com/ducvd89/bloodframe (MIT; it carries
 # the history of GameNative's MIT lsfg-vk Android fork it is based on, lsfg-vk 1.0 by PancakeTAS), and is
 # built here at a pinned commit with that repository's build-android.sh. Not a Vulkan layer: a single shared
 # library with the small C API of bb_lsfg.h; libbbgpu dlopen()s it only when frame generation is on
@@ -9,8 +8,7 @@
 # Lossless Scaling's shaders come from the player's own Lossless.dll at run time, never the APK.
 # Output: out/bionic/lib/libbloodframe.so and out/bionic/licenses/bloodframe-*.LICENSE*, bloodframe-source.txt;
 # build_bionic.sh runs this, build_release_runtime.py packages them.
-# tools/android/lsfg/bb_lsfg.h is the game's copy of the C API header (libbbgpu is built before this runs
-# and without network access to the private repository); this script fails when it differs from the
+# tools/android/lsfg/bb_lsfg.h is the game's copy of the C API header (libbbgpu is built before this runs); this script fails when it differs from the
 # header of the pinned commit, so a pin bump must copy android/bb_lsfg.h over it.
 # Prerequisite: tools/android/build_bionic_deps.sh (the NDK).
 set -euo pipefail
@@ -28,7 +26,7 @@ build=$out/bloodframe-build
 if [[ ! -d $src/.git ]]; then
     mkdir -p "$root/src"
     git clone -q "$BLOODFRAME_REPO" "$src" ||
-        { echo "Cannot clone $BLOODFRAME_REPO (private repository: are your GitHub credentials set up?)" >&2; exit 1; }
+        { echo "Cannot clone $BLOODFRAME_REPO (network?)" >&2; exit 1; }
 fi
 git -C "$src" cat-file -e "$BLOODFRAME_COMMIT^{commit}" 2>/dev/null ||
     git -C "$src" fetch -q origin main

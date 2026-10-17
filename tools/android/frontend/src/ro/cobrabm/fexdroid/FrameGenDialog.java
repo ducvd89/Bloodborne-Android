@@ -67,8 +67,8 @@ final class FrameGenDialog {
     /** The drawer row's second line. */
     static String summary(String frameGeneration,String upscaler,String lsfg,boolean dllFound) {
         if (fsrOn(frameGeneration,upscaler,lsfg)) return "FSR 3.1 (Graphics settings)";
-        if (lsfg==null || !lsfg.matches("[234]")) return "Off";
-        return dllFound ? "Lossless Scaling "+lsfg+"×" : "Needs Lossless.dll";
+        if (lsfg==null || !lsfg.matches("[234]")) return "Frame generation off";
+        return dllFound ? "Frame generation "+lsfg+"×" : "Frame generation: needs Lossless.dll";
     }
 
     void show() {
@@ -81,6 +81,9 @@ final class FrameGenDialog {
             TextView warning=note(box,"FSR 3.1 frame generation is on (Graphics settings): turn it off to use Lossless Scaling",1f);
             warning.setTypeface(Typeface.DEFAULT,Typeface.BOLD); warning.setTextSize(14);
         }
+        note(box,"Bloodframe is this app's frame generation engine. It runs Lossless Scaling's frame generation "
+            +"(LSFG 3.1) with the shaders from your own Lossless.dll and adds generated frames between the game's own, "
+            +"for smoother motion. It adds a little input lag and works best when the game already runs at 30 FPS or more.",0.8f);
         TextView heading=new TextView(activity); heading.setText("Lossless Scaling"); heading.setTextSize(15);
         heading.setTypeface(Typeface.DEFAULT,Typeface.BOLD); heading.setPadding(0,dp(10),0,dp(4)); box.addView(heading);
 
@@ -107,13 +110,14 @@ final class FrameGenDialog {
         };
         flow.setOnSeekBarChangeListener(flowText); flowText.onProgressChanged(flow,flow.getProgress(),false);
         box.addView(flow);
-        final Switch performance=new Switch(activity); performance.setText("Performance mode"); performance.setTextSize(15);
+        final Switch performance=new Switch(activity); performance.setText("Performance mode (recommended)"); performance.setTextSize(15);
         performance.setChecked("1".equals(get(ini,"lsfg_performance","1"))); performance.setPadding(0,dp(6),0,dp(6));
         box.addView(performance);
-        final Switch half=new Switch(activity); half.setText("Half precision (FP16, faster)"); half.setTextSize(15);
+        final Switch half=new Switch(activity); half.setText("Half precision, FP16 (recommended)"); half.setTextSize(15);
         half.setChecked("1".equals(get(ini,"lsfg_fp16","1"))); half.setPadding(0,dp(6),0,dp(6));
         box.addView(half);
-        final TextView halfNote=note(box,"Faster on most phones. Falls back to full precision if the GPU or driver can't. "
+        final TextView halfNote=note(box,"Recommended: 2× with performance mode and FP16 on. "
+            +"FP16 is faster on most phones and falls back to full precision if the GPU or driver can't. "
             +"A change restarts frame generation for a moment, while you play.",0.7f);
         halfNote.setPadding(0,0,0,dp(4));
 
@@ -153,7 +157,7 @@ final class FrameGenDialog {
         }
 
         ScrollView scroll=new ScrollView(activity); scroll.addView(box);
-        AlertDialog.Builder dialog=new AlertDialog.Builder(activity).setTitle("Frame generation").setView(scroll);
+        AlertDialog.Builder dialog=new AlertDialog.Builder(activity).setTitle("Bloodframe").setView(scroll);
         if (fsr) {
             dialog.setPositiveButton("Close",null);
         } else {
