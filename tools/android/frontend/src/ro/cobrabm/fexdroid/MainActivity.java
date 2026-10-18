@@ -263,13 +263,16 @@ public final class MainActivity extends Activity {
             new DebugDialog(this,new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame),this::restartGame).show();
         });
 
-        // The version, pinned under the scrolling menu.
+        // The version and the credit, pinned under the scrolling menu.
         String version="";
         try { version=" "+getPackageManager().getPackageInfo(getPackageName(),0).versionName; }
         catch (Exception ignored) {}
         TextView about=text("Bloodborne for Android"+version,12,0xff8e9097);
-        about.setPadding(dp(24),dp(8),dp(14),dp(14));
+        about.setPadding(dp(24),dp(8),dp(14),0);
         drawer.addView(about,new LinearLayout.LayoutParams(-1,-2));
+        TextView credit=text("by ducvd89@gmail.com\ngithub.com/ducvd89/Bloodborne-Android",10,0xff6f7178);
+        credit.setPadding(dp(24),dp(2),dp(14),dp(14));
+        drawer.addView(credit,new LinearLayout.LayoutParams(-1,-2));
         screen.addView(drawer,frame(dp(320),-1,Gravity.LEFT));
         setContentView(screen);
     }
