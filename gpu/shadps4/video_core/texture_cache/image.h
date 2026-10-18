@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "bbport_uma.h"
 #include "common/enum.h"
 #include "common/incremental_id.h"
 #include "common/types.h"
@@ -165,6 +166,17 @@ public:
     /// bbport: scheduler tick of the last binding that lets the GPU write it (render or depth target,
     /// storage image); 0 never.
     u64 gpu_write_tick{};
+    /// bbport BB_UMA: the image was noted as GPU-written (NoteGpuWritten), once.
+    bool uma_gpu_noted = false;
+    /// bbport BB_UMA: the image is (or may now be) written by the GPU: what
+    /// TextureCache::OverlapsGpuImage says about its memory changes once, so the buffer cache's
+    /// in-place verdicts (UmaDirect's memo) are taken again. Call wherever a GPU write is noted.
+    void NoteGpuWritten() {
+        if (!uma_gpu_noted) {
+            uma_gpu_noted = true;
+            BbUma::NoteVerdictChange();
+        }
+    }
     ImageId depth_id{};
     u64 depth_uid{};
     u64 image_uid{};

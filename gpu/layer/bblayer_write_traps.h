@@ -16,6 +16,9 @@ namespace BbLayer::WriteTraps {
 enum Reason : unsigned {
     Mirror = 1, ///< a VRAM copy of the page (the layer's memory module)
     Image = 2,  ///< an image made from the page (the texture cache)
+    /// bbport BB_UMA: a one-shot trap on memory bound in place through a shared granule's buffer;
+    /// the first CPU write marks its 64 KiB block dynamic (copies) and lifts it (BbUma::Dynamic).
+    UmaWatch = 4,
     /// Reads too: occlusion counters, until the game's first access after an event there
     /// (BB_OCCLUSION_READ_TRACE, diagnostics).
     QueryReads = 16,

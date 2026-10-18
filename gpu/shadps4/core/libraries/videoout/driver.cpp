@@ -441,9 +441,12 @@ static void PrintMemorySplit() {
         }
         std::printf("UMA: granule %llu KiB, shared %llu granules (%llu MiB), promotions %llu "
                     "(requests %llu, failed %llu), refused: exec %llu busy %llu class %llu image %llu "
-                    "size %llu backoff %llu, freeze faults %llu, io waits %llu, promote %.1f ms total / %.1f ms "
-                    "max, in-place bound %llu MiB, uma image writes %llu, verify %llu checked / %llu "
-                    "mismatches\n",
+                    "size %llu backoff %llu written %llu cross-granule %llu mapping %llu gpu-data %llu "
+                    "dynamic %llu, dynamic blocks %llu (verify %llu; armed %llu, trap faults %llu, "
+                    "announced writes %llu), "
+                    "freeze faults %llu, io waits %llu, promote %.1f ms total / %.1f ms max, granule "
+                    "buffer bindings %llu (%llu MiB; verdict memo %llu hits / %llu misses), uma image "
+                    "writes %llu, verify %llu checked / %llu mismatches\n",
                     (unsigned long long)(runtime.granule_bytes >> 10),
                     (unsigned long long)runtime.shared_granules,
                     (unsigned long long)(runtime.shared_bytes >> 20),
@@ -454,9 +457,22 @@ static void PrintMemorySplit() {
                     class_refusals, (unsigned long long)uma.refused_image.load(),
                     (unsigned long long)uma.refused_size.load(),
                     (unsigned long long)uma.refused_backoff.load(),
+                    (unsigned long long)uma.refused_written.load(),
+                    (unsigned long long)uma.refused_cross.load(),
+                    (unsigned long long)uma.refused_mapping.load(),
+                    (unsigned long long)uma.refused_gpu_data.load(),
+                    (unsigned long long)uma.refused_dynamic.load(),
+                    (unsigned long long)uma.dynamic_blocks.load(),
+                    (unsigned long long)uma.dynamic_verify.load(),
+                    (unsigned long long)uma.watch_armed.load(),
+                    (unsigned long long)uma.watch_faults.load(),
+                    (unsigned long long)uma.watch_notes.load(),
                     (unsigned long long)runtime.freeze_faults, (unsigned long long)runtime.io_waits,
                     runtime.promote_ns_total / 1e6, runtime.promote_ns_max / 1e6,
-                    (unsigned long long)(BbStats::bound_in_place_bytes.load() >> 20),
+                    (unsigned long long)uma.direct_bindings.load(),
+                    (unsigned long long)(uma.direct_bytes.load() >> 20),
+                    (unsigned long long)uma.memo_hits.load(),
+                    (unsigned long long)uma.memo_misses.load(),
                     (unsigned long long)uma.image_writes.load(),
                     (unsigned long long)uma.verify_checked.load(),
                     (unsigned long long)uma.verify_mismatches.load());

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "bbport_guest_memory.h"
 #include "bbport_toggles.h"
 #include <algorithm>
 #include <bit>
@@ -42,11 +41,9 @@ u64 RoundAllocationSize(u64 size) {
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_} {
     const char* env = std::getenv("BB_STAGING_KEEP_MB");
-    // bbport BB_UMA: buffers no longer go through staging (only texture uploads and copies do), so
-    // 128 MiB per ring instead of 512. The pool is made before the buffer cache decides whether UMA
-    // can run: asked for is enough.
-    const u64 default_keep_mb = BbGuestMemory::UmaRequested() ? 128 : 512;
-    keep_blocks = (env ? std::strtoull(env, nullptr, 10) : default_keep_mb) * 1_MB / BLOCK_SIZE;
+    // bbport BB_UMA: as copy mode (512 MiB per ring): the buffers that are not shared still go
+    // through staging (BB_STAGING_KEEP_MB to change it).
+    keep_blocks = (env ? std::strtoull(env, nullptr, 10) : 512) * 1_MB / BLOCK_SIZE;
     Ring& ring = rings[u32(MemoryType::HostUncached)];
     for (u64 i = 0; i < PREWARM_BLOCKS; ++i) {
         auto& block = ring.blocks.emplace_back(Block{

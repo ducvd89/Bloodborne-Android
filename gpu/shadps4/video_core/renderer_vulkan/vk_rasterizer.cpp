@@ -3569,6 +3569,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 }
             }
             image.usage.storage |= is_storage;
+            if (is_storage) {
+                image.NoteGpuWritten(); // bbport BB_UMA
+            }
             image.usage.texture |= !is_storage;
             if (FrameCapture::Active()) {
                 FrameCapture::Sampled(image.info, is_storage);
@@ -3998,6 +4001,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             attachment.image_layout = target.layout;
         }
         image->usage.render_target = 1u;
+        image->NoteGpuWritten(); // bbport BB_UMA
         if (cb == 0 && upscaler->Enabled()) {
             color_redirected = upscaler->RedirectColor(image_id, desc.view_info, redirect);
             if (color_redirected) {
@@ -4072,6 +4076,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             attachment.image_layout = target.layout;
         }
         image.usage.depth_target = true;
+        image.NoteGpuWritten(); // bbport BB_UMA
         if (upscaler->Enabled()) {
             VulkanUpscalerTarget depth_redirect;
             depth_redirected = upscaler->RedirectDepth(image_id, depth_redirect);
@@ -4252,6 +4257,9 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         // (a fill on the CPU now would land before earlier draws read the old data). Elsewhere
         // (VRAM copies, unbound memory: shader code, descriptors this thread reads) on the CPU in
         // decode order, as before; the VRAM copy follows through write tracking.
+        // bbport BB_UMA: over a shared granule (draws recorded before may read it live through the
+        // granule's buffer) the GPU fills the arena's copy in stream order; the range is then
+        // GPU-modified (copy mode's tracking) until the CPU's next access brings it back.
         if (!buffer_cache.IsAnyInPlace(address, num_bytes) &&
             !buffer_cache.IsRegionGpuModified(address, num_bytes) &&
             !VideoCore::BufferCache::LayerMirrored(address, num_bytes)) {
@@ -4311,10 +4319,10 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         if (src_gds) {
             return {gds_buffer, src};
         }
-        // bbport BB_UMA: a DMA source in shared memory is a CPU snapshot taken now, as the copy of
-        // copy mode was, not a GPU read of memory the game may rewrite before the copy runs. Not
-        // when GPU data or an image is there (the buffer cache brings those up to date in place).
-        if (BbGuestMemory::Uma() && buffer_cache.IsAnyInPlace(src, num_bytes) &&
+        // bbport BB_UMA: a DMA source in a shared granule (IsAnyInPlace) is a CPU snapshot taken
+        // now, as the copy of copy mode was, without arena residency for it. Not when GPU data or
+        // an image is there: copy mode's path (the arena's copy, brought up to date there).
+        if (VideoCore::UmaActive() && buffer_cache.IsAnyInPlace(src, num_bytes) &&
             !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             return buffer_cache.ObtainSnapshot(src, num_bytes);
@@ -4359,6 +4367,11 @@ bool Rasterizer::InvalidateMemoryUndrained(VAddr addr, u64 size, bool assume_loc
 }
 
 void Rasterizer::NoteAssetWrite(VAddr addr, u64 size) {
+    // bbport BB_UMA: file reads and loaders (before the data lands too): blocks bound in place
+    // there are dynamic from now on, their write traps lifted before the kernel's copy.
+    if (VideoCore::UmaActive()) {
+        page_manager.UmaNoteWrite(addr, size);
+    }
     buffer_cache.NoteAssetWrite(addr, size);
     InvalidateAfterWrite(addr, size);
 }
@@ -4392,6 +4405,11 @@ void Rasterizer::NoteCommandWrite(VAddr addr, const void* data, u64 size, bool r
 }
 
 void Rasterizer::OnCpuWrite(VAddr addr, u64 size) {
+    // bbport BB_UMA: a libc copy about to land on pages with write traps
+    // (runtime_memory_prepare_cpu_write): UmaWatch traps go first, the block becomes dynamic.
+    if (VideoCore::UmaActive()) {
+        page_manager.UmaNoteWrite(addr, size);
+    }
     BbStats::cpu_write_notes.fetch_add(1, std::memory_order_relaxed);
     BbStats::cpu_write_note_bytes.fetch_add(size, std::memory_order_relaxed);
     if (IsMapped(addr, size)) {
@@ -4652,6 +4670,8 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    // bbport BB_UMA: a new mapping starts without traps (the runtime forgot them): without marks.
+    BbUma::Dynamic::Forget(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -4664,6 +4684,7 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    BbUma::Dynamic::Forget(addr, size); // bbport BB_UMA: the traps go with the mapping
     buffer_cache.NotePreuploadMapping(addr, size, false);
     buffer_cache.UnmapInPlace(addr, size);
     buffer_cache.DropTwins(addr, size);

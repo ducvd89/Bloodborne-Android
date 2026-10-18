@@ -737,7 +737,7 @@ UmaRuntimeStats UmaRuntime() {
 
 namespace {
 // The granule table: one Chunk per shared granule, found by phys / granule in O(1) (v1's chunks were
-// a sorted array of at most 256), read without a lock (BindInPlace asks for every block): two
+// a sorted array of at most 256), read without a lock (UmaDirect asks for every binding): two
 // levels of atomic pointers, a leaf of 1024 granules made at its first use.
 constexpr std::size_t UmaLeafBits = 10, UmaLeafSize = std::size_t{1} << UmaLeafBits;
 constexpr std::size_t UmaTopSize = std::size_t{1} << 12; // 4 Mi granules: 1 TiB of 256 KiB ones
@@ -1244,7 +1244,8 @@ std::atomic<bool> uma_decided{false};
 
 /// The memory types the buffer cache's sparse arena takes (Buffer::Create: sparse binding and
 /// residency, the dma-buf handle type, the arena's uses), asked without creating a buffer. The shared
-/// granules are bound into it, so they must be of such a type.
+/// granules were bound into it at first; they no longer are (never sparse-bound), but their memory
+/// type is still picked among these (the type the device runs were made with).
 std::uint32_t ArenaSparseTypeBits() {
     const vk::ExternalMemoryBufferCreateInfo external{
         .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
@@ -1277,7 +1278,17 @@ bool UmaUsable(const Vulkan::Instance& instance) {
     }
     uma_mode = true; // DmaBufWorks picks UMA's memory types while probing
     mode = Mode::DmaBuf;
-    BbUma::KgslDiagnostic(); // log only: what KGSL does with imported dma-heap buffers
+    // Debugging switches (bisecting a device hang): BB_UMA_SKIP_KGSL=1, BB_UMA_SPARSE_PROBE=1 (the
+    // sparse probe, log only), BB_UMA_PROBES_ONLY=1 (every probe runs, then copies all the same).
+    const auto env_on = [](const char* name) {
+        const char* env = std::getenv(name);
+        return env && env[0] == '1';
+    };
+    if (env_on("BB_UMA_SKIP_KGSL")) {
+        std::printf("UMA KGSL: skipped (BB_UMA_SKIP_KGSL=1)\n");
+    } else {
+        BbUma::KgslDiagnostic(); // log only: what KGSL does with imported dma-heap buffers
+    }
     std::string failure;     // the first probe that failed
 
     // The arena must take the dma-buf memory and VRAM (Buffer::Create: else it turns the in-place model off).
@@ -1329,14 +1340,21 @@ bool UmaUsable(const Vulkan::Instance& instance) {
             }
         }
     }
-    // 3. A sparse buffer bound to dma-buf memory, on a throwaway device.
-    if (dma_ok) {
+    // 3. A sparse buffer bound to dma-buf memory, on a throwaway device: no longer needed. Shared
+    // granules are bound through their own ordinary buffers, never sparse-bound into the arena (on
+    // the AYN Thor, KGSL, sparse-binding granule memory into the real arena hard-reset the phone
+    // although this probe passed). BB_UMA_SPARSE_PROBE=1 still runs it, for the log only
+    // (BB_UMA_SKIP_SPARSE_PROBE=1 is accepted and changes nothing now).
+    if (dma_ok && env_on("BB_UMA_SPARSE_PROBE") && !env_on("BB_UMA_SKIP_SPARSE_PROBE")) {
         std::string detail;
         const bool sparse = BbUma::ProbeSparseDmaBuf(instance, detail);
-        UmaProbeLine("sparse binding of dma-buf memory (separate device)", sparse, detail);
-        if (!sparse && failure.empty()) {
-            failure = "binding dma-buf memory into a sparse buffer failed (" + detail + ")";
-        }
+        UmaProbeLine("sparse binding of dma-buf memory (separate device, log only)", sparse, detail);
+    } else if (dma_ok) {
+        std::printf("UMA probe: sparse binding of dma-buf memory: not used: shared memory is never "
+                    "sparse-bound\n");
+    }
+    if (failure.empty() && env_on("BB_UMA_PROBES_ONLY")) {
+        failure = "BB_UMA_PROBES_ONLY=1 (the probes ran; nothing is shared)";
     }
     if (!failure.empty()) {
         uma_mode = false;
@@ -1448,7 +1466,9 @@ void LogMemoryTypes(const Vulkan::Instance& instance) {
 namespace {
 /// BB_UMA=1: hands the runtime the granule allocator. Without it direct memory stays in the memfd.
 void InstallUma(const Vulkan::Instance& instance) {
-    if (!VideoCore::GuestInPlace() || VideoCore::NonSparseArenas()) {
+    // UmaActive: the buffer cache kept UMA's arena (the generic in-place model, GuestInPlace(), is
+    // off under BB_UMA: copy mode except for shared granules).
+    if (!VideoCore::UmaActive() || VideoCore::NonSparseArenas()) {
         // The buffer cache turned the in-place model off (BB_GUEST_IN_PLACE is not 1, no sparse
         // buffers, or a start-up probe failed: the lines above say which).
         if (!uma_decided.exchange(true)) {

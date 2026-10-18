@@ -57,12 +57,13 @@ module. In game: static world missing or black, lighting gone, textures glitched
    (beyond rounding to a granule).
 3. **Copies stay CPU snapshots at record time.** Only in-place buffer bindings read live memory. Texture
    uploads, arena uploads and DMA sources never GPU-copy out of shared memory.
-4. **Copy mode's GPU addressing.** The GPU reaches shared pages through the same sparse arena copy mode
-   uses (the PC "arena in place" path); descriptors and offsets do not change. No layer memory module.
+4. **Copy mode's GPU addressing, plus one buffer per shared granule.** Everything that is not shared
+   goes through copy mode's sparse arena unchanged. A shared granule is reached through its own ordinary
+   VkBuffer, never sparse-bound into the arena (see GPU view). No layer memory module.
 5. **The GPU never writes emulator-made data into shared memory** (re-tiled images, HTile fills): blocks
    those land on stay copies.
-6. **Proven before used.** Coherence and sparse binding of shared memory are checked at start; any
-   failure means copy mode with one log line naming why.
+6. **Proven before used.** Coherence of shared memory is checked at start; any failure means copy mode
+   with one log line naming why.
 7. **Per class, observable.** Buffer classes are enabled one at a time; a verify mode reports data that
    changed while the GPU used it.
 
@@ -71,11 +72,12 @@ module. In game: static world missing or black, lighting gone, textures glitched
 ```
  guest VA (FEX)      0x10_0000_0000..  direct mappings (aliases allowed) ──┐
  backing view        backing_base + phys (runtime's own view) ─────────────┤ same pages
- GPU                 arena (sparse, VA-indexed, 64 KiB blocks) ────────────┘ for SHARED granules
+ GPU                 the granule's own VkBuffer (one per granule) ─────────┘ for SHARED granules
 
  physical pool [0, 5056 MiB), in granules of BB_UMA_GRANULE_KB (2 MiB):
    CPU     memfd range, lazily committed       GPU: VRAM copy + staging upload (copy mode)
-   SHARED  dma-buf granule, CPU-cached         GPU: arena blocks bound to it, no copy
+   SHARED  dma-buf granule, CPU-cached         GPU: its buffer for read-only bindings in it, no copy;
+                                               anything else: copy mode (arena copy, upload)
  flexible memory [5056 MiB, +1 GiB)  always CPU
 ```
 
@@ -92,8 +94,8 @@ module. In game: static world missing or black, lighting gone, textures glitched
 
 ### Promotion (CPU → SHARED)
 
-Requested by the GPU side when a buffer binding of an enabled class needs arena residency on a CPU
-granule (`BindInPlace`). Under the runtime's write lock:
+Requested by the GPU side when a read-only buffer binding of an enabled class lies in one CPU granule
+(`UmaDirect`). Under the runtime's write lock:
 
 1. Allocate the granule (GPU library callback) and map it once at a scratch address.
 2. **Freeze writers:** every guest alias of the granule becomes read-only (trap reason `Promote`). A game
@@ -105,7 +107,7 @@ granule (`BindInPlace`). Under the runtime's write lock:
 4. `mmap(MAP_FIXED)` the granule over the backing view and every guest alias, with each alias's current
    protection (traps re-applied).
 5. Punch the memfd range (the RAM moves, it does not double).
-6. Unfreeze; hand the granule to the GPU side, which binds the arena blocks.
+6. Unfreeze; hand the granule to the GPU side, which binds the granule's buffer.
 
 Never promoted: granules holding executable mappings, flexible memory, granules the GPU library cannot
 allocate (they stay CPU, the binding takes a copy).
@@ -116,19 +118,106 @@ then released shared memory is cleared, not freed (as today's chunks).
 
 ### GPU view
 
-- `EnsureResident` → `BindInPlace` (already there for the PC path) binds arena blocks to chunk memory
-  when the block is in one direct mapping, block-aligned in physical memory and its granule is SHARED.
-  v2 adds: a CPU granule is promoted first if the binding's class is enabled; otherwise the block gets
-  a VRAM copy as in copy mode.
-- A block's first residency decides its backing. A block already copied stays a copy (the copy FIFO
-  returns it later); a shared block stays shared.
-- `GarlicInVram()` is false on phones: no VRAM mirrors of shared blocks.
-- The copy FIFO (`BB_VRAM_COPY_QUEUE`) stays active for the blocks that are still copies (today it is
-  off whenever `GuestInPlace()`).
+**Granule buffers, bound directly (2026-10-18).** The first design bound arena blocks to shared
+granules in place (`EnsureResident` → `BindInPlace`, the PC path). Device run 4 on the AYN Thor (Adreno
+740, KGSL, Turnip Gen8 V37, `BB_UMA_CLASSES=index`, verify 64): 8 granules were promoted, and right
+after "5 MiB of the arena bound in place" the **whole phone hard-reset** (no tombstone, no kernel
+message). Sparse-binding dma-buf granule memory into the real arena (a 4 GiB sparse buffer, a KGSL VBO,
+concurrent sharing, device addresses) kills the kernel, although the start-up probe (8 MiB exclusive
+sparse buffer on a throwaway device) had passed. v1 bound the same kind of exported dma-buf memory
+through ordinary (non-sparse) VkBuffers and never reset the phone. So: **shared memory is never
+sparse-bound on KGSL** (nor anywhere under `BB_UMA`).
+
+Now (`BufferCache::UmaDirect`, called by `ObtainBuffer` before copy mode's stream/arena paths):
+
+- A binding is bound through its granule's own buffer (an ordinary VkBuffer over the granule's
+  dma-buf memory, made once per granule, `GuestChunkSource`), at offset `phys - granule phys`, when
+  all of this holds:
+  - its class is enabled (`BbUma::ClassAllowed`);
+  - it is read-only (a written binding takes a copy, logged once: GPU writes into shared memory would
+    diverge from copy mode's tracking of the arena's copy);
+  - it is larger than the stream threshold (16 KiB) and not `force_resident` (DMA operands, fault
+    refetches): smaller reads stay in the stream buffer / constant ring as in copy mode;
+  - it lies in **one** direct mapping and **one** granule (`phys` granule-aligned down);
+  - it is not GPU-modified in copy mode's tracking (pages or `gpu_modified_ranges`): the arena's copy
+    holds newer GPU data until the CPU's access brings it back (`DownloadMemory`);
+  - it overlaps no GPU-written image (render/depth/storage target), and a texel binding no image or
+    metadata at all (those are synced from the image on copy mode's path);
+  - its granule is shared, or promotion succeeds (`runtime_memory_promote`; a refused granule is not
+    asked again for 5 s).
+- No arena residency, no upload and no page protection for it. Everything else takes copy mode's
+  arena path unchanged; its upload reads shared pages through the guest VA as a CPU snapshot, which is
+  fine. A range may be read live through the granule's buffer and also have an arena copy: the copy
+  keeps being refreshed by copy mode's write tracking, and as written bindings always take the copy,
+  the copy can hold newer GPU data only while the range is GPU-modified, which sends reads to the copy.
+- Consequence: **bindings crossing a 2 MiB granule boundary take copies**, and so does every index or
+  vertex range larger than a granule. `BB_UMA_GRANULE_KB` larger (4096, 8192, ...) shares more such
+  bindings at the cost of commit rounding (a promoted granule commits all of its pages).
+- The arena is exactly copy mode's: no external-memory flag, `in_place_blocks` stays empty,
+  `IsInPlace()` is false, unmaps change nothing in it. `IsAnyInPlace()` answers "touches a shared
+  granule" (`runtime_memory_granule_shared`): DMA fills and copies into shared memory are done by the
+  GPU in stream order (into the arena's copy, then GPU-modified: earlier draws reading the granule live
+  see the old bytes, later ones the copy), DMA sources there are CPU snapshots (`ObtainSnapshot`).
+- `GarlicInVram()` is false on phones; the copy FIFO (`BB_VRAM_COPY_QUEUE`) works as in copy mode.
+- Counters (the `UMA:` line): granule buffer bindings and MiB, refusals by class, written, cross-granule,
+  mapping, GPU data, image, backoff.
+
+### Dynamic blocks: one-shot write traps (2026-10-18)
+
+Runs 5 (`index`) and 6 (`index,vertex`) with granule buffers were stable (28-30 FPS, no reset); verify
+found one per-frame vertex buffer rewritten while the GPU used it. So a binding bound in place arms a
+one-shot write trap (`BbLayer::WriteTraps::UmaWatch` = 4, read-only) on its 64 KiB guest blocks
+(`PageManager::UmaArm`, blocks not armed or dynamic yet). The first CPU write there, as a fault
+(`GuestFaultSignalHandler`) or announced by the runtime (libc copies through
+`runtime_memory_prepare_cpu_write` → `Rasterizer::OnCpuWrite`, file reads and loaders through
+`NoteAssetWrite`), marks the block **dynamic** (`BbUma::Dynamic`, lock-free bitmaps by guest VA) and
+lifts the trap; a verify mismatch marks its blocks too. `UmaDirect` refuses ranges touching dynamic
+blocks (copies; `dynamic` in the `UMA:` line). A block stays dynamic until its mapping changes (map and
+unmap hooks forget both marks; the runtime forgets the traps then, and keeps them across promotions
+and the game's mprotect).
+
+The page manager (copy mode's write tracking) protects the same pages with the runtime's other
+mprotect, which ignores the traps (the last change wins). Hence: pages it denies reads are not armed
+(they get the trap when it lets them go); when it lets an armed page go it keeps it read-only for the
+trap (`UmaProtect`); the trap is lifted only where it does not restrict the page itself, elsewhere when
+it lets the page go; a fault on a page both protect goes on to its own handler.
+
+### Verdict memo (2026-10-18)
+
+Run 7 (`index,vertex`, 8 MiB granules, dynamic traps) was stable but the GPU thread went from ~30-35
+to ~54 us a draw. `UmaDirect` now keeps the last verdict per range in a per-thread table (1024
+entries, no lock): a direct binding (granule buffer + offset) stays valid while the runtime's mapping
+table generation and `BbUma::verdict_epoch` are unchanged; mapping, cross-granule and dynamic refusals
+while the generation is. The epoch moves when a block becomes dynamic or forgets its marks, when the
+copy path is about to mark GPU data over an armed block (the only place copy mode marks pages
+GPU-modified), and the first time each image becomes GPU-written (`Image::NoteGpuWritten`, at every
+site that sets `GpuModified`, `render_target`, `depth_target` or `storage`). GPU-data, image and
+backoff refusals and texel buffers are evaluated every time. `UmaArm` reads the armed bit before any
+atomic write or lock. The `UMA:` line shows memo hits / misses.
+
+### Copy mode everywhere else (2026-10-18)
+
+The first device run (`BB_UMA_CLASSES=none`, nothing shared) used 2.3 GB of VRAM copies against
+copy mode's 0.5 GB and crashed the driver: `BB_GUEST_IN_PLACE=1` had switched on the PC in-place model
+(`GuestInPlace()`: GPU-ordered WRITE_DATA/labels/timestamps/GDS stores, image downloads into the arena,
+the copy shader translated, game hooks, unmaps evicting copies, ...) for memory that is not shared.
+Now, under `BB_UMA`:
+
+- `GuestInPlace()` is **false** (guest_in_place state 3): every site of the generic in-place model,
+  `ConstantsInPlace()` included, behaves as `BB_GUEST_IN_PLACE=0`. `WriteTracking()` is on.
+- `UmaActive()` (state 3) is asked only by the probes, `ObtainBuffer` (`UmaDirect`, see GPU view) and
+  `IsAnyInPlace` (shared granules). (The arena-in-place variant of this fix, with `ArenaInPlace()`,
+  `UmaInPlaceWritten` and the spare-block unmaps, is gone with the move to granule buffers.)
+- WRITE_DATA, labels and image downloads stay CPU writes at copy mode's moment; into a shared granule
+  they land in the memory the GPU reads, so no upload is needed. The cost: GPU work recorded earlier but
+  run later sees the new value (the ordering hazard below; verify mode reports it).
+- The ProbesOnly / failed-probe paths turn UMA off in the buffer cache's constructor, before the
+  first binding exists: copy mode throughout.
 
 ### Classes
 
-The rasterizer tags each buffer binding before `ObtainBuffer`; only enabled classes may promote:
+The rasterizer tags each buffer binding before `ObtainBuffer`; only enabled classes may promote, and
+only their read-only bindings use shared memory (written ones take copies for now):
 
 | Class | Bindings | Hazard | Default |
 |---|---|---|---|
@@ -140,7 +229,8 @@ The rasterizer tags each buffer binding before `ObtainBuffer`; only enabled clas
 | `indirect` | indirect draw/dispatch arguments | low | off |
 
 Always copies: texture upload sources, DMA sources, arena uploads (`BB_CHUNK_UPLOADS` off), blocks
-written by `SynchronizeMemoryFromImage`, bindings of 16 KiB and less (stream buffer, constant ring).
+written by `SynchronizeMemoryFromImage`, bindings of 16 KiB and less (stream buffer, constant ring),
+written bindings, bindings crossing a granule or a direct mapping, GPU-modified ranges.
 
 ### Coherence
 
@@ -153,9 +243,9 @@ Checked once at start, before any granule is shared:
    CPU write → GPU read (whole buffer, and a single 64-byte line written right before the submit);
    GPU write → CPU read with the lines pre-loaded into the CPU caches; from two threads on different
    cores.
-3. **Sparse binding of shared memory**, on a separate throwaway VkDevice (a KGSL refusal must not lose
-   the game's device): bind an exported dma-buf into a sparse buffer at a 64 KiB offset, GPU write
-   through the sparse buffer / CPU read through the mmap, and the other way round.
+3. ~~Sparse binding of shared memory~~ on a throwaway VkDevice: **not used** (shared memory is never
+   sparse-bound; it passed on the Thor while the real arena hard-reset the phone). The code stays;
+   `BB_UMA_SPARSE_PROBE=1` runs it for the log only.
 
 Any failure → copy mode. If (1) shows the kernel does not make Turnip's imports coherent but accepts
 `IOCOHERENT`, the fix is a small patch to our Turnip build (import with the memory type's cache flags);
@@ -181,8 +271,8 @@ guest address, size and frame. This replaces guessing which binding causes a gli
   residency, staging, verify mismatches.
 - The texture collector's usage counts every Vulkan allocation: shared granule bytes are subtracted
   (v1 left the collector permanently "under pressure").
-- Staging keep (`BB_STAGING_KEEP_MB`) drops to 128 MiB per ring under `BB_UMA` (buffers no longer go
-  through staging; texture uploads still do).
+- Staging keep (`BB_STAGING_KEEP_MB`) stays at copy mode's 512 MiB per ring (the buffers that are not
+  shared still go through staging).
 
 ## Switches
 
@@ -190,7 +280,7 @@ guest address, size and frame. This replaces guessing which binding causes a gli
 |---|---|---|
 | `BB_UMA=1` | unified memory v2 (run-bionic.sh adds `BB_GUEST_IN_PLACE=1 BB_LAYER_MEMORY=0 BB_WRITE_TRACKING=1 BB_CHUNK_UPLOADS=0`) | off |
 | `BB_UMA_CLASSES` | comma list of classes, or `all` | `index,vertex` |
-| `BB_UMA_GRANULE_KB` | granule size, 64 KiB multiple, 256..65536 | 2048 |
+| `BB_UMA_GRANULE_KB` | granule size, power of two, 256..65536 (larger: fewer bindings cross a granule, more commit rounding) | 2048 |
 | `BB_UMA_VERIFY` | verify one in N in-place bindings (0: off) | 0 |
 | `BB_UMA_ALLOW_NONCOHERENT=1` | debugging only: share even if the coherence probe fails | off |
 | `BB_UMA_ORDER=1` | phase 3: game writes wait for in-flight GPU reads of shared blocks | off |
@@ -201,7 +291,7 @@ option.
 ## Phases
 
 1. **Setup (this change):** design, runtime granules and promotion, probes and diagnostics, class
-   policy, arena binding of shared granules, accounting, verify mode, switch. Builds; untested on a
+   policy, binding of shared granules (now through granule buffers, see GPU view), accounting, verify mode, switch. Builds; untested on a
    device.
 2. **Bring-up on the Thor:** read the probe and KGSL lines; `BB_UMA_CLASSES=index`, then `index,vertex`,
    with `BB_UMA_VERIFY=64`. Checkpoint: title and Yharnam render as copy mode, no verify mismatches,
@@ -221,8 +311,10 @@ option.
   syscall buffer; logged if seen.
 - **Swap:** shared granules are dma-buf pages, which zram cannot compress when the game is in the
   background.
-- **KGSL limits:** binding imported dma-bufs into sparse buffers (VBOs) is unverified (probe 3);
+- **KGSL limits:** sparse binding of imported dma-bufs hard-resets the Thor (run 4): never done.
+  One ordinary VkBuffer per shared granule (512 per GiB) is what v1 did without trouble;
   `KGSL_PROP_GPU_VA64_SIZE` unknown.
+- **Granule boundaries:** bindings crossing a granule (and all ranges larger than one) take copies.
 
 ## Other waste (not unified memory)
 
@@ -235,8 +327,8 @@ option.
 - `src/runtime_memory.c`: granules, promotion, freeze, map_phys, zero_phys; `src/probe.c` fault chain;
   `src/runtime_file.c` read guard.
 - `gpu/shim/bbport_guest_memory.cpp`: UMA mode, probes, granule allocator, chunk index.
-- `gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp`: `BindInPlace`, `ObtainBufferForImage`,
-  `CopyQueueActive`, `SynchronizeMemoryFromImage`.
+- `gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp`: `UmaDirect`, `UmaAnyShared`,
+  `GuestChunkSource`, `ObtainBufferForImage`, `SynchronizeMemoryFromImage`.
 - `gpu/shadps4/video_core/renderer_vulkan/vk_rasterizer.cpp`: binding classes.
 - `gpu/shadps4/video_core/texture_cache/texture_cache.cpp`: collector usage.
 - `gpu/shadps4/core/libraries/videoout/driver.cpp`: memory split line.

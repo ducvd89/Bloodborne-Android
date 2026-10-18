@@ -236,7 +236,9 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
     } else {
         buffer_ci.flags |=
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
-        // Bound to exported guest memory chunks (BB_GUEST_IN_PLACE) as well as VRAM blocks.
+        // Bound to exported guest memory chunks (BB_GUEST_IN_PLACE) as well as VRAM blocks. Not
+        // under BB_UMA: its shared granules are never bound into the arena (sparse binding of
+        // dma-buf memory hard-reset the phone on KGSL); the arena is copy mode's.
         const vk::ExternalMemoryBufferCreateInfo external{
             .handleTypes = BbGuestMemory::HandleType(),
         };
@@ -301,15 +303,20 @@ Buffer::Buffer(const Vulkan::Instance& instance, u64 size_bytes_, vk::DeviceMemo
     };
     // bbport BB_LAYER_MEMORY: what the GPU binds for the game's memory in place (no arena):
     // vertex, index and indirect data and device addresses too (the memory has them).
+    // bbport BB_UMA: a shared granule bound directly (BufferCache::UmaDirect): vertex, index and
+    // indirect data as well, no device addresses (granule memory is allocated without them; the
+    // granule's own buffer, AllocGranule, has the same uses).
     const bool layer = BbGuestMemory::LayerMemory();
     vk::BufferUsageFlags usage =
         vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eUniformBuffer |
         vk::BufferUsageFlagBits::eUniformTexelBuffer | vk::BufferUsageFlagBits::eStorageTexelBuffer;
-    if (layer) {
+    if (layer || BbGuestMemory::Uma()) {
         usage |= vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eIndexBuffer |
-                 vk::BufferUsageFlagBits::eIndirectBuffer |
-                 vk::BufferUsageFlagBits::eShaderDeviceAddress;
+                 vk::BufferUsageFlagBits::eIndirectBuffer;
+    }
+    if (layer) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
     }
     const vk::BufferCreateInfo buffer_ci = {
         .pNext = &external,

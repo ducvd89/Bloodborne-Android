@@ -71,8 +71,9 @@ const Chunk* Find(std::uint64_t phys);
 // ---- BB_UMA=1: unified memory v2 (docs/ANDROID_UNIFIED_MEMORY_PLAN.md) ----
 /// The game's buffers live in shared granules: the runtime (src/runtime_memory.c) keeps direct memory
 /// in granules, CPU (memfd) or SHARED (a dma-buf made here, AllocGranule); the buffer cache asks it to
-/// promote the granules a buffer binding of an enabled class (bbport_uma.h) needs, then binds the
-/// arena's blocks to them in place. Everything is behind BB_UMA=1; unset, nothing here runs.
+/// promote the granule a read-only buffer binding of an enabled class (bbport_uma.h) lies in, then
+/// binds that granule's own buffer (never the sparse arena). Everything is behind BB_UMA=1; unset,
+/// nothing here runs.
 
 /// BB_UMA=1 in the environment.
 bool UmaRequested();

@@ -4,6 +4,7 @@
 #include <boost/container/small_vector.hpp>
 #include "bbport_toggles.h"
 #include "bbport_fault.h"
+#include "bbport_uma.h"
 #include "bblayer_write_traps.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -305,8 +306,12 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
     inline static Vulkan::Rasterizer* rasterizer;
 
-    Impl() = default;
+    Impl() {
+        self = this;
+    }
     virtual ~Impl() = default;
+    /// bbport BB_UMA: the one instance, for the fault handler (static).
+    inline static Impl* self = nullptr;
 
     virtual void OnMap(VAddr address, size_t size) {
         // No-op
@@ -327,7 +332,148 @@ struct PageManager::Impl {
             runtime_memory_set_page_protected(address, size,
                                               !True(perms & Core::MemoryPermission::Write));
         }
+        // bbport BB_UMA: the runtime's mprotect for this manager ignores the write traps (the last
+        // change wins): pages of armed blocks it lets go stay read-only for UmaWatch.
+        if (True(perms & Core::MemoryPermission::Write) && VideoCore::UmaActive() &&
+            BbUma::Dynamic::AnyWatched(address, size)) {
+            UmaProtect(address, size, perms);
+            return;
+        }
         Protect(address, size, perms);
+    }
+
+    /// bbport BB_UMA: Protect for pages this manager lets go (`perms` allows writes) in watched
+    /// blocks: armed blocks (not dynamic) keep the UmaWatch trap (read-only, the trap set where it
+    /// was not: pages that were denied reads when armed); in dynamic ones it is lifted first.
+    void UmaProtect(VAddr address, size_t size, Core::MemoryPermission perms) {
+        using BbLayer::WriteTraps::Reason;
+        const auto flush = [&](VAddr from, VAddr to, bool keep) {
+            if (from >= to) {
+                return;
+            }
+            if (keep) {
+                Protect(from, to - from, perms & ~Core::MemoryPermission::Write);
+                BbLayer::WriteTraps::Set(from, to - from, BbLayer::WriteTraps::UmaWatch, true);
+                return;
+            }
+            bool trapped = false;
+            for (VAddr p = from; p < to && !trapped; p += PM_PAGE_SIZE) {
+                trapped = BbLayer::WriteTraps::Reasons(p) & BbLayer::WriteTraps::UmaWatch;
+            }
+            if (trapped) {
+                BbLayer::WriteTraps::Set(from, to - from, BbLayer::WriteTraps::UmaWatch, false);
+            }
+            Protect(from, to - from, perms);
+        };
+        const VAddr end = address + size;
+        VAddr run = address;
+        int run_keep = -1;
+        for (VAddr p = address; p < end; p += PM_PAGE_SIZE) {
+            const u64 block = p >> BbUma::Dynamic::BlockShift;
+            const int keep =
+                BbUma::Dynamic::Armed(block) && !BbUma::Dynamic::IsDynamic(block) ? 1 : 0;
+            if (run_keep >= 0 && keep != run_keep) {
+                flush(run, p, run_keep == 1);
+                run = p;
+            }
+            run_keep = keep;
+        }
+        flush(run, end, run_keep == 1);
+    }
+
+    /// The pages of the 64 KiB block `block`, under their locks: `f(first_page, end_page)`.
+    template <typename F>
+    void WithBlockPages(u64 block, F&& f) {
+        const size_t page = (block << BbUma::Dynamic::BlockShift) >> PM_PAGE_BITS;
+        const size_t page_end =
+            std::min<size_t>(page + (BbUma::Dynamic::BlockBytes >> PM_PAGE_BITS), NUM_ADDRESS_PAGES);
+        if (page >= page_end) {
+            return;
+        }
+        const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
+        const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
+        Common::RangeLockGuard lk(lock_start, lock_end);
+        f(page, page_end);
+    }
+
+    /// Calls `f(from, to)` for the runs of pages in [page, page_end) where `pick(page)` holds.
+    template <typename Pick, typename F>
+    static void ForEachPageRun(size_t page, size_t page_end, Pick&& pick, F&& f) {
+        size_t run = 0, run_pages = 0;
+        for (size_t p = page; p < page_end; ++p) {
+            if (pick(p)) {
+                if (run_pages == 0) {
+                    run = p;
+                }
+                ++run_pages;
+                continue;
+            }
+            if (run_pages != 0) {
+                f(VAddr(run) << PM_PAGE_BITS, VAddr(run + run_pages) << PM_PAGE_BITS);
+                run_pages = 0;
+            }
+        }
+        if (run_pages != 0) {
+            f(VAddr(run) << PM_PAGE_BITS, VAddr(run + run_pages) << PM_PAGE_BITS);
+        }
+    }
+
+    void UmaArm(VAddr addr, u64 size) {
+        if (size == 0) {
+            return;
+        }
+        const u64 first = addr >> BbUma::Dynamic::BlockShift;
+        const u64 last = (addr + size - 1) >> BbUma::Dynamic::BlockShift;
+        for (u64 block = first; block <= last; ++block) {
+            // Lock-free reads first: nearly every call finds its blocks armed already.
+            if (BbUma::Dynamic::Armed(block) || BbUma::Dynamic::IsDynamic(block) ||
+                !BbUma::Dynamic::TryArm(block)) {
+                continue; // armed already, or dynamic
+            }
+            BbUma::counters.watch_armed.fetch_add(1, std::memory_order_relaxed);
+            WithBlockPages(block, [&](size_t page, size_t page_end) {
+                // Pages denied reads (readbacks) would become readable under a read-only trap.
+                ForEachPageRun(
+                    page, page_end, [&](size_t p) { return cached_pages[p].num_read_watchers == 0; },
+                    [](VAddr from, VAddr to) {
+                        BbLayer::WriteTraps::Set(from, to - from, BbLayer::WriteTraps::UmaWatch,
+                                                 true);
+                    });
+            });
+        }
+    }
+
+    void UmaNoteWrite(VAddr addr, u64 size, bool fault) {
+        if (size == 0 || !BbUma::Dynamic::AnyWatched(addr, size)) {
+            return;
+        }
+        (fault ? BbUma::counters.watch_faults : BbUma::counters.watch_notes)
+            .fetch_add(1, std::memory_order_relaxed);
+        const u64 first = addr >> BbUma::Dynamic::BlockShift;
+        const u64 last = (addr + size - 1) >> BbUma::Dynamic::BlockShift;
+        for (u64 block = first; block <= last; ++block) {
+            if (!BbUma::Dynamic::Armed(block) && !BbUma::Dynamic::IsDynamic(block)) {
+                continue;
+            }
+            BbUma::Dynamic::Mark(block);
+            WithBlockPages(block, [&](size_t page, size_t page_end) {
+                // Lifted where this manager does not restrict the page: the game's protection comes
+                // back. Pages it restricts keep the trap's bit until it lets them go (UmaProtect),
+                // else the lift would drop its protection with ours.
+                ForEachPageRun(
+                    page, page_end,
+                    [&](size_t p) {
+                        return cached_pages[p].num_write_watchers == 0 &&
+                               cached_pages[p].num_read_watchers == 0 &&
+                               (BbLayer::WriteTraps::Reasons(VAddr(p) << PM_PAGE_BITS) &
+                                BbLayer::WriteTraps::UmaWatch);
+                    },
+                    [](VAddr from, VAddr to) {
+                        BbLayer::WriteTraps::Set(from, to - from, BbLayer::WriteTraps::UmaWatch,
+                                                 false);
+                    });
+            });
+        }
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
@@ -348,6 +494,26 @@ struct PageManager::Impl {
                 Common::IsWriteError(context), is_gpu_thread);
         }
         if (Common::IsWriteError(context)) {
+            // bbport BB_UMA: memory bound in place through a shared granule's buffer, written by the
+            // CPU: its block is dynamic from now on (copies) and the one-shot trap goes. Where this
+            // manager protects the page too, its own handling below lets the page go (and lifts the
+            // trap's bit with it, UmaProtect); else the write runs again now.
+            if (VideoCore::UmaActive() &&
+                (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::UmaWatch)) {
+                const VAddr page_addr = addr & ~VAddr(PM_PAGE_SIZE - 1);
+                self->UmaNoteWrite(page_addr, PM_PAGE_SIZE, true);
+                if (!(BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::UmaWatch)) {
+                    return true;
+                }
+                // A bit without marks (the mapping changed under it) and nothing of this
+                // manager's there: only ours, lifted, or the write would fault forever.
+                const auto& state = self->cached_pages[page_addr >> PM_PAGE_BITS];
+                if (state.num_write_watchers == 0 && state.num_read_watchers == 0) {
+                    BbLayer::WriteTraps::Set(page_addr, PM_PAGE_SIZE, BbLayer::WriteTraps::UmaWatch,
+                                             false);
+                    return true;
+                }
+            }
             if (ImageTraps() &&
                 !(BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::Image)) {
                 // Not an image's trap: another owner's being lifted by another thread, or one
@@ -777,6 +943,14 @@ void PageManager::OnGpuMap(VAddr address, size_t size) {
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
+}
+
+void PageManager::UmaArm(VAddr addr, u64 size) const {
+    impl->UmaArm(addr, size);
+}
+
+void PageManager::UmaNoteWrite(VAddr addr, u64 size) const {
+    impl->UmaNoteWrite(addr, size, false);
 }
 
 template <bool track>

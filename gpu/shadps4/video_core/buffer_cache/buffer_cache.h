@@ -150,8 +150,8 @@ public:
     /// memory (copy mode, the phones) are kept under a cap (BB_VRAM_COPY_CAP_MB, 1024) by returning
     /// the oldest first (FIFO) that were not used for BB_VRAM_IDLE_SECONDS.
     [[nodiscard]] static bool CopyQueueEnabled();
-    /// The FIFO is in use: switched on, copy mode (not GuestInPlace) or the copy part of BB_UMA (its
-    /// VRAM copies; shared blocks are never queued or returned), arenas bound sparsely.
+    /// The FIFO is in use: switched on, copy mode (not GuestInPlace; BB_UMA is copy mode: its VRAM
+    /// copies, shared blocks are never queued or returned), arenas bound sparsely.
     [[nodiscard]] bool CopyQueueActive() const;
 
     /// Attempts to obtain a buffer without modifying the cache contents.
@@ -265,9 +265,18 @@ public:
         if (LayerActive() && size != 0) {
             return !IsInVramLayer(addr, size); // bbport BB_LAYER_MEMORY: not all in one mirror
         }
+        // bbport BB_UMA: nothing is bound in place in the arena; "in place" is a granule shared
+        // with the GPU (bindings may read it live through the granule's buffer, UmaDirect): DMA
+        // fills and copies into it go to the GPU in stream order, its sources are CPU snapshots.
+        if (UmaActive()) {
+            return UmaAnyShared(addr, size);
+        }
         return GuestInPlace() && size != 0 &&
                in_place_blocks.Overlaps(addr >> block_shift, ((addr + size - 1) >> block_shift) + 1);
     }
+    /// bbport BB_UMA: whether [addr, addr + size) touches direct memory in a granule shared with
+    /// the GPU (runtime_memory_granule_shared).
+    [[nodiscard]] static bool UmaAnyShared(VAddr addr, u64 size);
     /// bbport BB_LAYER_MEMORY: [addr, addr + size) whole in one VRAM mirror.
     [[nodiscard]] bool IsInVramLayer(VAddr addr, u64 size) const;
 
@@ -306,12 +315,13 @@ private:
     };
     void BindInPlace(u64 start, u64 end, std::vector<ResidentBind>& out, IntervalList<>& rest,
                      bool any_type = false);
-    /// bbport BB_UMA: the block at `address` (direct memory `phys`, its mapping ends at `mapping_end`)
-    /// lies in a copy granule: when the binding's class (BbUma::Current) may, the granules under the
-    /// blocks [block, end_block) of the mapping are shared with the GPU (runtime_memory_promote) and
-    /// the chunk of `phys` is returned; null when it stays a copy (the block gets VRAM).
-    const BbGuestMemory::Chunk* UmaPromote(u64 block, u64 end_block, VAddr address, u64 phys,
-                                           uintptr_t mapping_end);
+    /// bbport BB_UMA: a read-only binding of an enabled class (BbUma::Current) lying in one direct
+    /// mapping and one granule, without GPU data or a GPU-written image there, is bound through the
+    /// granule's own buffer (the granule is shared first, runtime_memory_promote): no arena
+    /// residency, upload or page protection. nullopt: copy mode's path (the arena). Shared memory
+    /// is never sparse-bound (KGSL hard-reset the phone on it).
+    std::optional<std::pair<const Buffer*, u64>> UmaDirect(VAddr device_addr, u32 size,
+                                                           bool is_written, bool is_texel_buffer);
     /// bbport BB_UMA: where the Buffer wrapper of a shared granule is kept (GuestChunkSource).
     std::unique_ptr<Buffer>& ChunkBufferFor(const BbGuestMemory::Chunk* chunk);
     /// bbport: one block of memory blocks are bound to instead of being unbound (allocated the first
@@ -527,6 +537,8 @@ private:
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
     std::unique_ptr<MemoryTracker> memory_tracker;
+    /// bbport BB_UMA: arms the write traps of bindings in place (UmaDirect, PageManager::UmaArm).
+    PageManager& page_manager;
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;

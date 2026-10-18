@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport BB_UMA=1: unified memory v2 (docs/ANDROID_UNIFIED_MEMORY_PLAN.md). The game's buffers live in
-// shared (dma-buf) granules the GPU binds in place; textures and every copy stay CPU snapshots.
+// shared (dma-buf) granules the GPU reads in place through each granule's own buffer (never
+// sparse-bound); textures and every copy stay CPU snapshots.
 // This header holds what the buffer cache and the rasterizer share: the binding classes that may move
 // memory into shared granules, the counters, the verify mode and the start-up probes. The granule
 // allocator and the mode switch itself are in bbport_guest_memory.h (BbGuestMemory::Uma()).
@@ -63,12 +64,35 @@ struct Counters {
     std::atomic<std::uint64_t> refused_size{0};      ///< binding over BB_UMA_MAX_PROMOTE_MB
     std::atomic<std::uint64_t> refused_backoff{0};   ///< granule failed a moment ago, not asked again
     std::array<std::atomic<std::uint64_t>, ClassCount> refused_class{}; ///< class off, or None
-    std::atomic<std::uint64_t> image_writes{0};      ///< images re-tiled into shared blocks
+    std::atomic<std::uint64_t> refused_written{0};   ///< written binding (not shared yet): a copy
+    std::atomic<std::uint64_t> refused_cross{0};     ///< binding crosses a granule: a copy
+    std::atomic<std::uint64_t> refused_mapping{0};   ///< not in one direct memory mapping: a copy
+    std::atomic<std::uint64_t> refused_gpu_data{0};  ///< GPU data in the arena's copy: the copy
+    std::atomic<std::uint64_t> refused_dynamic{0};   ///< touches a block the CPU rewrites: a copy
+    std::atomic<std::uint64_t> watch_armed{0};       ///< 64 KiB blocks given the UmaWatch trap
+    std::atomic<std::uint64_t> watch_faults{0};      ///< write faults on that trap
+    std::atomic<std::uint64_t> watch_notes{0};       ///< announced writes (libc, file reads) there
+    std::atomic<std::uint64_t> dynamic_blocks{0};    ///< blocks marked dynamic (any cause)
+    std::atomic<std::uint64_t> dynamic_verify{0};    ///< ... of them by a verify mismatch
+    std::atomic<std::uint64_t> memo_hits{0};         ///< UmaDirect verdicts reused (no lookups)
+    std::atomic<std::uint64_t> memo_misses{0};       ///< ... evaluated
+    std::atomic<std::uint64_t> direct_bindings{0};   ///< bound through a shared granule's buffer
+    std::atomic<std::uint64_t> direct_bytes{0};      ///< their bytes
+    std::atomic<std::uint64_t> image_writes{0};      ///< images re-tiled over shared granules
     std::atomic<std::uint64_t> verify_checked{0};
     std::atomic<std::uint64_t> verify_mismatches{0};
     std::atomic<std::uint64_t> verify_dropped{0};    ///< ring full
 };
 inline Counters counters;
+
+/// Bumped whenever a verdict of BufferCache::UmaDirect may change without a change of the runtime's
+/// mapping table: a block became dynamic or forgot its marks, the GPU wrote (copy path) over an
+/// armed block, an image became GPU-written. UmaDirect's per-thread memo compares it (any thread,
+/// the fault handler included).
+inline std::atomic<std::uint64_t> verdict_epoch{0};
+inline void NoteVerdictChange() {
+    verdict_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
 
 /// BB_UMA_VERIFY=N: every Nth in-place read binding is hashed when recorded and again when the
 /// submission it was recorded in has completed. 0 (default): off.
@@ -82,6 +106,35 @@ void VerifyRecord(Class cls, std::uint64_t address, std::uint64_t size, std::uin
 /// Hashes again the bindings whose tick `done` says has completed, oldest first (the buffer
 /// cache's per-packet maintenance); a changed hash is logged and counted.
 void VerifyProcess(bool (*done)(void* context, std::uint64_t tick), void* context);
+
+// ---- dynamic blocks: memory the CPU rewrites while it is bound in place ----
+/// A binding bound in place (BufferCache::UmaDirect) arms a one-shot write trap
+/// (BbLayer::WriteTraps::UmaWatch) on its 64 KiB guest blocks; the first CPU write there (a fault,
+/// or a write the runtime announces: libc copies, file reads) makes the block dynamic and lifts the
+/// trap. Dynamic blocks are never bound in place again (copies, as in copy mode) until the
+/// mapping there changes. Keyed by guest VA, below 2^40; lock-free bitmaps (any thread, the fault
+/// handler included). The traps themselves are set and lifted by the page manager, which owns the
+/// pages' protection (VideoCore::PageManager::UmaArm / UmaNoteWrite).
+namespace Dynamic {
+constexpr unsigned BlockShift = 16;
+constexpr std::uint64_t BlockBytes = std::uint64_t{1} << BlockShift;
+/// Whether any block of [address, address + size) is dynamic.
+bool Any(std::uint64_t address, std::uint64_t size);
+/// Whether any block of the range is armed (bound in place, not dynamic).
+bool AnyArmed(std::uint64_t address, std::uint64_t size);
+/// Whether any block of the range is armed or dynamic (its pages may carry the trap).
+bool AnyWatched(std::uint64_t address, std::uint64_t size);
+bool Armed(std::uint64_t block);
+bool IsDynamic(std::uint64_t block);
+/// Marks the block armed; true when it was neither armed nor dynamic (the caller sets the trap).
+bool TryArm(std::uint64_t block);
+/// Marks the block dynamic (and no longer armed); true when it was not dynamic before.
+bool Mark(std::uint64_t block);
+/// Every block of the range dynamic (verify mismatches); the traps go at the next write.
+void MarkRange(std::uint64_t address, std::uint64_t size);
+/// The mapping changed (map or unmap): the blocks forget both marks (the runtime forgot the traps).
+void Forget(std::uint64_t address, std::uint64_t size);
+} // namespace Dynamic
 
 // ---- start-up probes (bbport_uma.cpp); each returns pass/fail and a short detail for the log ----
 

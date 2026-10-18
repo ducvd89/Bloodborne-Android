@@ -209,8 +209,155 @@ void VerifyProcess(bool (*done)(void* context, u64 tick), void* context) {
                         ClassName(entry.cls), (unsigned long long)entry.address,
                         (unsigned long long)entry.size, (unsigned long long)entry.tick);
         }
+        // Belt and braces next to the write traps: never bound in place again (copies).
+        Dynamic::MarkRange(entry.address, entry.size);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Dynamic blocks
+// ---------------------------------------------------------------------------------------------
+
+namespace Dynamic {
+namespace {
+constexpr u64 Limit = u64{1} << 40;
+constexpr u64 Words = (Limit >> BlockShift) / 64;
+/// Two bitmaps of Words each (armed, then dynamic), reserved at the first arm, not committed.
+std::atomic<std::atomic<u64>*> bits{nullptr};
+
+std::atomic<u64>* Table(bool create) {
+    std::atomic<u64>* table = bits.load(std::memory_order_acquire);
+    if (table || !create) {
+        return table;
+    }
+    void* mem = mmap(nullptr, 2 * Words * sizeof(u64), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (mem == MAP_FAILED) {
+        return nullptr;
+    }
+    std::atomic<u64>* expected = nullptr;
+    if (!bits.compare_exchange_strong(expected, static_cast<std::atomic<u64>*>(mem),
+                                      std::memory_order_acq_rel)) {
+        munmap(mem, 2 * Words * sizeof(u64));
+        return expected;
+    }
+    return static_cast<std::atomic<u64>*>(mem);
+}
+std::atomic<u64>* ArmedWord(std::atomic<u64>* table, u64 block) {
+    return &table[block >> 6];
+}
+std::atomic<u64>* DynamicWord(std::atomic<u64>* table, u64 block) {
+    return &table[Words + (block >> 6)];
+}
+bool InRange(u64 block) {
+    return block < (Limit >> BlockShift);
+}
+/// Calls `f(block)` for the blocks of [address, address + size) below the limit until it says stop.
+template <typename F>
+void ForEachBlock(u64 address, u64 size, F&& f) {
+    if (size == 0) {
+        return;
+    }
+    const u64 first = address >> BlockShift, last = (address + size - 1) >> BlockShift;
+    for (u64 block = first; block <= last && InRange(block); ++block) {
+        if (!f(block)) {
+            return;
+        }
+    }
+}
+} // namespace
+
+bool Armed(u64 block) {
+    std::atomic<u64>* table = Table(false);
+    return table && InRange(block) &&
+           (ArmedWord(table, block)->load(std::memory_order_acquire) >> (block & 63) & 1);
+}
+
+bool IsDynamic(u64 block) {
+    std::atomic<u64>* table = Table(false);
+    return table && InRange(block) &&
+           (DynamicWord(table, block)->load(std::memory_order_acquire) >> (block & 63) & 1);
+}
+
+bool Any(u64 address, u64 size) {
+    if (!Table(false)) {
+        return false;
+    }
+    bool found = false;
+    ForEachBlock(address, size, [&](u64 block) { return !(found = IsDynamic(block)); });
+    return found;
+}
+
+bool AnyArmed(u64 address, u64 size) {
+    if (!Table(false)) {
+        return false;
+    }
+    bool found = false;
+    ForEachBlock(address, size, [&](u64 block) { return !(found = Armed(block)); });
+    return found;
+}
+
+bool AnyWatched(u64 address, u64 size) {
+    if (!Table(false)) {
+        return false;
+    }
+    bool found = false;
+    ForEachBlock(address, size,
+                 [&](u64 block) { return !(found = Armed(block) || IsDynamic(block)); });
+    return found;
+}
+
+bool TryArm(u64 block) {
+    std::atomic<u64>* table = Table(true);
+    if (!table || !InRange(block) || IsDynamic(block)) {
+        return false;
+    }
+    const u64 bit = u64{1} << (block & 63);
+    return !(ArmedWord(table, block)->fetch_or(bit, std::memory_order_acq_rel) & bit);
+}
+
+bool Mark(u64 block) {
+    std::atomic<u64>* table = Table(true);
+    if (!table || !InRange(block)) {
+        return false;
+    }
+    const u64 bit = u64{1} << (block & 63);
+    const bool fresh = !(DynamicWord(table, block)->fetch_or(bit, std::memory_order_acq_rel) & bit);
+    ArmedWord(table, block)->fetch_and(~bit, std::memory_order_acq_rel);
+    if (fresh) {
+        // No log here: this runs in the fault handler (the binding thread reports, UmaDirect).
+        counters.dynamic_blocks.fetch_add(1, std::memory_order_relaxed);
+        NoteVerdictChange();
+    }
+    return fresh;
+}
+
+void MarkRange(u64 address, u64 size) {
+    ForEachBlock(address, size, [&](u64 block) {
+        if (Mark(block)) {
+            counters.dynamic_verify.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    });
+}
+
+void Forget(u64 address, u64 size) {
+    std::atomic<u64>* table = Table(false);
+    if (!table) {
+        return;
+    }
+    bool changed = false;
+    ForEachBlock(address, size, [&](u64 block) {
+        const u64 bit = u64{1} << (block & 63);
+        changed |= (ArmedWord(table, block)->fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
+        changed |= (DynamicWord(table, block)->fetch_and(~bit, std::memory_order_acq_rel) & bit) != 0;
+        return true;
+    });
+    if (changed) {
+        NoteVerdictChange();
+    }
+}
+} // namespace Dynamic
 
 // ---------------------------------------------------------------------------------------------
 // Probes
