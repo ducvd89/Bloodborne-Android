@@ -924,6 +924,7 @@ public final class MainActivity extends Activity {
     }
     private void answerIme(boolean ok,String value) {
         if (!imeAnswered.compareAndSet(false,true)) return;
+        // Read by the running game at once: written whole and renamed, not synced (it is useless after a reboot).
         File temporary=new File(BASE,"ime.request.result.tmp"), result=new File(BASE,"ime.request.result");
         try (java.io.Writer w=new java.io.OutputStreamWriter(new java.io.FileOutputStream(temporary),"UTF-8")) {
             w.write((ok ? "ok" : "cancel")+"\n"+value.replace('\n',' ')+"\n");

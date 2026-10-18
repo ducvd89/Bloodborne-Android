@@ -139,15 +139,15 @@ final class SettingsDialog {
     private void load() {
         values.clear(); lines.clear();
         if (!file.isFile()) return;
-        try (BufferedReader r=new BufferedReader(new InputStreamReader(new FileInputStream(file),"UTF-8"))) {
-            for (String line; (line=r.readLine())!=null;) {
+        try { // a file of NUL bytes (a hard reset before it was synced) reads as an empty one
+            for (String line:SafeWrite.readLines(file)) {
                 lines.add(line);
                 int eq=line.indexOf('=');
                 if (eq>0 && !line.startsWith("#")) values.put(line.substring(0,eq).trim(),line.substring(eq+1).trim());
             }
         } catch (Exception ex) { android.util.Log.e("Bloodborne","settings: "+ex); }
     }
-    /** Changed keys replace their lines; new keys are appended. Written whole, then renamed. */
+    /** Changed keys replace their lines; new keys are appended. Written whole and synced, then renamed. */
     private boolean save(Map<String,String> changed) {
         List<String> out=new ArrayList<>();
         Map<String,String> pending=new LinkedHashMap<>(changed);
@@ -158,11 +158,9 @@ final class SettingsDialog {
             else out.add(line);
         }
         for (Map.Entry<String,String> e:pending.entrySet()) out.add(e.getKey()+"="+e.getValue());
-        File temporary=new File(file.getPath()+".tmp");
-        try (Writer w=new OutputStreamWriter(new FileOutputStream(temporary),"UTF-8")) {
-            for (String line:out) w.write(line+"\n");
-        } catch (Exception ex) { android.util.Log.e("Bloodborne","settings: "+ex); return false; }
-        return temporary.renameTo(file);
+        try { SafeWrite.writeLines(file,out); }
+        catch (Exception ex) { android.util.Log.e("Bloodborne","settings: "+ex); return false; }
+        return true;
     }
     /** One setting, written at once (the GPU driver menu). Before the first start the file is
      *  the defaults (bbport.default.ini, as run-bionic.sh would copy it) plus this line. */
@@ -172,8 +170,9 @@ final class SettingsDialog {
     /** Several settings, written together (the Frame generation menu). */
     boolean setAll(Map<String,String> changed) {
         File defaults=new File(file.getParentFile(),"bbport.default.ini");
+        SafeWrite.repair(file); // all NUL bytes: missing, so the defaults below
         if (!file.isFile() && defaults.isFile())
-            try { java.nio.file.Files.copy(defaults.toPath(),file.toPath()); }
+            try { SafeWrite.write(file,java.nio.file.Files.readAllBytes(defaults.toPath())); }
             catch (Exception ex) { android.util.Log.e("Bloodborne","settings: "+ex); }
         load(); return save(changed);
     }
@@ -476,12 +475,10 @@ final class SettingsDialog {
             }).show();
     }
 
-    /** "10": infinite health on, items off (run-bionic.sh's BB_CHEATS_FILE), written whole then renamed. */
+    /** "10": infinite health on, items off (run-bionic.sh's BB_CHEATS_FILE), written whole and synced, then renamed. */
     private static boolean writeCheatState(File state,boolean health,boolean items) {
-        File temporary=new File(state.getPath()+".tmp");
-        try (Writer w=new OutputStreamWriter(new FileOutputStream(temporary),"UTF-8")) {
-            w.write((health ? "1" : "0")+(items ? "1" : "0")+"\n");
-        } catch (Exception ex) { android.util.Log.e("Bloodborne","cheats: "+ex); return false; }
-        return temporary.renameTo(state);
+        try { SafeWrite.write(state,(health ? "1" : "0")+(items ? "1" : "0")+"\n"); }
+        catch (Exception ex) { android.util.Log.e("Bloodborne","cheats: "+ex); return false; }
+        return true;
     }
 }
