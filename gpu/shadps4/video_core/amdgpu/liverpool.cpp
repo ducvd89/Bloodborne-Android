@@ -12,6 +12,7 @@
 #include <utility>
 #include <time.h>
 #include "bbport_cpu.h"
+#include "bbport_wait.h"
 #include "bbport_threads.h"
 #include "bbport_ce_stats.h"
 #include "bbport_timeline.h"
@@ -124,6 +125,9 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    // bbport BB_GPUCOMM_CPUS (e.g. 7, the Thor's prime core): this thread is in every frame's
+    // critical path but light once it waits instead of spinning.
+    BbThreads::PinFromEnv("BB_GPUCOMM_CPUS", "the GPU command processor");
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
@@ -133,6 +137,7 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
 
     while (!stoken.stop_requested()) {
+        BbThreads::KeepPinned(); // BB_GPUCOMM_CPUS after Android moved the app between cpusets
         // BB_HONEST_LABELS: fences (and GPU idle) wait for work not submitted yet. Submitted once
         // this thread has had nothing to do for 0.2 ms: the guest may be waiting for them.
         // BB_PIPE_SIGNALS: signals may still be on their way to the recording thread (tasks).
@@ -162,20 +167,28 @@ void Liverpool::Process(std::stop_token stoken) {
             BbTimeline::Note(BbTimeline::DecoderIdleBegin);
             // bbport: the game submits a frame in ~20 parts: waking from the condition variable for
             // each took tens of microseconds on the way to the GPU. Spins first, with cores to spare
-            // (BB_GPU_SPIN_US, default 200 with 12+ hardware threads, else 0).
+            // (BB_GPU_SPIN_US, default 200 with 12+ hardware threads, else 0). bbport: BB_SPIN_US
+            // instead of 200 (BB_SPIN_WAITS=1: 200), timed with the cycle counter.
+            static const bool spin_waits = BbWait::Spinning();
             static const auto spin_time = std::chrono::microseconds([] {
                 if (const char* env = std::getenv("BB_GPU_SPIN_US")) {
                     return std::max(0, std::atoi(env));
                 }
-                return BbThreads::Available() >= 12 ? 200 : 0;
+                if (BbThreads::Available() < 12) {
+                    return 0;
+                }
+                return spin_waits ? 200 : static_cast<int>(BbWait::SpinMicros());
             }());
             if (spin_time.count() > 0) {
+                static const u64 spin_cycles = BbCpu::MicrosToCycles(spin_time.count());
                 const auto spin_until = idle_start + spin_time;
+                const u64 spin_until_cycles = BbCpu::Cycles() + spin_cycles;
                 for (u32 spins = 1; !(num_commands || num_submits || submit_done) &&
                                     !stoken.stop_requested();
                      ++spins) {
                     BbCpu::Pause();
-                    if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                    if (!(spins & 255) && (spin_waits ? std::chrono::steady_clock::now() >= spin_until
+                                                      : BbCpu::Cycles() >= spin_until_cycles)) {
                         break;
                     }
                 }
