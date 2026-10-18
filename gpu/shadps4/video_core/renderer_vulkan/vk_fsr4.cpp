@@ -1,5 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_fsr4.h"
+
+#ifdef __ANDROID__
+// bbport: FSR 4 and FSR 4.1.1 are not in the Android build (ffx fsr4-v07 and fsr411/ are left out,
+// gpu/CMakeLists.txt): the menus offer FSR 3.1 and GSR 2 there (FSR 4 INT8 ran at ~470 ms a frame with a
+// black scene on the Adreno 740). This stand-in never runs: ConfigureUpscalerSupport marks FSR 4 unsupported.
+namespace Vulkan {
+struct Fsr4Upscaler::Impl {};
+Fsr4Upscaler::Fsr4Upscaler(const Instance&, Scheduler&) {}
+Fsr4Upscaler::~Fsr4Upscaler() = default;
+bool Fsr4Upscaler::Record(const Frame&) {
+    return false;
+}
+const char* Fsr4Upscaler::Problem() const noexcept {
+    return "FSR 4 is not in the Android build";
+}
+bool Fsr4Upscaler::Fatal() const noexcept {
+    return true;
+}
+} // namespace Vulkan
+#else
 #include "bbport_toggles.h"
 
 #include <algorithm>
@@ -410,3 +430,5 @@ bool Fsr4Upscaler::Fatal() const noexcept {
 }
 
 } // namespace Vulkan
+
+#endif // __ANDROID__
