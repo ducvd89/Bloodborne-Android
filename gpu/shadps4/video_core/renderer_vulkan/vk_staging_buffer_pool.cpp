@@ -70,16 +70,28 @@ StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 align
 
 StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 alignment,
                                                     MemoryType type) {
+    // bbport: the current block, else the lowest one with room. A round-robin walk kept every
+    // block a burst (loading) had added in use for good, so none was ever idle and trimmed (the
+    // Thor kept 544-672 MiB of staging standing still); lowest first, the blocks above what
+    // stays in flight go idle and are trimmed down to BB_STAGING_KEEP_MB.
     Block* best{};
     u64 best_offset{};
-    for (size_t i = 0; i < ring.blocks.size(); ++i) {
-        const size_t index = (ring.current + i) % ring.blocks.size();
+    const auto try_block = [&](size_t index) {
         Block* block = &ring.blocks[index];
         if (const auto offset = block->buffer->Reserve(size, alignment, false)) {
             ring.current = index;
             best = block;
             best_offset = *offset;
-            break;
+            return true;
+        }
+        return false;
+    };
+    const size_t tried = ring.current;
+    if (tried >= ring.blocks.size() || !try_block(tried)) {
+        for (size_t index = 0; index < ring.blocks.size(); ++index) {
+            if (index != tried && try_block(index)) {
+                break;
+            }
         }
     }
 
@@ -171,17 +183,32 @@ void StagingBufferPool::TickFrame() {
     }
     if (BbStats::enabled) {
         u64 bytes = 0;
-        for (const Ring& ring : rings) {
-            for (const Block& block : ring.blocks) {
-                bytes += block.buffer->SizeBytes();
+        for (size_t i = 0; i < NUM_TYPES && i < 3; ++i) {
+            u64 ring_bytes = 0, large_bytes = 0, held_bytes = 0;
+            for (const Block& block : rings[i].blocks) {
+                ring_bytes += block.buffer->SizeBytes();
             }
-        }
-        for (const auto& cache : large_caches) {
-            for (const LargeBuffer& entry : cache) {
-                bytes += entry.buffer->SizeBytes();
+            for (const LargeBuffer& entry : large_caches[i]) {
+                large_bytes += entry.buffer->SizeBytes();
+                held_bytes += entry.held ? entry.buffer->SizeBytes() : 0;
             }
+            BbStats::staging_ring_bytes[i].store(ring_bytes, std::memory_order_relaxed);
+            BbStats::staging_large_bytes[i].store(large_bytes, std::memory_order_relaxed);
+            BbStats::staging_held_bytes[i].store(held_bytes, std::memory_order_relaxed);
+            bytes += ring_bytes + large_bytes;
         }
         BbStats::staging_bytes.store(bytes, std::memory_order_relaxed);
+        const Ring& upload = rings[u32(MemoryType::HostUncached)];
+        u64 recent = 0, busy = 0;
+        for (const Block& block : upload.blocks) {
+            recent += frame - block.last_used_frame < RING_IDLE_FRAMES;
+            busy += !scheduler.IsFree(block.buffer->LastTick());
+        }
+        BbStats::staging_upload_blocks.store(upload.blocks.size(), std::memory_order_relaxed);
+        BbStats::staging_upload_recent.store(recent, std::memory_order_relaxed);
+        BbStats::staging_upload_busy.store(busy, std::memory_order_relaxed);
+        BbStats::staging_keep_blocks.store(keep_blocks, std::memory_order_relaxed);
+        BbStats::staging_frame.store(frame, std::memory_order_relaxed);
     }
     PublishStats();
 }

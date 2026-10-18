@@ -208,6 +208,12 @@ inline std::atomic<std::uint64_t> vram_copy_queue{0}, vram_copy_queue_length{0},
     vram_copies_returned{0};
 /// Staging pool memory (ring blocks and large buffers), bytes; refreshed once a frame with BB_FRAME_STATS.
 inline std::atomic<std::uint64_t> staging_bytes{0};
+/// Staging by memory type (DeviceLocal, HostUncached, HostCached): ring bytes, large-buffer bytes, of
+/// them held (deferred, not freed yet); refreshed with staging_bytes.
+inline std::atomic<std::uint64_t> staging_ring_bytes[3]{}, staging_large_bytes[3]{}, staging_held_bytes[3]{};
+/// Upload (host-uncached) ring: blocks, of them used in the last 3000 submissions, idle but GPU-busy, keep floor.
+inline std::atomic<std::uint64_t> staging_upload_blocks{0}, staging_upload_recent{0}, staging_upload_busy{0},
+    staging_keep_blocks{0}, staging_frame{0};
 /// Images the collector passed over (GPU-written, not evictable without memory pressure).
 inline std::atomic<std::uint64_t> gc_kept_images{0};
 struct WaitTimer {

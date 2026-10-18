@@ -431,6 +431,26 @@ static void PrintMemorySplit() {
                 (unsigned long long)(BbGuestMemory::ChunkBytes() >> 20),
                 BbGuestMemory::Unified() ? " (unified: shared with the GPU)" : "", rss >> 10, pss >> 10,
                 anon >> 10, shared >> 10, priv_dirty >> 10, swap >> 10);
+    {
+        const auto mib = [](const std::atomic<std::uint64_t>& v) {
+            return (unsigned long long)(v.load(std::memory_order_relaxed) >> 20);
+        };
+        std::printf("Staging by type: device-local ring %llu / large %llu (held %llu) MiB, host-uncached "
+                    "ring %llu / large %llu (held %llu) MiB, host-cached ring %llu / large %llu (held "
+                    "%llu) MiB\n",
+                    mib(BbStats::staging_ring_bytes[0]), mib(BbStats::staging_large_bytes[0]),
+                    mib(BbStats::staging_held_bytes[0]), mib(BbStats::staging_ring_bytes[1]),
+                    mib(BbStats::staging_large_bytes[1]), mib(BbStats::staging_held_bytes[1]),
+                    mib(BbStats::staging_ring_bytes[2]), mib(BbStats::staging_large_bytes[2]),
+                    mib(BbStats::staging_held_bytes[2]));
+        std::printf("Staging upload ring: %llu blocks, %llu used in the last 3000 submissions, %llu GPU-busy, "
+                    "keep %llu, submission %llu\n",
+                    (unsigned long long)BbStats::staging_upload_blocks.load(),
+                    (unsigned long long)BbStats::staging_upload_recent.load(),
+                    (unsigned long long)BbStats::staging_upload_busy.load(),
+                    (unsigned long long)BbStats::staging_keep_blocks.load(),
+                    (unsigned long long)BbStats::staging_frame.load());
+    }
     if (BbGuestMemory::Uma()) {
         // bbport BB_UMA: the shared granules (the runtime's counters) and what the GPU side did with them.
         const auto runtime = BbGuestMemory::UmaRuntime();
