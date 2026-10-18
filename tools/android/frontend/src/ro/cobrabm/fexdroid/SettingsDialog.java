@@ -34,8 +34,8 @@ final class SettingsDialog {
     private static final double[] ASPECT_RATIOS={0,4/3.0,16/10.0,16/9.0,21/9.0,32/9.0};
     private static final int ASPECT_DEFAULT=0, OUTPUT_DEFAULT_HEIGHT=1080;
     private static final int[] OUTPUT_HEIGHTS={360,480,540,720,1080,1440};
-    private static final String[] PRESET_NAMES={"Native","Quality","Balanced","Performance","Ultra performance"};
-    private static final double[] PRESET_SCALES={1.0,1.5,1.7,2.0,3.0};
+    private static final String[] PRESET_NAMES={"Native","Quality","Balanced","Performance","Ultra performance","Potato"};
+    private static final double[] PRESET_SCALES={1.0,1.5,1.7,2.0,3.0,4.0};
     private static int scene(int v,int preset) { return Math.max(2,(int)Math.rint(v/PRESET_SCALES[preset]/2)*2); }
     private static String presetName(int[] output,int preset) {
         return PRESET_NAMES[preset]+" ("+scene(output[0],preset)+"×"+scene(output[1],preset)+")";
@@ -302,7 +302,7 @@ final class SettingsDialog {
         final RadioGroup upscalers=choices(box,UPSCALER_NAMES,indexOf(UPSCALER_VALUES,get("upscaler","gsr2"),1));
         heading(box,"Render resolution");
         int preset=0;
-        try { preset=Math.max(0,Math.min(4,Integer.parseInt(get("preset","3")))); } catch (NumberFormatException ignored) { preset=3; }
+        try { preset=Math.max(0,Math.min(PRESET_NAMES.length-1,Integer.parseInt(get("preset","3")))); } catch (NumberFormatException ignored) { preset=3; }
         final RadioGroup presets=choices(box,PRESET_NAMES,preset);
         // FSR 3.1 and Lossless Scaling frame generation: one at a time. Lossless Scaling is set in the
         // Frame generation menu and applies at once; while it is on this switch is off and locked.

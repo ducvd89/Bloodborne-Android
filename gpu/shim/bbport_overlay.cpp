@@ -378,6 +378,7 @@ void Menu() {
                   BbSettings::PresetScale(preset));
     if (ImGui::BeginCombo(BbSettings::MenuText("Preset", "Пресет"), preset_label)) {
         for (int i = 0; i < BbSettings::PresetCount; ++i) {
+            if (i == BbSettings::Potato && !BbSettings::PotatoAllowed(s.upscaler)) continue;
             char label[64];
             const float scale = BbSettings::PresetScale(i);
             const int output = s.output_res;

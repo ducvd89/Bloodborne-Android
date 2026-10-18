@@ -197,8 +197,15 @@ bool FixedRenderSession() {
 
 int RenderPreset() {
     const auto& v = Get();
-    return FixedRenderSession() ? v.startup_preset :
-        v.upscaler == UpscalerTaa ? NativeAA : v.preset.load();
+    if (FixedRenderSession()) return v.startup_preset;
+    if (v.upscaler == UpscalerTaa) return NativeAA;
+    const int preset = v.preset.load();
+    // Potato is FSR 3.1 and GSR 2 only (FSR 4 and DLSS have no model below Ultra Performance).
+    return preset == Potato && !PotatoAllowed(v.upscaler) ? UltraPerformance : preset;
+}
+
+bool PotatoAllowed(int upscaler) {
+    return upscaler == UpscalerFsr3 || upscaler == UpscalerGsr2;
 }
 
 bool ResolutionNeedsRestart() {
@@ -299,13 +306,13 @@ void Save() {
 }
 
 float PresetScale(int preset) {
-    static constexpr float scales[PresetCount] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f};
+    static constexpr float scales[PresetCount] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f, 4.0f};
     return scales[std::clamp(preset, 0, PresetCount - 1)];
 }
 
 const char* PresetName(int preset) {
     static constexpr const char* names[PresetCount] = {"Native AA", "Quality", "Balanced",
-                                                       "Performance", "Ultra Performance"};
+                                                       "Performance", "Ultra Performance", "Potato"};
     return names[std::clamp(preset, 0, PresetCount - 1)];
 }
 

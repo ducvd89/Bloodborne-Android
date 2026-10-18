@@ -22,7 +22,8 @@ inline bool IsGsr2(int upscaler) {
 inline bool IsExternalUpscaler(int upscaler) {
     return IsFsr4(upscaler) || upscaler == UpscalerDlss || IsGsr2(upscaler);
 }
-enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
+// Potato (x4) is for FSR 3.1 and GSR 2 only; with another upscaler it renders as Ultra Performance (RenderPreset).
+enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, Potato, PresetCount };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 enum class MenuLanguage { English, Russian };
 
@@ -116,6 +117,8 @@ void Save();
 
 /// Render resolution divisor of a preset (1.0 native, 1.5 quality, ...).
 float PresetScale(int preset);
+/// Whether the Potato preset applies with this upscaler (FSR 3.1 and GSR 2).
+bool PotatoAllowed(int upscaler);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
 

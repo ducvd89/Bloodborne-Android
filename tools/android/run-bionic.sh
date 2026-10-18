@@ -95,12 +95,12 @@ echo "Display: aspect ratio $aspect_setting ($an:$ad), output $output (surface $
 # 0.11.0); any other value means FSR 3.1.
 case $upscaler in off|gsr2|fsr3) ;; '') upscaler=gsr2 ;; *) upscaler=fsr3 ;; esac
 echo "Upscaler setting: $upscaler"
-case $preset in 0|1|2|3|4) ;; *) preset=3 ;; esac
-# The scene size: the output / the preset's scale (1, 1.5, 1.7, 2, 3), each side rounded to even, as
+case $preset in 0|1|2|3|4|5) ;; *) preset=3 ;; esac
+# The scene size: the output / the preset's scale (1, 1.5, 1.7, 2, 3, Potato 4), each side rounded to even, as
 # patches.py (scaled_sizes) does; any size, any ratio.
 scale10=10
 if [ "$upscaler" != off ]; then
-    case $preset in 1) scale10=15 ;; 2) scale10=17 ;; 3) scale10=20 ;; 4) scale10=30 ;; esac
+    case $preset in 1) scale10=15 ;; 2) scale10=17 ;; 3) scale10=20 ;; 4) scale10=30 ;; 5) scale10=40 ;; esac
 fi
 scene_w=$(( (output_w * 10 + scale10) / (2 * scale10) * 2 )); scene_h=$(( (output_h * 10 + scale10) / (2 * scale10) * 2 ))
 [ "$scene_w" -ge 2 ] || scene_w=2

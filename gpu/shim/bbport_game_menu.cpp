@@ -196,10 +196,11 @@ void DefineTexts() {
     // Sliders and toggles first, the pop-up list last: a list opens downwards over the rows
     // below it, and their values showed through it.
     row(Preset, "Quality preset", "Пресет",
-        "Scene resolution: 0-1 Native AA, 2-3 Quality, 4-6 Balanced, 7-8 Performance, 9-10 Ultra",
-        "Разрешение сцены: 0-1 Native AA, 2-3 Quality, 4-6 Balanced, 7-8 Performance, 9-10 Ultra",
+        "Scene resolution: 0 Native AA, 1-2 Quality, 3-4 Balanced, 5-6 Performance, 7-8 Ultra, 9-10 Potato (FSR 3.1, GSR 2)",
+        "Разрешение сцены: 0 Native AA, 1-2 Quality, 3-4 Balanced, 5-6 Performance, 7-8 Ultra, 9-10 Potato (FSR 3.1, GSR 2)",
         {AddText("Native AA", "Native AA"), AddText("Quality", "Quality"), AddText("Balanced", "Balanced"),
-         AddText("Performance", "Performance"), AddText("Ultra Performance", "Ultra Performance")},
+         AddText("Performance", "Performance"), AddText("Ultra Performance", "Ultra Performance"),
+         AddText("Potato", "Potato")},
         Kind::Steps);
     row(Sharpness, "Sharpness", "Резкость", "RCAS after the upscaler: 0 off, 10 strongest",
         "RCAS после апскейлера: 0 выкл, 10 сильнее всего", {}, Kind::Slider);
