@@ -417,8 +417,10 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
+    void *guard=runtime_memory_io_begin((uintptr_t)buffer,size); /* no granule promotion freezes the pages meanwhile */
     touch_for_write(buffer,size);
     ssize_t n=read_retrying(h,buffer,size,0,0);
+    runtime_memory_io_end(guard);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -428,8 +430,10 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     runtime_memory_note_write((uintptr_t)buffer,size);
+    void *guard=runtime_memory_io_begin((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
     ssize_t n=read_retrying(h,buffer,size,offset,1);
+    runtime_memory_io_end(guard);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);

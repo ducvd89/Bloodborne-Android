@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <thread>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
 #include "bbport_free_check.h"
 #include "bbport_gc_budget.h"
+#include "bbport_guest_memory.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -85,6 +87,27 @@ std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
         out += fmt::format(" +{} more", shown - 3);
     }
     return out;
+}
+
+bool TextureCache::OverlapsGpuImage(VAddr addr, u64 size) {
+    // The binding thread asks; the texture binding helper and the fault handlers hold the lock for
+    // short stretches, and no caller of this holds it: a bounded wait, then "can't tell".
+    std::unique_lock lock{mutex, std::defer_lock};
+    for (int attempt = 0; attempt < 256 && !lock.owns_lock(); ++attempt) {
+        if (!lock.try_lock()) {
+            std::this_thread::yield();
+        }
+    }
+    if (!lock.owns_lock()) {
+        return true;
+    }
+    bool overlaps = false;
+    ForEachImageInRegion(addr, size, [&](ImageId, Image& image) {
+        overlaps = True(image.flags & ImageFlagBits::GpuModified) || image.usage.render_target ||
+                   image.usage.depth_target || image.usage.storage || image.gpu_write_tick != 0;
+        return overlaps;
+    });
+    return overlaps;
 }
 
 void TextureCache::ProcessDownloadImages() {
@@ -1176,6 +1199,11 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
+        // bbport: memory shared with the CPU (BB_UMA granules; v1's chunks) is the game's data, not
+        // the textures' or buffers' VRAM: it would keep the usage over the trigger for good.
+        const u64 shared = BbGuestMemory::UmaSharedBytes() +
+                           (BbGuestMemory::Unified() ? BbGuestMemory::ChunkBytes() : 0);
+        total_used_memory = total_used_memory > shared ? total_used_memory - shared : 0;
         // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
         // much more than images (buffers backing guest memory), and the startup budget left
         // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the

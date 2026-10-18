@@ -45,7 +45,8 @@ bool LayerMemory();
 /// The external memory handle type of the chunks (dma-buf or imported host memory): buffers bound
 /// to them (the arena, chunk buffers) are created with it. Valid after Usable().
 vk::ExternalMemoryHandleTypeFlagBits HandleType();
-/// BB_UNIFIED=1 (Android, opt-in): the game's direct memory is dma-buf chunks of CPU-cached,
+/// BB_UNIFIED=1 (v1, Android, opt-in; no longer wired to the Debug option, kept for reference and
+/// off whenever BB_UMA=1 is set): the game's direct memory is dma-buf chunks of CPU-cached,
 /// host-visible device memory (an integrated GPU: the phone's one RAM) the GPU uses in place through
 /// the layer's memory module, no sparse buffers needed. Whether it was asked for.
 bool UnifiedRequested();
@@ -63,6 +64,41 @@ const char* FallbackReason();
 std::uint64_t ChunkBytes();
 /// Hands the runtime direct memory chunks from now on (when enabled and supported).
 void Install(const Vulkan::Instance& instance);
-/// The chunk holding direct memory address `phys`, or null.
+/// The chunk holding direct memory address `phys`, or null. With BB_UMA a lock-free lookup of the
+/// granule table (one Chunk per shared granule).
 const Chunk* Find(std::uint64_t phys);
+
+// ---- BB_UMA=1: unified memory v2 (docs/ANDROID_UNIFIED_MEMORY_PLAN.md) ----
+/// The game's buffers live in shared granules: the runtime (src/runtime_memory.c) keeps direct memory
+/// in granules, CPU (memfd) or SHARED (a dma-buf made here, AllocGranule); the buffer cache asks it to
+/// promote the granules a buffer binding of an enabled class (bbport_uma.h) needs, then binds the
+/// arena's blocks to them in place. Everything is behind BB_UMA=1; unset, nothing here runs.
+
+/// BB_UMA=1 in the environment.
+bool UmaRequested();
+/// Whether it may run on this GPU: requested, integrated, not Mali/PanVK, sparse buffers (the
+/// arena must be sparse) and dma-buf export. Logs the reason once when it may not. The probes of
+/// Usable() come on top.
+bool UmaEligible(const Vulkan::Instance& instance);
+/// UMA is active: valid after Usable() (false when a probe failed: copies).
+bool Uma();
+/// BB_UMA_GRANULE_KB (a power of two, 256..65536; default 2048) in bytes.
+std::uint64_t UmaGranuleBytes();
+/// Bytes of direct memory in shared granules so far.
+std::uint64_t UmaSharedBytes();
+/// Why UMA is not active (empty before Usable() or when it is).
+const char* UmaFallbackReason();
+/// Asks the runtime to share every granule overlapping direct memory [phys, phys + size): true when
+/// all of them are shared afterwards. Allocates granules (AllocGranule) on the calling thread.
+bool UmaPromote(std::uint64_t phys, std::uint64_t size);
+/// The runtime's own counters (runtime_memory_uma_stats), same layout as RuntimeUmaStats there.
+struct UmaRuntimeStats {
+    std::uint64_t granule_bytes, shared_granules, shared_bytes, promotions, promotion_failures,
+        refused_exec, refused_busy, freeze_faults, io_waits, promote_ns_total, promote_ns_max;
+};
+UmaRuntimeStats UmaRuntime();
+/// A host-visible, CPU-cached memory type among `bits` (cached and coherent first), never a
+/// write-combined one; ~0u when none. Sets *coherent when given.
+std::uint32_t PickUnifiedType(const vk::PhysicalDeviceMemoryProperties& props, std::uint32_t bits,
+                              bool* coherent);
 } // namespace BbGuestMemory

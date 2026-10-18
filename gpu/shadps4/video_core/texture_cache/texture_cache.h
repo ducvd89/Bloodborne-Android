@@ -93,6 +93,11 @@ public:
     /// bbport (diagnostics): the images over [addr, addr + size), described briefly.
     std::string DescribeImagesIn(VAddr addr, u64 size);
 
+    /// bbport BB_UMA: an image the GPU writes (render or depth target, storage image, or GPU-modified)
+    /// overlaps [addr, addr + size): memory under it is not the game's data to share. True too when
+    /// the cache is busy (the lock is not taken for long): the answer that keeps a copy.
+    [[nodiscard]] bool OverlapsGpuImage(VAddr addr, u64 size);
+
     /// bbport: changes whenever an image is registered or unregistered.
     [[nodiscard]] u64 RegistryGeneration() const noexcept {
         return registry_generation.load(std::memory_order_acquire);

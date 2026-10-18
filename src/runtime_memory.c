@@ -16,8 +16,15 @@
 #ifndef _WIN32
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#ifndef SEEK_DATA
+#define SEEK_DATA 3
+#define SEEK_HOLE 4
+#endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
  * patches above 1080p need about 4 GiB more; run.sh sets it). */
 static uint64_t pool_size_bytes(void) {
@@ -115,6 +122,44 @@ static void add_region(uint64_t phys, uint64_t size) {
     regions[i]=(Region){phys,size,fd>=0 || fd==CHUNK_IMPORTED ? fd : -2};
     ++region_count;
 }
+/* bbport: UMA granules (BB_UMA, runtime_memory_set_granule_allocator): the third mode. Direct
+ * memory is split into granules; each is CPU (the memfd, lazily committed, as without UMA) or SHARED
+ * (a GPU-visible dma-buf the GPU library allocated when the GPU first needed the memory in place;
+ * promotion, below). Nothing is allocated up front: direct_allocate/ensure_chunks do nothing here,
+ * the chunk and whole-allocation code above never runs. States change under the write lock only;
+ * runtime_memory_granule_shared reads them without it. */
+typedef int (*GranuleAlloc)(uint64_t phys, uint64_t size);
+typedef void (*GranuleRelease)(uint64_t phys, uint64_t size);
+static GranuleAlloc granule_alloc;
+static GranuleRelease granule_release;
+static uint64_t granule_size;
+static _Atomic(int) *granule_fd; /* per granule: -1 CPU (memfd), else the SHARED dma-buf fd; NULL: UMA off */
+static int uma_fd(uint64_t g) { return atomic_load_explicit(&granule_fd[g],memory_order_acquire); }
+/* End of granule g in direct memory (the last one may be shorter). */
+static uint64_t uma_end(uint64_t g) {
+    const uint64_t end=(g+1)*granule_size;
+    return end<POOL_SIZE ? end : POOL_SIZE;
+}
+/* The run of granules from phys (below end) in the state of the first one: its length, *shared set.
+ * A SHARED run is one granule (each has its own fd) unless merge_shared (clearing, not mapping). */
+static uint64_t uma_run(uint64_t phys, uint64_t end, int *shared, int merge_shared) {
+    uint64_t g=phys/granule_size, at=uma_end(g);
+    *shared=uma_fd(g)>=0;
+    while (at<end && (!*shared || merge_shared) && (uma_fd(at/granule_size)>=0)==*shared) at=uma_end(at/granule_size);
+    return (at<end ? at : end)-phys;
+}
+/* The GPU page manager's last restriction of each 4 KiB page below 2^40 (runtime_memory_gpu_protect
+ * only called mprotect before): 0 none recorded, else 4|read|write<<1. Promotion needs it to give a
+ * remapped page the protection it had. Only kept in UMA mode; whatever else changes a page's
+ * protection (a trap, the game's mprotect, a new mapping) drops the record (gpu_forget): the record
+ * is the restriction that is in force. */
+#define GPU_STATE_LIMIT (1ull<<40)
+static uint8_t *gpu_state;
+static void gpu_forget(uintptr_t start, uintptr_t end) {
+    if (!gpu_state || start>=GPU_STATE_LIMIT) return;
+    if (end>GPU_STATE_LIMIT) end=GPU_STATE_LIMIT;
+    memset(gpu_state+(start>>12),0,((end+4095)>>12)-(start>>12));
+}
 #define FLEX_SPAN (UINT64_C(1024) * 1024 * 1024)
 static uint64_t flex_bitmap[FLEX_SPAN/PAGE/64];
 /* GPU hooks (bbgpu): notified outside the lock, in order, after each operation. */
@@ -153,7 +198,7 @@ static uint64_t chunk_size(uint64_t c) {
 }
 /* Decides where the chunks of [phys, phys+size) of direct memory live (lock held). */
 static void ensure_chunks(uint64_t phys, uint64_t size) {
-    if (!chunk_fds || phys>=POOL_SIZE) return;
+    if (!chunk_fds || phys>=POOL_SIZE || granule_fd) return; /* UMA granules are lazy */
     if (whole_chunks) {
         if (!chunk_alloc) return;
         const uint64_t end=phys+size<POOL_SIZE ? phys+size : POOL_SIZE;
@@ -178,10 +223,30 @@ static void ensure_chunks(uint64_t phys, uint64_t size) {
         chunk_fds[c]=fd>=0 || fd==CHUNK_IMPORTED ? fd : -2;
     }
 }
+/* UMA mode: one mmap per run of CPU granules (the memfd, as ever), one per SHARED granule it covers
+ * (its dma-buf at the offset inside the granule). */
+static void *map_uma(uintptr_t address, uint64_t size, int prot, uint64_t phys) {
+    for (uint64_t done=0;done<size;) {
+        const uint64_t at=phys+done;
+        int shared;
+        const uint64_t n=uma_run(at,phys+size,&shared,0);
+        const int fd=shared ? uma_fd(at/granule_size) : pool_fd;
+        if (mmap((void *)(address+done),n,prot,MAP_SHARED|MAP_FIXED,fd,(off_t)(shared ? at%granule_size : at))==MAP_FAILED) {
+            static int reported;
+            if (reported++ < 4)
+                fprintf(stderr,"Runtime: mapping direct memory %#" PRIx64 "+%#" PRIx64 " from %s failed: %s\n",
+                        at,n,shared ? "a shared granule (dma-buf)" : "the memfd",strerror(errno));
+            return MAP_FAILED;
+        }
+        done+=n;
+    }
+    return (void *)address;
+}
 /* mmap of direct or flexible memory at phys, split where it crosses chunks. */
 static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys) {
     if (!chunk_fds || phys>=POOL_SIZE)
         return mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys);
+    if (granule_fd) return map_uma(address,size,prot,phys);
     ensure_chunks(phys,size);
     for (uint64_t done=0;whole_chunks && done<size;) {
         const uint64_t at=phys+done;
@@ -218,13 +283,23 @@ static void *map_phys(uintptr_t address, uint64_t size, int prot, uint64_t phys)
     }
     return (void *)address;
 }
-/* Returns released physical memory to zero: hole punching in the memfd, a clear in a chunk. */
+/* Returns released physical memory to zero: hole punching in the memfd, a clear in a chunk or a shared granule. */
 static void zero_phys(uint64_t phys, uint64_t size) {
     for (uint64_t done=0;done<size;) {
         const uint64_t at=phys+done;
         if (!chunk_fds || at>=POOL_SIZE) {
             fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)at,(off_t)(size-done));
             return;
+        }
+        if (granule_fd) {
+            /* bbport UMA: SHARED granules are cleared (dma-buf pages cannot be punched out). TODO phase 4:
+             * a granule released whole goes back to CPU (demotion) instead of staying shared. */
+            int shared;
+            const uint64_t n=uma_run(at,phys+size<POOL_SIZE ? phys+size : POOL_SIZE,&shared,1);
+            if (shared) memset(backing_base+at,0,n);
+            else fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)at,(off_t)n);
+            done+=n;
+            continue;
         }
         if (whole_chunks) {
             uint64_t next;
@@ -362,6 +437,7 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     if (mapped==MAP_FAILED) return NO_MEMORY;
     drop_range(address,address+size);
     trap_forget(address,address+size); /* a new mapping starts without traps */
+    gpu_forget(address,address+size);  /* ... and without the GPU page manager's restriction */
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
@@ -451,6 +527,7 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     }
     drop_range(start,end);
     trap_forget(start,end);
+    gpu_forget(start,end);
     return 0;
 }
 static ABI int32_t direct_unmap(void *address, uint64_t size) {
@@ -556,6 +633,7 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     start&=~(uintptr_t)(PAGE-1);
     if ((prot & ~0x37) || !covered(start,end,0)) return INVALID;
     if (mprotect((void *)start,end-start,host_prot(prot))) return INVALID;
+    gpu_forget(start,end); /* the game's protection replaced the page manager's */
     trap_reapply(start,end); /* pages with write traps stay read-only */
     int error; size_t i=carve(start,end,&error);
     if (error) return NO_MEMORY;
@@ -849,6 +927,7 @@ static void trap_apply(uintptr_t a, uintptr_t b, int level) {
         const uintptr_t s=vmas[i].start>a ? vmas[i].start : a, e=vmas[i].end<b ? vmas[i].end : b;
         const int prot=host_prot(vmas[i].prot);
         mprotect((void *)s,e-s,level==2 ? PROT_NONE : level ? (prot & ~PROT_WRITE) : prot);
+        gpu_forget(s,e); /* the trap level is what is in force now */
     }
 }
 /* No traps in [start, end) any more: a mapping replaced or gone (runtime lock held). */
@@ -1058,9 +1137,360 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
         uintptr_t b=vmas[i].end<address+size ? vmas[i].end : address+size;
         int guest=host_prot(vmas[i].prot);
         int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
-        mprotect((void *)a,b-a,guest & want);
+        if (!mprotect((void *)a,b-a,guest & want) && gpu_state && a<GPU_STATE_LIMIT) {
+            /* bbport UMA: kept for promotion (a remapped granule gets its pages' protection back) */
+            const uintptr_t e=b<GPU_STATE_LIMIT ? b : GPU_STATE_LIMIT;
+            memset(gpu_state+(a>>12),4|(read ? 1 : 0)|(write ? 2 : 0),((e+4095)>>12)-(a>>12));
+        }
     }
     read_unlock();
+}
+/* ---- bbport: UMA granules, promotion CPU -> SHARED (docs/ANDROID_UNIFIED_MEMORY_PLAN.md) ----
+ * The GPU library asks for a granule to be shared (runtime_memory_promote) when it wants to bind it as
+ * a buffer in place. The game's pages must change from the memfd to the dma-buf without losing a
+ * write or a moment of access it should have: the writers are frozen (every guest alias of the
+ * granule read-only, a fault on it waits for the end), the data is copied, the dma-buf is mapped over
+ * the backing view and over each alias, the protections the pages had are given back, the writers go on.
+ * Lock order: promote_mutex, the runtime lock (exclusive), then io_mutex or trap_mutex; the callbacks
+ * into the GPU library (alloc, release) are never called with the runtime lock held. */
+#define UMA_MAX_ALIASES 16
+#define UMA_IO_SLOTS 64
+#define UMA_FROZEN_SLOTS 128
+#define UMA_IO_WAIT_NS (50ull*1000*1000)
+#define UMA_RETRY_NS (250ull*1000*1000)
+typedef struct { uintptr_t va; uint64_t offset, length; int prot; } Alias; /* offset in the granule */
+static pthread_mutex_t promote_mutex=PTHREAD_MUTEX_INITIALIZER;
+static RuntimeUmaStats uma;
+#define UMA_ADD(field,n) __atomic_fetch_add(&uma.field,(uint64_t)(n),__ATOMIC_RELAXED)
+_Static_assert(sizeof(RuntimeUmaStats)==11*sizeof(uint64_t),"RuntimeUmaStats is eleven counters");
+
+/* Kernel writes into guest memory in flight (a file read into a buffer): a frozen page would give the
+ * kernel EFAULT, or a short read, instead of a fault our handler waits out. io_mutex covers the slots,
+ * and the check of the frozen ranges in io_begin against the check of the slots in freeze_publish, so
+ * one of the two always sees the other. */
+static pthread_mutex_t io_mutex=PTHREAD_MUTEX_INITIALIZER;
+static struct { uintptr_t start, end; } io_ranges[UMA_IO_SLOTS]; /* end 0: free */
+
+/* The pages frozen by promotions, readable without a lock (the fault handler): a ring of ranges. A
+ * range stays after the thaw (done = when): a thread whose write faulted may only reach the handler
+ * after the freeze ended (preempted in between), and would otherwise take that for a real fault. The
+ * handler lets it retry once, then the fault is anyone's again. freeze_seq is odd while pages are
+ * frozen; the range's gen is the odd value of its freeze. */
+typedef struct { _Atomic uintptr_t start, end; _Atomic uint64_t done; _Atomic uint32_t gen; } Frozen;
+static Frozen frozen[UMA_FROZEN_SLOTS];
+static unsigned frozen_next; /* runtime lock */
+static _Atomic uint32_t freeze_seq;
+static _Atomic uint64_t thaw_ns; /* when the last freeze ended; 0: none yet */
+static __thread int freezing; /* this thread holds a freeze: its own faults cannot wait */
+static __thread uintptr_t retry_page;
+static __thread uint32_t retry_gen;
+
+static void futex_wait(uint32_t value) {
+#ifdef SYS_futex
+    const struct timespec t={0,2000000};
+    syscall(SYS_futex,&freeze_seq,128 /* FUTEX_WAIT_PRIVATE */,value,&t,NULL,0);
+#else
+    sched_yield(); (void)value;
+#endif
+}
+static void futex_wake(void) {
+#ifdef SYS_futex
+    syscall(SYS_futex,&freeze_seq,129 /* FUTEX_WAKE_PRIVATE */,INT_MAX,NULL,NULL,0);
+#endif
+}
+static int frozen_overlaps(uintptr_t start, uintptr_t end) { /* io_mutex held */
+    for (int i=0;i<UMA_FROZEN_SLOTS;++i) {
+        const uintptr_t e=atomic_load_explicit(&frozen[i].end,memory_order_acquire);
+        if (e && !atomic_load_explicit(&frozen[i].done,memory_order_relaxed) &&
+            start<e && atomic_load_explicit(&frozen[i].start,memory_order_relaxed)<end) return 1;
+    }
+    return 0;
+}
+/* Publishes the aliases as frozen (runtime lock held); 0 when a kernel write into one is in flight. */
+static int freeze_publish(const Alias *a, int n) {
+    pthread_mutex_lock(&io_mutex);
+    for (int i=0;i<n;++i)
+        for (int s=0;s<UMA_IO_SLOTS;++s)
+            if (io_ranges[s].end && a[i].va<io_ranges[s].end && io_ranges[s].start<a[i].va+a[i].length) {
+                pthread_mutex_unlock(&io_mutex);
+                return 0;
+            }
+    const uint32_t seq=atomic_load_explicit(&freeze_seq,memory_order_relaxed)+1; /* odd */
+    for (int i=0;i<n;++i) {
+        Frozen *f=&frozen[frozen_next++ % UMA_FROZEN_SLOTS];
+        atomic_store_explicit(&f->end,0,memory_order_relaxed); /* not a match while it is rewritten */
+        atomic_store_explicit(&f->start,a[i].va,memory_order_relaxed);
+        atomic_store_explicit(&f->gen,seq,memory_order_relaxed);
+        atomic_store_explicit(&f->done,0,memory_order_relaxed);
+        atomic_store_explicit(&f->end,a[i].va+a[i].length,memory_order_release);
+    }
+    atomic_store_explicit(&freeze_seq,seq,memory_order_release);
+    pthread_mutex_unlock(&io_mutex);
+    return 1;
+}
+/* The freeze ends: its ranges stay in the ring as history, the waiters go on (runtime lock held). */
+static void freeze_thaw(void) {
+    const uint64_t now=runtime_wait_clock();
+    for (int i=0;i<UMA_FROZEN_SLOTS;++i)
+        if (atomic_load_explicit(&frozen[i].end,memory_order_relaxed) && !atomic_load_explicit(&frozen[i].done,memory_order_relaxed))
+            atomic_store_explicit(&frozen[i].done,now,memory_order_release);
+    atomic_store_explicit(&thaw_ns,now,memory_order_release);
+    atomic_store_explicit(&freeze_seq,atomic_load_explicit(&freeze_seq,memory_order_relaxed)+1,memory_order_release);
+    futex_wake();
+}
+/* bbport: called from the fault chain (probe.c) after the guest CPU's own handler: a fault on a page a
+ * promotion froze waits for the end and the write is retried (1). Async-signal-safe: atomics, a futex,
+ * the clock. Everything else is 0 and costs one load until the first promotion. */
+int runtime_memory_promotion_fault(void *address) {
+    uint32_t seq=atomic_load_explicit(&freeze_seq,memory_order_acquire);
+    const uint64_t thawed=atomic_load_explicit(&thaw_ns,memory_order_acquire);
+    if (!(seq & 1) && !thawed) return 0;
+    if (freezing) return 0;
+    const int saved_errno=errno;
+    const uint64_t now=runtime_wait_clock();
+    int result=0;
+    if ((seq & 1) || thawed>=now || now-thawed<=UMA_RETRY_NS) {
+        const uintptr_t at=(uintptr_t)address;
+        for (int i=0;i<UMA_FROZEN_SLOTS && !result;++i) {
+            Frozen *f=&frozen[i];
+            const uintptr_t end=atomic_load_explicit(&f->end,memory_order_acquire);
+            if (!end || at>=end || at<atomic_load_explicit(&f->start,memory_order_relaxed)) continue;
+            const uint64_t done=atomic_load_explicit(&f->done,memory_order_acquire);
+            if (done && done<now && now-done>UMA_RETRY_NS) continue;
+            const uint32_t gen=atomic_load_explicit(&f->gen,memory_order_relaxed);
+            if (retry_gen==gen && retry_page==(at>>12)) continue; /* retried once already: this fault is another's */
+            retry_gen=gen; retry_page=at>>12;
+            if (!done) { /* the freeze is still on: this write waits for it (a late arrival only retries) */
+                __atomic_fetch_add(&uma.freeze_faults,1,__ATOMIC_RELAXED);
+                while (!atomic_load_explicit(&f->done,memory_order_acquire)) {
+                    seq=atomic_load_explicit(&freeze_seq,memory_order_acquire);
+                    if (!(seq & 1)) break;
+                    futex_wait(seq);
+                }
+            }
+            result=1;
+        }
+    }
+    errno=saved_errno;
+    return result;
+}
+/* bbport: the kernel is about to write [address, address+size) of guest memory for a syscall (a file
+ * read): no promotion freezes those pages until runtime_memory_io_end(token). Waits while a freeze
+ * covers the range. Off (NULL, no cost) without UMA; NULL as well when every slot is taken (the
+ * read is then unguarded, the old behaviour). */
+void *runtime_memory_io_begin(uintptr_t address, uint64_t size) {
+    if (!__atomic_load_n(&granule_fd,__ATOMIC_ACQUIRE) || !size) return NULL;
+    pthread_mutex_lock(&io_mutex);
+    for (;;) {
+        const uint32_t seq=atomic_load_explicit(&freeze_seq,memory_order_acquire);
+        if (!(seq & 1) || !frozen_overlaps(address,address+size)) break;
+        pthread_mutex_unlock(&io_mutex);
+        futex_wait(seq);
+        pthread_mutex_lock(&io_mutex);
+    }
+    for (int s=0;s<UMA_IO_SLOTS;++s)
+        if (!io_ranges[s].end) {
+            io_ranges[s].start=address; io_ranges[s].end=address+size;
+            pthread_mutex_unlock(&io_mutex);
+            return (void *)(uintptr_t)(s+1);
+        }
+    pthread_mutex_unlock(&io_mutex);
+    return NULL;
+}
+void runtime_memory_io_end(void *token) {
+    if (!token) return;
+    pthread_mutex_lock(&io_mutex);
+    io_ranges[(uintptr_t)token-1].start=io_ranges[(uintptr_t)token-1].end=0;
+    pthread_mutex_unlock(&io_mutex);
+}
+
+/* The host protection a page of a mapping with guest protection `guest` has to have: the guest's, the
+ * GPU page manager's recorded restriction or the write traps' level (whichever was applied last:
+ * gpu_forget keeps only one of them) -- what runtime_memory_gpu_protect and trap_apply made of it. */
+static int page_prot(int guest, uintptr_t page) {
+    const int prot=host_prot(guest);
+    const uint8_t g=gpu_state && page<(GPU_STATE_LIMIT>>12) ? gpu_state[page] : 0;
+    if (g) return prot & ((g&1 ? PROT_READ : 0)|(g&2 ? PROT_WRITE|PROT_READ : 0)|(prot & PROT_EXEC));
+    const uint8_t *traps=__atomic_load_n(&trap_reasons,__ATOMIC_ACQUIRE);
+    if (traps && page<(TRAP_LIMIT>>12)) {
+        const int level=trap_level(traps[page]);
+        if (level==2) return PROT_NONE;
+        if (level) return prot & ~PROT_WRITE;
+    }
+    return prot;
+}
+/* The pages of a guest alias to the protection they have to have (freeze: without write), one
+ * mprotect per run of pages that agree (runtime lock held, so no trap or GPU protection changes). */
+static void alias_protect(const Alias *a, int freeze) {
+    const uintptr_t end=a->va+a->length;
+    uintptr_t run=a->va; int run_prot=-1;
+    for (uintptr_t p=a->va;p<end;p+=4096) {
+        int prot=page_prot(a->prot,p>>12);
+        if (freeze) prot&=~PROT_WRITE;
+        if (prot==run_prot) continue;
+        if (run_prot>=0) mprotect((void *)run,p-run,run_prot);
+        run=p; run_prot=prot;
+    }
+    if (run_prot>=0) mprotect((void *)run,end-run,run_prot);
+}
+/* The direct mappings of granule [gs,ge) (runtime lock held): *refusal 1 if one is executable (code in
+ * a dma-buf mapping is not what the GPU wants shared), 2 if there are too many to freeze. */
+static int collect_aliases(uint64_t gs, uint64_t ge, Alias *out, int *refusal) {
+    int n=0;
+    *refusal=0;
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind!=KIND_DIRECT) continue;
+        const uint64_t length=v->end-v->start, lo=v->phys>gs ? v->phys : gs, hi=v->phys+length<ge ? v->phys+length : ge;
+        if (lo>=hi) continue;
+        if (v->prot & 4) { *refusal=1; return n; }
+        if (n==UMA_MAX_ALIASES) { *refusal=2; return n; }
+        out[n++]=(Alias){v->start+(lo-v->phys),lo-gs,hi-lo,v->prot};
+    }
+    return n;
+}
+/* DMA_BUF_IOCTL_SYNC around the CPU's copy into a dma-buf (flags: write; end): the caches are cleaned
+ * for the device when the kernel's heap needs it. A no-op for coherent memory or what is no dma-buf. */
+static void dmabuf_sync(int fd, int end) {
+    const uint64_t flags=2 /* DMA_BUF_SYNC_WRITE */ | (end ? 4 : 0) /* DMA_BUF_SYNC_END */;
+    const int saved_errno=errno;
+    ioctl(fd,_IOW('b',0,uint64_t) /* DMA_BUF_IOCTL_SYNC */,&flags);
+    errno=saved_errno;
+}
+/* The granule's bytes from the memfd into dst. Holes (never written, or released) read as zeros
+ * without committing them in the memfd, and are written as zeros: a dma-buf is not always cleared. */
+static void copy_granule(unsigned char *dst, uint64_t gs, uint64_t len) {
+    const uint64_t ge=gs+len;
+    for (uint64_t at=gs;at<ge;) {
+        const off_t data=lseek(pool_fd,(off_t)at,SEEK_DATA);
+        if (data<0 && errno!=ENXIO) { memcpy(dst+(at-gs),backing_base+at,ge-at); return; }
+        if (data<0 || (uint64_t)data>=ge) { memset(dst+(at-gs),0,ge-at); return; }
+        if ((uint64_t)data>at) memset(dst+(at-gs),0,(uint64_t)data-at);
+        const off_t hole=lseek(pool_fd,data,SEEK_HOLE);
+        const uint64_t end=hole<0 || (uint64_t)hole>ge ? ge : (uint64_t)hole;
+        memcpy(dst+((uint64_t)data-gs),backing_base+data,end-(uint64_t)data);
+        at=end;
+    }
+}
+static void hand_back(uint64_t gs, uint64_t len, int fd) {
+    close(fd);
+    if (granule_release) granule_release(gs,len);
+}
+/* Backing view and aliases of granule [gs,gs+len) from the memfd again (a promotion that failed in the
+ * middle): the bytes are the same, nobody wrote. A failed MAP_FIXED may have dropped what it replaced,
+ * so the piece that failed is mapped again as well. */
+static void views_to_memfd(uint64_t gs, uint64_t len, const Alias *a, int count) {
+    int ok=mmap(backing_base+gs,len,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)gs)!=MAP_FAILED;
+    for (int i=0;i<count && ok;++i)
+        ok=mmap((void *)a[i].va,a[i].length,PROT_NONE,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)(gs+a[i].offset))!=MAP_FAILED;
+    if (!ok) { fprintf(stderr,"STOP: UMA promotion could not restore granule %#" PRIx64 ": %s\n",gs,strerror(errno)); exit(22); }
+}
+static int promote_granule(uint64_t g) {
+    const uint64_t gs=g*granule_size, len=uma_end(g)-gs;
+    if (uma_fd(g)>=0) return 1;
+    Alias a[UMA_MAX_ALIASES];
+    int refusal=0, n=0;
+    /* The refusals first, from a snapshot: no granule is allocated to be given back at once. */
+    read_lock();
+    const int pooled=backing_base!=NULL; /* no direct memory yet: nothing to promote */
+    collect_aliases(gs,gs+len,a,&refusal);
+    read_unlock();
+    if (!pooled) return 0;
+    if (refusal) { if (refusal==1) UMA_ADD(refused_exec,1); else UMA_ADD(refused_busy,1); return 0; }
+    const int fd=granule_alloc(gs,len);
+    if (fd<0) { UMA_ADD(promotion_failures,1); return 0; }
+    /* populated now: the writers are not frozen while its pages are faulted in */
+    unsigned char *scratch=mmap(NULL,len,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_POPULATE,fd,0);
+    if (scratch==MAP_FAILED) { hand_back(gs,len,fd); UMA_ADD(promotion_failures,1); return 0; }
+    /* The runtime lock, and the pages frozen, unless a kernel write is landing in them: that one is
+     * waited for (without the lock: it needs none), as long as UMA_IO_WAIT_NS. */
+    const uint64_t deadline=runtime_wait_clock()+UMA_IO_WAIT_NS;
+    int waited=0, locked=0;
+    for (;;) {
+        write_lock();
+        if (uma_fd(g)>=0) { write_unlock(); munmap(scratch,len); hand_back(gs,len,fd); return 1; }
+        n=collect_aliases(gs,gs+len,a,&refusal); /* what is mapped now, not before the allocation */
+        if (!refusal && freeze_publish(a,n)) { locked=1; break; }
+        write_unlock();
+        if (refusal) break;
+        if (!waited++) UMA_ADD(io_waits,1);
+        if (runtime_wait_clock()>deadline) { refusal=2; break; }
+        const struct timespec t={0,50000};
+        nanosleep(&t,NULL);
+    }
+    if (!locked) {
+        munmap(scratch,len);
+        hand_back(gs,len,fd);
+        if (refusal==1) UMA_ADD(refused_exec,1); else UMA_ADD(refused_busy,1);
+        return 0;
+    }
+    /* Frozen: no guest thread writes the granule, the runtime's own writers wait for the lock. */
+    const uint64_t started=runtime_wait_clock();
+    freezing=1;
+    for (int i=0;i<n;++i) alias_protect(&a[i],1);
+    dmabuf_sync(fd,0);
+    copy_granule(scratch,gs,len);
+    dmabuf_sync(fd,1);
+    int mapped=mmap(backing_base+gs,len,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0)!=MAP_FAILED, done=0;
+    for (;mapped && done<n;++done) /* PROT_NONE until all views are switched: no thread sees only some of them */
+        mapped=mmap((void *)a[done].va,a[done].length,PROT_NONE,MAP_SHARED|MAP_FIXED,fd,(off_t)a[done].offset)!=MAP_FAILED;
+    if (mapped) {
+        fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)gs,(off_t)len); /* the RAM moved */
+        atomic_store_explicit(&granule_fd[g],fd,memory_order_release);
+    } else {
+        views_to_memfd(gs,len,a,done); /* done: the pieces mapped, and the one that failed */
+    }
+    for (int i=0;i<n;++i) alias_protect(&a[i],0); /* the protection each page had */
+    const uint64_t frozen_ns=runtime_wait_clock()-started;
+    freezing=0;
+    freeze_thaw();
+    write_unlock();
+    munmap(scratch,len);
+    if (!mapped) { hand_back(gs,len,fd); UMA_ADD(promotion_failures,1); return 0; }
+    UMA_ADD(promotions,1); UMA_ADD(shared_granules,1); UMA_ADD(shared_bytes,len); UMA_ADD(promote_ns_total,frozen_ns);
+    if (frozen_ns>uma.promote_ns_max) __atomic_store_n(&uma.promote_ns_max,frozen_ns,__ATOMIC_RELAXED); /* promote_mutex */
+    return 1;
+}
+int runtime_memory_promote(uint64_t phys, uint64_t size) {
+    if (!__atomic_load_n(&granule_fd,__ATOMIC_ACQUIRE) || exclusive_depth || !size || phys>=POOL_SIZE) return 0;
+    const uint64_t end=size<POOL_SIZE-phys ? phys+size : POOL_SIZE;
+    int all=1;
+    pthread_mutex_lock(&promote_mutex);
+    for (uint64_t g=phys/granule_size;g<=(end-1)/granule_size;++g)
+        if (!promote_granule(g)) all=0;
+    pthread_mutex_unlock(&promote_mutex);
+    return all;
+}
+int runtime_memory_granule_shared(uint64_t phys) {
+    _Atomic(int) *fds=__atomic_load_n(&granule_fd,__ATOMIC_ACQUIRE);
+    return fds && phys<POOL_SIZE && atomic_load_explicit(&fds[phys/granule_size],memory_order_acquire)>=0;
+}
+void runtime_memory_uma_stats(RuntimeUmaStats *out) {
+    const uint64_t *from=(const uint64_t *)&uma;
+    uint64_t *to=(uint64_t *)out;
+    for (size_t i=0;i<sizeof(uma)/sizeof(uint64_t);++i) to[i]=__atomic_load_n(&from[i],__ATOMIC_RELAXED);
+    out->granule_bytes=granule_size;
+}
+int runtime_memory_set_granule_allocator(int (*alloc)(uint64_t phys, uint64_t size),
+                                         void (*release)(uint64_t phys, uint64_t size), uint64_t granule) {
+    if (!alloc || granule<(UINT64_C(256)<<10) || granule>(UINT64_C(64)<<20) || (granule & (granule-1)) || granule%65536) return -1;
+    write_lock();
+    if (granule_fd || chunk_alloc) { write_unlock(); return -1; }
+    const uint64_t count=(POOL_SIZE+granule-1)/granule;
+    _Atomic(int) *fds=malloc(count*sizeof(*fds));
+    void *table=mmap(NULL,GPU_STATE_LIMIT>>12,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+    if (!fds || table==MAP_FAILED) {
+        free(fds);
+        if (table!=MAP_FAILED) munmap(table,GPU_STATE_LIMIT>>12);
+        write_unlock();
+        return -1;
+    }
+    for (uint64_t g=0;g<count;++g) atomic_init(&fds[g],-1);
+    gpu_state=table;
+    granule_alloc=alloc; granule_release=release; granule_size=granule;
+    __atomic_store_n(&granule_fd,fds,__ATOMIC_RELEASE);
+    write_unlock();
+    return 0;
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
@@ -1076,10 +1506,28 @@ void runtime_memory_report(void) {
            allocations, maps, live_bytes, POOL_SIZE);
     printf("Runtime: flexible maps=%zu, in use=%" PRIu64 ", protects=%zu, queries=%zu, regions=%zu\n",
            flexible_maps, flexible_bytes, protects, queries, vma_count);
+    if (granule_fd) {
+        RuntimeUmaStats u;
+        runtime_memory_uma_stats(&u);
+        printf("Runtime: UMA granule=%" PRIu64 " KiB, shared=%" PRIu64 " (%" PRIu64 " MiB), promotions=%" PRIu64 ", failures=%" PRIu64
+               ", refused exec=%" PRIu64 " busy=%" PRIu64 ", freeze faults=%" PRIu64 ", io waits=%" PRIu64
+               ", frozen %.1f ms total, %.2f ms longest\n",
+               u.granule_bytes>>10, u.shared_granules, u.shared_bytes>>20, u.promotions, u.promotion_failures, u.refused_exec,
+               u.refused_busy, u.freeze_faults, u.io_waits, (double)u.promote_ns_total/1e6, (double)u.promote_ns_max/1e6);
+    }
 }
 #else
 void *runtime_low_map(size_t size, int prot) { (void)size; (void)prot; return NULL; }
 uintptr_t runtime_memory_resolve(const char *name) { (void)name; return 0; }
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) { (void)address; (void)size; return 0; }
 void runtime_memory_report(void) { puts("Runtime: Windows direct-memory backend not implemented"); }
+int runtime_memory_set_granule_allocator(int (*alloc)(uint64_t, uint64_t), void (*release)(uint64_t, uint64_t), uint64_t granule) {
+    (void)alloc; (void)release; (void)granule; return -1;
+}
+int runtime_memory_promote(uint64_t phys, uint64_t size) { (void)phys; (void)size; return 0; }
+int runtime_memory_granule_shared(uint64_t phys) { (void)phys; return 0; }
+void runtime_memory_uma_stats(RuntimeUmaStats *out) { memset(out,0,sizeof(*out)); }
+int runtime_memory_promotion_fault(void *address) { (void)address; return 0; }
+void *runtime_memory_io_begin(uintptr_t address, uint64_t size) { (void)address; (void)size; return NULL; }
+void runtime_memory_io_end(void *token) { (void)token; }
 #endif

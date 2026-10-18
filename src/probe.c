@@ -171,6 +171,8 @@ static ABI void guest_exit(void) { puts("Runtime: process finalizer callback rea
 static void fault(int sig, siginfo_t *info, void *context) {
     /* The guest CPU's own faults (FEXCore's JIT), then GPU page tracking (write-protected guest pages). */
     if (guest_cpu_handle_fault(sig, info, context)) return;
+    /* bbport UMA: a page a granule promotion froze: wait for it, the access is retried. */
+    if (sig == SIGSEGV && runtime_memory_promotion_fault(info->si_addr)) return;
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {

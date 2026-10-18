@@ -16,6 +16,7 @@
 #include "bbport_adpf.h"
 #include "bbport_toggles.h"
 #include "bbport_guest_memory.h"
+#include "bbport_uma.h"
 #include "bbport_fault.h"
 #include "bbport_heap_sites.h"
 #include "bbport_wait_trace.h"
@@ -430,6 +431,36 @@ static void PrintMemorySplit() {
                 (unsigned long long)(BbGuestMemory::ChunkBytes() >> 20),
                 BbGuestMemory::Unified() ? " (unified: shared with the GPU)" : "", rss >> 10, pss >> 10,
                 anon >> 10, shared >> 10, priv_dirty >> 10, swap >> 10);
+    if (BbGuestMemory::Uma()) {
+        // bbport BB_UMA: the shared granules (the runtime's counters) and what the GPU side did with them.
+        const auto runtime = BbGuestMemory::UmaRuntime();
+        const auto& uma = BbUma::counters;
+        unsigned long long class_refusals = 0;
+        for (const auto& count : uma.refused_class) {
+            class_refusals += count.load();
+        }
+        std::printf("UMA: granule %llu KiB, shared %llu granules (%llu MiB), promotions %llu "
+                    "(requests %llu, failed %llu), refused: exec %llu busy %llu class %llu image %llu "
+                    "size %llu backoff %llu, freeze faults %llu, io waits %llu, promote %.1f ms total / %.1f ms "
+                    "max, in-place bound %llu MiB, uma image writes %llu, verify %llu checked / %llu "
+                    "mismatches\n",
+                    (unsigned long long)(runtime.granule_bytes >> 10),
+                    (unsigned long long)runtime.shared_granules,
+                    (unsigned long long)(runtime.shared_bytes >> 20),
+                    (unsigned long long)runtime.promotions,
+                    (unsigned long long)uma.promote_requests.load(),
+                    (unsigned long long)(runtime.promotion_failures + uma.promote_failures.load()),
+                    (unsigned long long)runtime.refused_exec, (unsigned long long)runtime.refused_busy,
+                    class_refusals, (unsigned long long)uma.refused_image.load(),
+                    (unsigned long long)uma.refused_size.load(),
+                    (unsigned long long)uma.refused_backoff.load(),
+                    (unsigned long long)runtime.freeze_faults, (unsigned long long)runtime.io_waits,
+                    runtime.promote_ns_total / 1e6, runtime.promote_ns_max / 1e6,
+                    (unsigned long long)(BbStats::bound_in_place_bytes.load() >> 20),
+                    (unsigned long long)uma.image_writes.load(),
+                    (unsigned long long)uma.verify_checked.load(),
+                    (unsigned long long)uma.verify_mismatches.load());
+    }
 }
 
 void VideoOutDriver::Flip(const Request& req) {

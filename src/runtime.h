@@ -35,6 +35,35 @@ int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 void runtime_memory_note_write(uintptr_t address, uint64_t size);
 void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size);
 void runtime_memory_prepare_cpu_write(uintptr_t address, uint64_t size);
+/* UMA granules (BB_UMA, src/runtime_memory.c): registering switches the runtime to lazy granules.
+ * alloc(phys,size) returns a dma-buf fd of `size` bytes of GPU-visible memory for direct memory
+ * [phys,phys+size), or -1 (the GPU side keeps its own record of it; the runtime owns the fd).
+ * release(phys,size): the runtime gives back a granule it allocated but could not use (the GPU side
+ * drops its record and frees it). granule: power of two, 256 KiB..64 MiB. Returns 0, or -1 (bad size,
+ * already registered, chunk mode already active). Called once by the GPU library before the game maps
+ * direct memory. Neither callback is called with the runtime lock held. */
+int runtime_memory_set_granule_allocator(int (*alloc)(uint64_t phys, uint64_t size),
+                                         void (*release)(uint64_t phys, uint64_t size), uint64_t granule);
+/* Makes every granule overlapping direct memory [phys,phys+size) SHARED, promoting CPU ones. 1 when
+ * all of them are shared afterwards, 0 otherwise (failed ones stay CPU). Blocking: it may call alloc
+ * and release, wait up to 50 ms per granule for a kernel write into guest memory, and freezes the
+ * game's writers of the granule for the copy. Never call it from a signal handler, from inside a
+ * runtime callback that holds the runtime lock (returns 0 when this thread holds it exclusively), or
+ * with a lock the allocator callbacks need. Promotions are serialized. */
+int runtime_memory_promote(uint64_t phys, uint64_t size);
+/* 1 if the granule holding phys is SHARED (lock-free, any thread). */
+int runtime_memory_granule_shared(uint64_t phys);
+typedef struct {
+    uint64_t granule_bytes, shared_granules, shared_bytes, promotions, promotion_failures,
+             refused_exec, refused_busy, freeze_faults, io_waits, promote_ns_total, promote_ns_max;
+} RuntimeUmaStats; /* promote_ns: how long the game's writers were frozen */
+void runtime_memory_uma_stats(RuntimeUmaStats *out);
+/* Fault chain (probe.c): a fault on a page frozen by a promotion waits for it to finish and returns 1
+ * (the access is retried); 0 for any other fault. Async-signal-safe. */
+int runtime_memory_promotion_fault(void *address);
+/* File/IO reads the kernel performs into guest memory: no promotion may freeze those pages meanwhile. */
+void *runtime_memory_io_begin(uintptr_t address, uint64_t size);
+void runtime_memory_io_end(void *token);
 /* bbport (frame stats): a guest thread was blocked `ns` in the runtime (0 cond, 1 mutex, 2 sema, 3 sleep). */
 void runtime_wait_note(int kind, uint64_t ns);
 void runtime_wait_report(double frames);

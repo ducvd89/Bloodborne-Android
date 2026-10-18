@@ -14,6 +14,7 @@
 #include "bbport_sections.h"
 #include "bbport_free_check.h"
 #include "bbport_guest_memory.h"
+#include "bbport_uma.h"
 #include "game_profile.h"
 #include "bblayer_gpu_memory.h"
 #include "bblayer_write_traps.h"
@@ -412,6 +413,11 @@ bool integrated_gpu = false;
 bool ChunkUploads() {
     static const bool on = [] {
         const char* env = std::getenv("BB_CHUNK_UPLOADS");
+        // bbport BB_UMA: copies are CPU snapshots at record time, never GPU copies out of shared
+        // memory: off unless asked for.
+        if (BbGuestMemory::Uma() && !(env && *env)) {
+            return false;
+        }
         return !(env && env[0] == '0');
     }();
     return on;
@@ -575,6 +581,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     integrated_gpu = instance.IsIntegrated();
     non_sparse_arenas = WantNonSparseArenas(instance);
     Detail::non_sparse_arenas.store(non_sparse_arenas, std::memory_order_relaxed);
+    if (BbGuestMemory::UmaRequested()) {
+        // bbport BB_UMA: needs the sparse arena (non_sparse_arenas is known now); logs why not.
+        (void)BbGuestMemory::UmaEligible(instance);
+    }
     if (non_sparse_arenas && BbGuestMemory::UnifiedEligible(instance)) {
         // bbport BB_UNIFIED=1: the chunks are bound by the layer's memory module, not into a sparse
         // arena; ranges outside the chunks keep the arenas that own their memory (Backed).
@@ -789,8 +799,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     const char* sparse_env = std::getenv("BB_SPARSE_BDA_TABLE");
     const bool sparse_wanted =
         sparse_env && sparse_env[0] ? sparse_env[0] != '0' : CopyQueueEnabled();
+    // bbport BB_UMA: the copy part of unified memory is copy mode: a sparse table as well (a 128 MiB
+    // table the game's memory never fills would be RAM the sharing was to save).
     sparse_bda_table =
-        !non_sparse_arenas && !GuestInPlace() && !LayerActive() && sparse_wanted &&
+        !non_sparse_arenas && (!GuestInPlace() || BbGuestMemory::Uma()) && !LayerActive() &&
+        sparse_wanted &&
         instance.GetPhysicalDevice().getProperties().sparseProperties.residencyNonResidentStrict;
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size,
@@ -1334,6 +1347,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         read_memo.generation == ResidencyGeneration()) {
         NoteUse(memo_first << block_shift, (memo_last - memo_first + 1) << block_shift);
         BbStats::bound_in_place_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (BbUma::VerifyEnabled()) {
+            BbUma::VerifyRecord(BbUma::Current(), device_addr, size, scheduler.CurrentTick());
+        }
         return {read_memo.arena, read_memo.arena->Offset(device_addr)};
     }
     if (GuestInPlace() && (is_written || size > STREAM_THRESHOLD || ConstantsInPlace() ||
@@ -1371,6 +1387,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             }
             if (is_texel_buffer && !is_written) {
                 SynchronizeMemoryFromImage(arena, arena->Offset(device_addr), device_addr, size);
+            }
+            if (!is_written && BbUma::VerifyEnabled()) {
+                BbUma::VerifyRecord(BbUma::Current(), device_addr, size, scheduler.CurrentTick());
             }
             TraceBinding(device_addr, size, is_written, is_written ? 0 : 2);
             if (!is_written && !is_texel_buffer) {
@@ -1510,7 +1529,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
             return *source;
         }
         NoteLayerMiss(device_addr, size, false);
-    } else if (GuestInPlace()) {
+    } else if (GuestInPlace() && !BbGuestMemory::Uma()) {
+        // bbport BB_UMA: no such source: a texture upload is a CPU snapshot at record time (below),
+        // never a GPU read of shared memory the game may rewrite before the GPU gets there.
         const u64 first_block = device_addr >> block_shift;
         const u64 last_block = (device_addr + size - 1) >> block_shift;
         if (InPlaceTextures()) {
@@ -1554,6 +1575,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
         }
     }
     TraceBinding(device_addr, size, false, 9);
+    return ObtainSnapshot(device_addr, size);
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainSnapshot(VAddr device_addr, u32 size) {
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
     if (!BbToggle::Disabled(BbToggle::DeferredUploads)) {
@@ -2158,6 +2183,19 @@ void BufferCache::ReleaseResidencySlot(vk::DeviceMemory memory, u64 offset) {
     NoteResidencyUnused();
 }
 
+vk::DeviceMemory BufferCache::SpareBindMemory() {
+    if (!evicted_memory) {
+        auto spare = instance.GetDevice().allocateMemory(
+            {.allocationSize = block_size, .memoryTypeIndex = arena_memory_type_index});
+        if (spare.result != vk::Result::eSuccess) {
+            return {};
+        }
+        evicted_memory = spare.value;
+        BbStats::device_alloc_bytes.fetch_add(block_size, std::memory_order_relaxed);
+    }
+    return evicted_memory;
+}
+
 bool BufferCache::EvictVramBlock(u64 block, bool idle) {
     if (non_sparse_arenas) {
         return false; // an arena's memory is its own: no block leaves it
@@ -2179,17 +2217,13 @@ bool BufferCache::EvictVramBlock(u64 block, bool idle) {
     // idle blocks returned at boot lost the device when the save loaded. Any driver: the block's
     // slot is free all the same, and nothing that may still read the block faults.
     vk::DeviceMemory bind_memory{};
-    if (CopyQueueEnabled()) {
-        if (!evicted_memory) {
-            auto spare = instance.GetDevice().allocateMemory(
-                {.allocationSize = block_size, .memoryTypeIndex = arena_memory_type_index});
-            if (spare.result != vk::Result::eSuccess) {
-                return false; // stays in VRAM
-            }
-            evicted_memory = spare.value;
-            BbStats::device_alloc_bytes.fetch_add(block_size, std::memory_order_relaxed);
+    // bbport BB_UMA: always (GuestInPlace is on, so unmapped memory evicts its VRAM copies here, which
+    // copy mode never did without the FIFO): an unbind would blank the neighbours on KGSL.
+    if (CopyQueueEnabled() || BbGuestMemory::Uma()) {
+        bind_memory = SpareBindMemory();
+        if (!bind_memory) {
+            return false; // stays in VRAM
         }
-        bind_memory = evicted_memory;
     }
     for (const auto& arena : arenas) {
         if (arena.cpu_addr <= address && address - arena.cpu_addr < arena.size_bytes) {
@@ -2242,7 +2276,11 @@ bool BufferCache::CopyQueueEnabled() {
 }
 
 bool BufferCache::CopyQueueActive() const {
-    return CopyQueueEnabled() && !GuestInPlace() && !non_sparse_arenas && !copy_fifo_seq.empty();
+    // bbport BB_UMA: the blocks that are copies (VRAM) are queued and returned as in copy mode; shared
+    // (in place) blocks never are: QueueCopies runs for binds to residency chunks only,
+    // ReturnQueuedCopies/EvictVramBlock/HasVramCopy skip in_place_blocks.
+    return CopyQueueEnabled() && (!GuestInPlace() || BbGuestMemory::Uma()) && !non_sparse_arenas &&
+           !copy_fifo_seq.empty();
 }
 
 u64 BufferCache::CopyCapBytes() {
@@ -2646,6 +2684,57 @@ bool BufferCache::VramEligible(u64 block, bool garlic_known) {
            (runtime_memory_vma_info(block << block_shift, &prot, &type, &vma_end) && type == 3);
 }
 
+const BbGuestMemory::Chunk* BufferCache::UmaPromote(u64 block, u64 end_block, VAddr address,
+                                                    u64 phys, uintptr_t mapping_end) {
+    BbUma::Counters& counters = BbUma::counters;
+    // Only buffer bindings of an enabled class move memory from the game's memfd to shared granules;
+    // everything else (textures, DMA, labels, downloads: Class::None) takes a copy as in copy mode.
+    const BbUma::Class cls = BbUma::Current();
+    if (!BbUma::ClassAllowed(cls)) {
+        counters.refused_class[static_cast<std::size_t>(cls)].fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    // The blocks of the request that lie in this mapping.
+    const u64 bytes = std::min<u64>(mapping_end - address, (end_block - block) << block_shift);
+    // A shader given nearly all memory as one buffer would share (commit) all of it: such bindings
+    // stay copies (BB_UMA_MAX_PROMOTE_MB, default 128).
+    static const u64 max_bytes = [] {
+        const char* env = std::getenv("BB_UMA_MAX_PROMOTE_MB");
+        const u64 mib = env && *env ? std::strtoull(env, nullptr, 10) : 128;
+        return std::max<u64>(mib, 1) << 20;
+    }();
+    if (bytes > max_bytes) {
+        counters.refused_size.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    // Memory under an image the GPU writes (render or depth target, storage image) is not data both
+    // sides use as a buffer: the GPU's own data lives in the image.
+    if (texture_cache.OverlapsGpuImage(address, bytes)) {
+        counters.refused_image.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    const u64 granule = BbGuestMemory::UmaGranuleBytes();
+    const u64 first = Common::AlignDown(phys, granule), last = Common::AlignUp(phys + bytes, granule);
+    // A granule the runtime just refused (executable memory, busy) is not asked again for a few
+    // seconds: the block takes VRAM and the next block of that granule finds the same.
+    const u32 now = BbStats::coarse_second.load(std::memory_order_relaxed);
+    if (const auto failed = uma_failed_granules.find(first / granule);
+        failed != uma_failed_granules.end() && now - failed->second < 5) {
+        counters.refused_backoff.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    counters.promote_requests.fetch_add(1, std::memory_order_relaxed);
+    if (!BbGuestMemory::UmaPromote(first, last - first)) {
+        counters.promote_failures.fetch_add(1, std::memory_order_relaxed);
+        for (u64 g = first; g < last; g += granule) {
+            if (!BbGuestMemory::Find(g)) {
+                uma_failed_granules[g / granule] = now;
+            }
+        }
+    }
+    return BbGuestMemory::Find(phys);
+}
+
 void BufferCache::BindInPlace(u64 start, u64 end, std::vector<ResidentBind>& out,
                               IntervalList<>& rest, bool any_type) {
     static std::atomic<u64> in_place_bytes{0}, vram_bytes{0}, reports{0};
@@ -2662,8 +2751,13 @@ void BufferCache::BindInPlace(u64 start, u64 end, std::vector<ResidentBind>& out
         // Without write tracking only data whose writes we hear of may keep a VRAM copy.
         const bool garlic = !any_type && VramEligible(block);
         // LayerMode: what reaches the arena is not bound in place (no chunk memory in sparse).
+        // bbport BB_UMA: a block in a copy granule may share it first (UmaPromote: the binding's class
+        // decides); else it gets VRAM below, as in copy mode.
         if (!garlic && !LayerMode() && runtime_memory_direct_phys(address, &phys, &mapping_end) &&
-            (phys & (block_size - 1)) == 0 && (chunk = BbGuestMemory::Find(phys)) != nullptr) {
+            (phys & (block_size - 1)) == 0 &&
+            ((chunk = BbGuestMemory::Find(phys)) != nullptr ||
+             (BbGuestMemory::Uma() &&
+              (chunk = UmaPromote(block, end, address, phys, mapping_end)) != nullptr))) {
             // Whole blocks within the mapping, the chunk and the range.
             const u64 bytes = std::min<u64>({mapping_end - address, chunk->phys + chunk->size - phys,
                                              (end - block) << block_shift});
@@ -2853,6 +2947,16 @@ void BufferCache::ProcessDemotions() {
     });
 }
 
+std::unique_ptr<Buffer>& BufferCache::ChunkBufferFor(const BbGuestMemory::Chunk* chunk) {
+    if (BbGuestMemory::Uma()) {
+        // Shared granules number in the thousands (index = phys / granule): a map, not the
+        // 256 slots of whole chunks (two granules would have shared a wrapper).
+        std::scoped_lock lk{uma_chunk_buffers_mutex};
+        return uma_chunk_buffers[chunk->index];
+    }
+    return chunk_buffers[chunk->index % chunk_buffers.size()];
+}
+
 std::optional<std::pair<const Buffer*, u64>> BufferCache::GuestChunkSource(VAddr address, u64 size) {
     u64 phys = 0;
     uintptr_t mapping_end = 0;
@@ -2862,7 +2966,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::GuestChunkSource(VAddr
         phys + size > chunk->phys + chunk->size) {
         return std::nullopt;
     }
-    auto& buffer = chunk_buffers[chunk->index % chunk_buffers.size()];
+    auto& buffer = ChunkBufferFor(chunk);
     if (!buffer) {
         buffer = std::make_unique<Buffer>(instance, chunk->size, chunk->memory,
                                           fmt::format("bbport guest memory {:#x}", chunk->phys));
@@ -3690,6 +3794,14 @@ void BufferCache::Maintain() {
     ProcessDemotions();
     ProcessPendingAssets();
     ProcessLateWrites();
+    if (BbUma::VerifyEnabled()) {
+        // bbport BB_UMA_VERIFY: bindings whose submission has completed are hashed again.
+        BbUma::VerifyProcess(
+            [](void* cache, u64 tick) {
+                return static_cast<BufferCache*>(cache)->scheduler.GetWorkSemaphore()->IsFree(tick);
+            },
+            this);
+    }
 }
 
 void BufferCache::ProcessPendingUnmaps() {
@@ -3724,10 +3836,27 @@ void BufferCache::ProcessPendingUnmaps() {
         });
         for (const auto& range : unbind) {
             const VAddr from = range.start << block_shift, to = range.end << block_shift;
+            // bbport BB_UMA: Adreno's KGSL unbinds every whole range a block lies in (see
+            // EvictVramBlock): a bind of a shared granule's blocks partly unmapped would blank the
+            // neighbours that stay mapped. Binding splits ranges: block by block to spare memory.
+            const vk::DeviceMemory spare =
+                BbGuestMemory::Uma() ? SpareBindMemory() : vk::DeviceMemory{};
             for (const auto& arena : arenas) {
                 const VAddr a = std::max<VAddr>(from, arena.cpu_addr);
                 const VAddr b = std::min<VAddr>(to, arena.cpu_addr + arena.size_bytes);
-                if (a < b) {
+                if (a >= b) {
+                    continue;
+                }
+                if (spare) {
+                    for (VAddr at = a; at < b; at += block_size) {
+                        BindsForArena(&arena)->binds.emplace_back(vk::SparseMemoryBind{
+                            .resourceOffset = at - arena.cpu_addr,
+                            .size = block_size,
+                            .memory = spare,
+                            .memoryOffset = 0,
+                        });
+                    }
+                } else {
                     BindsForArena(&arena)->binds.emplace_back(vk::SparseMemoryBind{
                         .resourceOffset = a - arena.cpu_addr,
                         .size = b - a,
@@ -3973,9 +4102,17 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offset,
                                              VAddr device_addr, u32 size) {
+    // bbport BB_UMA: where the target lies in shared blocks the GPU's data goes into the game's
+    // memory, as on a PS4 (HTile fills too); counted so the memory split shows how often.
+    const auto note_uma_write = [&] {
+        if (BbGuestMemory::Uma() && IsInPlace(device_addr, size)) {
+            BbUma::counters.image_writes.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
+            note_uma_write();
             runtime.FillBuffer(arena, arena_offset, size, ZmaskUncompressed);
             return true;
         } else {
@@ -4046,6 +4183,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, u64 arena_offs
         }
     }
     auto& tile_manager = texture_cache.GetTileManager();
+    note_uma_write();
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
     DropShadows(device_addr, size);
     // A GPU write like any other: what the GPU copies there each frame (a render target read as a

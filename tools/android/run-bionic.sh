@@ -176,18 +176,29 @@ export BB_DRAW_PIPE=${BB_DRAW_PIPE:-1}
 export BB_WINDOW_SIZE=$output
 export BB_OUTPUT_RES=$output BB_LIVE_RES=0
 if [ -n "$render" ]; then export BB_RENDER_RES=$render; else unset BB_RENDER_RES; fi
-# Unified memory (experimental, off by default; Debug options -> Unified memory, bbport.ini unified_memory=1,
-# or BB_UNIFIED=1 in the environment): the game's direct memory is Vulkan dma-buf chunks
-# the GPU uses in place (the PC memory model through the layer's memory module, no sparse buffers needed)
-# instead of copies. libbbgpu probes the driver and falls back to copies by itself, with one logged reason
-# (Mali/PanVK always, a driver without cached CPU-visible device memory, failed CPU/GPU roundtrips...).
-# Writes by the game are caught by page protection (BB_WRITE_TRACKING); no userfaultfd, no preupload.
-if [ -z "${BB_UNIFIED:-}" ] && [ "$(setting unified_memory)" = 1 ]; then BB_UNIFIED=1; fi
-if [ "${BB_UNIFIED:-0}" = 1 ]; then
+# Unified memory v2 (experimental, off by default; Debug options -> Unified memory, bbport.ini unified_memory=1,
+# or BB_UMA=1 in the environment): the game's buffers (index and vertex buffers first; BB_UMA_CLASSES) live in
+# dma-buf granules (BB_UMA_GRANULE_KB, 2048) the GPU binds in place through the sparse arena, instead of the game's
+# copy plus a GPU copy; textures and every other copy stay CPU snapshots (docs/ANDROID_UNIFIED_MEMORY_PLAN.md).
+# libbbgpu probes the driver (coherence, sparse binding of shared memory...) and falls back to copies by itself,
+# with one logged reason (Mali/PanVK always, a failed probe...). Writes by the game are caught by page protection
+# (BB_WRITE_TRACKING); BB_UMA_VERIFY=N reports data that changed while the GPU used it. BB_UNIFIED=1 (v1: whole
+# allocations through the layer memory module) stays for reference, only from the environment.
+if [ -z "${BB_UMA:-}" ] && [ "$(setting unified_memory)" = 1 ]; then BB_UMA=1; fi
+if [ "${BB_UMA:-0}" = 1 ]; then
+    export BB_UMA=1 BB_GUEST_IN_PLACE=1 BB_LAYER_MEMORY=0 BB_WRITE_TRACKING=1 BB_CHUNK_UPLOADS=0
+    unset BB_UNIFIED
+    for uma_var in BB_UMA_CLASSES BB_UMA_VERIFY BB_UMA_GRANULE_KB; do
+        eval "uma_val=\${$uma_var:-}"
+        [ -z "$uma_val" ] || export "$uma_var"
+    done
+    echo "Unified memory v2: requested (classes ${BB_UMA_CLASSES:-index,vertex}, granule ${BB_UMA_GRANULE_KB:-2048} KiB, verify ${BB_UMA_VERIFY:-0}; the driver is probed at start, falls back to copies with a logged reason)"
+elif [ "${BB_UNIFIED:-0}" = 1 ]; then
+    unset BB_UMA
     export BB_UNIFIED=1 BB_GUEST_IN_PLACE=1 BB_LAYER_MEMORY=1 BB_WRITE_TRACKING=1
-    echo "Unified memory: requested (the driver is probed at start; falls back to copies with a logged reason)"
+    echo "Unified memory v1 (BB_UNIFIED=1): requested (the driver is probed at start; falls back to copies with a logged reason)"
 else
-    unset BB_UNIFIED BB_LAYER_MEMORY BB_WRITE_TRACKING
+    unset BB_UMA BB_UNIFIED BB_LAYER_MEMORY BB_WRITE_TRACKING
     export BB_GUEST_IN_PLACE=0
 fi
 export BB_DMEM_MB=$dmem_mb BB_PREUPLOAD=0 BB_UFFD=0
@@ -290,8 +301,8 @@ dbg_prepare=on; dbg_drain=on; dbg_lock=on; dbg_stats=off; dbg_profile=off
 if [ "$(setting debug_fault_prepare)" = 0 ]; then export BB_FAULT_PREPARE=0; dbg_prepare=off; fi
 if [ "$(setting debug_fault_smart_drain)" = 0 ]; then export BB_FAULT_DRAIN=always; dbg_drain=off; fi
 if [ "$(setting debug_fault_sleep_lock)" = 0 ]; then export BB_FAULT_SPINLOCK=1; dbg_lock=off; fi
-# Free old GPU memory (FIFO; on by default, debug_vram_copy_queue=0 turns it off; copy mode only: unified memory
-# keeps its own memory): BB_VRAM_COPY_QUEUE=1, with the cap (MB) of debug_vram_copy_cap_mb when it is a positive
+# Free old GPU memory (FIFO; on by default, debug_vram_copy_queue=0 turns it off; copy mode, and the copies that
+# unified memory v2 still makes: its shared blocks are never queued): BB_VRAM_COPY_QUEUE=1, with the cap (MB) of debug_vram_copy_cap_mb when it is a positive
 # integer, else 512 (tested on the AYN Thor: copies held ~480 MiB, 33-39 FPS in Central Yharnam).
 dbg_fifo=off
 if [ "$(setting debug_vram_copy_queue)" != 0 ]; then

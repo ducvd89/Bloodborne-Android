@@ -32,6 +32,10 @@ namespace Core {
 class MemoryManager;
 }
 
+namespace BbGuestMemory {
+struct Chunk;
+}
+
 namespace Vulkan {
 class GraphicsPipeline;
 struct SubmitInfo;
@@ -146,11 +150,16 @@ public:
     /// memory (copy mode, the phones) are kept under a cap (BB_VRAM_COPY_CAP_MB, 1024) by returning
     /// the oldest first (FIFO) that were not used for BB_VRAM_IDLE_SECONDS.
     [[nodiscard]] static bool CopyQueueEnabled();
-    /// The FIFO is in use: switched on, copy mode (not GuestInPlace), arenas bound sparsely.
+    /// The FIFO is in use: switched on, copy mode (not GuestInPlace) or the copy part of BB_UMA (its
+    /// VRAM copies; shared blocks are never queued or returned), arenas bound sparsely.
     [[nodiscard]] bool CopyQueueActive() const;
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+
+    /// bbport BB_UMA: a CPU snapshot of [device_addr, device_addr + size) in staging, taken now (what copy
+    /// mode reads at record time): for sources that must not be read live out of shared memory.
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainSnapshot(VAddr device_addr, u32 size);
 
     /// bbport BB_GUEST_IN_PLACE: where a command processor write (WRITE_DATA) the GPU performs in
     /// stream order lands: the arena over the game's memory, if the range is bound there in place.
@@ -297,6 +306,17 @@ private:
     };
     void BindInPlace(u64 start, u64 end, std::vector<ResidentBind>& out, IntervalList<>& rest,
                      bool any_type = false);
+    /// bbport BB_UMA: the block at `address` (direct memory `phys`, its mapping ends at `mapping_end`)
+    /// lies in a copy granule: when the binding's class (BbUma::Current) may, the granules under the
+    /// blocks [block, end_block) of the mapping are shared with the GPU (runtime_memory_promote) and
+    /// the chunk of `phys` is returned; null when it stays a copy (the block gets VRAM).
+    const BbGuestMemory::Chunk* UmaPromote(u64 block, u64 end_block, VAddr address, u64 phys,
+                                           uintptr_t mapping_end);
+    /// bbport BB_UMA: where the Buffer wrapper of a shared granule is kept (GuestChunkSource).
+    std::unique_ptr<Buffer>& ChunkBufferFor(const BbGuestMemory::Chunk* chunk);
+    /// bbport: one block of memory blocks are bound to instead of being unbound (allocated the first
+    /// time); null handle when that fails.
+    vk::DeviceMemory SpareBindMemory();
     /// bbport: the housekeeping EnsureResident did before every binding (Process*), once a packet.
     void Maintain();
     u64 packet_epoch = 1, maintained_epoch = 0;
@@ -646,6 +666,12 @@ private:
     std::atomic<bool> late_writes_pending{false};
     u64 bind_wait_tick = 0;                            ///< the next arena binds wait for it
     std::array<std::unique_ptr<Buffer>, 256> chunk_buffers{}; ///< per guest memory chunk (Chunk::index)
+    /// bbport BB_UMA: the same for shared granules (thousands, indexed by phys / granule).
+    std::mutex uma_chunk_buffers_mutex;
+    std::unordered_map<u32, std::unique_ptr<Buffer>> uma_chunk_buffers;
+    /// bbport BB_UMA: granules a promotion failed for, with the second of the failure: not asked
+    /// again for a few seconds (a granule with executable memory is refused every time).
+    std::unordered_map<u64, u32> uma_failed_granules;
 
     /// bbport: arenas are plain buffers that own their memory, allocated when created
     /// (NonSparseArenas): no vkQueueBindSparse, residency of a block is its place in the arena's
