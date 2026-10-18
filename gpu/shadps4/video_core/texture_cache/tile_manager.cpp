@@ -284,7 +284,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 }
 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
-                            const VideoCore::Buffer* out_buffer, u64 out_offset) {
+                            const VideoCore::Buffer* out_buffer, u64 out_offset, bool zero_linear) {
     const auto& info = in_image.info;
     if (!info.props.is_tiled) {
         for (auto& copy : buffer_copies) {
@@ -313,9 +313,15 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = sizeof(params),
     };
 
-    const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal);
+    const auto staging = zero_linear ? runtime.GetStagingPool().Request(info.guest_size,
+                                                                         MemoryType::DeviceLocal, 256)
+                                     : runtime.GetStagingPool().Request(info.guest_size,
+                                                                         MemoryType::DeviceLocal);
     for (auto& copy : buffer_copies) {
         copy.bufferOffset += staging.offset;
+    }
+    if (zero_linear) {
+        runtime.FillBuffer(staging.buffer, staging.offset, info.guest_size & ~u64{3}, 0);
     }
 
     runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);

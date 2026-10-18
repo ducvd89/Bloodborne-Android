@@ -5,6 +5,7 @@
 #include "bbport_toggles.h"
 #include "bbport_fault.h"
 #include "bbport_uma.h"
+#include "bbport_tex_home.h"
 #include "bblayer_write_traps.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -449,17 +450,11 @@ struct PageManager::Impl {
         }
         (fault ? BbUma::counters.watch_faults : BbUma::counters.watch_notes)
             .fetch_add(1, std::memory_order_relaxed);
-        const u64 first = addr >> BbUma::Dynamic::BlockShift;
-        const u64 last = (addr + size - 1) >> BbUma::Dynamic::BlockShift;
-        for (u64 block = first; block <= last; ++block) {
-            if (!BbUma::Dynamic::Armed(block) && !BbUma::Dynamic::IsDynamic(block)) {
-                continue;
-            }
-            BbUma::Dynamic::Mark(block);
+        // Lifted where this manager does not restrict the page: the game's protection comes back.
+        // Pages it restricts keep the trap's bit until it lets them go (UmaProtect), else the lift
+        // would drop its protection with ours.
+        const auto lift = [&](u64 block) {
             WithBlockPages(block, [&](size_t page, size_t page_end) {
-                // Lifted where this manager does not restrict the page: the game's protection comes
-                // back. Pages it restricts keep the trap's bit until it lets them go (UmaProtect),
-                // else the lift would drop its protection with ours.
                 ForEachPageRun(
                     page, page_end,
                     [&](size_t p) {
@@ -473,6 +468,22 @@ struct PageManager::Impl {
                                                  false);
                     });
             });
+        };
+        const u64 first = addr >> BbUma::Dynamic::BlockShift;
+        const u64 last = (addr + size - 1) >> BbUma::Dynamic::BlockShift;
+        for (u64 block = first; block <= last; ++block) {
+            if (!BbUma::Dynamic::Armed(block) && !BbUma::Dynamic::IsDynamic(block)) {
+                continue;
+            }
+            const BbUma::Dynamic::Marked marked = BbUma::Dynamic::Mark(block);
+            lift(block);
+            // A ring: its whole 2 MiB regions became dynamic; their traps go now too (the blocks
+            // of this write are done in this loop).
+            for (u64 other = marked.first; other < marked.end; ++other) {
+                if (other < first || other > last) {
+                    lift(other);
+                }
+            }
         }
     }
 
@@ -485,6 +496,13 @@ struct PageManager::Impl {
             BbStats::gpu_signal_faults.fetch_add(1, std::memory_order_relaxed);
         }
         // Traps on reads too (no access, BbLayer::WriteTraps::NoAccess): their owner first.
+        // bbport BB_TEX_HOME: a homed texture page: re-tiled back first (any other handling would
+        // see a hole), then the access runs again (and faults again if this manager protects it).
+        if (BbTexHome::Active() &&
+            (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::TexHome)) {
+            const auto handler = BbTexHome::fault_handler.load(std::memory_order_acquire);
+            return handler && handler(context, addr);
+        }
         if (BbLayer::WriteTraps::Reasons(addr) & BbLayer::WriteTraps::VramData) {
             return rasterizer->OnVramDataAccess(addr, is_gpu_thread);
         }

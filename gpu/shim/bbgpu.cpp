@@ -12,6 +12,7 @@
 #include "bbport_free_check.h"
 #include "bbport_toggles.h"
 #include "bbport_fault.h"
+#include "bbport_tex_home.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -193,6 +194,9 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     }
 }
 void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
+    // bbport BB_TEX_HOME: homed pages back first (on the GPU threads; a copy thread finds none,
+    // the GPU side cleared them before queuing the copy).
+    BbTexHome::BeforeAccess(source, size);
     // bbport: large uploads (streaming) are split across the copy threads.
     constexpr u64 Chunk = 512 * 1024;
     if (size < 4 * Chunk || !BbCopy::Enabled()) {

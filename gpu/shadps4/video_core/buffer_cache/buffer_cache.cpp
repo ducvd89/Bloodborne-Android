@@ -15,6 +15,7 @@
 #include "bbport_free_check.h"
 #include "bbport_guest_memory.h"
 #include "bbport_uma.h"
+#include "bbport_tex_home.h"
 #include "game_profile.h"
 #include "bblayer_gpu_memory.h"
 #include "bblayer_write_traps.h"
@@ -40,6 +41,7 @@
 #include <string>
 #include <fmt/format.h>
 #include <sys/mman.h>
+#include <cerrno>
 #include <ucontext.h>
 #include "common/signal_context.h"
 #include "core/signals.h"
@@ -913,6 +915,8 @@ void BufferCache::RunGuestCopy(const BbCopy::Item& item) {
 // idle most of the time); PoolSmallCopies (toggle 524288) batches them for the copy threads.
 // Each source is noted once the copy is queued (a WaitHostCopies started after the note covers it).
 void BufferCache::SmallGuestCopy(const BbCopy::Item& item) {
+    // bbport BB_TEX_HOME: the copy may run on another thread, which must not meet homed pages.
+    BbTexHome::BeforeAccess(item.source, item.size);
     if (!scheduler.IsRecordingDeferred()) {
         // bbport: commands recorded on this thread (direct mode: the draw or dispatch after the
         // upscaler's passes; or BB_VK_RECORD_THREAD=0): the copy runs now, before the commands
@@ -1117,8 +1121,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             constexpr u64 mask = ~(align - 1ULL);
             total_size_bytes += (new_size + align - 1) & mask;
         };
-        gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        gpu_modified_ranges.Subtract(address, size);
+        gpu_modified_ranges.TakeInRange(address, size, add_download);
     });
     if (total_size_bytes == 0) {
         return;
@@ -1315,6 +1318,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                                                         bool is_written, bool is_texel_buffer,
                                                         bool force_resident) {
     BB_SECTION(ObtainBuffer);
+    // bbport BB_TEX_HOME: homed texture pages back before anything reads (or the GPU writes) them.
+    BbTexHome::BeforeAccess(device_addr, size);
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
@@ -1534,6 +1539,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::CommandWriteTarget(VAd
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+    BbTexHome::BeforeAccess(device_addr, size); // bbport BB_TEX_HOME
     // bbport BB_GUEST_IN_PLACE: texture data is read by the GPU from the game's memory itself:
     // through the arena where it is bound in place, else (BB_CHUNK_TEXTURES) from its guest
     // memory chunk.
@@ -1596,6 +1602,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainSnapshot(VAddr device_addr, u32 size) {
+    BbTexHome::BeforeAccess(device_addr, size); // bbport BB_TEX_HOME: copied on the copy threads
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
     if (!BbToggle::Disabled(BbToggle::DeferredUploads)) {
@@ -1933,6 +1940,12 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         if (CopyQueueActive() && residency_chunks.contains(static_cast<VkDeviceMemory>(bind.memory))) {
             QueueCopies(bind.start, bind.end);
         }
+        // bbport BB_UMA: VRAM copies by binding class ("Arena by class" in the memory split).
+        if (UmaActive() && residency_chunks.contains(static_cast<VkDeviceMemory>(bind.memory))) {
+            for (u64 block = bind.start; block < bind.end; ++block) {
+                NoteArenaResident(block);
+            }
+        }
 
         const u64 resource_offset = (bind.start << block_shift) - arena->cpu_addr;
         const u64 bind_size = (bind.end - bind.start) << block_shift;
@@ -2253,6 +2266,7 @@ bool BufferCache::EvictVramBlock(u64 block, bool idle) {
         }
     }
     resident_ranges.Subtract(block, block + 1);
+    NoteArenaReleased(block); // bbport BB_UMA
     memory_tracker->UnmarkRegionAsGpuModified(address, block_size);
     gpu_modified_ranges.Subtract(address, block_size);
     memory_tracker->MarkRegionAsCpuModified(address, block_size);
@@ -2706,6 +2720,10 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
     // Only buffer bindings of an enabled class read shared memory live; everything else (textures,
     // DMA, labels, downloads: Class::None) takes copy mode's path.
     const BbUma::Class cls = BbUma::Current();
+    const auto by_class = [&](std::size_t kind) {
+        counters.refused_by[static_cast<std::size_t>(cls)][kind].fetch_add(1,
+                                                                          std::memory_order_relaxed);
+    };
     if (!BbUma::ClassAllowed(cls)) {
         counters.refused_class[static_cast<std::size_t>(cls)].fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
@@ -2714,6 +2732,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
     // same bytes (the arena): written bindings take copies for now.
     if (is_written) {
         counters.refused_written.fetch_add(1, std::memory_order_relaxed);
+        by_class(5);
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed)) {
             std::printf("UMA: written bindings are not shared yet (class %s): they take copies as in "
@@ -2762,12 +2781,15 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
         switch (memo.verdict) {
         case Verdict::Mapping:
             counters.refused_mapping.fetch_add(1, std::memory_order_relaxed);
+            by_class(0);
             return std::nullopt;
         case Verdict::Cross:
             counters.refused_cross.fetch_add(1, std::memory_order_relaxed);
+            by_class(1);
             return std::nullopt;
         case Verdict::Dynamic:
             counters.refused_dynamic.fetch_add(1, std::memory_order_relaxed);
+            by_class(2);
             return std::nullopt;
         case Verdict::Direct:
             if (memo.epoch == epoch) {
@@ -2791,6 +2813,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
     if (!runtime_memory_direct_phys(device_addr, &phys, &mapping_end) ||
         device_addr + size > mapping_end) {
         counters.refused_mapping.fetch_add(1, std::memory_order_relaxed);
+        by_class(0);
         remember(Verdict::Mapping);
         return std::nullopt;
     }
@@ -2798,6 +2821,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
     const u64 first = Common::AlignDown(phys, granule);
     if (phys + size > first + granule) {
         counters.refused_cross.fetch_add(1, std::memory_order_relaxed);
+        by_class(1);
         remember(Verdict::Cross);
         return std::nullopt;
     }
@@ -2805,6 +2829,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
     // announced, or verify saw it change): a per-frame buffer. Copies keep the draw's own data.
     if (BbUma::Dynamic::Any(device_addr, size)) {
         counters.refused_dynamic.fetch_add(1, std::memory_order_relaxed);
+        by_class(2);
         remember(Verdict::Dynamic);
         return std::nullopt;
     }
@@ -2812,6 +2837,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
     // stream order, until the CPU's access brought it back (DownloadMemory).
     if (IsRegionGpuModified(device_addr, size) || gpu_modified_ranges.Intersects(device_addr, size)) {
         counters.refused_gpu_data.fetch_add(1, std::memory_order_relaxed);
+        by_class(3);
         return std::nullopt;
     }
     // Memory under an image the GPU writes (render or depth target, storage image) is not data both
@@ -2821,6 +2847,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
         (is_texel_buffer && (texture_cache.IsMeta(device_addr) ||
                              texture_cache.FindImageFromRange(device_addr, size)))) {
         counters.refused_image.fetch_add(1, std::memory_order_relaxed);
+        by_class(4);
         return std::nullopt;
     }
     const BbGuestMemory::Chunk* chunk = BbGuestMemory::Find(phys);
@@ -2831,12 +2858,14 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
         if (const auto failed = uma_failed_granules.find(first / granule);
             failed != uma_failed_granules.end() && now - failed->second < 5) {
             counters.refused_backoff.fetch_add(1, std::memory_order_relaxed);
+            by_class(6);
             return std::nullopt;
         }
         counters.promote_requests.fetch_add(1, std::memory_order_relaxed);
         if (!BbGuestMemory::UmaPromote(first, granule) ||
             (chunk = BbGuestMemory::Find(phys)) == nullptr) {
             counters.promote_failures.fetch_add(1, std::memory_order_relaxed);
+            by_class(6);
             uma_failed_granules[first / granule] = now;
             return std::nullopt;
         }
@@ -2845,6 +2874,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
     const auto source = GuestChunkSource(device_addr, size);
     if (!source) {
         counters.refused_cross.fetch_add(1, std::memory_order_relaxed);
+        by_class(1);
         return std::nullopt;
     }
     // The first CPU write there from now on makes its blocks dynamic (one-shot write traps).
@@ -2870,6 +2900,61 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
                     (unsigned long long)counters.memo_misses.load());
     }
     return bound(*source);
+}
+
+void BufferCache::NoteArenaResident(u64 block) {
+    if (!arena_class_table) {
+        arena_class_entries = (u64{1} << 40) >> block_shift;
+        void* mem = mmap(nullptr, arena_class_entries, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (mem == MAP_FAILED) {
+            arena_class_entries = 0;
+            return;
+        }
+        arena_class_table = static_cast<std::atomic<u8>*>(mem);
+    }
+    if (block >= arena_class_entries ||
+        arena_class_table[block].load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    const auto cls = static_cast<u8>(BbUma::Current());
+    // Were its guest pages in RAM before the GPU wanted them (the upload that follows reads them
+    // and commits them)? A shared granule is; else what mincore says of the guest mapping (the
+    // memfd's pages: written or read by the CPU, or by a loader).
+    const VAddr address = block << block_shift;
+    bool touched = false;
+    u64 phys = 0;
+    uintptr_t mapping_end = 0;
+    if (runtime_memory_direct_phys(address, &phys, &mapping_end) &&
+        runtime_memory_granule_shared(phys)) {
+        touched = true;
+    } else {
+        std::array<unsigned char, 64> pages{};
+        const u64 bytes = std::min<u64>(u64{1} << block_shift, pages.size() * 4_KB);
+        if (mincore(reinterpret_cast<void*>(address), bytes, pages.data()) == 0) {
+            for (u64 i = 0; i < bytes / 4_KB && !touched; ++i) {
+                touched = pages[i] & 1;
+            }
+        } else if (errno != ENOMEM) {
+            BbUma::counters.arena_mincore_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    arena_class_table[block].store(static_cast<u8>(0x80 | (touched ? 8 : 0) | cls),
+                                   std::memory_order_relaxed);
+    BbUma::counters.arena_bytes[cls][touched ? 1 : 0].fetch_add(u64{1} << block_shift,
+                                                                std::memory_order_relaxed);
+}
+
+void BufferCache::NoteArenaReleased(u64 block) {
+    if (!arena_class_table || block >= arena_class_entries) {
+        return;
+    }
+    const u8 entry = arena_class_table[block].exchange(0, std::memory_order_relaxed);
+    if (entry == 0) {
+        return;
+    }
+    BbUma::counters.arena_bytes[entry & 7][(entry & 8) ? 1 : 0].fetch_sub(
+        u64{1} << block_shift, std::memory_order_relaxed);
 }
 
 bool BufferCache::UmaAnyShared(VAddr addr, u64 size) {
@@ -4169,6 +4254,12 @@ const Buffer* BufferCache::UploadCopies(const Buffer* arena, std::span<vk::Buffe
         return nullptr;
     }
     BbStats::buffer_upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+    // bbport BB_TEX_HOME: the sources (dstOffset: guest addresses here) are read on the copy threads.
+    if (BbTexHome::Active()) {
+        for (const auto& copy : copies) {
+            BbTexHome::BeforeAccess(copy.dstOffset, copy.size);
+        }
+    }
     const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
     // bbport: the guest memory is copied into staging on the copy threads, started now in
     // groups of about 1 MiB; submission and guest-visible fences wait for them

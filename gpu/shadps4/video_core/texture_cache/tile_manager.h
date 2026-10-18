@@ -46,8 +46,10 @@ public:
                          Vulkan::Runtime& runtime, StreamBuffer& stream_buffer);
     ~TileManager();
 
+    /// `zero_linear` (bbport BB_TEX_HOME): the linear copy of the image is cleared first, so bytes no
+    /// texel covers (pitch padding) are zeros, the same on every re-tile.
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
-                   const VideoCore::Buffer* out_buffer, u64 out_offset);
+                   const VideoCore::Buffer* out_buffer, u64 out_offset, bool zero_linear = false);
 
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
                                               const ImageInfo& info);

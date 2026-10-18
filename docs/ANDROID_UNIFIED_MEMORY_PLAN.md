@@ -182,6 +182,23 @@ mprotect, which ignores the traps (the last change wins). Hence: pages it denies
 trap (`UmaProtect`); the trap is lifted only where it does not restrict the page itself, elsewhere when
 it lets the page go; a fault on a page both protect goes on to its own handler.
 
+### Rings, arena by class, constant and texel (2026-10-18)
+
+- **Rings:** run 14's verify mismatches were a rotating set of 256 KiB vertex slots (skinned or
+  animated geometry). When a block becomes dynamic and another dynamic block lies within 2 MiB of it,
+  the 2 MiB-aligned regions of both become dynamic at once (`dynamic regions`; traps lifted there by
+  the page manager, verdict epoch moved). A verify mismatch marks its whole 2 MiB regions.
+- **Arena by class:** each VRAM block of the arena records the class current when it became
+  resident and whether its guest pages were in RAM then (mincore of the guest mapping; a shared
+  granule counts as in RAM): "CPU pages" (a copy duplicates them, sharing would save it) vs
+  "GPU-only" (sharing saves nothing). Added on residency, subtracted when the block leaves VRAM
+  (`EvictVramBlock`, the only way out in copy mode). Printed as `Arena by class:` next to the `UMA:`
+  line, with `UMA refusals by class:` for the classes allowed.
+- **constant / texel:** read-only like index and vertex; the same refusals apply (texel: any image
+  or metadata over the range, as copy mode's `SynchronizeMemoryFromImage` would copy from it). One
+  gap fixed: a read binding over memory a written binding of the same shader stage covers is never
+  read in place (class None): the write goes to the arena's copy and the shader must see it.
+
 ### Verdict memo (2026-10-18)
 
 Run 7 (`index,vertex`, 8 MiB granules, dynamic traps) was stable but the GPU thread went from ~30-35
@@ -284,6 +301,9 @@ guest address, size and frame. This replaces guessing which binding causes a gli
 | `BB_UMA_VERIFY` | verify one in N in-place bindings (0: off) | 0 |
 | `BB_UMA_ALLOW_NONCOHERENT=1` | debugging only: share even if the coherence probe fails | off |
 | `BB_UMA_ORDER=1` | phase 3: game writes wait for in-flight GPU reads of shared blocks | off |
+| `BB_TEX_HOME=1` | Plan A: sampled textures the CPU left alone live only in the GPU (copy mode or `BB_UMA`) | off |
+| `BB_TEX_HOME_IDLE_S` | seconds since the last CPU write before a texture is homed (1..3600) | 10 |
+| `BB_TEX_HOME_LOG=1` | names the textures whose re-tile differed (first 40) | off |
 
 `BB_UNIFIED=1` (v1, layer mode) stays in the code for reference but is no longer wired to the Debug
 option.
@@ -316,6 +336,135 @@ option.
   `KGSL_PROP_GPU_VA64_SIZE` unknown.
 - **Granule boundaries:** bindings crossing a granule (and all ranges larger than one) take copies.
 
+## Plan A: textures homed in the GPU (BB_TEX_HOME, phase 1, 2026-10-19)
+
+"Textures cannot be single-copy" above holds for textures the game still touches. A texture the game
+loaded and then left alone exists twice for nothing: its tiled copy in the memfd (318-363 MiB of
+"cached images" at the Thor's test spot) and the VkImage. Plan A keeps only the image for those: the
+game's pages are freed and rebuilt from the image, by an exact re-tile, on any access. Opt-in,
+`BB_TEX_HOME=1` (off: byte-for-byte today's behaviour); copy mode and `BB_UMA=1`.
+
+### Which textures (checked by the collector's pass, `TexHomeEligible`)
+
+All of these, else the reason is counted (`refused (looks)` in the stats line):
+
+- registered, sampled only (`usage.texture`; never a render/depth target, storage image, video out
+  surface, scene proxy, bound target), never GPU-written (not `GpuModified`/`GpuDirty`,
+  `gpu_write_tick` 0);
+- one sample (no MSAA backing), no depth or stencil, no CMASK/FMASK/HTILE;
+- host format equal to the guest's, or a bitwise reinterpretation (`R8_SRGB`/`R8_UNORM`,
+  `R8G8_SRGB`/`R8G8_UNORM`, `Instance::GetSupportedFormat`'s substitutions that keep the bytes);
+- `guest_size` >= 256 KiB and at least one whole host page inside it; only the whole host pages
+  inside the texture are dropped (edge pages stay);
+- uploaded and clean (no `Dirty` bit), tracked whole, and its last refresh from the game's memory
+  (`tex_home_stamp`, set in `RefreshImage`) at least `BB_TEX_HOME_IDLE_S` (10) seconds ago: a CPU
+  write to a tracked texture always makes it dirty and refreshed, so this is "the CPU has not written
+  it for 10 s";
+- its pages in one direct memory mapping (not flexible memory), in no shared UMA granule (nor a v1
+  chunk), no other image over its range, no GPU data of the buffer cache on its pages;
+- never refused for different bytes before.
+
+At most 4 re-tiles in flight and 256 images looked at per scan, a scan every 250 ms; refused images
+are not looked at again for 5 s (60 s for lasting reasons, until 10 s after the refresh for recent).
+
+### Homing
+
+1. **Re-tile** (`TexHomeTile`): `TileManager::TileImage` (with a zeroed linear copy:
+   `zero_linear`) into a zeroed host-cached staging buffer, the regions of `RefreshImage`'s upload,
+   then a barrier to host reads. Recorded in the pass; no wait.
+2. **Verify and drop**, at a later pass once the GPU is past it (`TexHomeFinish`): the conditions
+   again (and the refresh stamp unchanged), the copy threads' copies waited for
+   (`WaitHostCopies`), then `runtime_memory_home` under the runtime's lock: every guest alias of
+   the pages gets the trap reason `TexHome` (64, no access), the pages are compared with the re-tile
+   through the backing view, and when equal the memfd range is punched out
+   (`FALLOC_FL_PUNCH_HOLE`). Different bytes: traps lifted, nothing changed, the image is never
+   tried again (`bytes differ`, `BB_TEX_HOME_LOG=1` names them).
+3. The runtime keeps a record per home (ticket) and the ticket of every homed 4 KiB page; new
+   mappings of homed pages get the trap; the game's `mprotect` and the GPU page manager's
+   protections keep homed pages without access; released pages leave their home (no rebuild).
+
+### Rebuilding
+
+The image is re-tiled again, the GPU waited for (`Scheduler::Finish`), the bytes written into the
+memfd through the backing view, then the traps lifted (`runtime_memory_home_restore`); pages the GPU
+page manager write-protects (BB_FAULT_PREPARE's map) stay read-only, so the texture's own write
+tracking goes on. The image stays valid (it equals the data) and is not homed again before it was
+left alone for `BB_TEX_HOME_IDLE_S` again.
+
+Who asks:
+
+- **A guest access** (fault, `TexHome` among the trap reasons, first in
+  `PageManager::GuestFaultSignalHandler`).
+- **The GPU side before it reads or lets the GPU write guest memory** (`BbTexHome::BeforeAccess`):
+  `ObtainBuffer` (every binding, read or written), `ObtainBufferForImage`, `ObtainSnapshot`,
+  `SmallGuestCopy`, `UploadCopies`, `MemoryManager::CopySparseMemory`. One relaxed load while
+  nothing is homed, then a lock-free check of the trap table per 2 MiB region.
+- **The runtime before it touches homed pages itself** (home hook): `read_backing` and
+  `write_backing` (the backing view is not trapped; a GPU download lands after the rebuild, so it is
+  not overwritten), `note_write` (file reads), `prepare_cpu_write` (libc copies), `io_begin`.
+- **The texture cache**: a new image over homed pages (`RegisterImage`, on the GPU threads), an
+  image about to be GPU-written (render/depth target, storage), an image freed (overlaps,
+  `UnmapMemory`, the collector).
+
+Per thread (`TextureCache::TexHomeRehydrateFrom`):
+
+| Thread | What happens |
+|---|---|
+| GPU command thread (stage A) | draw pipe drained, rebuilt inline (in a fault handler too, as the buffer cache's readbacks with `assume_locks`) |
+| draw recording thread (stage B) | inline |
+| game threads (guest code, or host functions they called) | `Liverpool::SendCommand` (run after the GPU thread's drain), the thread waits as long as it takes (a log line after 5 s) |
+| other host threads (copy workers, recording workers, binding helper, AvPlayer, ...) | the same, but they wait 250 ms at most (the GPU thread may be waiting for them): then a fault ends the process with the fault report, a runtime read goes on with zeros (`timed out` in the stats). Kept away from homed pages: every copy queued for them is preceded by `BeforeAccess` on the GPU thread, and homing waits for the copies in flight |
+| threads with a speculative-read recovery point (draw preparation) | not handled: they recover as for any fault |
+
+### Collector and frees
+
+- A homed image is kept by the collector (`kept`) unless the usage is over the critical mark; then
+  `FreeImage` rebuilds it first and it is evicted.
+- `FreeImage` of a homed image rebuilds it first on the GPU threads. `UnmapMemory` rebuilds the
+  homes of the images it will free before it takes the cache's lock (the memory may stay allocated
+  and be mapped again; released memory has no home left by then). A homed image freed off the GPU
+  threads under the lock anyway (nothing known does) is forgotten: its pages come back as zeros
+  (`forgotten`).
+
+### UMA
+
+`runtime_memory_promote` refuses granules with homed pages (counted in the runtime's report);
+homing refuses shared granules. A binding over homed pages is rebuilt before `UmaDirect` is asked
+(the check is at the top of `ObtainBuffer`).
+
+### Requirements (else `Texture home: off: ...` once)
+
+Copy mode or `BB_UMA` (not `BB_GUEST_IN_PLACE` alone), write tracking, `BB_FAULT_PREPARE` on (its
+map of the page manager's write protections is how a rebuild keeps them), signal tracking (not
+`BB_UFFD=1`), no v1 chunks (`BB_UNIFIED`, `BB_GUEST_GPU_MEMORY`).
+
+### Stats (`BB_FRAME_STATS`, the 10 s block)
+
+`Texture home: N images, X MiB freed (homed so far, re-tiles verified); rebuilt N (ms total / max;
+by fault, access, runtime, collector, free/unmap, gpu-write, new image; by the GPU thread for
+others, timed out, forgotten); verify failures: bytes differ N; refused (looks): ...`. The
+runtime's report at exit adds its own counters (restores, released pages, refusals by code,
+promotions refused).
+
+### Risks
+
+- **Stutter on mass rebuilds.** Each rebuild is a re-tile plus a full GPU wait (`Finish`) on the
+  GPU thread; an area change that rewrites many homed textures, or the game reading back many,
+  costs one wait each (`ms total / max` in the stats). Phase 2: batch the homes of one fault window,
+  rebuild from the readback queue.
+- **Threads that cannot wait** (above): a homed page met by a copy or recording worker is a crash
+  (fault) or zeros (runtime read); prevented by the checks before queuing, not by construction.
+- **Kernel I/O into homed pages** other than the runtime's file reads and `io_begin` users: the
+  kernel gets `EFAULT` (file reads touch and retry).
+- **The runtime's lock in fault context**: the fault handler looks the page's home up under the
+  runtime's lock (shared); a thread faulting on a homed page while it holds the lock exclusively
+  would ask the GPU thread for a rebuild that needs the lock (not seen: nothing writes guest memory
+  under it).
+- **Memory**: up to 4 re-tiles in host-cached staging at a time (the textures' sizes), returned to
+  the staging pool.
+- **x86-64 hosts** count every thread as the game's (no 250 ms limit); not a target.
+- Untested on a device (phase 1: builds, host test `tests/test_tex_home.c` for the runtime side).
+
 ## Other waste (not unified memory)
 
 - `BB_STAGING_KEEP_MB` keeps up to 512 MiB of idle staging per ring.
@@ -324,7 +473,9 @@ option.
 
 ## Key files
 
-- `src/runtime_memory.c`: granules, promotion, freeze, map_phys, zero_phys; `src/probe.c` fault chain;
+- `src/runtime_memory.c`: granules, promotion, freeze, map_phys, zero_phys, texture homes; `src/probe.c` fault chain;
+- `gpu/shadps4/video_core/texture_cache/bbport_tex_home.cpp`, `gpu/shim/bbport_tex_home.h`: Plan A
+  (homing, rebuilds, per-thread policy); `tests/test_tex_home.c`: the runtime side;
   `src/runtime_file.c` read guard.
 - `gpu/shim/bbport_guest_memory.cpp`: UMA mode, probes, granule allocator, chunk index.
 - `gpu/shadps4/video_core/buffer_cache/buffer_cache.cpp`: `UmaDirect`, `UmaAnyShared`,

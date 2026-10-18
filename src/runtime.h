@@ -61,6 +61,41 @@ void runtime_memory_uma_stats(RuntimeUmaStats *out);
 /* Fault chain (probe.c): a fault on a page frozen by a promotion waits for it to finish and returns 1
  * (the access is retried); 0 for any other fault. Async-signal-safe. */
 int runtime_memory_promotion_fault(void *address);
+/* bbport BB_TEX_HOME (src/runtime_memory.c, "Textures homed in the GPU"; docs/ANDROID_UNIFIED_MEMORY_PLAN.md,
+ * "Plan A"): pages of direct memory whose bytes a GPU image holds exactly are dropped (no access on every
+ * guest alias, the memfd range punched out) and rebuilt on any access. */
+enum { RUNTIME_HOME_OK, RUNTIME_HOME_ARGS, RUNTIME_HOME_MAPPING, RUNTIME_HOME_SHARED, RUNTIME_HOME_HOMED,
+       RUNTIME_HOME_ALIASES, RUNTIME_HOME_FULL, RUNTIME_HOME_MISMATCH, RUNTIME_HOME_CODES };
+#define RUNTIME_HOME_TRAP 64u /* the trap reason of homed pages (runtime_memory_trap_reasons) */
+/* Homes guest [address, address+size) (aligned to runtime_memory_home_granule(), in one direct memory
+ * mapping, no page homed already, not in a shared UMA granule): traps every alias of its pages (no access),
+ * compares them with `expected` and, when equal, punches them out of the memfd. 0 and *ticket set, or a
+ * RUNTIME_HOME_* refusal (MISMATCH: the bytes differ; nothing changed). Takes the runtime lock exclusively. */
+int runtime_memory_home(uintptr_t address, uint64_t size, const void *expected, uint32_t *ticket);
+/* The pages of a home back: `data` (the home's whole range, `size` its size) written into the pages still
+ * homed, their traps lifted (pages the GPU page manager write-protects stay read-only). data NULL: the pages
+ * come back as zeros (forgotten). Returns the pages restored, -1 for a ticket that is gone (all released or
+ * restored already), -2 for a wrong size. */
+int runtime_memory_home_restore(uint32_t ticket, const void *data, uint64_t size);
+uint64_t runtime_memory_home_alive(uint32_t ticket);      /* pages still homed, 0: gone */
+uint32_t runtime_memory_home_ticket(uintptr_t address);   /* the home of the page at address, 0 none */
+int runtime_memory_home_tickets(uintptr_t address, uint64_t size, uint32_t *out, int max); /* homes behind a range */
+int runtime_memory_home_touches(uintptr_t address, uint64_t size); /* lock-free: a page of the range is homed */
+/* A fault on a page with RUNTIME_HOME_TRAP but no home (stale): the trap goes, 1. 0: the page is homed. */
+int runtime_memory_home_unstale(uintptr_t address);
+uint64_t runtime_memory_home_granule(void);               /* the host page size */
+uint64_t runtime_memory_homed_pages(void);                /* 4 KiB pages homed now */
+/* Called with a ticket before the runtime touches homed pages itself (backing view reads and writes, write
+ * announcements, kernel I/O), with no runtime lock held; returns 1 when the home is gone afterwards. */
+void runtime_memory_set_home_hook(int (*rehydrate)(uint32_t ticket));
+typedef struct {
+    uint64_t homes, restores, restored_pages, forgotten_pages, released_pages, refused_promotions, hook_calls,
+             homed_pages, refused[RUNTIME_HOME_CODES];
+} RuntimeHomeStats;
+void runtime_memory_home_stats(RuntimeHomeStats *out);
+/* bbport: 1 when the calling thread runs the game's code (`ucontext`: at a signal; NULL: now, in a host
+ * function the game called), 0 for host threads (src/runtime_kernel.c). */
+int runtime_thread_is_guest(const void *ucontext);
 /* File/IO reads the kernel performs into guest memory: no promotion may freeze those pages meanwhile. */
 void *runtime_memory_io_begin(uintptr_t address, uint64_t size);
 void runtime_memory_io_end(void *token);

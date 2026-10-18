@@ -420,6 +420,15 @@ static void drop_range(uintptr_t start, uintptr_t end) {
 /* bbport: write traps (runtime_memory_trap, below), kept across the game's own changes. */
 static void trap_reapply(uintptr_t start, uintptr_t end);
 static void trap_forget(uintptr_t start, uintptr_t end);
+/* bbport BB_TEX_HOME: textures homed in the GPU (below, "Textures homed in the GPU"). */
+static _Atomic uint64_t home_pages; /* direct memory pages (4 KiB) homed now; 0: none, every hook is one load */
+static void home_map(uintptr_t address, uint64_t size, uint64_t phys);
+static void home_release(uint64_t phys, uint64_t size);
+static int home_collect_va(uintptr_t address, uint64_t size, uint32_t *out, int max);
+static void home_rehydrate_va(uintptr_t address, uint64_t size);
+static int home_mprotect(uintptr_t start, uintptr_t end, int prot);
+static int home_any_phys(uint64_t phys, uint64_t size);
+static void home_va_forget(uintptr_t start, uintptr_t end);
 /* Places a host mapping; with MAP_FIXED it replaces what the guest had there. */
 static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t alignment,
                      int kind, int type, uint64_t phys) {
@@ -439,6 +448,7 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     trap_forget(address,address+size); /* a new mapping starts without traps */
     gpu_forget(address,address+size);  /* ... and without the GPU page manager's restriction */
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
+    if (kind==KIND_DIRECT && atomic_load_explicit(&home_pages,memory_order_relaxed)) home_map(address,size,phys);
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
@@ -568,6 +578,7 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
         if (right.size) for (int j=0;j<LIMIT;++j) if (!blocks[j].used) { blocks[j]=right; break; }
         live_bytes-=e-a;
     }
+    if (atomic_load_explicit(&home_pages,memory_order_relaxed)) home_release(start,size); /* no rebuild: the data goes */
     zero_phys(start,size); /* zero on reuse */
     write_unlock();
     flush_hooks();
@@ -632,7 +643,9 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     uintptr_t end=start+align_up(size,PAGE);
     start&=~(uintptr_t)(PAGE-1);
     if ((prot & ~0x37) || !covered(start,end,0)) return INVALID;
-    if (mprotect((void *)start,end-start,host_prot(prot))) return INVALID;
+    /* bbport BB_TEX_HOME: homed pages (holes in the memfd) never readable, not even until trap_reapply */
+    if (atomic_load_explicit(&home_pages,memory_order_relaxed) ? home_mprotect(start,end,host_prot(prot))
+                                                               : mprotect((void *)start,end-start,host_prot(prot))) return INVALID;
     gpu_forget(start,end); /* the game's protection replaced the page manager's */
     trap_reapply(start,end); /* pages with write traps stay read-only */
     int error; size_t i=carve(start,end,&error);
@@ -816,6 +829,7 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
  * nothing to catch there. */
 void runtime_memory_set_note_write_hook(GpuRange note) { hook_note_write=note; }
 void runtime_memory_note_write(uintptr_t address, uint64_t size) {
+    if (atomic_load_explicit(&home_pages,memory_order_relaxed)) home_rehydrate_va(address,size); /* the texture's bytes first */
     if (!hook_invalidate || !size) return;
     uintptr_t starts[8], ends[8];
     int n=0;
@@ -935,6 +949,7 @@ static void trap_forget(uintptr_t start, uintptr_t end) {
     if (!trap_reasons || start>=TRAP_LIMIT) return;
     if (end>TRAP_LIMIT) end=TRAP_LIMIT;
     pthread_mutex_lock(&trap_mutex);
+    if (atomic_load_explicit(&home_pages,memory_order_relaxed)) home_va_forget(start,end);
     memset(trap_reasons+(start>>12),0,((end+4095)>>12)-(start>>12));
     pthread_mutex_unlock(&trap_mutex);
 }
@@ -953,15 +968,20 @@ static void trap_reapply(uintptr_t start, uintptr_t end) {
     if (run) trap_apply(run,end,run_level);
     pthread_mutex_unlock(&trap_mutex);
 }
-void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int on) {
-    if (!size || address>=TRAP_LIMIT) return;
-    if (!trap_reasons) {
+/* The trap table, made on first use (NULL: no memory for it). */
+static uint8_t *trap_table(void) {
+    if (!__atomic_load_n(&trap_reasons,__ATOMIC_ACQUIRE)) {
         void *bytes=mmap(NULL,TRAP_LIMIT>>12,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
-        if (bytes==MAP_FAILED) { perror("bbport: write trap table"); return; }
+        if (bytes==MAP_FAILED) { perror("bbport: write trap table"); return NULL; }
         uint8_t *expected=NULL;
         if (!__atomic_compare_exchange_n(&trap_reasons,&expected,(uint8_t *)bytes,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
             munmap(bytes,TRAP_LIMIT>>12);
     }
+    return __atomic_load_n(&trap_reasons,__ATOMIC_ACQUIRE);
+}
+void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int on) {
+    if (!size || address>=TRAP_LIMIT) return;
+    if (!trap_table()) return;
     uintptr_t end=address+size>TRAP_LIMIT ? TRAP_LIMIT : address+size;
     read_lock();
     pthread_mutex_lock(&trap_mutex);
@@ -983,7 +1003,11 @@ void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int 
  * lifts its traps, instead of the write faulting (a fault handler waits for the draws the GPU
  * thread has queued; libc copies into small textures every frame made the game's frames late).
  * Its announcement after the write (runtime_memory_note_cpu_write) stays as it was. */
+int runtime_memory_home_touches(uintptr_t address, uint64_t size);
 void runtime_memory_prepare_cpu_write(uintptr_t address, uint64_t size) {
+    /* bbport BB_TEX_HOME: homed pages rebuilt first (the write would fault on them otherwise) */
+    if (atomic_load_explicit(&home_pages,memory_order_relaxed) && runtime_memory_home_touches(address,size))
+        home_rehydrate_va(address,size);
     /* The page manager's protected pages first (BB_FAULT_PREPARE): the range's write faults in one call. */
     if (hook_prepare_write && any_page_protected(address,size)) hook_prepare_write(address,size);
     const uint8_t *table=__atomic_load_n(&trap_reasons,__ATOMIC_ACQUIRE);
@@ -1041,8 +1065,22 @@ static void store_once(unsigned char *dst, const unsigned char *src, uint64_t n)
         else { __atomic_store_n(dst,*src,__ATOMIC_RELEASE); ++dst; ++src; --n; }
     }
 }
+/* bbport BB_TEX_HOME: the runtime lock (shared) taken with no homed page in [address, address+size):
+ * homed ones are rebuilt first, outside the lock (their texture is re-tiled by the GPU side), and the
+ * lock keeps them from being homed again while it is held. After a few rounds (a rebuild that cannot
+ * be done on this thread) it goes on with what is there. */
+static void read_lock_unhomed(uintptr_t address, uint64_t size) {
+    for (int round=0;;++round) {
+        read_lock();
+        if (!atomic_load_explicit(&home_pages,memory_order_relaxed) || round==4) return;
+        uint32_t tickets[8];
+        if (!home_collect_va(address,size,tickets,8)) return;
+        read_unlock();
+        home_rehydrate_va(address,size);
+    }
+}
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
-    read_lock();
+    read_lock_unhomed(address,size);
     int ok=1;
     for (uintptr_t at=address, end=address+size; at<end && ok;) {
         size_t i=vma_index(at);
@@ -1060,7 +1098,7 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
  * as zeros. */
 void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size) {
     unsigned char *out=data;
-    read_lock();
+    read_lock_unhomed(address,size);
     for (uintptr_t at=address, end=address+size; at<end;) {
         const size_t i=vma_index(at);
         uint64_t n;
@@ -1137,13 +1175,347 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
         uintptr_t b=vmas[i].end<address+size ? vmas[i].end : address+size;
         int guest=host_prot(vmas[i].prot);
         int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
-        if (!mprotect((void *)a,b-a,guest & want) && gpu_state && a<GPU_STATE_LIMIT) {
+        /* bbport BB_TEX_HOME: homed pages (holes) keep no access whatever the page manager wants */
+        const int failed=atomic_load_explicit(&home_pages,memory_order_relaxed) ? home_mprotect(a,b,guest & want)
+                                                                                 : mprotect((void *)a,b-a,guest & want);
+        if (!failed && gpu_state && a<GPU_STATE_LIMIT) {
             /* bbport UMA: kept for promotion (a remapped granule gets its pages' protection back) */
             const uintptr_t e=b<GPU_STATE_LIMIT ? b : GPU_STATE_LIMIT;
             memset(gpu_state+(a>>12),4|(read ? 1 : 0)|(write ? 2 : 0),((e+4095)>>12)-(a>>12));
         }
     }
     read_unlock();
+}
+/* ---- bbport BB_TEX_HOME: textures homed in the GPU (docs/ANDROID_UNIFIED_MEMORY_PLAN.md, "Plan A") ----
+ * A texture the game no longer touches exists twice: its tiled bytes here (the memfd) and the GPU's
+ * image. The GPU library re-tiles the image, and when the bytes equal the game's it homes the pages
+ * (runtime_memory_home): every guest alias of them gets the HOME_TRAP trap (no access), then their
+ * memfd range is punched out. Any access gets them back first (runtime_memory_home_restore with the
+ * bytes the GPU side re-tiled again): a guest access faults into the GPU library's handler (HOME_TRAP
+ * among the reasons); the runtime's own users of the backing view (read/write_backing), its write
+ * announcements (note_write, prepare_cpu_write) and kernel I/O (io_begin) call the home hook first,
+ * outside the runtime lock. A home is a record of a run of direct memory pages (one ticket); every
+ * homed 4 KiB page names its ticket. Released pages leave their record (no rebuild: the data goes
+ * with them); new mappings of homed pages get the trap. Lock order: the runtime lock, home_mutex,
+ * trap_mutex. Nothing here costs anything while no page is homed (home_pages 0). */
+#define HOME_TRAP 64u /* trap reason (>=16: no access); BbLayer::WriteTraps::TexHome */
+#define HOME_SLOTS 4096
+#define HOME_MAX_ALIASES 16
+#define HOME_REGION_SHIFT 21 /* home_region_pages: per 2 MiB of guest addresses */
+typedef struct { uint64_t phys, size, pages; uint32_t ticket; } Home; /* pages: still homed; ticket 0: free */
+static Home homes[HOME_SLOTS];
+static uint32_t home_generation;
+static _Atomic(uint32_t) *home_owner;          /* per 4 KiB page of direct memory: its ticket, 0 not homed */
+static _Atomic(uint16_t) *home_region_pages;   /* per 2 MiB of guest addresses: pages with HOME_TRAP */
+static pthread_mutex_t home_mutex=PTHREAD_MUTEX_INITIALIZER;
+static int (*home_hook)(uint32_t ticket);
+static RuntimeHomeStats home_stats;
+#define HOME_ADD(field,n) __atomic_fetch_add(&home_stats.field,(uint64_t)(n),__ATOMIC_RELAXED)
+static uint64_t host_page(void) {
+    static uint64_t page;
+    if (!page) { const long v=sysconf(_SC_PAGESIZE); page=v>4096 ? (uint64_t)v : 4096; }
+    return page;
+}
+static int home_tables(void) {
+    if (__atomic_load_n(&home_owner,__ATOMIC_ACQUIRE)) return 0;
+    pthread_mutex_lock(&home_mutex);
+    if (!home_owner) {
+        void *owners=mmap(NULL,(POOL_SIZE>>12)*sizeof(uint32_t),PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+        void *regions=mmap(NULL,(TRAP_LIMIT>>HOME_REGION_SHIFT)*sizeof(uint16_t),PROT_READ|PROT_WRITE,
+                           MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+        if (owners==MAP_FAILED || regions==MAP_FAILED) {
+            if (owners!=MAP_FAILED) munmap(owners,(POOL_SIZE>>12)*sizeof(uint32_t));
+            if (regions!=MAP_FAILED) munmap(regions,(TRAP_LIMIT>>HOME_REGION_SHIFT)*sizeof(uint16_t));
+            pthread_mutex_unlock(&home_mutex);
+            return -1;
+        }
+        home_region_pages=regions;
+        __atomic_store_n(&home_owner,(_Atomic(uint32_t) *)owners,__ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&home_mutex);
+    return 0;
+}
+static uint32_t home_owner_at(uint64_t phys) {
+    _Atomic(uint32_t) *owners=__atomic_load_n(&home_owner,__ATOMIC_ACQUIRE);
+    return owners && phys<POOL_SIZE ? atomic_load_explicit(&owners[phys>>12],memory_order_acquire) : 0;
+}
+static Home *home_find(uint32_t ticket) { /* home_mutex held */
+    Home *h=&homes[ticket%HOME_SLOTS];
+    return ticket && h->ticket==ticket ? h : NULL;
+}
+static int home_any_phys(uint64_t phys, uint64_t size) {
+    for (uint64_t at=phys&~UINT64_C(4095);at<phys+size && at<POOL_SIZE;at+=4096)
+        if (home_owner_at(at)) return 1;
+    return 0;
+}
+/* HOME_TRAP bits of [start, end) about to be cleared with the rest of their reasons (trap_mutex held). */
+static void home_va_forget(uintptr_t start, uintptr_t end) {
+    if (!trap_reasons || !home_region_pages) return;
+    for (uintptr_t p=start>>12;p<(end+4095)>>12;++p)
+        if (trap_reasons[p] & HOME_TRAP) atomic_fetch_sub_explicit(&home_region_pages[p>>(HOME_REGION_SHIFT-12)],1,memory_order_relaxed);
+}
+/* HOME_TRAP set or cleared on the guest pages [a, b) (runtime lock held, both tables made). Each page
+ * gets the protection its reasons want; one whose last reason goes stays read-only where the GPU page
+ * manager write-protects it (BB_FAULT_PREPARE's map of its protections), so the texture's own write
+ * tracking survives the rebuild (a plain trap lift gives the game's protection back). */
+static void home_trap(uintptr_t a, uintptr_t b, int on) {
+    if (a>=TRAP_LIMIT) return;
+    if (b>TRAP_LIMIT) b=TRAP_LIMIT;
+    uint8_t *t=trap_reasons;
+    pthread_mutex_lock(&trap_mutex);
+    for (uintptr_t p=a>>12;p<(b+4095)>>12;++p) {
+        const uint8_t old=t[p], now=on ? (uint8_t)(old|HOME_TRAP) : (uint8_t)(old & ~HOME_TRAP);
+        if (old==now) continue;
+        __atomic_store_n(&t[p],now,__ATOMIC_RELEASE);
+        if (on) atomic_fetch_add_explicit(&home_region_pages[p>>(HOME_REGION_SHIFT-12)],1,memory_order_relaxed);
+        else atomic_fetch_sub_explicit(&home_region_pages[p>>(HOME_REGION_SHIFT-12)],1,memory_order_relaxed);
+    }
+    for (size_t i=vma_index(a); i<vma_count && vmas[i].start<b; ++i) {
+        if (vmas[i].kind==KIND_RESERVED) continue;
+        const uintptr_t s=vmas[i].start>a ? vmas[i].start : a, e=vmas[i].end<b ? vmas[i].end : b;
+        const int prot=host_prot(vmas[i].prot);
+        uintptr_t run=s; int run_prot=-1;
+        for (uintptr_t p=s;p<e;p+=4096) {
+            const int level=trap_level(t[p>>12]);
+            const int guarded=!level && any_page_protected(p,4096);
+            const int want=level==2 ? PROT_NONE : (level || guarded) ? (prot & ~PROT_WRITE) : prot;
+            if (gpu_state && p<GPU_STATE_LIMIT) gpu_state[p>>12]=guarded ? (uint8_t)(4|1) : 0; /* the restriction in force */
+            if (want==run_prot) continue;
+            if (run_prot>=0) mprotect((void *)run,p-run,run_prot);
+            run=p; run_prot=want;
+        }
+        if (run_prot>=0) mprotect((void *)run,e-run,run_prot);
+    }
+    pthread_mutex_unlock(&trap_mutex);
+}
+/* home_trap on every guest alias of direct memory [phys, phys+size) (runtime lock held). */
+static void home_trap_phys(uint64_t phys, uint64_t size, int on) {
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind!=KIND_DIRECT) continue;
+        const uint64_t length=v->end-v->start, lo=v->phys>phys ? v->phys : phys,
+                       hi=v->phys+length<phys+size ? v->phys+length : phys+size;
+        if (lo<hi) home_trap(v->start+(lo-v->phys),v->start+(hi-v->phys),on);
+    }
+}
+/* mprotect of [start, end) to prot, homed pages left as they are (no access) (runtime lock held). */
+static int home_mprotect(uintptr_t start, uintptr_t end, int prot) {
+    const uint8_t *t=__atomic_load_n(&trap_reasons,__ATOMIC_ACQUIRE);
+    if (!t || start>=TRAP_LIMIT) return mprotect((void *)start,end-start,prot);
+    int failed=0;
+    uintptr_t run=0;
+    for (uintptr_t p=start;p<end;p+=4096) {
+        const int homed=p<TRAP_LIMIT && (__atomic_load_n(&t[p>>12],__ATOMIC_ACQUIRE) & HOME_TRAP);
+        if (!homed && !run) run=p;
+        if (homed && run) { failed|=mprotect((void *)run,p-run,prot); run=0; }
+    }
+    if (run) failed|=mprotect((void *)run,end-run,prot);
+    return failed ? -1 : 0;
+}
+/* A new mapping of direct memory phys at address: its homed pages get the trap (runtime lock held). */
+static void home_map(uintptr_t address, uint64_t size, uint64_t phys) {
+    if (!home_owner || !trap_reasons) return;
+    for (uint64_t at=0;at<size;) {
+        if (!home_owner_at(phys+at)) { at+=4096; continue; }
+        uint64_t end=at;
+        while (end<size && home_owner_at(phys+end)) end+=4096;
+        home_trap(address+at,address+end,1);
+        at=end;
+    }
+}
+/* Direct memory [phys, phys+size) released (runtime lock held exclusively, its mappings gone). */
+static void home_release(uint64_t phys, uint64_t size) {
+    if (!home_owner) return;
+    pthread_mutex_lock(&home_mutex);
+    uint64_t released=0;
+    for (uint64_t at=phys;at<phys+size && at<POOL_SIZE;at+=4096) {
+        const uint32_t ticket=home_owner_at(at);
+        if (!ticket) continue;
+        atomic_store_explicit(&home_owner[at>>12],0,memory_order_release);
+        Home *h=home_find(ticket);
+        if (h && !--h->pages) h->ticket=0;
+        ++released;
+    }
+    pthread_mutex_unlock(&home_mutex);
+    if (released) { atomic_fetch_sub(&home_pages,released); HOME_ADD(released_pages,released); }
+}
+/* The tickets of homed pages behind guest [address, address+size), at most max (runtime lock held). */
+static int home_collect_va(uintptr_t address, uint64_t size, uint32_t *out, int max) {
+    int n=0;
+    if (!home_owner || !size) return 0;
+    for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size && n<max; ++i) {
+        if (vmas[i].kind!=KIND_DIRECT) continue;
+        const uintptr_t s=vmas[i].start>address ? vmas[i].start : address, e=vmas[i].end<address+size ? vmas[i].end : address+size;
+        for (uintptr_t p=s&~(uintptr_t)4095;p<e && n<max;p+=4096) {
+            const uint32_t ticket=home_owner_at(vmas[i].phys+(p-vmas[i].start));
+            if (!ticket) continue;
+            int seen=0;
+            for (int k=0;k<n && !seen;++k) seen=out[k]==ticket;
+            if (!seen) out[n++]=ticket;
+        }
+    }
+    return n;
+}
+/* Homed pages behind guest [address, address+size) rebuilt through the home hook (no lock held). */
+static void home_rehydrate_va(uintptr_t address, uint64_t size) {
+    if (!home_hook || !size) return;
+    for (int round=0;round<8;++round) {
+        uint32_t tickets[16];
+        read_lock();
+        const int n=home_collect_va(address,size,tickets,16);
+        read_unlock();
+        if (!n) return;
+        int progress=0;
+        for (int k=0;k<n;++k) { HOME_ADD(hook_calls,1); progress|=home_hook(tickets[k]); }
+        if (!progress) return; /* this thread cannot have them rebuilt (logged by the GPU side) */
+    }
+}
+uint64_t runtime_memory_home_granule(void) { return host_page(); }
+uint64_t runtime_memory_homed_pages(void) { return atomic_load_explicit(&home_pages,memory_order_relaxed); }
+void runtime_memory_set_home_hook(int (*rehydrate)(uint32_t ticket)) { home_hook=rehydrate; }
+int runtime_memory_home(uintptr_t address, uint64_t size, const void *expected, uint32_t *ticket) {
+    const uint64_t hp=host_page();
+    if (!size || address%hp || size%hp || !expected || !ticket || address>=TRAP_LIMIT || size>TRAP_LIMIT-address)
+        return RUNTIME_HOME_ARGS;
+    if (!trap_table() || home_tables()) return RUNTIME_HOME_ARGS;
+    write_lock();
+    int rc=RUNTIME_HOME_OK;
+    uint64_t phys=0;
+    const size_t i=vma_index(address);
+    if (!backing_base || i==vma_count || vmas[i].start>address || vmas[i].end<address+size || vmas[i].kind!=KIND_DIRECT)
+        rc=RUNTIME_HOME_MAPPING;
+    else {
+        phys=vmas[i].phys+(address-vmas[i].start);
+        if (phys>=POOL_SIZE || size>POOL_SIZE-phys) rc=RUNTIME_HOME_MAPPING;
+    }
+    if (!rc && chunk_alloc) rc=RUNTIME_HOME_SHARED; /* GPU-visible chunks (v1, BB_GUEST_GPU_MEMORY) */
+    if (!rc && granule_fd)
+        for (uint64_t g=phys/granule_size;g<=(phys+size-1)/granule_size;++g)
+            if (uma_fd(g)>=0) { rc=RUNTIME_HOME_SHARED; break; }
+    if (!rc && home_any_phys(phys,size)) rc=RUNTIME_HOME_HOMED;
+    if (!rc) {
+        int aliases=0;
+        for (size_t k=0;k<vma_count;++k)
+            if (vmas[k].kind==KIND_DIRECT && vmas[k].phys<phys+size && phys<vmas[k].phys+(vmas[k].end-vmas[k].start)) ++aliases;
+        if (aliases>HOME_MAX_ALIASES) rc=RUNTIME_HOME_ALIASES;
+    }
+    size_t slot=HOME_SLOTS;
+    if (!rc) {
+        pthread_mutex_lock(&home_mutex);
+        for (size_t k=0;k<HOME_SLOTS;++k) if (!homes[k].ticket) { slot=k; break; }
+        pthread_mutex_unlock(&home_mutex);
+        if (slot==HOME_SLOTS) rc=RUNTIME_HOME_FULL;
+    }
+    if (!rc) {
+        /* No access through any alias from here (mprotect returns once every CPU sees it); the bytes are
+         * then the game's last ones, compared through the backing view, which only the runtime uses
+         * (its writers wait for this lock). */
+        home_trap_phys(phys,size,1);
+        if (memcmp(backing_base+phys,expected,size)) {
+            home_trap_phys(phys,size,0);
+            rc=RUNTIME_HOME_MISMATCH;
+        } else {
+            pthread_mutex_lock(&home_mutex);
+            uint32_t generation=++home_generation % (UINT32_MAX/HOME_SLOTS);
+            if (!generation) generation=++home_generation % (UINT32_MAX/HOME_SLOTS);
+            const uint32_t t=generation*HOME_SLOTS+(uint32_t)slot;
+            homes[slot]=(Home){phys,size,size>>12,t};
+            for (uint64_t at=phys;at<phys+size;at+=4096) atomic_store_explicit(&home_owner[at>>12],t,memory_order_release);
+            pthread_mutex_unlock(&home_mutex);
+            atomic_fetch_add(&home_pages,size>>12);
+            fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size); /* the RAM goes */
+            *ticket=t;
+            HOME_ADD(homes,1);
+        }
+    }
+    write_unlock();
+    if (rc>0 && rc<RUNTIME_HOME_CODES) HOME_ADD(refused[rc],1);
+    return rc;
+}
+int runtime_memory_home_restore(uint32_t ticket, const void *data, uint64_t size) {
+    if (!ticket || !__atomic_load_n(&home_owner,__ATOMIC_ACQUIRE)) return -1;
+    read_lock();
+    pthread_mutex_lock(&home_mutex);
+    Home *h=home_find(ticket);
+    if (!h || (data && size!=h->size)) {
+        pthread_mutex_unlock(&home_mutex);
+        read_unlock();
+        return h ? -2 : -1;
+    }
+    uint64_t restored=0;
+    for (uint64_t at=h->phys, end=h->phys+h->size; at<end;) {
+        if (home_owner_at(at)!=ticket) { at+=4096; continue; } /* released meanwhile */
+        uint64_t run_end=at;
+        while (run_end<end && home_owner_at(run_end)==ticket) run_end+=4096;
+        /* The bytes first, through the backing view (not trapped), then the pages are the game's again. */
+        if (data) memcpy(backing_base+at,(const unsigned char *)data+(at-h->phys),run_end-at);
+        for (uint64_t p=at;p<run_end;p+=4096) atomic_store_explicit(&home_owner[p>>12],0,memory_order_release);
+        home_trap_phys(at,run_end-at,0);
+        restored+=(run_end-at)>>12;
+        at=run_end;
+    }
+    h->ticket=0;
+    pthread_mutex_unlock(&home_mutex);
+    read_unlock();
+    atomic_fetch_sub(&home_pages,restored);
+    HOME_ADD(restores,1);
+    if (data) HOME_ADD(restored_pages,restored); else HOME_ADD(forgotten_pages,restored);
+    return (int)restored;
+}
+uint64_t runtime_memory_home_alive(uint32_t ticket) {
+    pthread_mutex_lock(&home_mutex);
+    const Home *h=home_find(ticket);
+    const uint64_t pages=h ? h->pages : 0;
+    pthread_mutex_unlock(&home_mutex);
+    return pages;
+}
+uint32_t runtime_memory_home_ticket(uintptr_t address) {
+    if (!__atomic_load_n(&home_owner,__ATOMIC_ACQUIRE)) return 0;
+    read_lock();
+    const size_t i=vma_index(address);
+    const uint32_t ticket = i<vma_count && vmas[i].start<=address && vmas[i].kind==KIND_DIRECT
+        ? home_owner_at(vmas[i].phys+(address-vmas[i].start)) : 0;
+    read_unlock();
+    return ticket;
+}
+int runtime_memory_home_tickets(uintptr_t address, uint64_t size, uint32_t *out, int max) {
+    if (!atomic_load_explicit(&home_pages,memory_order_relaxed)) return 0;
+    read_lock();
+    const int n=home_collect_va(address,size,out,max);
+    read_unlock();
+    return n;
+}
+int runtime_memory_home_unstale(uintptr_t address) {
+    if (!__atomic_load_n(&trap_reasons,__ATOMIC_ACQUIRE) || address>=TRAP_LIMIT) return 1;
+    const uintptr_t page=address&~(uintptr_t)4095;
+    read_lock();
+    const size_t i=vma_index(address);
+    const int owned = i<vma_count && vmas[i].start<=address && vmas[i].kind==KIND_DIRECT &&
+                      home_owner_at(vmas[i].phys+(page-vmas[i].start));
+    if (!owned && (trap_reasons[page>>12] & HOME_TRAP) && home_region_pages) home_trap(page,page+4096,0);
+    read_unlock();
+    return !owned;
+}
+int runtime_memory_home_touches(uintptr_t address, uint64_t size) {
+    if (!atomic_load_explicit(&home_pages,memory_order_relaxed) || !size || address>=TRAP_LIMIT) return 0;
+    const uint8_t *t=__atomic_load_n(&trap_reasons,__ATOMIC_ACQUIRE);
+    _Atomic(uint16_t) *regions=home_region_pages;
+    if (!t || !regions) return 0;
+    const uintptr_t end=size<TRAP_LIMIT-address ? address+size : TRAP_LIMIT;
+    for (uintptr_t r=address>>HOME_REGION_SHIFT;r<=(end-1)>>HOME_REGION_SHIFT;++r) {
+        if (!atomic_load_explicit(&regions[r],memory_order_relaxed)) continue;
+        const uintptr_t lo=r<<HOME_REGION_SHIFT>address ? r<<HOME_REGION_SHIFT : address;
+        const uintptr_t hi=(r+1)<<HOME_REGION_SHIFT<end ? (r+1)<<HOME_REGION_SHIFT : end;
+        for (uintptr_t p=lo>>12;p<=(hi-1)>>12;++p)
+            if (__atomic_load_n(&t[p],__ATOMIC_ACQUIRE) & HOME_TRAP) return 1;
+    }
+    return 0;
+}
+void runtime_memory_home_stats(RuntimeHomeStats *out) {
+    const uint64_t *from=(const uint64_t *)&home_stats;
+    uint64_t *to=(uint64_t *)out;
+    for (size_t i=0;i<sizeof(home_stats)/sizeof(uint64_t);++i) to[i]=__atomic_load_n(&from[i],__ATOMIC_RELAXED);
+    out->homed_pages=atomic_load_explicit(&home_pages,memory_order_relaxed);
 }
 /* ---- bbport: UMA granules, promotion CPU -> SHARED (docs/ANDROID_UNIFIED_MEMORY_PLAN.md) ----
  * The GPU library asks for a granule to be shared (runtime_memory_promote) when it wants to bind it as
@@ -1279,6 +1651,8 @@ int runtime_memory_promotion_fault(void *address) {
  * covers the range. Off (NULL, no cost) without UMA; NULL as well when every slot is taken (the
  * read is then unguarded, the old behaviour). */
 void *runtime_memory_io_begin(uintptr_t address, uint64_t size) {
+    /* bbport BB_TEX_HOME: the kernel cannot fault homed pages in: rebuilt first */
+    if (atomic_load_explicit(&home_pages,memory_order_relaxed) && size) home_rehydrate_va(address,size);
     if (!__atomic_load_n(&granule_fd,__ATOMIC_ACQUIRE) || !size) return NULL;
     pthread_mutex_lock(&io_mutex);
     for (;;) {
@@ -1409,6 +1783,8 @@ static int promote_granule(uint64_t g) {
     for (;;) {
         write_lock();
         if (uma_fd(g)>=0) { write_unlock(); munmap(scratch,len); hand_back(gs,len,fd); return 1; }
+        /* bbport BB_TEX_HOME: homed pages (their data is in a texture only) are not copied in */
+        if (atomic_load_explicit(&home_pages,memory_order_relaxed) && home_any_phys(gs,len)) { write_unlock(); refusal=3; break; }
         n=collect_aliases(gs,gs+len,a,&refusal); /* what is mapped now, not before the allocation */
         if (!refusal && freeze_publish(a,n)) { locked=1; break; }
         write_unlock();
@@ -1421,7 +1797,9 @@ static int promote_granule(uint64_t g) {
     if (!locked) {
         munmap(scratch,len);
         hand_back(gs,len,fd);
-        if (refusal==1) UMA_ADD(refused_exec,1); else UMA_ADD(refused_busy,1);
+        if (refusal==1) UMA_ADD(refused_exec,1);
+        else if (refusal==3) __atomic_fetch_add(&home_stats.refused_promotions,1,__ATOMIC_RELAXED);
+        else UMA_ADD(refused_busy,1);
         return 0;
     }
     /* Frozen: no guest thread writes the granule, the runtime's own writers wait for the lock. */
@@ -1506,6 +1884,17 @@ void runtime_memory_report(void) {
            allocations, maps, live_bytes, POOL_SIZE);
     printf("Runtime: flexible maps=%zu, in use=%" PRIu64 ", protects=%zu, queries=%zu, regions=%zu\n",
            flexible_maps, flexible_bytes, protects, queries, vma_count);
+    if (home_stats.homes) {
+        RuntimeHomeStats h;
+        runtime_memory_home_stats(&h);
+        printf("Runtime: texture homes=%" PRIu64 ", homed now %" PRIu64 " pages, restores=%" PRIu64 " (%" PRIu64 " pages, %" PRIu64
+               " forgotten), released %" PRIu64 " pages, refused: mismatch %" PRIu64 " mapping %" PRIu64 " shared %" PRIu64
+               " homed %" PRIu64 " aliases %" PRIu64 " full %" PRIu64 ", promotions refused %" PRIu64 ", hook calls %" PRIu64 "\n",
+               h.homes, h.homed_pages, h.restores, h.restored_pages, h.forgotten_pages, h.released_pages,
+               h.refused[RUNTIME_HOME_MISMATCH], h.refused[RUNTIME_HOME_MAPPING], h.refused[RUNTIME_HOME_SHARED],
+               h.refused[RUNTIME_HOME_HOMED], h.refused[RUNTIME_HOME_ALIASES], h.refused[RUNTIME_HOME_FULL],
+               h.refused_promotions, h.hook_calls);
+    }
     if (granule_fd) {
         RuntimeUmaStats u;
         runtime_memory_uma_stats(&u);
@@ -1530,4 +1919,17 @@ void runtime_memory_uma_stats(RuntimeUmaStats *out) { memset(out,0,sizeof(*out))
 int runtime_memory_promotion_fault(void *address) { (void)address; return 0; }
 void *runtime_memory_io_begin(uintptr_t address, uint64_t size) { (void)address; (void)size; return NULL; }
 void runtime_memory_io_end(void *token) { (void)token; }
+int runtime_memory_home(uintptr_t address, uint64_t size, const void *expected, uint32_t *ticket) {
+    (void)address; (void)size; (void)expected; (void)ticket; return RUNTIME_HOME_ARGS;
+}
+int runtime_memory_home_restore(uint32_t ticket, const void *data, uint64_t size) { (void)ticket; (void)data; (void)size; return -1; }
+uint64_t runtime_memory_home_alive(uint32_t ticket) { (void)ticket; return 0; }
+uint32_t runtime_memory_home_ticket(uintptr_t address) { (void)address; return 0; }
+int runtime_memory_home_tickets(uintptr_t address, uint64_t size, uint32_t *out, int max) { (void)address; (void)size; (void)out; (void)max; return 0; }
+int runtime_memory_home_touches(uintptr_t address, uint64_t size) { (void)address; (void)size; return 0; }
+int runtime_memory_home_unstale(uintptr_t address) { (void)address; return 1; }
+uint64_t runtime_memory_home_granule(void) { return 4096; }
+uint64_t runtime_memory_homed_pages(void) { return 0; }
+void runtime_memory_set_home_hook(int (*rehydrate)(uint32_t ticket)) { (void)rehydrate; }
+void runtime_memory_home_stats(RuntimeHomeStats *out) { memset(out,0,sizeof(*out)); }
 #endif

@@ -499,3 +499,13 @@ static void sample_report(void) {
 }
 /* The first three return addresses into the game's code on the calling thread's stack. */
 void runtime_guest_call_sites(uint64_t out[3]) { guest_call_sites(out); }
+/* bbport BB_TEX_HOME: whether the calling thread is one of the game's (the GPU library's fault handler
+ * sends the work of a guest thread to its own command thread and waits; host threads it waits for
+ * itself must not wait for it). On x86-64 hosts every thread counts as the game's (no telling apart). */
+int runtime_thread_is_guest(const void *ucontext) {
+    if (ucontext) {
+        GuestRegs regs;
+        return guest_cpu_signal_regs(ucontext, &regs) != 0;
+    }
+    return guest_cpu_stack_pointer() != 0;
+}

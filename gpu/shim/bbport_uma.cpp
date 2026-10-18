@@ -4,6 +4,7 @@
 #include "bbport_uma.h"
 
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -316,29 +317,100 @@ bool TryArm(u64 block) {
     return !(ArmedWord(table, block)->fetch_or(bit, std::memory_order_acq_rel) & bit);
 }
 
-bool Mark(u64 block) {
-    std::atomic<u64>* table = Table(true);
-    if (!table || !InRange(block)) {
+namespace {
+constexpr unsigned RegionShift = 21; // 2 MiB of guest VA
+constexpr u64 RegionBlocks = u64{1} << (RegionShift - BlockShift);
+static_assert(RegionBlocks == 32, "a region is half a bitmap word");
+
+/// Every block of region `region` dynamic (and no longer armed); true when one of them was not.
+bool MarkRegion(std::atomic<u64>* table, u64 region) {
+    const u64 block = region * RegionBlocks;
+    if (!InRange(block)) {
         return false;
     }
-    const u64 bit = u64{1} << (block & 63);
-    const bool fresh = !(DynamicWord(table, block)->fetch_or(bit, std::memory_order_acq_rel) & bit);
-    ArmedWord(table, block)->fetch_and(~bit, std::memory_order_acq_rel);
-    if (fresh) {
-        // No log here: this runs in the fault handler (the binding thread reports, UmaDirect).
-        counters.dynamic_blocks.fetch_add(1, std::memory_order_relaxed);
-        NoteVerdictChange();
+    const u64 mask = u64{0xffffffffu} << ((region & 1) * 32);
+    const u64 before = DynamicWord(table, block)->fetch_or(mask, std::memory_order_acq_rel);
+    ArmedWord(table, block)->fetch_and(~mask, std::memory_order_acq_rel);
+    const u64 fresh = mask & ~before;
+    if (fresh == 0) {
+        return false;
     }
-    return fresh;
+    counters.dynamic_blocks.fetch_add(static_cast<u64>(std::popcount(fresh)),
+                                      std::memory_order_relaxed);
+    counters.dynamic_regions.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+/// A dynamic block other than `block` within RegionBlocks blocks of it (2 MiB either side), or ~0.
+u64 DynamicNeighbour(std::atomic<u64>* table, u64 block) {
+    const u64 from = block >= RegionBlocks ? block - RegionBlocks : 0;
+    const u64 to = std::min<u64>(block + RegionBlocks, (Limit >> BlockShift) - 1); // inclusive
+    for (u64 word = from >> 6; word <= to >> 6; ++word) {
+        u64 bits = table[Words + word].load(std::memory_order_acquire);
+        const u64 lo = word == from >> 6 ? from & 63 : 0, hi = word == to >> 6 ? to & 63 : 63;
+        bits &= (hi == 63 ? ~u64{0} : (u64{2} << hi) - 1) & ~((u64{1} << lo) - 1);
+        if (word == block >> 6) {
+            bits &= ~(u64{1} << (block & 63));
+        }
+        if (bits != 0) {
+            return (word << 6) + static_cast<u64>(std::countr_zero(bits));
+        }
+    }
+    return ~u64{0};
+}
+} // namespace
+
+Marked Mark(u64 block) {
+    Marked marked{};
+    std::atomic<u64>* table = Table(true);
+    if (!table || !InRange(block)) {
+        return marked;
+    }
+    const u64 bit = u64{1} << (block & 63);
+    marked.fresh = !(DynamicWord(table, block)->fetch_or(bit, std::memory_order_acq_rel) & bit);
+    ArmedWord(table, block)->fetch_and(~bit, std::memory_order_acq_rel);
+    if (!marked.fresh) {
+        return marked;
+    }
+    // No log here: this runs in the fault handler (the binding thread reports, UmaDirect).
+    counters.dynamic_blocks.fetch_add(1, std::memory_order_relaxed);
+    // A second dynamic block within 2 MiB: a ring of per-frame slots (skinned or animated
+    // geometry rotating through 256 KiB vertex slots). The 2 MiB regions of both are dynamic at
+    // once, instead of one verify mismatch or trap fault per slot.
+    if (const u64 neighbour = DynamicNeighbour(table, block); neighbour != ~u64{0}) {
+        const u64 a = std::min(block, neighbour) / RegionBlocks;
+        const u64 b = std::max(block, neighbour) / RegionBlocks;
+        bool any = false;
+        for (u64 region = a; region <= b; ++region) {
+            any |= MarkRegion(table, region);
+        }
+        if (any) {
+            marked.first = a * RegionBlocks;
+            marked.end = (b + 1) * RegionBlocks;
+        }
+    }
+    NoteVerdictChange();
+    return marked;
 }
 
 void MarkRange(u64 address, u64 size) {
-    ForEachBlock(address, size, [&](u64 block) {
-        if (Mark(block)) {
+    std::atomic<u64>* table = Table(true);
+    if (!table || size == 0) {
+        return;
+    }
+    // A verify mismatch: the whole 2 MiB regions of the binding at once (a binding that changed
+    // under the GPU is per-frame data; its neighbours are usually its other slots).
+    const u64 first = (address >> RegionShift), last = ((address + size - 1) >> RegionShift);
+    bool any = false;
+    for (u64 region = first; region <= last; ++region) {
+        if (MarkRegion(table, region)) {
+            any = true;
             counters.dynamic_verify.fetch_add(1, std::memory_order_relaxed);
         }
-        return true;
-    });
+    }
+    if (any) {
+        NoteVerdictChange();
+    }
 }
 
 void Forget(u64 address, u64 size) {

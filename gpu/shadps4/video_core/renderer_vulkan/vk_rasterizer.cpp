@@ -3118,6 +3118,33 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                              Shader::PushData& push_data, u32& write_index) {
     BB_SECTION(BindBuffers);
     const u64 alignment = instance.StorageMinAlignment();
+    // bbport BB_UMA: a read-only binding of this stage over memory a written binding of the same
+    // stage also covers is never read in place: the write goes to copy mode's copy (written
+    // bindings are not shared), and a read of the game's memory beside it would miss what the
+    // shader writes during the dispatch (copy mode reads and writes the same copy). Later draws
+    // see the range GPU-modified and take the copy anyway.
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 4> uma_written;
+    if (VideoCore::UmaActive() &&
+        (BbUma::ClassAllowed(BbUma::Class::Constant) || BbUma::ClassAllowed(BbUma::Class::Texel))) {
+        for (u32 i = 0; i < stage.buffers.size(); ++i) {
+            const auto& d = stage.buffers[i];
+            if (!d.is_written || d.IsSpecial()) {
+                continue;
+            }
+            const auto sharp = prepared ? prepared->buffer_sharps[i] : d.GetSharp(stage);
+            if (sharp.base_address != 0 && sharp.GetSize() != 0) {
+                uma_written.emplace_back(sharp.base_address, sharp.base_address + sharp.GetSize());
+            }
+        }
+    }
+    const auto uma_overlaps_written = [&](VAddr address, u64 size) {
+        for (const auto& [from, to] : uma_written) {
+            if (address < to && from < address + size) {
+                return true;
+            }
+        }
+        return false;
+    };
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
         const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
@@ -3259,9 +3286,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
                 // bbport BB_UMA: every guest buffer is a storage buffer descriptor here; by use:
                 // formatted = texel, written = storage, the rest (read-only) = constant.
-                const BbUma::ClassScope buffer_class{desc.is_formatted ? BbUma::Class::Texel
-                                                     : desc.is_written ? BbUma::Class::Storage
-                                                                       : BbUma::Class::Constant};
+                const BbUma::ClassScope buffer_class{
+                    desc.is_written ? (desc.is_formatted ? BbUma::Class::Texel : BbUma::Class::Storage)
+                    : !uma_written.empty() && uma_overlaps_written(vsharp.base_address, size)
+                        ? BbUma::Class::None // see uma_written above
+                    : desc.is_formatted ? BbUma::Class::Texel
+                                        : BbUma::Class::Constant};
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 TraceShaderBinding(stage, vsharp.base_address, size, desc.is_written, buffer_cache);

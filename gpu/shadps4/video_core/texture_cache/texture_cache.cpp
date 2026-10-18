@@ -293,6 +293,12 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
+    // bbport BB_TEX_HOME: homes in the range back first, without the lock (from a guest thread the GPU
+    // command thread does it, and it may need the lock meanwhile). The memory may stay allocated and
+    // be mapped again; released memory comes here after its homes are gone (nothing to do then).
+    if (homes_count.load(std::memory_order_relaxed) != 0) {
+        TexHomeBeforeUnmap(cpu_addr, size);
+    }
     std::scoped_lock lk{mutex};
 
     ImageIds deleted_images;
@@ -795,6 +801,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     Image& image = slot_images[image_id];
     WatchImage(image, refresh ? "texture (refresh)" : "texture (no refresh)");
     if (desc.type == BindingType::Storage) {
+        if (homes_count.load(std::memory_order_relaxed) != 0) {
+            TexHomeRehydrateImage(image_id, BbTexHome::ByGpuWrite);
+        }
         image.flags |= ImageFlagBits::GpuModified;
         image.gpu_write_tick = scheduler.CurrentTick();
         image.NoteGpuWritten();
@@ -827,6 +836,9 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     WatchImage(image, "render target");
+    if (homes_count.load(std::memory_order_relaxed) != 0) {
+        TexHomeRehydrateImage(image_id, BbTexHome::ByGpuWrite);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     image.gpu_write_tick = scheduler.CurrentTick();
     image.NoteGpuWritten();
@@ -857,6 +869,9 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     WatchImage(image, "depth target");
+    if (homes_count.load(std::memory_order_relaxed) != 0) {
+        TexHomeRehydrateImage(image_id, BbTexHome::ByGpuWrite);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     image.gpu_write_tick = scheduler.CurrentTick();
     image.NoteGpuWritten();
@@ -901,6 +916,10 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    // bbport BB_TEX_HOME: when the game's bytes were last taken (homing waits BB_TEX_HOME_IDLE_S).
+    image.tex_home_stamp = u32(std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count()) | 1u;
     BbStats::Timer timer{BbStats::t_refresh};
 
     RENDERER_TRACE;
@@ -1062,6 +1081,11 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.lru_touched_tick = gc_tick;
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+    // bbport BB_TEX_HOME: a new image over homed pages will read them (and homes have no other image
+    // over them): back first, on the GPU threads (elsewhere the reads themselves bring them back).
+    if (homes_count.load(std::memory_order_relaxed) != 0) {
+        TexHomeOnRegister(image.info.guest_address, image.info.guest_size);
+    }
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
@@ -1305,6 +1329,14 @@ void TextureCache::GarbageCollectImages() {
             return true;
         }
         auto& image = slot_images[image_id];
+        // bbport BB_TEX_HOME: a homed image holds the only copy of its bytes: kept unless over the
+        // critical mark, where FreeImage re-tiles it into the game's memory first.
+        if (homes_count.load(std::memory_order_relaxed) != 0 && !aggresive &&
+            TexHomeTicketOf(image_id) != 0) {
+            lru_cache.Touch(image.lru_id, gc_tick);
+            BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
         // bbport: images that cannot go now (GPU-written: their contents exist only here, and
@@ -1425,6 +1457,7 @@ void TextureCache::RunGarbageCollector() {
 
     GarbageCollectImages();
     GarbageCollectSamplers();
+    TexHomePass(); // bbport BB_TEX_HOME
 }
 
 void TextureCache::TouchImage(const Image& image) {

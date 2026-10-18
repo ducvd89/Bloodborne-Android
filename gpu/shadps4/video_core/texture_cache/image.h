@@ -168,6 +168,12 @@ public:
     u64 gpu_write_tick{};
     /// bbport BB_UMA: the image was noted as GPU-written (NoteGpuWritten), once.
     bool uma_gpu_noted = false;
+    /// bbport BB_TEX_HOME: its re-tile differed from the game's bytes: never homed.
+    bool tex_home_never = false;
+    /// bbport BB_TEX_HOME: steady seconds of the last refresh from the game's memory (0: none yet),
+    /// and the second before which it is not looked at again (a home refused for now).
+    u32 tex_home_stamp = 0;
+    u32 tex_home_retry = 0;
     /// bbport BB_UMA: the image is (or may now be) written by the GPU: what
     /// TextureCache::OverlapsGpuImage says about its memory changes once, so the buffer cache's
     /// in-place verdicts (UmaDirect's memo) are taken again. Call wherever a GPU write is noted.

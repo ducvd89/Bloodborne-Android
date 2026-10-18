@@ -73,12 +73,22 @@ struct Counters {
     std::atomic<std::uint64_t> watch_faults{0};      ///< write faults on that trap
     std::atomic<std::uint64_t> watch_notes{0};       ///< announced writes (libc, file reads) there
     std::atomic<std::uint64_t> dynamic_blocks{0};    ///< blocks marked dynamic (any cause)
-    std::atomic<std::uint64_t> dynamic_verify{0};    ///< ... of them by a verify mismatch
+    std::atomic<std::uint64_t> dynamic_verify{0};    ///< regions marked by a verify mismatch
+    std::atomic<std::uint64_t> dynamic_regions{0};   ///< 2 MiB regions marked whole (rings)
     std::atomic<std::uint64_t> memo_hits{0};         ///< UmaDirect verdicts reused (no lookups)
     std::atomic<std::uint64_t> memo_misses{0};       ///< ... evaluated
     std::atomic<std::uint64_t> direct_bindings{0};   ///< bound through a shared granule's buffer
     std::atomic<std::uint64_t> direct_bytes{0};      ///< their bytes
     std::atomic<std::uint64_t> image_writes{0};      ///< images re-tiled over shared granules
+    /// Arena residency (VRAM copies) by the class current when each block became resident, [1]:
+    /// its guest pages were in RAM then (the CPU had touched them, or a shared granule: a copy
+    /// duplicates them), [0]: not (GPU-only data: sharing it would save nothing).
+    std::array<std::array<std::atomic<std::uint64_t>, 2>, ClassCount> arena_bytes{};
+    std::atomic<std::uint64_t> arena_mincore_failures{0};
+    /// Refusals per class (UmaDirect, classes allowed): mapping, cross, dynamic, gpu-data, image,
+    /// written, backoff/promotion.
+    static constexpr std::size_t RefusalKinds = 7;
+    std::array<std::array<std::atomic<std::uint64_t>, RefusalKinds>, ClassCount> refused_by{};
     std::atomic<std::uint64_t> verify_checked{0};
     std::atomic<std::uint64_t> verify_mismatches{0};
     std::atomic<std::uint64_t> verify_dropped{0};    ///< ring full
@@ -128,9 +138,16 @@ bool Armed(std::uint64_t block);
 bool IsDynamic(std::uint64_t block);
 /// Marks the block armed; true when it was neither armed nor dynamic (the caller sets the trap).
 bool TryArm(std::uint64_t block);
-/// Marks the block dynamic (and no longer armed); true when it was not dynamic before.
-bool Mark(std::uint64_t block);
-/// Every block of the range dynamic (verify mismatches); the traps go at the next write.
+/// What Mark did: `fresh` when the block was not dynamic before; [first, end) the blocks of the
+/// 2 MiB regions marked with it (empty: none), when another dynamic block lies within 2 MiB.
+struct Marked {
+    bool fresh = false;
+    std::uint64_t first = 0, end = 0;
+};
+/// Marks the block dynamic (and no longer armed). A second dynamic block within 2 MiB (a ring of
+/// per-frame slots) makes the 2 MiB-aligned regions of both dynamic (`dynamic_regions`).
+Marked Mark(std::uint64_t block);
+/// The 2 MiB regions of the range dynamic (verify mismatches); their traps go at the next write.
 void MarkRange(std::uint64_t address, std::uint64_t size);
 /// The mapping changed (map or unmap): the blocks forget both marks (the runtime forgot the traps).
 void Forget(std::uint64_t address, std::uint64_t size);

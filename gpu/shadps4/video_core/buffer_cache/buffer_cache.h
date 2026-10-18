@@ -313,6 +313,12 @@ private:
         vk::DeviceMemory memory;
         u64 offset;
     };
+    /// bbport BB_UMA: arena residency by binding class (BbUma::Counters::arena_bytes): `block` got a
+    /// VRAM copy / lost it.
+    void NoteArenaResident(u64 block);
+    void NoteArenaReleased(u64 block);
+    std::atomic<u8>* arena_class_table = nullptr; ///< per block: 0x80 | touched << 3 | class
+    u64 arena_class_entries = 0;
     void BindInPlace(u64 start, u64 end, std::vector<ResidentBind>& out, IntervalList<>& rest,
                      bool any_type = false);
     /// bbport BB_UMA: a read-only binding of an enabled class (BbUma::Current) lying in one direct
@@ -542,7 +548,9 @@ private:
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
-    RangeSet gpu_modified_ranges;
+    /// Several threads (LockedRangeSet): the recording thread adds, the GPU command thread and
+    /// the write-fault handler read and subtract.
+    LockedRangeSet gpu_modified_ranges;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

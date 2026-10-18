@@ -10,9 +10,12 @@
 #include <time.h>
 #include <sys/resource.h>
 #include <cstring>
+#include <string>
+#include <fmt/format.h>
 #include <dirent.h>
 #include <unistd.h>
 #include "common/assert.h"
+#include "bbport_tex_home.h"
 #include "bbport_adpf.h"
 #include "bbport_toggles.h"
 #include "bbport_guest_memory.h"
@@ -451,6 +454,38 @@ static void PrintMemorySplit() {
                     (unsigned long long)BbStats::staging_keep_blocks.load(),
                     (unsigned long long)BbStats::staging_frame.load());
     }
+    if (BbTexHome::Enabled()) {
+        // bbport BB_TEX_HOME: textures whose game copy was dropped (docs: "Plan A").
+        const auto& c = BbTexHome::counters;
+        std::string rebuilt, refused;
+        for (std::size_t k = 0; k < BbTexHome::RebuildKinds; ++k) {
+            if (const u64 n = c.rebuilt[k].load()) {
+                rebuilt += fmt::format("{}{} {}", rebuilt.empty() ? "" : ", ", BbTexHome::RebuildNames[k], n);
+            }
+        }
+        for (std::size_t k = 0; k < BbTexHome::RefusalKinds; ++k) {
+            if (const u64 n = c.refused[k].load()) {
+                refused += fmt::format("{}{} {}", refused.empty() ? "" : ", ", BbTexHome::RefusalNames[k], n);
+            }
+        }
+        u64 rebuilds = 0;
+        for (const auto& n : c.rebuilt) {
+            rebuilds += n.load();
+        }
+        std::printf("Texture home: %llu images, %llu MiB freed (%llu homed so far, %llu re-tiles "
+                    "verified); rebuilt %llu (%.1f ms total / %.2f ms max; %s; %llu by the GPU thread "
+                    "for others, %llu timed out, %llu forgotten); verify failures: bytes differ %llu; "
+                    "refused (looks): %s\n",
+                    (unsigned long long)c.homed_images.load(),
+                    (unsigned long long)(runtime_memory_homed_pages() * 4096 >> 20),
+                    (unsigned long long)c.homes.load(), (unsigned long long)c.verifies.load(),
+                    (unsigned long long)rebuilds, double(c.rebuild_ns_total.load()) / 1e6,
+                    double(c.rebuild_ns_max.load()) / 1e6, rebuilt.empty() ? "none" : rebuilt.c_str(),
+                    (unsigned long long)c.forwarded.load(), (unsigned long long)c.timeouts.load(),
+                    (unsigned long long)c.lost.load(),
+                    (unsigned long long)c.refused[BbTexHome::Mismatch].load(),
+                    refused.empty() ? "none" : refused.c_str());
+    }
     if (BbGuestMemory::Uma()) {
         // bbport BB_UMA: the shared granules (the runtime's counters) and what the GPU side did with them.
         const auto runtime = BbGuestMemory::UmaRuntime();
@@ -462,7 +497,8 @@ static void PrintMemorySplit() {
         std::printf("UMA: granule %llu KiB, shared %llu granules (%llu MiB), promotions %llu "
                     "(requests %llu, failed %llu), refused: exec %llu busy %llu class %llu image %llu "
                     "size %llu backoff %llu written %llu cross-granule %llu mapping %llu gpu-data %llu "
-                    "dynamic %llu, dynamic blocks %llu (verify %llu; armed %llu, trap faults %llu, "
+                    "dynamic %llu, dynamic blocks %llu (regions %llu, verify regions %llu; armed %llu, "
+                    "trap faults %llu, "
                     "announced writes %llu), "
                     "freeze faults %llu, io waits %llu, promote %.1f ms total / %.1f ms max, granule "
                     "buffer bindings %llu (%llu MiB; verdict memo %llu hits / %llu misses), uma image "
@@ -483,6 +519,7 @@ static void PrintMemorySplit() {
                     (unsigned long long)uma.refused_gpu_data.load(),
                     (unsigned long long)uma.refused_dynamic.load(),
                     (unsigned long long)uma.dynamic_blocks.load(),
+                    (unsigned long long)uma.dynamic_regions.load(),
                     (unsigned long long)uma.dynamic_verify.load(),
                     (unsigned long long)uma.watch_armed.load(),
                     (unsigned long long)uma.watch_faults.load(),
@@ -496,6 +533,42 @@ static void PrintMemorySplit() {
                     (unsigned long long)uma.image_writes.load(),
                     (unsigned long long)uma.verify_checked.load(),
                     (unsigned long long)uma.verify_mismatches.load());
+        // Which class holds the VRAM copies, and whether the CPU had their pages (sharing saves
+        // those) or not (GPU-only data: sharing saves nothing).
+        std::string by_class;
+        u64 total = 0;
+        for (std::size_t c = 0; c < BbUma::ClassCount; ++c) {
+            const u64 cpu = uma.arena_bytes[c][1].load(), gpu = uma.arena_bytes[c][0].load();
+            total += cpu + gpu;
+            if (cpu + gpu != 0) {
+                by_class += fmt::format("{}{} {} MiB (CPU pages {}, GPU-only {})",
+                                        by_class.empty() ? "" : ", ",
+                                        BbUma::ClassName(static_cast<BbUma::Class>(c)),
+                                        (cpu + gpu) >> 20, cpu >> 20, gpu >> 20);
+            }
+        }
+        std::printf("Arena by class: %llu MiB: %s%s\n", (unsigned long long)(total >> 20),
+                    by_class.empty() ? "nothing" : by_class.c_str(),
+                    uma.arena_mincore_failures.load() ? " (mincore failed for some blocks)" : "");
+        // Refusals of the classes allowed, by reason.
+        static constexpr std::array<const char*, BbUma::Counters::RefusalKinds> reasons{
+            "mapping", "cross-granule", "dynamic", "gpu-data", "image", "written", "promotion"};
+        std::string refusals;
+        for (std::size_t c = 0; c < BbUma::ClassCount; ++c) {
+            std::string row;
+            for (std::size_t k = 0; k < reasons.size(); ++k) {
+                if (const u64 n = uma.refused_by[c][k].load()) {
+                    row += fmt::format(" {} {}", reasons[k], n);
+                }
+            }
+            if (!row.empty()) {
+                refusals += fmt::format("{}{}:{}", refusals.empty() ? "" : "; ",
+                                        BbUma::ClassName(static_cast<BbUma::Class>(c)), row);
+            }
+        }
+        if (!refusals.empty()) {
+            std::printf("UMA refusals by class: %s\n", refusals.c_str());
+        }
     }
 }
 
