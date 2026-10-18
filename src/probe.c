@@ -34,6 +34,8 @@
 #include <time.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/prctl.h>
+#include <errno.h>
 #endif
 
 #if defined(__ANDROID__) && !defined(_WIN32)
@@ -168,13 +170,255 @@ __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
 #endif
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
 #ifndef _WIN32
+/* ---- Fault entry (bb_fault_entry): faults the kernel would otherwise kill silently ----
+ * A SIGSEGV/SIGBUS the kernel cannot deliver kills the process with no output (exit 139, no
+ * tombstone: this handler replaced debuggerd's): one raised while the handler runs with the
+ * signal blocked (a fault inside the chain below: FEX, promotion wait, GPU page tracking, the
+ * crash report itself), or one whose handler frame does not fit on the stack (an overflow).
+ * - SA_NODEFER: a fault inside the handler re-enters bb_fault_entry, which sees this thread's
+ *   depth and reports both faults with async-signal-safe writes (dladdr: acceptable when dying),
+ *   then exits with 128 + signal as before.
+ * - AArch64 Linux, also SA_ONSTACK: the kernel delivers on the thread's alternate signal stack
+ *   (Bionic gives every thread a small one). There a stack overflow (no room left below the
+ *   interrupted sp) or an overflow of the alternate stack itself is reported; any other fault is
+ *   handled as before, on the thread's own stack just below the interrupted frame (where the
+ *   kernel put the frame without SA_ONSTACK), with a spare alternate stack swapped in meanwhile so
+ *   a nested signal finds one that is free (the thread's own still holds this signal's frame).
+ *   BB_FAULT_ALTSTACK=0: SA_NODEFER only, on the thread's stack as before. */
+enum { FAULT_STAGE_ENTRY = 1, FAULT_STAGE_GUEST_CPU, FAULT_STAGE_PROMOTION, FAULT_STAGE_GPU,
+       FAULT_STAGE_RECOVER, FAULT_STAGE_REPORT };
+static const char *const fault_stage_names[] = {
+    "?", "entry", "guest CPU (FEX)", "granule promotion wait", "GPU page tracking (bbgpu_handle_fault)",
+    "recovery point", "crash report"};
+static __thread int fault_depth; /* 1 while this thread runs the handler, 2 while it reports a nested fault */
+static __thread int fault_stage, fault_outer_sig;
+static __thread uintptr_t fault_outer_addr, fault_outer_pc;
+#if defined(__aarch64__) && defined(__linux__)
+#define FAULT_ALTSTACK 1
+static int fault_altstack = 1; /* BB_FAULT_ALTSTACK=0: off (read before the handler is installed) */
+static __thread unsigned char fault_spare_stack[32 * 1024] __attribute__((aligned(16)));
+static __thread stack_t fault_thread_altstack; /* the thread's own, read at its first fault */
+static __thread int fault_altstack_known;      /* 0 not read yet, 1 it has one, -1 none */
+static __thread int fault_swapped;             /* the spare is installed (fault_leave restores) */
+#endif
+/* The handler is done on this thread (returning, or resuming a recovery point). */
+static void fault_leave(void) {
+#ifdef FAULT_ALTSTACK
+    if (fault_swapped) {
+        fault_swapped = 0;
+        sigaltstack(&fault_thread_altstack, NULL); /* on the thread's stack here: allowed */
+    }
+#endif
+    fault_stage = 0;
+    fault_depth = 0;
+}
+static uintptr_t fault_uc_sp(const void *context) {
+#if defined(__aarch64__) && defined(__linux__)
+    return (uintptr_t)((const ucontext_t *)context)->uc_mcontext.sp;
+#elif defined(__x86_64__) && defined(__linux__)
+    return (uintptr_t)((const ucontext_t *)context)->uc_mcontext.gregs[REG_RSP];
+#else
+    (void)context; return 0;
+#endif
+}
+static uintptr_t fault_uc_lr(const void *context) {
+#if defined(__aarch64__) && defined(__linux__)
+    return (uintptr_t)((const ucontext_t *)context)->uc_mcontext.regs[30];
+#else
+    (void)context; return 0;
+#endif
+}
+/* A line built without stdio (async-signal-safe), written with write(2). */
+typedef struct { char text[640]; size_t n; } FaultLine;
+static void fl_str(FaultLine *l, const char *s) {
+    while (s && *s && l->n < sizeof(l->text) - 2) l->text[l->n++] = *s++;
+}
+static void fl_hex(FaultLine *l, uint64_t v) {
+    char d[19]; int i = 18; d[i] = 0;
+    do { d[--i] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v);
+    d[--i] = 'x'; d[--i] = '0';
+    fl_str(l, d + i);
+}
+static void fl_dec(FaultLine *l, uint64_t v) {
+    char d[21]; int i = 20; d[i] = 0;
+    do { d[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+    fl_str(l, d + i);
+}
+static void fl_where(FaultLine *l, uintptr_t pc) {
+    Dl_info where;
+    if (image && pc - (uintptr_t)image < 0x10000000) { fl_str(l, "guest +"); fl_hex(l, pc - (uintptr_t)image); return; }
+    if (pc && dladdr((void *)pc, &where) && where.dli_fname) {
+        const char *base = strrchr(where.dli_fname, '/');
+        fl_str(l, base ? base + 1 : where.dli_fname); fl_str(l, "+"); fl_hex(l, pc - (uintptr_t)where.dli_fbase);
+        if (where.dli_sname) { fl_str(l, " ("); fl_str(l, where.dli_sname); fl_str(l, ")"); }
+        return;
+    }
+    fl_hex(l, pc);
+    fl_str(l, " (in no shared object: JIT code or a freed mapping)");
+}
+static void fl_thread(FaultLine *l) {
+    char name[17] = {0};
+    fl_str(l, prctl(PR_GET_NAME, name, 0, 0, 0) == 0 ? name : "?");
+}
+static void fl_flush(FaultLine *l) {
+    l->text[l->n++] = '\n';
+    for (size_t at = 0; at < l->n;) {
+        const ssize_t w = write(2, l->text + at, l->n - at);
+        if (w <= 0) break;
+        at += (size_t)w;
+    }
+    l->n = 0;
+}
+/* The interrupted code's pc, return address and sp. */
+static void fl_context(FaultLine *l, const void *context) {
+    fl_str(l, "  at "); fl_where(l, guest_cpu_host_pc(context)); fl_flush(l);
+    if (fault_uc_lr(context)) { fl_str(l, "  return address "); fl_where(l, fault_uc_lr(context)); fl_flush(l); }
+    fl_str(l, "  sp "); fl_hex(l, fault_uc_sp(context)); fl_flush(l);
+}
+/* A fault while this thread was already in the handler. */
+__attribute__((noreturn)) static void fault_nested(int sig, siginfo_t *info, void *context) {
+    if (fault_depth >= 2) {
+        static const char text[] = "Fault inside the nested-fault report; exiting\n";
+        ssize_t written_ = write(2, text, sizeof(text) - 1); (void)written_;
+        _exit(128 + sig);
+    }
+    fault_depth = 2;
+    FaultLine l = {.n = 0};
+    const int stage = fault_stage >= 0 && fault_stage < (int)(sizeof(fault_stage_names) / sizeof(*fault_stage_names)) ? fault_stage : 0;
+    fl_str(&l, "Nested fault (signal "); fl_dec(&l, (uint64_t)sig); fl_str(&l, ", address "); fl_hex(&l, (uintptr_t)info->si_addr);
+    fl_str(&l, ") inside the fault handler, in its "); fl_str(&l, fault_stage_names[stage]); fl_str(&l, " stage; thread ");
+    fl_thread(&l); fl_flush(&l);
+    fl_context(&l, context);
+    fl_str(&l, "  while handling signal "); fl_dec(&l, (uint64_t)fault_outer_sig); fl_str(&l, ", address "); fl_hex(&l, fault_outer_addr);
+    fl_str(&l, ", at "); fl_where(&l, fault_outer_pc); fl_flush(&l);
+    _exit(128 + sig);
+}
+#ifdef FAULT_ALTSTACK
+/* A stack too small for the handler: reported from the alternate stack, then the process ends. */
+__attribute__((noreturn)) static void fault_overflow(int sig, siginfo_t *info, void *context, const char *what) {
+    fault_depth = 2; /* a fault in this report: the short message */
+    FaultLine l = {.n = 0};
+    fl_str(&l, "Stack overflow (signal "); fl_dec(&l, (uint64_t)sig); fl_str(&l, ", address "); fl_hex(&l, (uintptr_t)info->si_addr);
+    fl_str(&l, "): "); fl_str(&l, what); fl_str(&l, " is exhausted; thread "); fl_thread(&l); fl_flush(&l);
+    fl_context(&l, context);
+    _exit(128 + sig);
+}
+/* At least `bytes` readable below sp (process_vm_readv reports EFAULT instead of faulting). A guard
+ * page, a gap or the end of the stack mapping is unreadable. 1 when it cannot be told. */
+static int fault_stack_room(uintptr_t sp, size_t bytes) {
+    enum { PAGES = 4 };
+    unsigned char sink[PAGES];
+    struct iovec local[PAGES], remote[PAGES];
+    const size_t pages = bytes / 4096 < PAGES ? bytes / 4096 : PAGES;
+    for (size_t i = 0; i < pages; ++i) {
+        local[i] = (struct iovec){sink + i, 1};
+        remote[i] = (struct iovec){(void *)(sp - 1 - i * 4096), 1};
+    }
+    const ssize_t got = process_vm_readv(getpid(), local, pages, remote, pages, 0);
+    if (got < 0) return errno != EFAULT;
+    return (size_t)got == pages;
+}
+void bb_fault_call_on_stack(void (*fn)(int, siginfo_t *, void *), int sig, siginfo_t *info, void *context, uintptr_t top);
+/* bb_fault_call_on_stack(fn, sig, info, context, top): fn(sig, info, context) with sp = top (16-aligned
+ * down); a frame record and CFI, so the crash report's unwinder goes on through it. */
+__asm__(".text\n"
+        ".p2align 2\n"
+        ".globl bb_fault_call_on_stack\n"
+        ".type bb_fault_call_on_stack, %function\n"
+        "bb_fault_call_on_stack:\n"
+        ".cfi_startproc\n"
+        " hint #34\n" /* BTI c */
+        " stp x29, x30, [sp, #-16]!\n"
+        ".cfi_def_cfa_offset 16\n"
+        ".cfi_offset x29, -16\n"
+        ".cfi_offset x30, -8\n"
+        " mov x29, sp\n"
+        ".cfi_def_cfa_register x29\n"
+        " mov x9, x0\n"
+        " mov w0, w1\n"
+        " mov x1, x2\n"
+        " mov x2, x3\n"
+        " and x4, x4, #-16\n"
+        " mov sp, x4\n"
+        " blr x9\n"
+        " mov sp, x29\n"
+        ".cfi_def_cfa sp, 16\n"
+        " ldp x29, x30, [sp], #16\n"
+        ".cfi_def_cfa_offset 0\n"
+        ".cfi_restore x29\n"
+        ".cfi_restore x30\n"
+        " ret\n"
+        ".cfi_endproc\n"
+        ".size bb_fault_call_on_stack, .-bb_fault_call_on_stack\n");
+#endif
+static void fault(int sig, siginfo_t *info, void *context) __attribute__((noinline));
+void bb_fault_entry(int sig, siginfo_t *info, void *context);
+#ifdef FAULT_ALTSTACK
+void bb_fault_on_thread_stack(int sig, siginfo_t *info, void *context);
+void bb_fault_on_thread_stack(int sig, siginfo_t *info, void *context) {
+    const stack_t spare = {.ss_sp = fault_spare_stack, .ss_flags = 0, .ss_size = sizeof(fault_spare_stack)};
+    fault_swapped = sigaltstack(&spare, NULL) == 0;
+    fault(sig, info, context);
+    fault_leave();
+}
+#endif
+/* The installed SIGSEGV/SIGBUS/SIGILL handler (SA_NODEFER; SA_ONSTACK on AArch64 Linux). */
+void bb_fault_entry(int sig, siginfo_t *info, void *context) {
+    if (fault_depth) fault_nested(sig, info, context);
+    const int saved_errno = errno;
+    fault_outer_sig = sig;
+    fault_outer_addr = (uintptr_t)info->si_addr;
+    fault_outer_pc = guest_cpu_host_pc(context);
+#ifdef FAULT_ALTSTACK
+    if (fault_altstack) {
+        if (!fault_altstack_known) {
+            stack_t ss;
+            if (sigaltstack(NULL, &ss) == 0 && !(ss.ss_flags & SS_DISABLE) && ss.ss_size) {
+                fault_thread_altstack = ss;
+                fault_thread_altstack.ss_flags = 0;
+                fault_altstack_known = 1;
+            } else {
+                fault_altstack_known = -1;
+            }
+        }
+        const uintptr_t here = (uintptr_t)__builtin_frame_address(0);
+        const uintptr_t base = (uintptr_t)fault_thread_altstack.ss_sp;
+        if (fault_altstack_known > 0 && here - base < fault_thread_altstack.ss_size) {
+            /* On the alternate stack: the interrupted code's stack has to take the handler. */
+            const uintptr_t sp = fault_uc_sp(context), address = (uintptr_t)info->si_addr;
+            if (sp < base && base - sp <= 65536)
+                fault_overflow(sig, info, context, "the alternate signal stack (a signal handler ran past its end)");
+            /* A fault on the stack itself (near sp; the game's memory and the handled traps are
+             * far from any host stack) with no room left below sp. */
+            const uintptr_t distance = address > sp ? address - sp : sp - address;
+            if ((sig == SIGSEGV || sig == SIGBUS) && distance < (UINT64_C(1) << 20) && !fault_stack_room(sp, 16384))
+                fault_overflow(sig, info, context, "the thread's stack");
+            fault_depth = 1;
+            fault_stage = FAULT_STAGE_ENTRY;
+            /* Below the interrupted frame (AArch64 has no red zone), as the kernel would have put it. */
+            bb_fault_call_on_stack(bb_fault_on_thread_stack, sig, info, context, sp - 256);
+            errno = saved_errno;
+            return;
+        }
+    }
+#endif
+    fault_depth = 1;
+    fault_stage = FAULT_STAGE_ENTRY;
+    fault(sig, info, context);
+    fault_leave();
+    errno = saved_errno;
+}
 static void fault(int sig, siginfo_t *info, void *context) {
     /* The guest CPU's own faults (FEXCore's JIT), then GPU page tracking (write-protected guest pages). */
+    fault_stage = FAULT_STAGE_GUEST_CPU;
     if (guest_cpu_handle_fault(sig, info, context)) return;
     /* bbport UMA: a page a granule promotion froze: wait for it, the access is retried. */
+    fault_stage = FAULT_STAGE_PROMOTION;
     if (sig == SIGSEGV && runtime_memory_promotion_fault(info->si_addr)) return;
+    fault_stage = FAULT_STAGE_GPU;
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
+    fault_stage = FAULT_STAGE_RECOVER;
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;
         runtime_fault_recover = NULL;
@@ -182,8 +426,10 @@ static void fault(int sig, siginfo_t *info, void *context) {
         sigemptyset(&unblock);
         sigaddset(&unblock, sig);
         pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
+        fault_leave(); /* this thread's handler ends here (and its alternate stack comes back) */
         siglongjmp(*recover, 1);
     }
+    fault_stage = FAULT_STAGE_REPORT;
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     GuestRegs regs;
     const int in_guest = guest_cpu_signal_regs(context, &regs);
@@ -239,7 +485,12 @@ static void fault(int sig, siginfo_t *info, void *context) {
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
     int depth = backtrace(frames, 32);
-    for (int i = 2; i < depth; ++i) {
+    /* From the frame after bb_fault_entry's (the kernel's sigreturn trampoline, then the faulting
+     * code): the handler's own frames (fault, the stack switch) are not printed. */
+    int first = 2;
+    for (int i = 0; i < depth && i < 8; ++i)
+        if (dladdr(frames[i], &where) && where.dli_saddr == (void *)bb_fault_entry) first = i + 1;
+    for (int i = first; i < depth; ++i) {
         if (dladdr(frames[i], &where) && where.dli_fname)
             snprintf(line, sizeof(line), "  #%d %s+0x%lx (%s)\n", i, where.dli_fname,
                      (unsigned long)((uintptr_t)frames[i] - (uintptr_t)where.dli_fbase), where.dli_sname ? where.dli_sname : "?");
@@ -514,7 +765,15 @@ int main(int argc, char **argv) {
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
-    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
+    /* SA_NODEFER (and SA_ONSTACK on AArch64 Linux): see bb_fault_entry. */
+    struct sigaction sa = {0}; sa.sa_sigaction = bb_fault_entry; sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+#ifdef FAULT_ALTSTACK
+    {
+        const char *altstack = getenv("BB_FAULT_ALTSTACK");
+        fault_altstack = !(altstack && altstack[0] == '0');
+        if (fault_altstack) sa.sa_flags |= SA_ONSTACK;
+    }
+#endif
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
     Dl_info self_info;
