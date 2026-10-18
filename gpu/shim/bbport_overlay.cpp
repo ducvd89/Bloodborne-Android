@@ -284,6 +284,9 @@ void Menu() {
                                    : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
                                    : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load()
                                                                      : true;
+#ifdef __ANDROID__
+            if (!supported) continue; // FSR 4 and DLSS are not offered on Android (ConfigureUpscalerSupport)
+#endif
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
                 Store(s.upscaler, i, true);

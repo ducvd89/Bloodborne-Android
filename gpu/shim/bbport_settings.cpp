@@ -165,6 +165,11 @@ void Load() {
 
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
     auto& v = Get();
+#ifdef __ANDROID__
+    // Android offers FSR 3.1 and GSR 2 only: FSR 4 (INT8) took ~470 ms a frame with a black scene on the
+    // Adreno 740, and 4.1.1 needs an RX 7000/9000. Not offered, the menus leave them out.
+    fsr4 = fsr411 = false;
+#endif
     v.fsr4_supported = fsr4;
     v.fsr411_supported = fsr4 && fsr411;
     const int requested = v.upscaler;
@@ -179,6 +184,10 @@ void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
 
 void ConfigureDlssSupport(bool available, const char* problem) {
     auto& v = Get();
+#ifdef __ANDROID__
+    available = false; // NVIDIA RTX only: not offered on Android, the menus leave it out
+    problem = "not offered on Android";
+#endif
     v.dlss_supported = available;
     static std::string kept;
     kept = problem ? problem : "";
