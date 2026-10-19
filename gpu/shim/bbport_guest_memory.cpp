@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <csignal>
 #include <mutex>
+#include <vector>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -31,6 +32,9 @@ extern "C" int runtime_memory_set_granule_allocator(int (*alloc)(uint64_t phys, 
                                                     uint64_t granule);
 extern "C" int runtime_memory_promote(uint64_t phys, uint64_t size);
 extern "C" void runtime_memory_uma_stats(BbGuestMemory::UmaRuntimeStats* out);
+extern "C" int runtime_memory_demote(uint64_t phys, uint64_t size);
+extern "C" size_t runtime_memory_granule_scan(uint8_t* out, size_t count);
+extern "C" void runtime_memory_uma_demote_stats(BbGuestMemory::UmaDemoteStats* out);
 
 namespace BbGuestMemory {
 namespace {
@@ -735,6 +739,20 @@ UmaRuntimeStats UmaRuntime() {
     return stats;
 }
 
+bool UmaDemote(std::uint64_t phys, std::uint64_t size) {
+    return runtime_memory_demote(phys, size) == 1;
+}
+
+std::size_t UmaGranuleScan(std::uint8_t* out, std::size_t count) {
+    return runtime_memory_granule_scan(out, count);
+}
+
+UmaDemoteStats UmaDemoteRuntime() {
+    UmaDemoteStats stats{};
+    runtime_memory_uma_demote_stats(&stats);
+    return stats;
+}
+
 namespace {
 // The granule table: one Chunk per shared granule, found by phys / granule in O(1) (v1's chunks were
 // a sorted array of at most 256), read without a lock (UmaDirect asks for every binding): two
@@ -881,6 +899,11 @@ int AllocGranule(u64 phys, u64 size) {
     return fd;
 }
 
+/// Chunks of demoted granules, kept a while after their memory was freed: UmaDirect's lock-free readers
+/// (a verdict memo, a lookup in flight) may still hold one and read its `demoting` flag.
+std::mutex retired_mutex;
+std::vector<std::pair<Chunk*, std::chrono::steady_clock::time_point>> retired_chunks;
+
 /// The runtime could not use a granule AllocGranule made: dropped and freed (no GPU work used it).
 void ReleaseGranule(u64 phys, u64 size) {
     const unsigned shift = UmaShift();
@@ -901,6 +924,37 @@ void ReleaseGranule(u64 phys, u64 size) {
     delete chunk;
 }
 } // namespace
+
+void UmaRetire(const Chunk* chunk) {
+    if (!chunk) {
+        return;
+    }
+    auto* owned = const_cast<Chunk*>(chunk);
+    owned->demoting.store(true, std::memory_order_seq_cst);
+    owned->retired.store(true, std::memory_order_seq_cst);
+    const unsigned shift = UmaShift();
+    const u64 first = chunk->phys >> shift, last = (chunk->phys + chunk->size - 1) >> shift;
+    for (u64 g = first; g <= last; ++g) {
+        if (std::atomic<Chunk*>* slot = UmaSlot(g, false)) {
+            Chunk* expected = owned;
+            slot->compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+        }
+    }
+    uma_shared_bytes.fetch_sub(chunk->size);
+    uma_granule_count.fetch_sub(static_cast<std::uint32_t>(chunk->size >> shift));
+    device.destroyBuffer(chunk->buffer);
+    device.freeMemory(chunk->memory);
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lk{retired_mutex};
+    std::erase_if(retired_chunks, [&](const auto& entry) {
+        if (now - entry.second < std::chrono::seconds{60}) {
+            return false;
+        }
+        delete entry.first;
+        return true;
+    });
+    retired_chunks.emplace_back(owned, now);
+}
 
 bool HostImported() {
     return mode == Mode::HostImport;

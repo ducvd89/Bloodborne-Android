@@ -209,6 +209,10 @@ inline std::atomic<std::uint32_t> coarse_second{0};
 inline std::atomic<std::uint64_t> vram_idle_bytes{0}, vram_unmapped_bytes{0}, vram_chunks_freed_bytes{0};
 /// Residency chunks, chunks sent away (ProcessIdleBlocks), and their blocks that had to stay.
 inline std::atomic<std::uint64_t> residency_chunk_count{0}, evacuations{0}, evac_kept_gpu{0}, evac_kept_other{0};
+/// Arena repack (BufferCache::RepackResidency): on, bytes of VRAM copies moved into fuller chunks,
+/// chunks it emptied; residency chunks given back to the driver (any cause). Cumulative.
+inline std::atomic<std::uint64_t> arena_repack_on{0}, arena_repack_moved_bytes{0}, arena_repack_emptied{0},
+    residency_chunks_freed{0};
 /// BB_VRAM_COPY_QUEUE (FIFO of VRAM copies): on, queue length, bytes of copies, copies returned.
 inline std::atomic<std::uint64_t> vram_copy_queue{0}, vram_copy_queue_length{0}, vram_copy_bytes{0},
     vram_copies_returned{0};

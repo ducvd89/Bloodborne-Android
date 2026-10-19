@@ -112,9 +112,9 @@ Requested by the GPU side when a read-only buffer binding of an enabled class li
 Never promoted: granules holding executable mappings, flexible memory, granules the GPU library cannot
 allocate (they stay CPU, the binding takes a copy).
 
-A granule fully released by the game is **demoted** later (phase 4): GPU blocks rebound to the
-evicted-memory block, VkDeviceMemory freed after the GPU tick, backing view back to the memfd. Until
-then released shared memory is cleared, not freed (as today's chunks).
+Granules the game released, or that nothing binds in place any more, are **demoted** back to the memfd
+(see Demotion, 2026-10-19). Released shared memory is cleared at the release (a dma-buf cannot be hole
+punched) and freed by the demotion.
 
 ### GPU view
 
@@ -162,39 +162,204 @@ Now (`BufferCache::UmaDirect`, called by `ObtainBuffer` before copy mode's strea
   copy, then GPU-modified) left the game's memory with the old bytes, which readbacks (relaxed by
   default) never fixed: the game raised its own fatal exception a few minutes into streaming an area.
   Trade-off: draws recorded earlier that read the granule live through its buffer may see the new bytes
-  early (a possible visual glitch, no corrupted CPU data); a CPU write into an armed block hits the
-  UmaWatch trap and the block goes back to copies. `BB_UMA_DMA_GPU=1` brings back the GPU path. The
+  early (a possible visual glitch, no corrupted CPU data); a CPU write into an armed region hits the
+  UmaWatch trap and the region goes back to copies. `BB_UMA_DMA_GPU=1` brings back the GPU path. The
   `UMA:` line counts them (`DMA into shared: N (X MiB; cpu A, gpu B)`) and logs the first 32 destinations.
 - `GarlicInVram()` is false on phones; the copy FIFO (`BB_VRAM_COPY_QUEUE`) works as in copy mode.
 - Counters (the `UMA:` line): granule buffer bindings and MiB, refusals by class, written, cross-granule,
   mapping, GPU data, image, backoff.
 
-### Dynamic blocks: one-shot write traps (2026-10-18)
+### Dynamic blocks: one-shot write traps (2026-10-18; per region 2026-10-19)
 
 Runs 5 (`index`) and 6 (`index,vertex`) with granule buffers were stable (28-30 FPS, no reset); verify
 found one per-frame vertex buffer rewritten while the GPU used it. So a binding bound in place arms a
-one-shot write trap (`BbLayer::WriteTraps::UmaWatch` = 4, read-only) on its 64 KiB guest blocks
-(`PageManager::UmaArm`, blocks not armed or dynamic yet). The first CPU write there, as a fault
-(`GuestFaultSignalHandler`) or announced by the runtime (libc copies through
+one-shot write trap (`BbLayer::WriteTraps::UmaWatch` = 4, read-only). The first CPU write there, as a
+fault (`GuestFaultSignalHandler`) or announced by the runtime (libc copies through
 `runtime_memory_prepare_cpu_write` → `Rasterizer::OnCpuWrite`, file reads and loaders through
-`NoteAssetWrite`), marks the block **dynamic** (`BbUma::Dynamic`, lock-free bitmaps by guest VA) and
-lifts the trap; a verify mismatch marks its blocks too. `UmaDirect` refuses ranges touching dynamic
-blocks (copies; `dynamic` in the `UMA:` line). A block stays dynamic until its mapping changes (map and
-unmap hooks forget both marks; the runtime forgets the traps then, and keeps them across promotions
-and the game's mprotect).
+`NoteAssetWrite`), makes the memory **dynamic** (`BbUma::Dynamic`, lock-free bitmaps by guest VA, one
+bit per 64 KiB block) and lifts the trap; a verify mismatch marks it too. `UmaDirect` refuses ranges
+touching dynamic blocks (copies; `dynamic` in the `UMA:` line). Marks stay until the mapping changes
+(map and unmap hooks forget both; the runtime forgets the traps then, and keeps them across
+promotions and the game's mprotect).
+
+**Per 2 MiB region, not per 64 KiB block (2026-10-19).** The first version armed and lifted each
+64 KiB block on its own. Every change of a page's protection splits the kernel's mappings: on the Thor
+(`index,vertex`, 8 MiB granules) the process went from 9150 to 28310 mappings within a minute of
+loading a save and kept growing ~300 per 10 s standing still (33045, of them 28637 `/dmabuf:` mappings
+of shared granules, 28365 ≤ 64 KiB, mostly `r--s` armed blocks and `rw-s` lifted ones between them).
+`vm.max_map_count` is 65530; at the limit every mmap fails (an earlier crash: `vkQueueSubmit` →
+`VK_ERROR_MEMORY_MAP_FAILED`, Turnip's mmap of a new command BO) and the game's allocations would too.
+Now (`PageManager::UmaArm` / `UmaNoteWrite`):
+
+- **Region** = the 2 MiB-aligned guest VA range, clipped to the binding's direct mapping (the runtime's
+  VMA: `runtime_memory_direct_phys`, its start found by a binary search over pages) and its granule's
+  VA span, rounded out to whole 64 KiB blocks (the old blocks were whole too).
+- **Arming:** when `UmaDirect` binds a range in place and not every 64 KiB block of the range is armed
+  yet, every region the range touches gets its not-yet-armed, non-dynamic blocks armed **at once** (one
+  `runtime_memory_trap` call per run of pages: the region becomes one read-only mapping, and adjacent
+  armed regions of the same granule merge). The marks stay per block, so a region armed in part (a
+  clip, a remap that forgot part of it) is completed by the next binding that needs the rest.
+- **Lifting:** a CPU write fault or announced write on watched blocks of a region marks the **whole
+  region** dynamic (all 32 blocks) and lifts the trap on every page of it at once: the pages merge back
+  into the `rw-s` mapping around them. A region dynamic already lifts only the pages written (bits left
+  behind on pages the page manager held then). A verify mismatch marks its regions dynamic and leaves
+  their armed marks: the next write there lifts the whole region.
+- The ring rule (a second dynamic block within 2 MiB marks the regions of both) is gone: every write
+  marks its whole region now.
+- **Expected mappings:** about one per shared granule (its dma-buf mapping), plus at most two per armed
+  region inside a run of lifted ones (armed neighbours merge), plus the page manager's own copy-mode
+  protections.
 
 The page manager (copy mode's write tracking) protects the same pages with the runtime's other
 mprotect, which ignores the traps (the last change wins). Hence: pages it denies reads are not armed
 (they get the trap when it lets them go); when it lets an armed page go it keeps it read-only for the
 trap (`UmaProtect`); the trap is lifted only where it does not restrict the page itself, elsewhere when
-it lets the page go; a fault on a page both protect goes on to its own handler.
+it lets the page go; a fault on a page both protect goes on to its own handler. Its write protections
+inside an armed region are read-only like the trap (no extra split); inside a lifted region the
+mappings are exactly copy mode's.
+
+**Mapping cap (`BB_UMA_MAX_MAPS`, default 40000; 0: off).** `BbUma::Maps`: a low-priority thread
+(`BbUmaMaps`, started at the first arming) counts the lines of `/proc/self/maps` every 2 s; between
+counts each region armed adds 2 to the estimate. At or above the cap no new region is armed:
+`UmaDirect` refuses a range whose blocks are not all armed yet (before promoting its granule: a new
+shared granule is a new mapping too), and if `UmaArm` cannot cover the range (the cap engaged
+meanwhile) the range is refused too: never bound in place without a trap. Those ranges take copy
+mode's path (`maps-cap` in the `UMA:` line and in `UMA refusals by class`). Arming resumes when the
+count drops below the cap. Logged once: `UMA: about N memory mappings (BB_UMA_MAX_MAPS ...): no new
+regions are armed ...`.
+
+**Stats:** the `UMA:` line has `maps-cap N` among the refusals, `dynamic blocks N (regions D, verify
+regions V; armed B in A regions, ...)` (cumulative), and the 10 s block's `Memory mappings: N of M`
+line (M: `vm.max_map_count`, or 65530 when the app cannot read it, as on Android) adds `UMA arming cap
+40000` (`(reached)` while it holds).
+
+### Mapping compaction (2026-10-19)
+
+The region traps did not stop the climb: the kernel **never merges dma-buf mappings** (the system
+heap's mmap makes `VM_PFNMAP|VM_IO` "special" VMAs, which `vma_merge` skips). Each mprotect of part of
+a shared granule's mapping (the page manager's 4 KiB write tracking above all, the traps) splits it for
+good; giving the pages the protection they had leaves the pieces (`/proc/self/maps`: runs of identical
+`r--s` 4 KiB lines with contiguous offsets). On the Thor 30001 of ~33k mappings were `/dmabuf:`, 27809
+of them 4 KiB. Copy mode is immune (the memfd's shmem mappings merge).
+
+`src/runtime_memory.c` now compacts SHARED granules (`runtime_memory_compact_granule` /
+`runtime_memory_compact_shared`):
+
+- **One granule:** under the runtime lock (exclusive) and a promotion's freeze (`freeze_publish`: the
+  aliases' VA ranges published as frozen; a kernel write in flight (`io_begin`) skips the granule until
+  the next round, new ones wait for the thaw), each run of the granule's guest aliases that follows on
+  in both the guest's addresses and the granule is mapped again from the dma-buf in one `mmap`
+  (`MAP_FIXED|MAP_SHARED`), with the protection every page of the run allows (read-only, or none when a
+  page is no access: nobody gets an access its page refuses). Then each run of pages that allows more
+  gets it in one mprotect (`page_prot`: the guest's protection, the page manager's recorded
+  restriction, the trap level, as promotion gives back). No byte is copied: the data is the dma-buf's.
+  An access the narrower mapping refuses faults, waits in `runtime_memory_promotion_fault` and is
+  retried, as during a promotion. The backing view is mapped again too if the scan found it split
+  (nothing protects it; its users never notice: same pages, same protection). Granules with an
+  executable alias or more than 64 aliases are left alone.
+- **Policy:** a low-priority thread (`BbUmaCompact`, nice 10) counts `/proc/self/maps` every 2 s. At or
+  above `BB_UMA_COMPACT_AT` (default 20000; 0: off) it scans the mapping starts in the guest range and
+  the backing view, counts the splits inside each SHARED granule's aliases, and compacts the granules
+  that gained the most since their last compaction (at least 16 more mappings), 32 per round with a
+  rescan between rounds, up to 256 a tick, until the count is under 3/4 of the threshold. Each granule's
+  freeze is one mmap plus its runs (≲ 1 ms for 2 MiB). Logged once per power of two of the rounds:
+  `UMA: compacted N granules, VMAs X -> Y (...)`; the runtime's report has a `UMA mapping compaction`
+  line. `BbUma::Maps` uses the thread's count instead of reading the file itself; the maps cap
+  (`BB_UMA_MAX_MAPS`) should now only engage if compaction cannot keep up.
+- What stays after a compaction is one mapping per run of different protection per alias: the page
+  manager's real write tracking. Truly scattered protections cannot be compacted away.
+- Host test: `tests/test_uma_granules.c` `compaction()` (the memfd stand-ins merge, so it checks what
+  must not change: bytes, each page's protection in two aliases, writes and kernel reads during
+  thousands of compactions, protection and alias churn meanwhile).
+
+### Demotion SHARED -> CPU (2026-10-19)
+
+Thor, ~15 min walking with `index,vertex`, 8 MiB granules: PSS 7.76 GB (5.2 GB at the start spot),
+174 granules (1392 MiB) shared and never given back, KGSL imported 1.48 GB; many of them dynamic by
+then (their bindings take copies anyway: shared memory and arena copies). Shared granules are
+dma-bufs: committed whole, not swappable by zram, released parts only cleared.
+
+**When** (`BufferCache::UmaDemoterLoop`, thread `BbUmaDemote`, nice 10, a round a second; on with
+`BB_UMA`, `BB_UMA_DEMOTE=0` off):
+
+- **released**: no direct memory allocated over the granule any more (`runtime_memory_granule_scan`),
+  at most 16 a round;
+- **idle**: no binding in place through its buffer for `BB_UMA_DEMOTE_IDLE_S` (20; 0: released ones
+  only), at most 4 a round. Counted as **idle-dynamic** when at least half of its 64 KiB blocks are
+  dynamic (the ones whose bindings all take copies), else idle. `BB_UMA_DEMOTE_DYNAMIC_PCT=N`: only
+  idle granules with N % of their blocks dynamic are demoted (default 0: any idle granule).
+
+**Sequence**:
+
+1. GPU side: the granule's `Chunk` gets `demoting` (sequentially consistent store), the verdict epoch
+   moves (memoized direct verdicts drop), then the demoter reads the granule's last in-place tick.
+   `UmaDirect` publishes the tick of every in-place binding (`UmaUse`: the largest one, a CAS) before
+   it reads `demoting`: a binding that finds it clear has its tick seen by the demoter; one that finds
+   it set takes copies (`demoting` in the refusals). The demotion waits until the GPU is past that tick
+   + 2 (the draw pipe may record a packet bound a submission earlier), retried each round, never on the
+   render thread.
+2. Runtime (`runtime_memory_demote`, the mirror of promotion, under `promote_mutex` and the runtime's
+   lock): every guest alias frozen read-only (`freeze_publish`: a write faults, waits, and is retried on
+   the new mapping; kernel writes in flight waited for up to 50 ms, new ones wait for the thaw), the
+   memfd range punched, the dma-buf's non-zero 4 KiB pages copied into it through a scratch mapping of
+   the memfd (all-zero pages stay holes: released parts and never-written pages are not committed;
+   nothing at all is copied when no direct memory is allocated there), the memfd mapped over the
+   backing view and every alias (`PROT_NONE` until all are switched), each page's exact protection
+   given back as runs (`alias_protect`/`page_prot`: the guest's, the page manager's, the traps'), the
+   state CPU, the fd closed. A mapping that fails is undone (the dma-buf again); busy (I/O in flight,
+   more than 64 aliases): tried again next round, given up after 5 tries (`demoting` cleared, not
+   tried for 60 s).
+3. GPU side again: the granule's Buffer wrapper dropped under `uma_chunk_buffers_mutex` (the `Chunk`
+   marked `retired`: no new wrapper is made for it), the slot in the granule table cleared, its
+   VkBuffer and VkDeviceMemory freed (`BbGuestMemory::UmaRetire`); the `Chunk` record is deleted a
+   minute later (lock-free readers may still hold it, and its `demoting` stays set).
+4. No promotion of the granule for `BB_UMA_REPROMOTE_S` (30) after it (`backoff`); then a binding
+   promotes it as the first time (`re-promotions`). Dynamic marks and armed traps stay with the guest
+   addresses (copy mode ignores them; a dynamic range is never promoted again).
+
+**Stats**: the `UMA:` line ends with `demotions N (X MiB; released A, idle-dynamic B, idle C;
+non-zero pages kept K MiB; retries R, given up G), demote T ms max (the freeze), re-promotions P,
+refused demoting D`; `shared` (granules, MiB) goes down; the runtime's report has a `UMA demotions`
+line. Host test: `tests/test_uma_granules.c` `demotion()` (data in two aliases, a read-only one and the
+backing view, exact protections before/after, zero pages not kept, a CPU granule, kernel I/O in
+flight, released memory, re-promotion) and `demotion_hammer()` (two writers and kernel reads while
+granules are promoted and demoted back and forth: no write lost).
+
+### Arena repack (2026-10-19)
+
+The same run: "guest blocks in VRAM 832 MiB allocated, 459 MiB of it unused ... 12 chunks, 0 emptied".
+The FIFO returns idle copies one by one, leaving free slots scattered over every 64 MiB residency chunk;
+only an empty chunk goes back to the driver, and `CompactResidency` empties one only when **none** of
+its copies was bound in the last 2 s and none holds GPU data (it returns them, to be uploaded again):
+with the FIFO keeping exactly the copies in use, every chunk has one, so none ever qualified.
+
+`BufferCache::RepackResidency` (on with `BB_UMA`, `BB_ARENA_REPACK=1` elsewhere, `=0` off; copy mode
+with sparse arenas only), once a second from the buffer cache's maintenance:
+
+- **When**: free slots ≥ `BB_ARENA_REPACK_MB` (128) or over a quarter of the residency allocated.
+- **Source**: the chunk with the fewest copies (not the current chunk, not one filled in the last 10 s)
+  whose copies fit in the free slots of the others plus the current chunk's tail; kept until empty.
+- **Move** (at most `BB_ARENA_REPACK_MBPS` (32) MiB a second, one batch in flight): each copy gets a
+  slot of the fullest other chunk (then the current chunk's tail), its residency points there, its arena
+  place is rebound there (every arena over it, as `EvictVramBlock`), its old slot is released. The bytes:
+  a GPU copy from the arena (still bound to the old slot) into a transfer buffer over the new slot's
+  chunk (`RepackHelper`, one per chunk), recorded in its own command buffer and submitted right before
+  the next submission's sparse binds (`SubmitPendingArenaBinds`: `before_submit`, after every earlier
+  submission, full barriers), and the binds wait for its timeline semaphore. Work recorded in that
+  submission runs after the binds, so it reads and writes the new slot, which holds everything
+  submitted before; copies in use and copies with GPU data move as well.
+- The emptied chunk goes back to the driver after 5 s, once the GPU is past the submission that
+  emptied it (`FreeEmptyResidencyChunks`, which also destroys its transfer buffer). KGSL: nothing is
+  ever bound to null; the old slots are reused by later copies.
+- **Stats**: the `Memory:` line ends with `arena repack: X MiB of copies moved, N chunks emptied, M
+  chunks freed` (cumulative), and a log line per power of two of chunks emptied.
 
 ### Rings, arena by class, constant and texel (2026-10-18)
 
 - **Rings:** run 14's verify mismatches were a rotating set of 256 KiB vertex slots (skinned or
-  animated geometry). When a block becomes dynamic and another dynamic block lies within 2 MiB of it,
-  the 2 MiB-aligned regions of both become dynamic at once (`dynamic regions`; traps lifted there by
-  the page manager, verdict epoch moved). A verify mismatch marks its whole 2 MiB regions.
+  animated geometry). Then: when a block became dynamic and another dynamic block lay within 2 MiB of
+  it, the 2 MiB-aligned regions of both became dynamic at once. Since 2026-10-19 every write marks its
+  whole 2 MiB region (see above), which covers rings. A verify mismatch marks its whole 2 MiB regions.
 - **Arena by class:** each VRAM block of the arena records the class current when it became
   resident and whether its guest pages were in RAM then (mincore of the guest mapping; a shared
   granule counts as in RAM): "CPU pages" (a copy duplicates them, sharing would save it) vs
@@ -306,6 +471,15 @@ guest address, size and frame. This replaces guessing which binding causes a gli
 | `BB_UMA_CLASSES` | comma list of classes, or `all` | `index,vertex` |
 | `BB_UMA_GRANULE_KB` | granule size, power of two, 256..65536 (larger: fewer bindings cross a granule, more commit rounding) | 2048 |
 | `BB_UMA_VERIFY` | verify one in N in-place bindings (0: off) | 0 |
+| `BB_UMA_MAX_MAPS` | no new write-trap regions armed past this many process mappings (0: no cap) | 40000 |
+| `BB_UMA_COMPACT_AT` | compact shared granules' mappings above this many process mappings (0: off) | 20000 |
+| `BB_UMA_DEMOTE=0` | no demotion of shared granules | on |
+| `BB_UMA_DEMOTE_IDLE_S` | demote a granule bound in place by nothing for this long (0: released granules only) | 20 |
+| `BB_UMA_DEMOTE_DYNAMIC_PCT` | demote idle granules only with this share of dynamic blocks (0: any) | 0 |
+| `BB_UMA_REPROMOTE_S` | no promotion of a demoted granule for this long | 30 |
+| `BB_ARENA_REPACK` | move VRAM copies out of the emptiest residency chunk (1 on, 0 off) | on with `BB_UMA` |
+| `BB_ARENA_REPACK_MB` | repack above this many MiB of free copy slots (or a quarter of the residency) | 128 |
+| `BB_ARENA_REPACK_MBPS` | MiB of copies moved a second at most | 32 |
 | `BB_UMA_ALLOW_NONCOHERENT=1` | debugging only: share even if the coherence probe fails | off |
 | `BB_UMA_ORDER=1` | phase 3: game writes wait for in-flight GPU reads of shared blocks | off |
 | `BB_UMA_DMA_GPU=1` | DMA fills and copies into shared granules go to the GPU (arena copy), not the CPU | off |
@@ -329,8 +503,8 @@ option.
    memory split shows staging/arena down.
 3. **More classes:** `storage`, `texel`, `indirect`, then `constant`; order trap where verify finds
    hazards. Checkpoint: 15 minutes on Thor and N5 per class without glitches.
-4. **Memory:** demotion of released granules, granule size tuning, lmkd behaviour (dma-buf pages are not
-   swappable). Checkpoint: PSS below copy mode by the staging + arena share, FPS equal or better.
+4. **Memory:** demotion of released and idle granules and the arena repack (2026-10-19, untested on a
+   device), granule size tuning, lmkd behaviour (dma-buf pages are not swappable). Checkpoint: PSS below copy mode by the staging + arena share, FPS equal or better.
 5. **Rollout:** default on for Adreno with the bundled driver once 2–4 hold; Mali/PanVK and drivers
    failing the probes stay on copies.
 

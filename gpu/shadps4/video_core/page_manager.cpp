@@ -9,6 +9,7 @@
 #include "bblayer_write_traps.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/alignment.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/range_lock.h"
@@ -18,6 +19,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <cstdio>
 #include <sys/uio.h>
@@ -382,12 +384,12 @@ struct PageManager::Impl {
         flush(run, end, run_keep == 1);
     }
 
-    /// The pages of the 64 KiB block `block`, under their locks: `f(first_page, end_page)`.
+    /// The pages of [from, to) (page aligned), under their locks: `f(first_page, end_page)`. A
+    /// 2 MiB region lies under one lock (PAGES_PER_LOCK pages: 4 MiB).
     template <typename F>
-    void WithBlockPages(u64 block, F&& f) {
-        const size_t page = (block << BbUma::Dynamic::BlockShift) >> PM_PAGE_BITS;
-        const size_t page_end =
-            std::min<size_t>(page + (BbUma::Dynamic::BlockBytes >> PM_PAGE_BITS), NUM_ADDRESS_PAGES);
+    void WithPages(VAddr from, VAddr to, F&& f) {
+        const size_t page = from >> PM_PAGE_BITS;
+        const size_t page_end = std::min<size_t>(to >> PM_PAGE_BITS, NUM_ADDRESS_PAGES);
         if (page >= page_end) {
             return;
         }
@@ -419,42 +421,86 @@ struct PageManager::Impl {
         }
     }
 
-    void UmaArm(VAddr addr, u64 size) {
-        if (size == 0) {
-            return;
+    /// The bits of the blocks of [from, to) (inside region `region`), bit i = block i of it.
+    static u32 RegionBlockMask(u64 region, VAddr from, VAddr to) {
+        using namespace BbUma::Dynamic;
+        const VAddr base = VAddr(region) << RegionShift;
+        if (from >= to) {
+            return 0;
         }
-        const u64 first = addr >> BbUma::Dynamic::BlockShift;
-        const u64 last = (addr + size - 1) >> BbUma::Dynamic::BlockShift;
-        for (u64 block = first; block <= last; ++block) {
-            // Lock-free reads first: nearly every call finds its blocks armed already.
-            if (BbUma::Dynamic::Armed(block) || BbUma::Dynamic::IsDynamic(block) ||
-                !BbUma::Dynamic::TryArm(block)) {
-                continue; // armed already, or dynamic
+        const u64 lo = (from - base) >> BlockShift, hi = (to - 1 - base) >> BlockShift; // inclusive
+        const u64 bits = (hi == 63 ? ~u64{0} : (u64{2} << hi) - 1) & ~((u64{1} << lo) - 1);
+        return static_cast<u32>(bits);
+    }
+
+    bool UmaArm(VAddr addr, u64 size, VAddr clip_begin, VAddr clip_end) {
+        using namespace BbUma::Dynamic;
+        if (size == 0) {
+            return true;
+        }
+        bool covered = true;
+        const u64 first_region = addr >> RegionShift, last_region = (addr + size - 1) >> RegionShift;
+        for (u64 region = first_region; region <= last_region; ++region) {
+            const VAddr base = VAddr(region) << RegionShift, top = base + RegionBytes;
+            // The region within the binding's mapping and granule, in whole blocks (the old
+            // per-block traps covered whole blocks too).
+            const VAddr lo = std::max(base, clip_begin & ~(BlockBytes - 1));
+            const VAddr hi = std::min(top, Common::AlignUp(clip_end, BlockBytes));
+            const u32 span = RegionBlockMask(region, lo, hi);
+            const u32 need = RegionBlockMask(region, std::max(base, addr), std::min(top, addr + size));
+            // Lock-free reads first: nearly every call finds its region armed already.
+            const u32 armed = RegionArmed(region), dynamic = RegionDynamic(region);
+            const u32 missing = (span | need) & ~armed & ~dynamic;
+            if (missing == 0) {
+                continue;
             }
-            BbUma::counters.watch_armed.fetch_add(1, std::memory_order_relaxed);
-            WithBlockPages(block, [&](size_t page, size_t page_end) {
-                // Pages denied reads (readbacks) would become readable under a read-only trap.
+            if (!BbUma::Maps::ArmingAllowed()) {
+                covered = covered && (need & ~armed) == 0;
+                continue;
+            }
+            const u32 fresh = ArmBlocks(region, missing);
+            if (fresh == 0) {
+                continue; // armed by another thread meanwhile, or dynamic
+            }
+            BbUma::counters.watch_armed.fetch_add(static_cast<u64>(std::popcount(fresh)),
+                                                  std::memory_order_relaxed);
+            if ((armed & span) == 0) {
+                BbUma::counters.armed_regions.fetch_add(1, std::memory_order_relaxed);
+            }
+            BbUma::Maps::NoteArmed();
+            // One trap over the region's fresh blocks: one read-only mapping (adjacent read-only
+            // ones merge). Pages denied reads (readbacks) would become readable under a read-only
+            // trap: left out, they get the trap when this manager lets them go (UmaProtect).
+            WithPages(base, top, [&](size_t page, size_t page_end) {
+                const size_t base_page = base >> PM_PAGE_BITS;
                 ForEachPageRun(
-                    page, page_end, [&](size_t p) { return cached_pages[p].num_read_watchers == 0; },
+                    page, page_end,
+                    [&](size_t p) {
+                        const u64 bit = (p - base_page) >> (BlockShift - PM_PAGE_BITS);
+                        return ((fresh >> bit) & 1) != 0 && cached_pages[p].num_read_watchers == 0;
+                    },
                     [](VAddr from, VAddr to) {
                         BbLayer::WriteTraps::Set(from, to - from, BbLayer::WriteTraps::UmaWatch,
                                                  true);
                     });
             });
         }
+        return covered;
     }
 
     void UmaNoteWrite(VAddr addr, u64 size, bool fault) {
-        if (size == 0 || !BbUma::Dynamic::AnyWatched(addr, size)) {
+        using namespace BbUma::Dynamic;
+        if (size == 0 || !AnyWatched(addr, size)) {
             return;
         }
         (fault ? BbUma::counters.watch_faults : BbUma::counters.watch_notes)
             .fetch_add(1, std::memory_order_relaxed);
         // Lifted where this manager does not restrict the page: the game's protection comes back.
         // Pages it restricts keep the trap's bit until it lets them go (UmaProtect), else the lift
-        // would drop its protection with ours.
-        const auto lift = [&](u64 block) {
-            WithBlockPages(block, [&](size_t page, size_t page_end) {
+        // would drop its protection with ours. Runs of pages: one mprotect each, and the lifted
+        // pages merge back into the mapping around them.
+        const auto lift = [&](VAddr from, VAddr to) {
+            WithPages(from, to, [&](size_t page, size_t page_end) {
                 ForEachPageRun(
                     page, page_end,
                     [&](size_t p) {
@@ -469,21 +515,26 @@ struct PageManager::Impl {
                     });
             });
         };
-        const u64 first = addr >> BbUma::Dynamic::BlockShift;
-        const u64 last = (addr + size - 1) >> BbUma::Dynamic::BlockShift;
-        for (u64 block = first; block <= last; ++block) {
-            if (!BbUma::Dynamic::Armed(block) && !BbUma::Dynamic::IsDynamic(block)) {
+        const u64 first_region = addr >> RegionShift, last_region = (addr + size - 1) >> RegionShift;
+        for (u64 region = first_region; region <= last_region; ++region) {
+            const VAddr base = VAddr(region) << RegionShift, top = base + RegionBytes;
+            // Only where the written blocks are watched (a region armed in part, clipped to a
+            // mapping, keeps its other part to itself).
+            const u32 written = RegionBlockMask(region, std::max(base, addr), std::min(top, addr + size));
+            if (((RegionArmed(region) | RegionDynamic(region)) & written) == 0) {
                 continue;
             }
-            const BbUma::Dynamic::Marked marked = BbUma::Dynamic::Mark(block);
-            lift(block);
-            // A ring: its whole 2 MiB regions became dynamic; their traps go now too (the blocks
-            // of this write are done in this loop).
-            for (u64 other = marked.first; other < marked.end; ++other) {
-                if (other < first || other > last) {
-                    lift(other);
-                }
+            // A write in an armed region: all of it dynamic, its trap lifted on all of it at once.
+            const Marked marked = MarkRegion(region);
+            if (marked.fresh || marked.had_armed) {
+                lift(base, top);
+                continue;
             }
+            // Dynamic already: only bits left behind (pages this manager held then) on the pages
+            // written now.
+            const VAddr from = std::max(base, addr & ~VAddr(PM_PAGE_SIZE - 1));
+            const VAddr to = std::min(top, Common::AlignUp(addr + size, PM_PAGE_SIZE));
+            lift(from, to);
         }
     }
 
@@ -513,7 +564,8 @@ struct PageManager::Impl {
         }
         if (Common::IsWriteError(context)) {
             // bbport BB_UMA: memory bound in place through a shared granule's buffer, written by the
-            // CPU: its block is dynamic from now on (copies) and the one-shot trap goes. Where this
+            // CPU: its 2 MiB region is dynamic from now on (copies) and the one-shot trap goes on
+            // all of it. Where this
             // manager protects the page too, its own handling below lets the page go (and lifts the
             // trap's bit with it, UmaProtect); else the write runs again now.
             if (VideoCore::UmaActive() &&
@@ -963,8 +1015,8 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
 }
 
-void PageManager::UmaArm(VAddr addr, u64 size) const {
-    impl->UmaArm(addr, size);
+bool PageManager::UmaArm(VAddr addr, u64 size, VAddr clip_begin, VAddr clip_end) const {
+    return impl->UmaArm(addr, size, clip_begin, clip_end);
 }
 
 void PageManager::UmaNoteWrite(VAddr addr, u64 size) const {

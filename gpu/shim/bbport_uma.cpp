@@ -14,7 +14,10 @@
 #include <mutex>
 #include <sched.h>
 #include <string_view>
+#include <fcntl.h>
+#include <pthread.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -28,6 +31,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 
 extern "C" int runtime_memory_direct_phys(uintptr_t address, uint64_t* phys, uintptr_t* end);
+/// The runtime's own count of /proc/self/maps (its mapping compaction thread; 0: not running). Weak:
+/// the renderer tests link no runtime.
+extern "C" __attribute__((weak)) uint64_t runtime_memory_maps_count(void);
 
 namespace BbUma {
 namespace {
@@ -308,87 +314,79 @@ bool AnyWatched(u64 address, u64 size) {
     return found;
 }
 
-bool TryArm(u64 block) {
-    std::atomic<u64>* table = Table(true);
-    if (!table || !InRange(block) || IsDynamic(block)) {
+bool AllArmed(u64 address, u64 size) {
+    if (!Table(false) || size == 0) {
         return false;
     }
-    const u64 bit = u64{1} << (block & 63);
-    return !(ArmedWord(table, block)->fetch_or(bit, std::memory_order_acq_rel) & bit);
+    bool all = true;
+    ForEachBlock(address, size, [&](u64 block) { return (all = Armed(block)); });
+    return all && InRange((address + size - 1) >> BlockShift);
 }
 
 namespace {
-constexpr unsigned RegionShift = 21; // 2 MiB of guest VA
-constexpr u64 RegionBlocks = u64{1} << (RegionShift - BlockShift);
 static_assert(RegionBlocks == 32, "a region is half a bitmap word");
-
-/// Every block of region `region` dynamic (and no longer armed); true when one of them was not.
-bool MarkRegion(std::atomic<u64>* table, u64 region) {
-    const u64 block = region * RegionBlocks;
-    if (!InRange(block)) {
-        return false;
-    }
-    const u64 mask = u64{0xffffffffu} << ((region & 1) * 32);
-    const u64 before = DynamicWord(table, block)->fetch_or(mask, std::memory_order_acq_rel);
-    ArmedWord(table, block)->fetch_and(~mask, std::memory_order_acq_rel);
-    const u64 fresh = mask & ~before;
-    if (fresh == 0) {
-        return false;
-    }
-    counters.dynamic_blocks.fetch_add(static_cast<u64>(std::popcount(fresh)),
-                                      std::memory_order_relaxed);
-    counters.dynamic_regions.fetch_add(1, std::memory_order_relaxed);
-    return true;
-}
-
-/// A dynamic block other than `block` within RegionBlocks blocks of it (2 MiB either side), or ~0.
-u64 DynamicNeighbour(std::atomic<u64>* table, u64 block) {
-    const u64 from = block >= RegionBlocks ? block - RegionBlocks : 0;
-    const u64 to = std::min<u64>(block + RegionBlocks, (Limit >> BlockShift) - 1); // inclusive
-    for (u64 word = from >> 6; word <= to >> 6; ++word) {
-        u64 bits = table[Words + word].load(std::memory_order_acquire);
-        const u64 lo = word == from >> 6 ? from & 63 : 0, hi = word == to >> 6 ? to & 63 : 63;
-        bits &= (hi == 63 ? ~u64{0} : (u64{2} << hi) - 1) & ~((u64{1} << lo) - 1);
-        if (word == block >> 6) {
-            bits &= ~(u64{1} << (block & 63));
-        }
-        if (bits != 0) {
-            return (word << 6) + static_cast<u64>(std::countr_zero(bits));
-        }
-    }
-    return ~u64{0};
+u64 RegionShiftInWord(u64 region) {
+    return (region & 1) * 32;
 }
 } // namespace
 
-Marked Mark(u64 block) {
+u32 RegionArmed(u64 region) {
+    std::atomic<u64>* table = Table(false);
+    const u64 block = region * RegionBlocks;
+    if (!table || !InRange(block)) {
+        return 0;
+    }
+    return static_cast<u32>(ArmedWord(table, block)->load(std::memory_order_acquire) >>
+                            RegionShiftInWord(region));
+}
+
+u32 RegionDynamic(u64 region) {
+    std::atomic<u64>* table = Table(false);
+    const u64 block = region * RegionBlocks;
+    if (!table || !InRange(block)) {
+        return 0;
+    }
+    return static_cast<u32>(DynamicWord(table, block)->load(std::memory_order_acquire) >>
+                            RegionShiftInWord(region));
+}
+
+u32 ArmBlocks(u64 region, u32 mask) {
+    std::atomic<u64>* table = Table(true);
+    const u64 block = region * RegionBlocks;
+    if (!table || !InRange(block) || mask == 0) {
+        return 0;
+    }
+    const u64 shift = RegionShiftInWord(region);
+    const u32 dynamic =
+        static_cast<u32>(DynamicWord(table, block)->load(std::memory_order_acquire) >> shift);
+    const u64 bits = u64{mask & ~dynamic} << shift;
+    if (bits == 0) {
+        return 0;
+    }
+    const u64 before = ArmedWord(table, block)->fetch_or(bits, std::memory_order_acq_rel);
+    return static_cast<u32>((bits & ~before) >> shift);
+}
+
+Marked MarkRegion(u64 region) {
     Marked marked{};
     std::atomic<u64>* table = Table(true);
+    const u64 block = region * RegionBlocks;
     if (!table || !InRange(block)) {
         return marked;
     }
-    const u64 bit = u64{1} << (block & 63);
-    marked.fresh = !(DynamicWord(table, block)->fetch_or(bit, std::memory_order_acq_rel) & bit);
-    ArmedWord(table, block)->fetch_and(~bit, std::memory_order_acq_rel);
-    if (!marked.fresh) {
+    const u64 mask = u64{0xffffffffu} << RegionShiftInWord(region);
+    const u64 before = DynamicWord(table, block)->fetch_or(mask, std::memory_order_acq_rel);
+    const u64 armed = ArmedWord(table, block)->fetch_and(~mask, std::memory_order_acq_rel);
+    const u64 fresh = mask & ~before;
+    marked.had_armed = (armed & mask) != 0;
+    if (fresh == 0) {
         return marked;
     }
+    marked.fresh = true;
     // No log here: this runs in the fault handler (the binding thread reports, UmaDirect).
-    counters.dynamic_blocks.fetch_add(1, std::memory_order_relaxed);
-    // A second dynamic block within 2 MiB: a ring of per-frame slots (skinned or animated
-    // geometry rotating through 256 KiB vertex slots). The 2 MiB regions of both are dynamic at
-    // once, instead of one verify mismatch or trap fault per slot.
-    if (const u64 neighbour = DynamicNeighbour(table, block); neighbour != ~u64{0}) {
-        const u64 a = std::min(block, neighbour) / RegionBlocks;
-        const u64 b = std::max(block, neighbour) / RegionBlocks;
-        bool any = false;
-        for (u64 region = a; region <= b; ++region) {
-            any |= MarkRegion(table, region);
-        }
-        if (any) {
-            marked.first = a * RegionBlocks;
-            marked.end = (b + 1) * RegionBlocks;
-        }
-    }
+    counters.dynamic_blocks.fetch_add(static_cast<u64>(std::popcount(fresh)),
+                                      std::memory_order_relaxed);
+    counters.dynamic_regions.fetch_add(1, std::memory_order_relaxed);
     NoteVerdictChange();
     return marked;
 }
@@ -399,12 +397,23 @@ void MarkRange(u64 address, u64 size) {
         return;
     }
     // A verify mismatch: the whole 2 MiB regions of the binding at once (a binding that changed
-    // under the GPU is per-frame data; its neighbours are usually its other slots).
+    // under the GPU is per-frame data; its neighbours are usually its other slots). The armed marks
+    // stay: the next write there lifts the trap on the whole region (PageManager::UmaNoteWrite).
     const u64 first = (address >> RegionShift), last = ((address + size - 1) >> RegionShift);
     bool any = false;
     for (u64 region = first; region <= last; ++region) {
-        if (MarkRegion(table, region)) {
+        const u64 block = region * RegionBlocks;
+        if (!InRange(block)) {
+            break;
+        }
+        const u64 mask = u64{0xffffffffu} << RegionShiftInWord(region);
+        const u64 fresh =
+            mask & ~DynamicWord(table, block)->fetch_or(mask, std::memory_order_acq_rel);
+        if (fresh != 0) {
             any = true;
+            counters.dynamic_blocks.fetch_add(static_cast<u64>(std::popcount(fresh)),
+                                              std::memory_order_relaxed);
+            counters.dynamic_regions.fetch_add(1, std::memory_order_relaxed);
             counters.dynamic_verify.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -430,6 +439,116 @@ void Forget(u64 address, u64 size) {
     }
 }
 } // namespace Dynamic
+
+// ---------------------------------------------------------------------------------------------
+// The kernel's mapping count
+// ---------------------------------------------------------------------------------------------
+
+namespace Maps {
+namespace {
+std::atomic<u64> sampled{0}; ///< lines of /proc/self/maps at the last count (0: none yet)
+std::atomic<u64> growth{0};  ///< estimated new mappings since that count (regions armed)
+std::atomic<bool> started{false};
+std::atomic<bool> engaged{false};
+
+/// Lines of /proc/self/maps (one per mapping); 0 when it cannot be read.
+u64 CountMaps(std::vector<char>& buffer) {
+    const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    u64 lines = 0;
+    for (;;) {
+        const ssize_t n = read(fd, buffer.data(), buffer.size());
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        lines += static_cast<u64>(std::count(buffer.data(), buffer.data() + n, '\n'));
+    }
+    close(fd);
+    return lines;
+}
+
+void Counter() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "BbUmaMaps");
+    setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 10); // this thread only
+#endif
+    std::vector<char> buffer(256 * 1024);
+    for (;;) {
+        // Arms during the count are counted again by the next one (an estimate on the high side).
+        const u64 before = growth.load(std::memory_order_acquire);
+        // The runtime's compaction thread counts every 2 s already: its count, not a second read.
+        const u64 runtime_count = runtime_memory_maps_count ? runtime_memory_maps_count() : 0;
+        if (const u64 lines = runtime_count ? runtime_count : CountMaps(buffer); lines != 0) {
+            sampled.store(lines, std::memory_order_release);
+            growth.fetch_sub(before, std::memory_order_acq_rel);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+}
+} // namespace
+
+u64 Cap() {
+    static const u64 cap = [] {
+        const char* env = std::getenv("BB_UMA_MAX_MAPS");
+        return env && *env ? std::strtoull(env, nullptr, 0) : u64{40000};
+    }();
+    return cap;
+}
+
+u64 KernelLimit() {
+    static const u64 limit = [] {
+        unsigned long long value = 0;
+        if (FILE* file = std::fopen("/proc/sys/vm/max_map_count", "r")) {
+            if (std::fscanf(file, "%llu", &value) != 1) {
+                value = 0;
+            }
+            std::fclose(file);
+        }
+        return value ? u64{value} : u64{65530};
+    }();
+    return limit;
+}
+
+u64 Estimate() {
+    const u64 count = sampled.load(std::memory_order_acquire);
+    return count ? count + growth.load(std::memory_order_acquire) : 0;
+}
+
+bool ArmingAllowed() {
+    const u64 cap = Cap();
+    if (cap == 0) {
+        return true;
+    }
+    if (!started.load(std::memory_order_acquire) && !started.exchange(true, std::memory_order_acq_rel)) {
+        std::thread(Counter).detach();
+    }
+    const u64 estimate = Estimate();
+    if (estimate < cap) {
+        return true;
+    }
+    if (!engaged.exchange(true, std::memory_order_acq_rel)) {
+        std::printf("UMA: about %llu memory mappings (BB_UMA_MAX_MAPS %llu, vm.max_map_count %llu): "
+                    "no new regions are armed; bindings outside armed regions take copies (maps "
+                    "cap)\n",
+                    (unsigned long long)estimate, (unsigned long long)cap,
+                    (unsigned long long)KernelLimit());
+    }
+    return false;
+}
+
+void NoteArmed() {
+    growth.fetch_add(2, std::memory_order_acq_rel);
+}
+
+bool Engaged() {
+    return engaged.load(std::memory_order_acquire);
+}
+} // namespace Maps
 
 // ---------------------------------------------------------------------------------------------
 // DMA fills and copies into shared granules

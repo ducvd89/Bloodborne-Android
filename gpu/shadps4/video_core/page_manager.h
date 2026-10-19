@@ -50,14 +50,18 @@ public:
     /// answer costs a fault or a call that finds nothing to do).
     [[nodiscard]] bool IsWriteProtected(VAddr address) const;
 
-    /// bbport BB_UMA (BbUma::Dynamic): [addr, addr + size) was bound in place through a shared
-    /// granule's buffer: its 64 KiB blocks not armed or dynamic yet get the one-shot write trap
-    /// (BbLayer::WriteTraps::UmaWatch). Pages this manager denies reads are left out; they get
-    /// it when the manager lets them go (ApplyProtect).
-    void UmaArm(VAddr addr, u64 size) const;
+    /// bbport BB_UMA (BbUma::Dynamic): [addr, addr + size) is bound in place through a shared
+    /// granule's buffer: the 2 MiB regions it touches, within [clip_begin, clip_end) (its direct
+    /// mapping and granule) in whole 64 KiB blocks, get the one-shot write trap
+    /// (BbLayer::WriteTraps::UmaWatch) where not armed or dynamic yet, each region at once. Pages
+    /// this manager denies reads are left out; they get it when the manager lets them go
+    /// (ApplyProtect). False when a block of the range stays unarmed (BbUma::Maps cap): the range
+    /// must not be bound in place.
+    bool UmaArm(VAddr addr, u64 size, VAddr clip_begin, VAddr clip_end) const;
     /// bbport BB_UMA: the CPU writes, or is about to write, [addr, addr + size) (a write fault, a
-    /// libc copy, a file read): its armed blocks become dynamic, and their trap is lifted on the
-    /// pages this manager does not restrict itself (on the others when it lets them go).
+    /// libc copy, a file read): the armed regions it touches become dynamic whole, and their trap is
+    /// lifted on every page of them this manager does not restrict itself (on the others when it
+    /// lets them go).
     void UmaNoteWrite(VAddr addr, u64 size) const;
 
     /// Updates watches in the pages touching the specified region.

@@ -8,6 +8,8 @@
 // runtime's memfd, as before.
 #pragma once
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -22,6 +24,17 @@ struct Chunk {
     vk::Buffer buffer;      ///< the whole chunk, for transfers
     vk::DeviceMemory memory;
     std::uint32_t index = 0; ///< creation order (stable key)
+    // bbport BB_UMA: what the demotion of a shared granule needs (BufferCache::UmaDemoter), any thread.
+    /// The scheduler tick of its last binding in place (the largest one: BufferCache::UmaUse).
+    mutable std::atomic<std::uint64_t> last_tick{0};
+    /// BbStats::coarse_second of its last binding in place (0: none yet).
+    mutable std::atomic<std::uint32_t> last_second{0};
+    /// The guest address of the granule's first byte in the mapping of a binding (0: none yet).
+    mutable std::atomic<std::uint64_t> granule_va{0};
+    /// Being demoted: no new binding in place (UmaDirect refuses, "demoting"); stays set once retired.
+    mutable std::atomic<bool> demoting{false};
+    /// Its memory is about to be freed: the buffer cache makes no wrapper for it any more.
+    mutable std::atomic<bool> retired{false};
 };
 
 /// Whether the runtime can use such chunks: dma-buf export and mmap of the dma-buf. Checked once
@@ -98,6 +111,24 @@ struct UmaRuntimeStats {
         refused_exec, refused_busy, freeze_faults, io_waits, promote_ns_total, promote_ns_max;
 };
 UmaRuntimeStats UmaRuntime();
+/// Demotes every shared granule overlapping [phys, phys + size) back to the runtime's memfd
+/// (runtime_memory_demote): true when none is shared afterwards. The granule's GPU memory stays
+/// allocated (its Chunk stays in the table, `demoting` set): UmaRetire frees it once the GPU is done.
+bool UmaDemote(std::uint64_t phys, std::uint64_t size);
+/// The granule's GPU memory freed (its buffer and memory) and its slot in the table cleared; the Chunk
+/// record itself is kept a minute more (lock-free readers may still hold it). The runtime must have
+/// demoted it first; no GPU work may use its memory any more. Any thread.
+void UmaRetire(const Chunk* chunk);
+/// runtime_memory_granule_scan: per granule of direct memory, bits UmaGranuleShared / Allocated /
+/// Mapped; returns the number of granules (0 without UMA).
+enum : std::uint8_t { UmaGranuleShared = 1, UmaGranuleAllocated = 2, UmaGranuleMapped = 4 };
+std::size_t UmaGranuleScan(std::uint8_t* out, std::size_t count);
+/// The runtime's demotion counters (runtime_memory_uma_demote_stats), same layout.
+struct UmaDemoteStats {
+    std::uint64_t demotions, released, busy, failures, kept_bytes, demoted_bytes, demote_ns_total,
+        demote_ns_max;
+};
+UmaDemoteStats UmaDemoteRuntime();
 /// A host-visible, CPU-cached memory type among `bits` (cached and coherent first), never a
 /// write-combined one; ~0u when none. Sets *coherent when given.
 std::uint32_t PickUnifiedType(const vk::PhysicalDeviceMemoryProperties& props, std::uint32_t bits,

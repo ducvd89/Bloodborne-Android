@@ -6,7 +6,11 @@
 #include "bbport_copy.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <stop_token>
+#include <thread>
+#include <vector>
 #include <future>
 #include <map>
 #include <mutex>
@@ -234,7 +238,9 @@ public:
     /// BB_CHUNK_TEXTURES: texture data read by the GPU straight from the guest memory chunk it is
     /// in (no CPU copy, no VRAM buffer copy), when the range is contiguous there. Also the target
     /// of labels the GPU writes (Rasterizer::WriteLabelOnGpu). GPU side threads.
-    std::optional<std::pair<const Buffer*, u64>> GuestChunkSource(VAddr address, u64 size);
+    /// bbport BB_UMA: `used` (when given) is the granule's Chunk the source belongs to.
+    std::optional<std::pair<const Buffer*, u64>> GuestChunkSource(
+        VAddr address, u64 size, const BbGuestMemory::Chunk** used = nullptr);
     /// bbport BB_LAYER_MEMORY: whether the layer's memory module binds the game's memory.
     static bool LayerActive();
     /// bbport BB_LAYER_MEMORY: [addr, addr + size) touches a block with a VRAM copy (it may hold the
@@ -333,8 +339,26 @@ private:
     /// is never sparse-bound (KGSL hard-reset the phone on it).
     std::optional<std::pair<const Buffer*, u64>> UmaDirect(VAddr device_addr, u32 size,
                                                            bool is_written, bool is_texel_buffer);
-    /// bbport BB_UMA: where the Buffer wrapper of a shared granule is kept (GuestChunkSource).
+    /// bbport: where the Buffer wrapper of a guest memory chunk is kept (GuestChunkSource; not
+    /// BB_UMA's granules: uma_chunk_buffers).
     std::unique_ptr<Buffer>& ChunkBufferFor(const BbGuestMemory::Chunk* chunk);
+    /// bbport BB_UMA: a binding in place through `chunk`'s granule buffer is about to be recorded:
+    /// its tick (the largest so far) and second published for the demoter, then false when the
+    /// granule is being demoted (the binding takes a copy). Stores before the flag's load, as the
+    /// demoter sets the flag before it reads the tick: one of the two always sees the other.
+    bool UmaUse(const BbGuestMemory::Chunk* chunk, VAddr granule_va);
+    /// bbport BB_UMA: demotion of shared granules back to the memfd (docs/ANDROID_UNIFIED_MEMORY_PLAN.md,
+    /// "Demotion"): the BbUmaDemote thread, a round a second.
+    void UmaDemoterLoop(std::stop_token stop);
+    /// bbport BB_UMA: a demoted granule's wrapper dropped, its GPU memory freed (UmaRetire).
+    void UmaReleaseGranule(const BbGuestMemory::Chunk* chunk);
+    /// bbport BB_UMA: BB_UMA_DEMOTE (default on), BB_UMA_DEMOTE_IDLE_S (20; 0: released granules only),
+    /// BB_UMA_DEMOTE_DYNAMIC_PCT (0: any idle granule; N: only those with N % of their blocks dynamic),
+    /// BB_UMA_REPROMOTE_S (30: no promotion of a demoted granule for so long).
+    static bool UmaDemoteEnabled();
+    static u32 UmaDemoteIdleSeconds();
+    static u32 UmaDemoteDynamicPercent();
+    static u32 UmaRepromoteSeconds();
     /// bbport: one block of memory blocks are bound to instead of being unbound (allocated the first
     /// time); null handle when that fails.
     vk::DeviceMemory SpareBindMemory();
@@ -445,6 +469,37 @@ private:
     [[nodiscard]] bool RecentCopy(u64 block, u32 now) const;
     /// bbport: chunks without blocks for 5 s go back to the driver.
     void FreeEmptyResidencyChunks(u32 now);
+    /// bbport arena repack (BB_ARENA_REPACK; on with BB_UMA): with BB_ARENA_REPACK_MB (128) of free
+    /// slots or over a quarter of the residency free, the VRAM copies of the emptiest chunk move into
+    /// free slots of fuller ones (a GPU copy before the next submission, then the sparse rebind, in
+    /// stream order: SubmitPendingArenaBinds), at most BB_ARENA_REPACK_MBPS (32) a second; the emptied
+    /// chunk goes back to the driver (FreeEmptyResidencyChunks). Copies in use and copies with GPU data
+    /// move as well (their bytes are copied), unlike CompactResidency's returns. Once a second.
+    void RepackResidency(u32 now);
+    [[nodiscard]] static bool RepackEnabled();
+    /// A free slot outside `source` (the fullest chunk's first, then the current chunk's tail).
+    std::optional<std::pair<vk::DeviceMemory, u64>> RepackSlot(VkDeviceMemory source);
+    /// A transfer buffer over residency chunk `memory` (made once; null when the driver refuses).
+    vk::Buffer RepackHelper(VkDeviceMemory memory);
+    struct RepackMove {
+        vk::Buffer arena;  ///< read at the block's place (still bound to its old slot)
+        u64 arena_offset;
+        vk::Buffer helper; ///< the new slot's chunk
+        u64 helper_offset;
+    };
+    /// Records and submits the copies of a batch (before_submit, right before its binds).
+    void SubmitRepackCopies(const std::vector<RepackMove>& moves, u64 value);
+    std::vector<RepackMove> repack_moves; ///< for the next submission
+    std::unordered_map<VkDeviceMemory, vk::Buffer> repack_helpers;
+    VkDeviceMemory repack_source = VK_NULL_HANDLE;
+    u32 repack_second = 0;
+    bool repack_off = false; ///< the driver refused a helper buffer: no repack
+    std::mutex repack_mutex; ///< the copy submissions' pool (before_submit runs on the submit thread)
+    vk::CommandPool repack_pool{};
+    std::array<vk::CommandBuffer, 2> repack_cmdbufs{};
+    std::array<u64, 2> repack_cmd_value{};
+    vk::Semaphore repack_semaphore{}; ///< timeline: a batch's copies done
+    u64 repack_value = 0;             ///< the last batch's value
     [[nodiscard]] static u32 VramIdleSeconds();
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
@@ -692,8 +747,17 @@ private:
     u64 bind_wait_tick = 0;                            ///< the next arena binds wait for it
     std::array<std::unique_ptr<Buffer>, 256> chunk_buffers{}; ///< per guest memory chunk (Chunk::index)
     /// bbport BB_UMA: the same for shared granules (thousands, indexed by phys / granule).
+    /// Each wrapper names the Chunk it was made for (a granule demoted and shared again is another).
     std::mutex uma_chunk_buffers_mutex;
-    std::unordered_map<u32, std::unique_ptr<Buffer>> uma_chunk_buffers;
+    struct UmaWrapper {
+        const BbGuestMemory::Chunk* chunk = nullptr;
+        std::unique_ptr<Buffer> buffer;
+    };
+    std::unordered_map<u32, UmaWrapper> uma_chunk_buffers;
+    /// bbport BB_UMA: per granule, the coarse second of its last demotion (0: never): no promotion
+    /// for BB_UMA_REPROMOTE_S after it (UmaDirect).
+    std::unique_ptr<std::atomic<u32>[]> uma_demoted_second;
+    std::size_t uma_granule_total = 0;
     /// bbport BB_UMA: granules a promotion failed for, with the second of the failure: not asked
     /// again for a few seconds (a granule with executable memory is refused every time).
     std::unordered_map<u64, u32> uma_failed_granules;
@@ -752,6 +816,7 @@ private:
         u64 empty_tick;   ///< the submission then being recorded (it carries the rebinds)
         std::vector<u64> free_offsets; ///< slots of blocks that left (byte offsets)
         u32 evacuated_second = 0;      ///< when its blocks were last sent away (ProcessIdleBlocks)
+        u32 filled_second = 0;         ///< when the arena repack last moved blocks into it
     };
     std::unordered_map<VkDeviceMemory, ResidencyChunk> residency_chunks;
     u32 idle_scan_second = 0;
@@ -764,6 +829,10 @@ private:
     u64 max_arena_bytes{}; ///< the largest sparse buffer the driver was seen to create
     u32 blocks_per_arena_page{};
     u32 blocks_per_arena_page_shift{};
+    /// bbport BB_UMA: the demotion thread; last, so it stops first.
+    std::mutex uma_demoter_mutex;
+    std::condition_variable_any uma_demoter_wake;
+    std::jthread uma_demoter;
 };
 
 } // namespace VideoCore

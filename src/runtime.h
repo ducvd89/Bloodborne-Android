@@ -63,6 +63,48 @@ void runtime_memory_uma_stats(RuntimeUmaStats *out);
 /* Fault chain (probe.c): a fault on a page frozen by a promotion waits for it to finish and returns 1
  * (the access is retried); 0 for any other fault. Async-signal-safe. */
 int runtime_memory_promotion_fault(void *address);
+/* bbport UMA: VMA compaction of SHARED granules. The kernel never merges the mappings of a dma-buf
+ * (special mappings, VM_PFNMAP/VM_IO), so every page protection change splits a granule's mappings for
+ * good, and the process walks into vm.max_map_count. A compaction maps the granule's dma-buf again over
+ * each run of its guest aliases (one mapping) and gives every page its protection back in runs: the
+ * mappings left are the runs of different protections. No data moves; the game's writers wait as for a
+ * promotion (frozen pages), kernel writes in flight make it skip the granule.
+ * runtime_memory_compact_granule: the granule holding phys; returns the host mappings it left (>= 1),
+ * 0 when the granule is not SHARED, -1 when it was skipped (kernel I/O in flight, executable or too many
+ * aliases, or this thread holds the runtime lock).
+ * runtime_memory_compact_shared: the (at most max) most fragmented SHARED granules, by /proc/self/maps,
+ * those with at least min_gain more mappings than their last compaction left; returns how many.
+ * A low-priority thread does this on its own: every 2 s it counts /proc/self/maps, and above
+ * BB_UMA_COMPACT_AT mappings (default 20000, 0 off) compacts until 3/4 of that. Neither call is for a
+ * signal handler or with the runtime lock held. */
+int runtime_memory_compact_granule(uint64_t phys);
+size_t runtime_memory_compact_shared(size_t max, uint64_t min_gain);
+typedef struct {
+    uint64_t rounds, granules, skipped, maps_last, maps_before, maps_after, compact_ns_total, compact_ns_max;
+} RuntimeUmaCompactStats; /* maps_last: the last count of /proc/self/maps (0: none); before/after: last round */
+void runtime_memory_uma_compact_stats(RuntimeUmaCompactStats *out);
+/* The last count of /proc/self/maps by the compaction thread (0: not running, or no count yet). */
+uint64_t runtime_memory_maps_count(void);
+/* bbport UMA: demotion SHARED -> CPU, the mirror of promotion. Every SHARED granule overlapping direct
+ * memory [phys,phys+size) goes back to the memfd: under the runtime lock and a freeze of its writers (as a
+ * promotion's: every guest alias read-only, a fault waits and is retried, kernel writes in flight are waited
+ * for up to 50 ms), its bytes are copied from the dma-buf into the memfd (pages that are all zero stay
+ * holes: nothing committed for them; nothing at all when no direct memory is allocated there any more),
+ * the memfd is mapped over the backing view and every alias, each page gets its exact protection back
+ * (the guest's, the GPU page manager's, the traps'), the state goes to CPU and the runtime's fd is closed.
+ * The GPU library's own handle of the memory is NOT released here: the caller frees it once the GPU is
+ * done with it. Returns 1 when none of them is SHARED afterwards, 0 when one stayed SHARED (kernel I/O
+ * in flight for too long, too many aliases, a mapping failed and was undone). Blocking, serialized with
+ * promotions; not from a signal handler or with the runtime lock held (returns 0 then). */
+int runtime_memory_demote(uint64_t phys, uint64_t size);
+/* Per granule of direct memory, out[g] = RUNTIME_GRANULE_* bits (SHARED; some direct memory allocated in
+ * it; some of it mapped). Returns the number of granules (writes min(count, that) entries); 0 without UMA. */
+enum { RUNTIME_GRANULE_SHARED=1, RUNTIME_GRANULE_ALLOCATED=2, RUNTIME_GRANULE_MAPPED=4 };
+size_t runtime_memory_granule_scan(uint8_t *out, size_t count);
+typedef struct {
+    uint64_t demotions, released, busy, failures, kept_bytes, demoted_bytes, demote_ns_total, demote_ns_max;
+} RuntimeUmaDemoteStats; /* released: nothing allocated there (no copy); kept_bytes: non-zero pages copied back */
+void runtime_memory_uma_demote_stats(RuntimeUmaDemoteStats *out);
 /* bbport BB_TEX_HOME (src/runtime_memory.c, "Textures homed in the GPU"; docs/ANDROID_UNIFIED_MEMORY_PLAN.md,
  * "Plan A"): pages of direct memory whose bytes a GPU image holds exactly are dropped (no access on every
  * guest alias, the memfd range punched out) and rebuilt on any access. */

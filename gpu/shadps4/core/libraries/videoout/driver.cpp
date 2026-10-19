@@ -363,10 +363,19 @@ static void PrintMemory() {
                       (unsigned long long)(BbStats::vram_copy_bytes.load() >> 20),
                       (unsigned long long)BbStats::vram_copies_returned.load());
     }
+    // bbport arena repack (BufferCache::RepackResidency): cumulative.
+    char repack_text[160] = "";
+    if (BbStats::arena_repack_on.load()) {
+        std::snprintf(repack_text, sizeof(repack_text),
+                      "; arena repack: %llu MiB of copies moved, %llu chunks emptied, %llu chunks freed",
+                      (unsigned long long)(BbStats::arena_repack_moved_bytes.load() >> 20),
+                      (unsigned long long)BbStats::arena_repack_emptied.load(),
+                      (unsigned long long)BbStats::residency_chunks_freed.load());
+    }
     std::printf("Memory: VRAM %llu MiB, GTT %llu MiB, RSS %llu MiB; Vulkan memory %llu MiB "
                 "allocated (VMA blocks %llu MiB, %llu MiB of them used); Vulkan images %llu MiB; "
                 "cached images %llu MiB in %llu; guest blocks in VRAM %llu MiB allocated, "
-                "%llu MiB of it unused (%llu MiB moved back idle, %llu MiB unmapped, %llu MiB freed; %llu chunks, %llu emptied, blocks kept: %llu GPU-written, %llu not direct memory); texture collector: usage %llu MiB, starts at %llu MiB, %llu images freed, %llu GPU-written kept%s\n",
+                "%llu MiB of it unused (%llu MiB moved back idle, %llu MiB unmapped, %llu MiB freed; %llu chunks, %llu emptied, blocks kept: %llu GPU-written, %llu not direct memory); texture collector: usage %llu MiB, starts at %llu MiB, %llu images freed, %llu GPU-written kept%s%s\n",
                 (unsigned long long)(vram_kib >> 10), (unsigned long long)(gtt_kib >> 10),
                 (unsigned long long)(rss >> 20), (unsigned long long)(device >> 20),
                 (unsigned long long)(vma_blocks >> 20), (unsigned long long)(vma_used >> 20),
@@ -385,7 +394,7 @@ static void PrintMemory() {
                 (unsigned long long)(BbStats::gc_used_bytes.load() >> 20),
                 (unsigned long long)(BbStats::gc_trigger_bytes.load() >> 20),
                 (unsigned long long)BbStats::gc_freed_images.exchange(0),
-                (unsigned long long)BbStats::gc_kept_images.exchange(0), fifo_text);
+                (unsigned long long)BbStats::gc_kept_images.exchange(0), fifo_text, repack_text);
     // bbport: what holds the Vulkan memory that is not images (the texture collector's usage
     // counts all of it).
     std::printf("Vulkan buffers: %s\n", VideoCore::DescribeBufferKinds().c_str());
@@ -415,13 +424,16 @@ static void PrintMemorySplit() {
             }
             std::fclose(file);
         }
-        if (FILE* file = std::fopen("/proc/sys/vm/max_map_count", "r")) {
-            if (std::fscanf(file, "%llu", &limit) != 1) {
-                limit = 0;
-            }
-            std::fclose(file);
+        // An app cannot read /proc/sys/vm/max_map_count on Android: the kernel's default then.
+        limit = BbUma::Maps::KernelLimit();
+        // BB_UMA: past BB_UMA_MAX_MAPS no new write-trap regions are armed (BbUma::Maps).
+        std::string uma_cap;
+        if (BbUma::Maps::Estimate() != 0 && BbUma::Maps::Cap() != 0) {
+            uma_cap = fmt::format(", UMA arming cap {}{}", BbUma::Maps::Cap(),
+                                  BbUma::Maps::Estimate() >= BbUma::Maps::Cap() ? " (reached)" : "");
         }
-        std::printf("Memory mappings: %llu of %llu (vm.max_map_count)%s\n", maps, limit,
+        std::printf("Memory mappings: %llu of %llu (vm.max_map_count)%s%s\n", maps, limit,
+                    uma_cap.c_str(),
                     limit && maps * 10 > limit * 9 ? " -- NEAR THE LIMIT: mmap will start failing" : "");
     }
     unsigned long long rss = 0, pss = 0, anon = 0, shared = 0, priv_dirty = 0, swap = 0;
@@ -517,6 +529,7 @@ static void PrintMemorySplit() {
         const auto runtime = BbGuestMemory::UmaRuntime();
         const auto& uma = BbUma::counters;
         const auto shared_dma = BbUma::SharedDma();
+        const auto demote = BbGuestMemory::UmaDemoteRuntime();
         unsigned long long class_refusals = 0;
         for (const auto& count : uma.refused_class) {
             class_refusals += count.load();
@@ -525,13 +538,15 @@ static void PrintMemorySplit() {
                     "(requests %llu, failed %llu), refused: exec %llu busy %llu class %llu image %llu "
                     "size %llu backoff %llu texture-first %llu written %llu cross-granule %llu mapping "
                     "%llu gpu-data %llu "
-                    "dynamic %llu, dynamic blocks %llu (regions %llu, verify regions %llu; armed %llu, "
-                    "trap faults %llu, "
+                    "dynamic %llu maps-cap %llu, dynamic blocks %llu (regions %llu, verify regions "
+                    "%llu; armed %llu in %llu regions, trap faults %llu, "
                     "announced writes %llu), "
                     "freeze faults %llu, io waits %llu, promote %.1f ms total / %.1f ms max, granule "
                     "buffer bindings %llu (%llu MiB; verdict memo %llu hits / %llu misses), uma image "
                     "writes %llu, verify %llu checked / %llu mismatches, DMA into shared: %llu "
-                    "(%.1f MiB; cpu %llu, gpu %llu)\n",
+                    "(%.1f MiB; cpu %llu, gpu %llu), demotions %llu (%llu MiB; released %llu, "
+                    "idle-dynamic %llu, idle %llu; non-zero pages kept %llu MiB; retries %llu, given "
+                    "up %llu), demote %.1f ms max, re-promotions %llu, refused demoting %llu\n",
                     (unsigned long long)(runtime.granule_bytes >> 10),
                     (unsigned long long)runtime.shared_granules,
                     (unsigned long long)(runtime.shared_bytes >> 20),
@@ -548,10 +563,12 @@ static void PrintMemorySplit() {
                     (unsigned long long)uma.refused_mapping.load(),
                     (unsigned long long)uma.refused_gpu_data.load(),
                     (unsigned long long)uma.refused_dynamic.load(),
+                    (unsigned long long)uma.refused_maps_cap.load(),
                     (unsigned long long)uma.dynamic_blocks.load(),
                     (unsigned long long)uma.dynamic_regions.load(),
                     (unsigned long long)uma.dynamic_verify.load(),
                     (unsigned long long)uma.watch_armed.load(),
+                    (unsigned long long)uma.armed_regions.load(),
                     (unsigned long long)uma.watch_faults.load(),
                     (unsigned long long)uma.watch_notes.load(),
                     (unsigned long long)runtime.freeze_faults, (unsigned long long)runtime.io_waits,
@@ -564,7 +581,17 @@ static void PrintMemorySplit() {
                     (unsigned long long)uma.verify_checked.load(),
                     (unsigned long long)uma.verify_mismatches.load(),
                     (unsigned long long)shared_dma.count, double(shared_dma.bytes) / (1 << 20),
-                    (unsigned long long)shared_dma.cpu, (unsigned long long)shared_dma.gpu);
+                    (unsigned long long)shared_dma.cpu, (unsigned long long)shared_dma.gpu,
+                    (unsigned long long)demote.demotions,
+                    (unsigned long long)(demote.demoted_bytes >> 20),
+                    (unsigned long long)uma.demote_released.load(),
+                    (unsigned long long)uma.demote_idle_dynamic.load(),
+                    (unsigned long long)uma.demote_idle.load(),
+                    (unsigned long long)(demote.kept_bytes >> 20),
+                    (unsigned long long)uma.demote_retries.load(),
+                    (unsigned long long)uma.demote_given_up.load(), demote.demote_ns_max / 1e6,
+                    (unsigned long long)uma.repromotions.load(),
+                    (unsigned long long)uma.refused_demoting.load());
         // bbport: DMA fills and copies into shared granules: where, the first 32 destinations, when
         // there are new ones since the last time.
         std::string dma_list;
@@ -590,7 +617,8 @@ static void PrintMemorySplit() {
                     uma.arena_mincore_failures.load() ? " (mincore failed for some blocks)" : "");
         // Refusals of the classes allowed, by reason.
         static constexpr std::array<const char*, BbUma::Counters::RefusalKinds> reasons{
-            "mapping", "cross-granule", "dynamic", "gpu-data", "image", "written", "promotion"};
+            "mapping", "cross-granule", "dynamic", "gpu-data", "image", "written", "promotion",
+            "maps-cap", "demoting"};
         std::string refusals;
         for (std::size_t c = 0; c < BbUma::ClassCount; ++c) {
             std::string row;

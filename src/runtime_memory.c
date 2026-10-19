@@ -19,6 +19,7 @@
 #include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #ifndef SEEK_DATA
@@ -292,8 +293,9 @@ static void zero_phys(uint64_t phys, uint64_t size) {
             return;
         }
         if (granule_fd) {
-            /* bbport UMA: SHARED granules are cleared (dma-buf pages cannot be punched out). TODO phase 4:
-             * a granule released whole goes back to CPU (demotion) instead of staying shared. */
+            /* bbport UMA: SHARED granules are cleared (dma-buf pages cannot be punched out). The GPU side
+             * demotes a granule with nothing allocated in it (runtime_memory_demote): back to CPU, its
+             * pages freed (zero pages are not copied back). */
             int shared;
             const uint64_t n=uma_run(at,phys+size<POOL_SIZE ? phys+size : POOL_SIZE,&shared,1);
             if (shared) memset(backing_base+at,0,n);
@@ -1725,6 +1727,11 @@ static int collect_aliases(uint64_t gs, uint64_t ge, Alias *out, int *refusal) {
 }
 /* DMA_BUF_IOCTL_SYNC around the CPU's copy into a dma-buf (flags: write; end): the caches are cleaned
  * for the device when the kernel's heap needs it. A no-op for coherent memory or what is no dma-buf. */
+static void dmabuf_sync_flags(int fd, uint64_t flags) { /* 1 READ, 2 WRITE, 4 END (0: START) */
+    const int saved_errno=errno;
+    ioctl(fd,_IOW('b',0,uint64_t) /* DMA_BUF_IOCTL_SYNC */,&flags);
+    errno=saved_errno;
+}
 static void dmabuf_sync(int fd, int end) {
     const uint64_t flags=2 /* DMA_BUF_SYNC_WRITE */ | (end ? 4 : 0) /* DMA_BUF_SYNC_END */;
     const int saved_errno=errno;
@@ -1849,6 +1856,444 @@ void runtime_memory_uma_stats(RuntimeUmaStats *out) {
     for (size_t i=0;i<sizeof(uma)/sizeof(uint64_t);++i) to[i]=__atomic_load_n(&from[i],__ATOMIC_RELAXED);
     out->granule_bytes=granule_size;
 }
+/* ---- bbport UMA: VMA compaction of SHARED granules (runtime.h, runtime_memory_compact_granule) ----
+ * A SHARED granule's mappings are dma-buf mappings, which the kernel never merges (VM_PFNMAP/VM_IO:
+ * "special" VMAs): each mprotect of part of one (the GPU page manager's 4 KiB write tracking, the
+ * traps) splits it for good, and giving the pages their old protection back does not join the pieces.
+ * Seen on the Thor: 30000 dma-buf VMAs, most of them 4 KiB, within minutes; at vm.max_map_count every
+ * mmap fails (Turnip: vkQueueSubmit -> VK_ERROR_MEMORY_MAP_FAILED). A compaction maps the dma-buf again
+ * over each run of the granule's guest aliases that is contiguous in both the guest's addresses and the
+ * granule (one mapping, with the protection every page of it allows at least), then gives the pages
+ * whose protection allows more theirs, one mprotect per run (page_prot: what promotion gives back). No
+ * byte moves: the data is in the dma-buf, before and after. Under the runtime lock (exclusive: no
+ * protection changes meanwhile) and a freeze as a promotion's: an access the narrower mapping refuses
+ * faults, waits in runtime_memory_promotion_fault and is retried; kernel writes in flight (io_begin) make
+ * the granule wait for the next round, and new ones wait for the freeze to end. Lock order: compact_mutex,
+ * the runtime lock, io_mutex. */
+#define UMA_COMPACT_ALIASES 64
+#define UMA_COMPACT_ROUND 32         /* granules per round (a scan of /proc/self/maps each) */
+#define UMA_COMPACT_TICK_MAX 256     /* granules per 2 s tick, at most */
+#define UMA_COMPACT_MIN_GAIN 16      /* mappings a granule has to have gained since its last compaction */
+static pthread_mutex_t compact_mutex=PTHREAD_MUTEX_INITIALIZER;
+static uint32_t *compact_floor; /* per granule: splits its last compaction left (compact_mutex) */
+static RuntimeUmaCompactStats compact_stats;
+static _Atomic uint64_t maps_sampled;
+#define COMPACT_ADD(field,n) __atomic_fetch_add(&compact_stats.field,(uint64_t)(n),__ATOMIC_RELAXED)
+/* Compacts granule g (compact_mutex held, runtime lock not): 1 done (*runs: the mappings left over its
+ * aliases, *groups: the mmaps it took), 0 not SHARED, -1 skipped for now (kernel I/O in flight), -2
+ * skipped while its mappings stay as they are (an executable alias, too many aliases). */
+static int compact_one(uint64_t g, int remap_backing, uint64_t *runs, uint64_t *groups) {
+    const uint64_t gs=g*granule_size, ge=uma_end(g);
+    Alias a[UMA_COMPACT_ALIASES], grp[UMA_COMPACT_ALIASES];
+    int n=0, m=0;
+    *runs=*groups=0;
+    write_lock();
+    const int fd=uma_fd(g);
+    if (fd<0) { write_unlock(); return 0; }
+    for (size_t i=0;i<vma_count;++i) { /* the aliases, in address order */
+        const Vma *v=&vmas[i];
+        if (v->kind!=KIND_DIRECT) continue;
+        const uint64_t length=v->end-v->start, lo=v->phys>gs ? v->phys : gs, hi=v->phys+length<ge ? v->phys+length : ge;
+        if (lo>=hi) continue;
+        if ((v->prot & 4) || n==UMA_COMPACT_ALIASES) { write_unlock(); COMPACT_ADD(skipped,1); return -2; }
+        a[n++]=(Alias){v->start+(lo-v->phys),lo-gs,hi-lo,v->prot};
+    }
+    /* Pieces of the runtime's table that follow each other in both spaces: one mmap. */
+    for (int i=0;i<n;++i) {
+        if (m && grp[m-1].va+grp[m-1].length==a[i].va && grp[m-1].offset+grp[m-1].length==a[i].offset) grp[m-1].length+=a[i].length;
+        else grp[m++]=a[i];
+    }
+    if (m && !freeze_publish(grp,m)) { write_unlock(); COMPACT_ADD(skipped,1); return -1; }
+    const uint64_t started=runtime_wait_clock();
+    freezing=1;
+    for (int k=0,i=0;k<m;++k) {
+        /* The protection every page of the group allows: nobody gets an access the page refuses. */
+        const uintptr_t gend=grp[k].va+grp[k].length;
+        int base=PROT_READ|PROT_WRITE;
+        for (int j=i;j<n && a[j].va<gend;++j)
+            for (uintptr_t p=a[j].va;p<a[j].va+a[j].length && base;p+=4096) base&=page_prot(a[j].prot,p>>12);
+        int tries=0;
+        while (mmap((void *)grp[k].va,grp[k].length,base,MAP_SHARED|MAP_FIXED,fd,(off_t)grp[k].offset)==MAP_FAILED) {
+            if (++tries==8) {
+                fprintf(stderr,"STOP: UMA compaction could not map granule %#" PRIx64 " at %#" PRIxPTR "+%#" PRIx64 ": %s\n",
+                        gs,grp[k].va,grp[k].length,strerror(errno));
+                exit(23);
+            }
+            const struct timespec t={0,1000000};
+            nanosleep(&t,NULL); /* ENOMEM at the map count limit: another thread's munmap may come */
+        }
+        /* The pages that allow more than the base: one mprotect per run (one mapping each). */
+        uintptr_t run=grp[k].va; int run_prot=base;
+        uint64_t count=1;
+        for (;i<n && a[i].va<gend;++i)
+            for (uintptr_t p=a[i].va;p<a[i].va+a[i].length;p+=4096) {
+                const int prot=page_prot(a[i].prot,p>>12);
+                if (prot==run_prot) continue;
+                if (run_prot!=base) mprotect((void *)run,p-run,run_prot);
+                run=p; run_prot=prot; ++count;
+            }
+        if (run_prot!=base) mprotect((void *)run,gend-run,run_prot);
+        *runs+=count;
+    }
+    *groups=(uint64_t)m;
+    /* The backing view: nothing protects it, but should anything have split it, it is one mapping again
+     * (the same pages, read-write as before: its users never notice). */
+    if (remap_backing && backing_base &&
+        mmap(backing_base+gs,ge-gs,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0)==MAP_FAILED) {
+        fprintf(stderr,"STOP: UMA compaction could not map the backing view of granule %#" PRIx64 ": %s\n",gs,strerror(errno));
+        exit(23);
+    }
+    const uint64_t frozen_ns=runtime_wait_clock()-started;
+    freezing=0;
+    if (m) freeze_thaw();
+    write_unlock();
+    COMPACT_ADD(granules,1); COMPACT_ADD(compact_ns_total,frozen_ns);
+    if (frozen_ns>compact_stats.compact_ns_max) __atomic_store_n(&compact_stats.compact_ns_max,frozen_ns,__ATOMIC_RELAXED);
+    if (compact_floor) compact_floor[g]=(uint32_t)(*runs-*groups);
+    return 1;
+}
+int runtime_memory_compact_granule(uint64_t phys) {
+    if (!__atomic_load_n(&granule_fd,__ATOMIC_ACQUIRE) || exclusive_depth || phys>=POOL_SIZE) return exclusive_depth ? -1 : 0;
+    pthread_mutex_lock(&compact_mutex);
+    uint64_t runs, groups;
+    const int rc=compact_one(phys/granule_size,1,&runs,&groups);
+    pthread_mutex_unlock(&compact_mutex);
+    return rc>0 ? (int)(runs+1) : rc<0 ? -1 : 0; /* + the backing view */
+}
+/* Mapping start addresses (of /proc/self/maps) in the guest's range and in the backing view. */
+typedef struct { uintptr_t *v; size_t n, cap; } MapStarts;
+/* Lines of /proc/self/maps, 0 when it cannot be read; with starts, the start addresses that matter. */
+static uint64_t maps_scan(char *buffer, size_t size, MapStarts *starts) {
+    const int fd=open("/proc/self/maps",O_RDONLY|O_CLOEXEC);
+    if (fd<0) return 0;
+    const uintptr_t back_lo=(uintptr_t)backing_base, back_hi=back_lo+(backing_base ? POOL_SIZE : 0);
+    uint64_t lines=0; uintptr_t value=0; int in_address=1;
+    if (starts) starts->n=0;
+    for (;;) {
+        const ssize_t got=read(fd,buffer,size);
+        if (got<0 && errno==EINTR) continue;
+        if (got<=0) break;
+        if (!starts) {
+            for (const char *p=buffer, *end=buffer+got; (p=memchr(p,'\n',(size_t)(end-p)));++p) ++lines;
+            continue;
+        }
+        for (ssize_t k=0;k<got;++k) {
+            const char c=buffer[k];
+            if (c=='\n') { ++lines; value=0; in_address=1; continue; }
+            if (!in_address) continue;
+            if (c>='0' && c<='9') value=value<<4|(uintptr_t)(c-'0');
+            else if (c>='a' && c<='f') value=value<<4|(uintptr_t)(c-'a'+10);
+            else {
+                in_address=0;
+                if ((value>=USER_MIN && value<USER_MAX) || (value>=back_lo && value<back_hi)) {
+                    if (starts->n==starts->cap) {
+                        const size_t cap=starts->cap ? starts->cap*2 : 65536;
+                        uintptr_t *grown=realloc(starts->v,cap*sizeof(*grown));
+                        if (!grown) { close(fd); return lines; }
+                        starts->v=grown; starts->cap=cap;
+                    }
+                    starts->v[starts->n++]=value;
+                }
+            }
+        }
+    }
+    close(fd);
+    return lines;
+}
+/* Mappings starting strictly inside (lo, hi): the splits of what was mapped there in one piece. */
+static uint64_t splits_inside(const MapStarts *s, uintptr_t lo, uintptr_t hi) {
+    size_t a=0, b=s->n;
+    while (a<b) { const size_t mid=(a+b)/2; if (s->v[mid]<=lo) a=mid+1; else b=mid; }
+    size_t c=a, d=s->n;
+    while (c<d) { const size_t mid=(c+d)/2; if (s->v[mid]<hi) c=mid+1; else d=mid; }
+    return c-a;
+}
+typedef struct { uint64_t gain, g; int backing; } CompactPick;
+static int pick_order(const void *x, const void *y) {
+    const CompactPick *a=x, *b=y;
+    return a->gain<b->gain ? 1 : a->gain>b->gain ? -1 : (a->g>b->g)-(a->g<b->g);
+}
+/* The most fragmented SHARED granules by starts (a scan of /proc/self/maps), compacted (compact_mutex held). */
+static size_t compact_from_scan(const MapStarts *starts, size_t max, uint64_t min_gain) {
+    const uint64_t count=(POOL_SIZE+granule_size-1)/granule_size;
+    if (!compact_floor && !(compact_floor=calloc(count,sizeof(*compact_floor)))) return 0;
+    uint32_t *splits=calloc(count,sizeof(*splits));
+    unsigned char *backing=calloc(count,1);
+    CompactPick *picks=NULL;
+    size_t picked=0, done=0;
+    if (!splits || !backing) goto out;
+    read_lock();
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind!=KIND_DIRECT || v->phys>=POOL_SIZE) continue;
+        const uint64_t length=v->end-v->start, pend=v->phys+length<POOL_SIZE ? v->phys+length : POOL_SIZE;
+        for (uint64_t g=v->phys/granule_size;g*granule_size<pend;++g) {
+            if (uma_fd(g)<0) continue;
+            const uint64_t gs=g*granule_size, ge=uma_end(g), lo=v->phys>gs ? v->phys : gs, hi=pend<ge ? pend : ge;
+            const uint64_t s=splits_inside(starts,v->start+(lo-v->phys),v->start+(hi-v->phys));
+            splits[g]=splits[g]+s>UINT32_MAX ? UINT32_MAX : (uint32_t)(splits[g]+s);
+        }
+    }
+    for (uint64_t g=0;g<count && backing_base;++g)
+        if (uma_fd(g)>=0 && splits_inside(starts,(uintptr_t)backing_base+g*granule_size,(uintptr_t)backing_base+uma_end(g))) {
+            backing[g]=1;
+            if (splits[g]<UINT32_MAX) ++splits[g];
+        }
+    read_unlock();
+    for (uint64_t g=0;g<count;++g) if (splits[g]>compact_floor[g] && splits[g]-compact_floor[g]>=min_gain) ++picked;
+    if (!picked || !(picks=malloc(picked*sizeof(*picks)))) goto out;
+    picked=0;
+    for (uint64_t g=0;g<count;++g)
+        if (splits[g]>compact_floor[g] && splits[g]-compact_floor[g]>=min_gain) picks[picked++]=(CompactPick){splits[g]-compact_floor[g],g,backing[g]};
+    qsort(picks,picked,sizeof(*picks),pick_order);
+    for (size_t k=0;k<picked && done<max;++k) {
+        uint64_t runs, groups;
+        const int rc=compact_one(picks[k].g,picks[k].backing,&runs,&groups);
+        if (rc>0) ++done;
+        else if (rc==-2) compact_floor[picks[k].g]=splits[picks[k].g]; /* again once it gained min_gain more */
+        const struct timespec t={0,300000};
+        nanosleep(&t,NULL); /* the writers a freeze held go on before the next one */
+    }
+out:
+    free(splits); free(backing); free(picks);
+    return done;
+}
+static MapStarts compact_starts;
+static char *compact_buffer;
+#define COMPACT_BUFFER (256u<<10)
+size_t runtime_memory_compact_shared(size_t max, uint64_t min_gain) {
+    if (!__atomic_load_n(&granule_fd,__ATOMIC_ACQUIRE) || exclusive_depth || !max) return 0;
+    pthread_mutex_lock(&compact_mutex);
+    size_t done=0;
+    if (compact_buffer || (compact_buffer=malloc(COMPACT_BUFFER))) {
+        const uint64_t lines=maps_scan(compact_buffer,COMPACT_BUFFER,&compact_starts);
+        if (lines) {
+            atomic_store_explicit(&maps_sampled,lines,memory_order_relaxed);
+            done=compact_from_scan(&compact_starts,max,min_gain);
+        }
+    }
+    pthread_mutex_unlock(&compact_mutex);
+    return done;
+}
+void runtime_memory_uma_compact_stats(RuntimeUmaCompactStats *out) {
+    const uint64_t *from=(const uint64_t *)&compact_stats;
+    uint64_t *to=(uint64_t *)out;
+    for (size_t i=0;i<sizeof(compact_stats)/sizeof(uint64_t);++i) to[i]=__atomic_load_n(&from[i],__ATOMIC_RELAXED);
+    out->maps_last=atomic_load_explicit(&maps_sampled,memory_order_relaxed);
+}
+uint64_t runtime_memory_maps_count(void) { return atomic_load_explicit(&maps_sampled,memory_order_relaxed); }
+static uint64_t compact_threshold(void) {
+    const char *env=getenv("BB_UMA_COMPACT_AT");
+    return env && *env ? strtoull(env,NULL,0) : 20000;
+}
+/* Every 2 s: the process's mapping count; above the threshold, rounds of compactions of the most
+ * fragmented granules until 3/4 of it (at most UMA_COMPACT_TICK_MAX granules a tick, the rest next tick). */
+static void *uma_compactor(void *arg) {
+    const uint64_t at=(uint64_t)(uintptr_t)arg, low=at-at/4;
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(),"BbUmaCompact");
+    setpriority(PRIO_PROCESS,(id_t)syscall(SYS_gettid),10); /* this thread only */
+#endif
+    char *buffer=malloc(COMPACT_BUFFER);
+    if (!buffer) return NULL;
+    printf("UMA: mapping compaction above %" PRIu64 " mappings (BB_UMA_COMPACT_AT)\n",at);
+    for (;;) {
+        const struct timespec tick={2,0};
+        nanosleep(&tick,NULL);
+        uint64_t lines=maps_scan(buffer,COMPACT_BUFFER,NULL);
+        if (!lines) continue;
+        atomic_store_explicit(&maps_sampled,lines,memory_order_relaxed);
+        if (lines<at) continue;
+        const uint64_t before=lines;
+        size_t tick_done=0;
+        pthread_mutex_lock(&compact_mutex);
+        for (;;) { /* a scan, a round; the last scan is the count after */
+            const uint64_t scanned=maps_scan(buffer,COMPACT_BUFFER,&compact_starts);
+            if (!scanned) break;
+            lines=scanned;
+            atomic_store_explicit(&maps_sampled,lines,memory_order_relaxed);
+            if (lines<low || tick_done>=UMA_COMPACT_TICK_MAX) break;
+            const size_t done=compact_from_scan(&compact_starts,UMA_COMPACT_ROUND,UMA_COMPACT_MIN_GAIN);
+            if (!done) break; /* nothing gained enough since its last compaction */
+            tick_done+=done;
+        }
+        pthread_mutex_unlock(&compact_mutex);
+        if (!tick_done) continue;
+        const uint64_t rounds=__atomic_add_fetch(&compact_stats.rounds,1,__ATOMIC_RELAXED);
+        __atomic_store_n(&compact_stats.maps_before,before,__ATOMIC_RELAXED);
+        __atomic_store_n(&compact_stats.maps_after,lines,__ATOMIC_RELAXED);
+        if (!(rounds & (rounds-1)))
+            printf("UMA: compacted %zu granules, VMAs %" PRIu64 " -> %" PRIu64 " (round %" PRIu64 ", %" PRIu64 " granules in all, %.2f ms longest freeze)\n",
+                   tick_done,before,lines,rounds,__atomic_load_n(&compact_stats.granules,__ATOMIC_RELAXED),
+                   (double)__atomic_load_n(&compact_stats.compact_ns_max,__ATOMIC_RELAXED)/1e6);
+    }
+    return NULL;
+}
+static void compactor_start(void) {
+    const uint64_t at=compact_threshold();
+    if (!at) { puts("UMA: mapping compaction off (BB_UMA_COMPACT_AT=0)"); return; }
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr,PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread,&attr,uma_compactor,(void *)(uintptr_t)at)) fputs("UMA: no mapping compaction thread\n",stderr);
+    pthread_attr_destroy(&attr);
+}
+/* ---- bbport UMA: demotion SHARED -> CPU (runtime.h, runtime_memory_demote) ----
+ * The mirror of promote_granule: the writers frozen (every guest alias read-only; a fault waits in
+ * runtime_memory_promotion_fault and is retried on the new mapping; the runtime's own writers wait for its
+ * lock; kernel writes in flight are waited for, new ones wait for the thaw), the granule's bytes copied from
+ * the dma-buf into the memfd range (punched since the promotion) through a scratch mapping of the memfd,
+ * all-zero pages left as holes, the memfd mapped over the backing view and every alias (PROT_NONE until all
+ * are switched), every page's protection given back (page_prot), the state CPU, the fd closed. The GPU
+ * library frees its own handle of the memory itself, after its last use of it. Lock order as promotion:
+ * promote_mutex, the runtime lock, io_mutex; then compact_mutex alone. */
+static RuntimeUmaDemoteStats demote_stats;
+#define DEMOTE_ADD(field,n) __atomic_fetch_add(&demote_stats.field,(uint64_t)(n),__ATOMIC_RELAXED)
+static int page_all_zero(const unsigned char *p) {
+    const uint64_t *w=(const uint64_t *)p;
+    for (size_t i=0;i<4096/8;i+=4) if (w[i]|w[i+1]|w[i+2]|w[i+3]) return 0;
+    return 1;
+}
+/* len bytes from src into dst, runs of non-zero 4 KiB pages only (dst is a hole elsewhere); returns them. */
+static uint64_t copy_nonzero(unsigned char *dst, const unsigned char *src, uint64_t len) {
+    uint64_t kept=0;
+    for (uint64_t at=0;at<len;) {
+        if (page_all_zero(src+at)) { at+=4096; continue; }
+        uint64_t end=at+4096;
+        while (end<len && !page_all_zero(src+end)) end+=4096;
+        memcpy(dst+at,src+at,end-at);
+        kept+=end-at;
+        at=end;
+    }
+    return kept;
+}
+static int range_any_allocated(uint64_t start, uint64_t end) { /* runtime lock held */
+    for (int i=0;i<LIMIT;++i)
+        if (blocks[i].used && blocks[i].start<end && start<blocks[i].start+blocks[i].size) return 1;
+    return 0;
+}
+/* Every direct mapping of [gs,ge), executable ones too (runtime lock held); *too_many past UMA_COMPACT_ALIASES. */
+static int demote_aliases(uint64_t gs, uint64_t ge, Alias *out, int *too_many) {
+    int n=0;
+    *too_many=0;
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind!=KIND_DIRECT) continue;
+        const uint64_t length=v->end-v->start, lo=v->phys>gs ? v->phys : gs, hi=v->phys+length<ge ? v->phys+length : ge;
+        if (lo>=hi) continue;
+        if (n==UMA_COMPACT_ALIASES) { *too_many=1; return n; }
+        out[n++]=(Alias){v->start+(lo-v->phys),lo-gs,hi-lo,v->prot};
+    }
+    return n;
+}
+/* A demotion that failed in the middle: the backing view and the aliases switched so far (and the one
+ * that failed) back to the dma-buf, whose bytes nobody changed (frozen). */
+static void views_to_dmabuf(int fd, uint64_t gs, uint64_t len, const Alias *a, int count) {
+    int ok=mmap(backing_base+gs,len,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0)!=MAP_FAILED;
+    for (int i=0;i<count && ok;++i)
+        ok=mmap((void *)a[i].va,a[i].length,PROT_NONE,MAP_SHARED|MAP_FIXED,fd,(off_t)a[i].offset)!=MAP_FAILED;
+    if (!ok) { fprintf(stderr,"STOP: UMA demotion could not restore granule %#" PRIx64 ": %s\n",gs,strerror(errno)); exit(22); }
+}
+static int demote_granule(uint64_t g) {
+    const uint64_t gs=g*granule_size, len=uma_end(g)-gs;
+    if (uma_fd(g)<0) return 1;
+    unsigned char *scratch=mmap(NULL,len,PROT_READ|PROT_WRITE,MAP_SHARED,pool_fd,(off_t)gs);
+    if (scratch==MAP_FAILED) { DEMOTE_ADD(failures,1); return 0; }
+    Alias a[UMA_COMPACT_ALIASES];
+    int n=0, too_many=0, locked=0, waited=0, fd=-1;
+    const uint64_t deadline=runtime_wait_clock()+UMA_IO_WAIT_NS;
+    for (;;) {
+        write_lock();
+        fd=uma_fd(g);
+        if (fd<0) { write_unlock(); munmap(scratch,len); return 1; }
+        n=demote_aliases(gs,gs+len,a,&too_many);
+        if (too_many) { write_unlock(); break; }
+        if (freeze_publish(a,n)) { locked=1; break; }
+        write_unlock();
+        if (!waited++) UMA_ADD(io_waits,1);
+        if (runtime_wait_clock()>deadline) break;
+        const struct timespec t={0,50000};
+        nanosleep(&t,NULL);
+    }
+    if (!locked) { munmap(scratch,len); DEMOTE_ADD(busy,1); return 0; }
+    /* Frozen: no guest thread writes the granule, the runtime's own writers wait for the lock, and the GPU
+     * never writes shared memory (written bindings take copies; DMA into it is done by the CPU). */
+    const uint64_t started=runtime_wait_clock();
+    freezing=1;
+    for (int i=0;i<n;++i) alias_protect(&a[i],1);
+    const int allocated=range_any_allocated(gs,gs+len);
+    fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)gs,(off_t)len); /* holes since the promotion */
+    uint64_t kept=0;
+    if (allocated) { /* released memory reads as zeros: nothing to keep when none is allocated */
+        dmabuf_sync_flags(fd,1 /* READ, START */);
+        kept=copy_nonzero(scratch,backing_base+gs,len);
+        dmabuf_sync_flags(fd,1|4 /* READ, END */);
+    }
+    int ok=mmap(backing_base+gs,len,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)gs)!=MAP_FAILED, done=0;
+    for (;ok && done<n;++done) /* PROT_NONE until all views are switched: no thread sees only some of them */
+        ok=mmap((void *)a[done].va,a[done].length,PROT_NONE,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)(gs+a[done].offset))!=MAP_FAILED;
+    if (ok) atomic_store_explicit(&granule_fd[g],-1,memory_order_release);
+    else views_to_dmabuf(fd,gs,len,a,done);
+    for (int i=0;i<n;++i) alias_protect(&a[i],0); /* the protection each page had */
+    const uint64_t frozen_ns=runtime_wait_clock()-started;
+    freezing=0;
+    freeze_thaw();
+    write_unlock();
+    munmap(scratch,len);
+    if (!ok) {
+        fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)gs,(off_t)len); /* the copy goes */
+        DEMOTE_ADD(failures,1);
+        return 0;
+    }
+    close(fd);
+    __atomic_fetch_sub(&uma.shared_granules,1,__ATOMIC_RELAXED);
+    __atomic_fetch_sub(&uma.shared_bytes,len,__ATOMIC_RELAXED);
+    DEMOTE_ADD(demotions,1); DEMOTE_ADD(kept_bytes,kept); DEMOTE_ADD(demoted_bytes,len); DEMOTE_ADD(demote_ns_total,frozen_ns);
+    if (!allocated) DEMOTE_ADD(released,1);
+    if (frozen_ns>demote_stats.demote_ns_max) __atomic_store_n(&demote_stats.demote_ns_max,frozen_ns,__ATOMIC_RELAXED); /* promote_mutex */
+    pthread_mutex_lock(&compact_mutex);
+    if (compact_floor) compact_floor[g]=0; /* a new promotion starts from one mapping per alias */
+    pthread_mutex_unlock(&compact_mutex);
+    return 1;
+}
+int runtime_memory_demote(uint64_t phys, uint64_t size) {
+    if (!__atomic_load_n(&granule_fd,__ATOMIC_ACQUIRE) || exclusive_depth || !size || phys>=POOL_SIZE) return 0;
+    const uint64_t end=size<POOL_SIZE-phys ? phys+size : POOL_SIZE;
+    int all=1;
+    pthread_mutex_lock(&promote_mutex);
+    for (uint64_t g=phys/granule_size;g<=(end-1)/granule_size;++g)
+        if (!demote_granule(g)) all=0;
+    pthread_mutex_unlock(&promote_mutex);
+    return all;
+}
+size_t runtime_memory_granule_scan(uint8_t *out, size_t count) {
+    if (!__atomic_load_n(&granule_fd,__ATOMIC_ACQUIRE)) return 0;
+    const uint64_t total=(POOL_SIZE+granule_size-1)/granule_size;
+    if (!out || !count) return (size_t)total;
+    const uint64_t n=count<total ? count : total;
+    memset(out,0,(size_t)n);
+    read_lock();
+    for (uint64_t g=0;g<n;++g) if (uma_fd(g)>=0) out[g]|=RUNTIME_GRANULE_SHARED;
+    for (int i=0;i<LIMIT;++i) {
+        if (!blocks[i].used || !blocks[i].size || blocks[i].start>=POOL_SIZE) continue;
+        const uint64_t last=(blocks[i].start+blocks[i].size-1)/granule_size;
+        for (uint64_t g=blocks[i].start/granule_size;g<=last && g<n;++g) out[g]|=RUNTIME_GRANULE_ALLOCATED;
+    }
+    for (size_t i=0;i<vma_count;++i) {
+        const Vma *v=&vmas[i];
+        if (v->kind!=KIND_DIRECT || v->phys>=POOL_SIZE || v->end<=v->start) continue;
+        const uint64_t last=(v->phys+(v->end-v->start)-1)/granule_size;
+        for (uint64_t g=v->phys/granule_size;g<=last && g<n;++g) out[g]|=RUNTIME_GRANULE_MAPPED;
+    }
+    read_unlock();
+    return (size_t)total;
+}
+void runtime_memory_uma_demote_stats(RuntimeUmaDemoteStats *out) {
+    const uint64_t *from=(const uint64_t *)&demote_stats;
+    uint64_t *to=(uint64_t *)out;
+    for (size_t i=0;i<sizeof(demote_stats)/sizeof(uint64_t);++i) to[i]=__atomic_load_n(&from[i],__ATOMIC_RELAXED);
+}
 int runtime_memory_set_granule_allocator(int (*alloc)(uint64_t phys, uint64_t size),
                                          void (*release)(uint64_t phys, uint64_t size), uint64_t granule) {
     if (!alloc || granule<(UINT64_C(256)<<10) || granule>(UINT64_C(64)<<20) || (granule & (granule-1)) || granule%65536) return -1;
@@ -1868,6 +2313,7 @@ int runtime_memory_set_granule_allocator(int (*alloc)(uint64_t phys, uint64_t si
     granule_alloc=alloc; granule_release=release; granule_size=granule;
     __atomic_store_n(&granule_fd,fds,__ATOMIC_RELEASE);
     write_unlock();
+    compactor_start();
     return 0;
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
@@ -1903,6 +2349,18 @@ void runtime_memory_report(void) {
                ", frozen %.1f ms total, %.2f ms longest\n",
                u.granule_bytes>>10, u.shared_granules, u.shared_bytes>>20, u.promotions, u.promotion_failures, u.refused_exec,
                u.refused_busy, u.freeze_faults, u.io_waits, (double)u.promote_ns_total/1e6, (double)u.promote_ns_max/1e6);
+        RuntimeUmaCompactStats c;
+        runtime_memory_uma_compact_stats(&c);
+        printf("Runtime: UMA mapping compaction: %" PRIu64 " rounds, %" PRIu64 " granules, %" PRIu64 " skipped, mappings now %" PRIu64
+               " (last round %" PRIu64 " -> %" PRIu64 "), frozen %.1f ms total, %.2f ms longest\n",
+               c.rounds, c.granules, c.skipped, c.maps_last, c.maps_before, c.maps_after,
+               (double)c.compact_ns_total/1e6, (double)c.compact_ns_max/1e6);
+        RuntimeUmaDemoteStats d;
+        runtime_memory_uma_demote_stats(&d);
+        printf("Runtime: UMA demotions=%" PRIu64 " (%" PRIu64 " MiB; released %" PRIu64 "), kept %" PRIu64 " MiB of non-zero pages, busy=%" PRIu64
+               ", failures=%" PRIu64 ", frozen %.1f ms total, %.2f ms longest\n",
+               d.demotions, d.demoted_bytes>>20, d.released, d.kept_bytes>>20, d.busy, d.failures,
+               (double)d.demote_ns_total/1e6, (double)d.demote_ns_max/1e6);
     }
 }
 #else
@@ -1917,6 +2375,13 @@ int runtime_memory_promote(uint64_t phys, uint64_t size) { (void)phys; (void)siz
 int runtime_memory_granule_shared(uint64_t phys) { (void)phys; return 0; }
 void runtime_memory_uma_stats(RuntimeUmaStats *out) { memset(out,0,sizeof(*out)); }
 int runtime_memory_promotion_fault(void *address) { (void)address; return 0; }
+int runtime_memory_compact_granule(uint64_t phys) { (void)phys; return 0; }
+size_t runtime_memory_compact_shared(size_t max, uint64_t min_gain) { (void)max; (void)min_gain; return 0; }
+void runtime_memory_uma_compact_stats(RuntimeUmaCompactStats *out) { memset(out,0,sizeof(*out)); }
+uint64_t runtime_memory_maps_count(void) { return 0; }
+int runtime_memory_demote(uint64_t phys, uint64_t size) { (void)phys; (void)size; return 0; }
+size_t runtime_memory_granule_scan(uint8_t *out, size_t count) { (void)out; (void)count; return 0; }
+void runtime_memory_uma_demote_stats(RuntimeUmaDemoteStats *out) { memset(out,0,sizeof(*out)); }
 void *runtime_memory_io_begin(uintptr_t address, uint64_t size) { (void)address; (void)size; return NULL; }
 void runtime_memory_io_end(void *token) { (void)token; }
 int runtime_memory_home(uintptr_t address, uint64_t size, const void *expected, uint32_t *ticket) {

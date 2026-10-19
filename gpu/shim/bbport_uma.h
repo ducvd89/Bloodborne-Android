@@ -72,11 +72,14 @@ struct Counters {
     std::atomic<std::uint64_t> refused_gpu_data{0};  ///< GPU data in the arena's copy: the copy
     std::atomic<std::uint64_t> refused_dynamic{0};   ///< touches a block the CPU rewrites: a copy
     std::atomic<std::uint64_t> watch_armed{0};       ///< 64 KiB blocks given the UmaWatch trap
+    std::atomic<std::uint64_t> armed_regions{0};     ///< 2 MiB regions armed (whole, at once)
     std::atomic<std::uint64_t> watch_faults{0};      ///< write faults on that trap
     std::atomic<std::uint64_t> watch_notes{0};       ///< announced writes (libc, file reads) there
     std::atomic<std::uint64_t> dynamic_blocks{0};    ///< blocks marked dynamic (any cause)
     std::atomic<std::uint64_t> dynamic_verify{0};    ///< regions marked by a verify mismatch
-    std::atomic<std::uint64_t> dynamic_regions{0};   ///< 2 MiB regions marked whole (rings)
+    std::atomic<std::uint64_t> dynamic_regions{0};   ///< 2 MiB regions marked dynamic (whole)
+    /// Not armed because the process has BB_UMA_MAX_MAPS memory mappings: a copy (Maps).
+    std::atomic<std::uint64_t> refused_maps_cap{0};
     std::atomic<std::uint64_t> memo_hits{0};         ///< UmaDirect verdicts reused (no lookups)
     std::atomic<std::uint64_t> memo_misses{0};       ///< ... evaluated
     std::atomic<std::uint64_t> direct_bindings{0};   ///< bound through a shared granule's buffer
@@ -87,9 +90,18 @@ struct Counters {
     /// duplicates them), [0]: not (GPU-only data: sharing it would save nothing).
     std::array<std::array<std::atomic<std::uint64_t>, 2>, ClassCount> arena_bytes{};
     std::atomic<std::uint64_t> arena_mincore_failures{0};
+    /// Demotion SHARED -> CPU (BufferCache::UmaDemoter): by reason, granules whose demotion was
+    /// given up (the runtime stayed busy), retries, granules shared again after a demotion.
+    std::atomic<std::uint64_t> demote_released{0};     ///< no direct memory allocated there any more
+    std::atomic<std::uint64_t> demote_idle_dynamic{0}; ///< idle, mostly dynamic blocks
+    std::atomic<std::uint64_t> demote_idle{0};         ///< idle
+    std::atomic<std::uint64_t> demote_retries{0};      ///< the runtime was busy: tried again later
+    std::atomic<std::uint64_t> demote_given_up{0};     ///< ... too often: shared again
+    std::atomic<std::uint64_t> repromotions{0};        ///< promoted again after a demotion
+    std::atomic<std::uint64_t> refused_demoting{0};    ///< binding over a granule being demoted
     /// Refusals per class (UmaDirect, classes allowed): mapping, cross, dynamic, gpu-data, image,
-    /// written, backoff/promotion.
-    static constexpr std::size_t RefusalKinds = 7;
+    /// written, backoff/promotion, maps cap, demoting.
+    static constexpr std::size_t RefusalKinds = 9;
     std::array<std::array<std::atomic<std::uint64_t>, RefusalKinds>, ClassCount> refused_by{};
     std::atomic<std::uint64_t> verify_checked{0};
     std::atomic<std::uint64_t> verify_mismatches{0};
@@ -138,39 +150,74 @@ bool SharedDmaNewList(std::string& text);
 
 // ---- dynamic blocks: memory the CPU rewrites while it is bound in place ----
 /// A binding bound in place (BufferCache::UmaDirect) arms a one-shot write trap
-/// (BbLayer::WriteTraps::UmaWatch) on its 64 KiB guest blocks; the first CPU write there (a fault,
-/// or a write the runtime announces: libc copies, file reads) makes the block dynamic and lifts the
-/// trap. Dynamic blocks are never bound in place again (copies, as in copy mode) until the
-/// mapping there changes. Keyed by guest VA, below 2^40; lock-free bitmaps (any thread, the fault
-/// handler included). The traps themselves are set and lifted by the page manager, which owns the
-/// pages' protection (VideoCore::PageManager::UmaArm / UmaNoteWrite).
+/// (BbLayer::WriteTraps::UmaWatch) on the 2 MiB-aligned regions of guest VA it touches, whole (the
+/// region clipped to its direct mapping and granule); the first CPU write in an armed region (a
+/// fault, or a write the runtime announces: libc copies, file reads) makes the whole region dynamic
+/// and lifts the trap on all of it at once. Per region, not per 64 KiB block: every change of a
+/// page's protection splits the kernel's mappings (vm.max_map_count), and per-block traps had the
+/// process at 30000+ mappings within minutes. Dynamic memory is never bound in place again (copies,
+/// as in copy mode) until the mapping there changes. The marks are kept per 64 KiB block (a region
+/// clipped to a mapping is armed only in part, a remap forgets part of one), keyed by guest VA below
+/// 2^40; lock-free bitmaps (any thread, the fault handler included). The traps themselves are set
+/// and lifted by the page manager, which owns the pages' protection (VideoCore::PageManager::UmaArm
+/// / UmaNoteWrite).
 namespace Dynamic {
 constexpr unsigned BlockShift = 16;
 constexpr std::uint64_t BlockBytes = std::uint64_t{1} << BlockShift;
+constexpr unsigned RegionShift = 21; // 2 MiB of guest VA
+constexpr std::uint64_t RegionBytes = std::uint64_t{1} << RegionShift;
+constexpr std::uint64_t RegionBlocks = std::uint64_t{1} << (RegionShift - BlockShift); // 32
 /// Whether any block of [address, address + size) is dynamic.
 bool Any(std::uint64_t address, std::uint64_t size);
 /// Whether any block of the range is armed (bound in place, not dynamic).
 bool AnyArmed(std::uint64_t address, std::uint64_t size);
+/// Whether every block of the range is armed.
+bool AllArmed(std::uint64_t address, std::uint64_t size);
 /// Whether any block of the range is armed or dynamic (its pages may carry the trap).
 bool AnyWatched(std::uint64_t address, std::uint64_t size);
 bool Armed(std::uint64_t block);
 bool IsDynamic(std::uint64_t block);
-/// Marks the block armed; true when it was neither armed nor dynamic (the caller sets the trap).
-bool TryArm(std::uint64_t block);
-/// What Mark did: `fresh` when the block was not dynamic before; [first, end) the blocks of the
-/// 2 MiB regions marked with it (empty: none), when another dynamic block lies within 2 MiB.
+/// The region's blocks armed / dynamic, bit i = block `region * RegionBlocks + i`.
+std::uint32_t RegionArmed(std::uint64_t region);
+std::uint32_t RegionDynamic(std::uint64_t region);
+/// Marks the blocks of `mask` (in `region`) armed, those not dynamic; returns the ones that were
+/// neither armed nor dynamic (the caller sets their trap).
+std::uint32_t ArmBlocks(std::uint64_t region, std::uint32_t mask);
+/// What MarkRegion did: `fresh` when a block of the region was not dynamic before, `had_armed` when
+/// a block was armed (its trap is still set: lift it on the whole region).
 struct Marked {
     bool fresh = false;
-    std::uint64_t first = 0, end = 0;
+    bool had_armed = false;
 };
-/// Marks the block dynamic (and no longer armed). A second dynamic block within 2 MiB (a ring of
-/// per-frame slots) makes the 2 MiB-aligned regions of both dynamic (`dynamic_regions`).
-Marked Mark(std::uint64_t block);
-/// The 2 MiB regions of the range dynamic (verify mismatches); their traps go at the next write.
+/// Every block of the region dynamic and no longer armed (a CPU write there).
+Marked MarkRegion(std::uint64_t region);
+/// The 2 MiB regions of the range dynamic (verify mismatches). Armed marks stay: the next write
+/// there lifts the trap on the whole region (UmaNoteWrite).
 void MarkRange(std::uint64_t address, std::uint64_t size);
 /// The mapping changed (map or unmap): the blocks forget both marks (the runtime forgot the traps).
 void Forget(std::uint64_t address, std::uint64_t size);
 } // namespace Dynamic
+
+// ---- the kernel's mapping count (vm.max_map_count) ----
+/// Every page protection change splits the process's mappings; at the kernel's limit every mmap
+/// fails (Turnip's command buffers: vkQueueSubmit -> VK_ERROR_MEMORY_MAP_FAILED, and the game's own).
+/// A low-priority thread counts /proc/self/maps every 2 s; between counts each region armed adds an
+/// estimate of 2. Above BB_UMA_MAX_MAPS no new region is armed: bindings outside armed regions take
+/// copies (refused "maps cap").
+namespace Maps {
+/// BB_UMA_MAX_MAPS (env, read once): default 40000; 0: no cap.
+std::uint64_t Cap();
+/// vm.max_map_count, or 65530 (the kernel's default) when it cannot be read (Android apps cannot).
+std::uint64_t KernelLimit();
+/// The last count plus the estimate since (0 before the first count).
+std::uint64_t Estimate();
+/// Whether new regions may be armed (starts the counting thread; logs once when the cap engages).
+bool ArmingAllowed();
+/// A region was armed (one or two new mappings until the next count).
+void NoteArmed();
+/// Whether the cap has refused arming at least once.
+bool Engaged();
+} // namespace Maps
 
 // ---- start-up probes (bbport_uma.cpp); each returns pass/fail and a short detail for the log ----
 

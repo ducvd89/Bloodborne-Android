@@ -1,11 +1,11 @@
-/* UMA granules (runtime_memory.c, BB_UMA): promotion CPU -> SHARED with a fake allocator. Each "granule"
+/* UMA granules (runtime_memory.c, BB_UMA): promotion CPU -> SHARED and demotion back with a fake allocator. Each "granule"
  * is a memfd of the granule's size standing in for the GPU library's dma-buf; the test keeps a dup of it
  * (what the GPU would see) next to the runtime's.
  *
  * Standalone: needs only runtime_memory.c (stubs for three symbols of the rest of the runtime below).
  *   cc -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_uma_granules.c src/runtime_memory.c \
  *      -o out/uma-granules-test && out/uma-granules-test [granule KiB, 256..2048, default 256]
- * (run it with 256 and 2048). */
+ * (run it with 256 and 2048). BB_UMA_COMPACT_AT is set to 0 below: the compactions here are the test's. */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <assert.h>
@@ -71,12 +71,21 @@ static void fake_release(uint64_t phys, uint64_t size) {
     ++release_count;
 }
 /* What the GPU sees at phys: a mapping of the granule's dma-buf. */
+static unsigned char *views[MAX_GRANULES];
 static unsigned char *gpu_view(uint64_t phys) {
-    static unsigned char *views[MAX_GRANULES];
     const uint64_t g=phys/gsz;
     CHECK(gpu_fd[g]>=0);
     if (!views[g]) { views[g]=mmap(NULL,gsz,PROT_READ|PROT_WRITE,MAP_SHARED,gpu_fd[g],0); CHECK(views[g]!=MAP_FAILED); }
     return views[g]+phys%gsz;
+}
+
+/* A demotion leaves the GPU library's handle alone (it frees it after the GPU's last use): the fake
+ * GPU side drops it here, as BufferCache::UmaDemoter does with the granule's memory. */
+static void gpu_forget_granule(uint64_t phys) {
+    const uint64_t g=phys/gsz;
+    CHECK(gpu_fd[g]>=0);
+    if (views[g]) { munmap(views[g],gsz); views[g]=NULL; }
+    close(gpu_fd[g]); gpu_fd[g]=-1;
 }
 
 /* ---- faults ---- */
@@ -201,7 +210,7 @@ static void lazy_and_promotion(void) {
     CHECK(release_direct(phys,region)==0);
     for (uint64_t i=0;i<region;i+=4096) CHECK(!back[i] && !back[i+4095]);
     for (uint64_t i=0;i<2*gsz;i+=4096) CHECK(!gpu_view(phys+i)[0]);
-    CHECK(runtime_memory_granule_shared(phys)); /* TODO phase 4: demotion */
+    CHECK(runtime_memory_granule_shared(phys)); /* until the GPU side demotes it (demotion() below) */
     /* the same range allocated and mapped again starts empty, from the shared granules */
     int64_t again=-1;
     CHECK(allocate_direct((int64_t)phys,(int64_t)(phys+region),region,gsz,3,&again)==0 && (uint64_t)again==phys);
@@ -499,8 +508,339 @@ static void chaos(void) {
     free(state); free(trap_on); free(expected);
 }
 
+/* ---- VMA compaction (runtime_memory_compact_granule / _shared) ----
+ * On the device the dma-buf mappings never merge; here the stand-ins (memfds) do, so this checks what a
+ * compaction must not change: the bytes, every page's protection, the writes made meanwhile. */
+static void fault_matrix(const unsigned char *p, uint64_t pages, unsigned char *out) {
+    for (uint64_t i=0;i<pages;++i) out[i]=(unsigned char)(faults(p+i*4096,0) | faults(p+i*4096,1)<<1);
+}
+typedef struct { uint64_t phys, granules; volatile int *stop; uint64_t compactions, skipped; } Compactor;
+static void *compact_thread(void *arg) {
+    Compactor *c=arg;
+    while (!*c->stop) {
+        for (uint64_t g=0;g<c->granules && !*c->stop;++g) {
+            const int rc=runtime_memory_compact_granule(c->phys+g*gsz);
+            CHECK(rc!=0);
+            if (rc<0) ++c->skipped; else ++c->compactions;
+        }
+        usleep(100);
+    }
+    return NULL;
+}
+static void compaction(void) {
+    /* exact protections, in two aliases, one of them split in the runtime's table */
+    const uint64_t pages=gsz/4096, phys=alloc_direct(gsz);
+    unsigned char *p=map_at(phys,gsz,3), *q=map_at(phys,gsz,3);
+    fill(p,gsz,9);
+    const uintptr_t at=(uintptr_t)p;
+    runtime_memory_gpu_protect(at,4096,1,0);
+    runtime_memory_gpu_protect(at+4096,4096,0,0);
+    runtime_memory_trap(at+2*4096,4096,1,1);
+    runtime_memory_trap(at+3*4096,4096,16,1);
+    runtime_memory_gpu_protect(at+4*4096,4096,1,0);
+    runtime_memory_gpu_protect(at+4*4096,4096,1,1);
+    CHECK(guest_mprotect(p+2*PS4_PAGE,PS4_PAGE,1)==0);
+    CHECK(guest_mprotect(p+3*PS4_PAGE,PS4_PAGE,3)==0); /* the table split, the protection as before */
+    for (uint64_t i=16;i<pages;i+=3) runtime_memory_gpu_protect(at+i*4096,4096,1,(i/3)&1);
+    runtime_memory_gpu_protect((uintptr_t)q+5*4096,4096,1,0);
+    CHECK(guest_mprotect(q+PS4_PAGE,PS4_PAGE,1)==0);
+    CHECK(runtime_memory_compact_granule(phys)==0); /* not shared yet: nothing to do */
+    CHECK(runtime_memory_promote(phys,gsz)==1);
+    unsigned char *before=malloc(2*pages), *after=malloc(2*pages);
+    CHECK(before && after);
+    fault_matrix(p,pages,before); fault_matrix(q,pages,before+pages);
+    const RuntimeUmaStats s0=stats();
+    for (int round=0;round<3;++round) {
+        CHECK(runtime_memory_compact_granule(phys)>=2);
+        fault_matrix(p,pages,after); fault_matrix(q,pages,after+pages);
+        CHECK(!memcmp(before,after,2*pages));
+    }
+    CHECK(stats().promotions==s0.promotions && stats().promotion_failures==s0.promotion_failures);
+    /* the bytes: readable pages through the aliases, all of them through the backing view and the GPU */
+    CHECK(same(runtime_memory_backing_pointer(phys),gsz,9,0) && same(gpu_view(phys),gsz,9,0));
+    for (uint64_t i=0;i<pages;++i) if (!(before[i]&1)) CHECK(same(p+i*4096,4096,9,i*4096));
+    /* one memory still, and the restrictions still their owners' */
+    q[9*4096+1]=0x31;
+    CHECK(p[9*4096+1]==0x31 && gpu_view(phys)[9*4096+1]==0x31);
+    runtime_memory_gpu_protect(at,2*4096,1,1);
+    runtime_memory_trap(at+2*4096,4096,1,0);
+    runtime_memory_trap(at+3*4096,4096,16,0);
+    for (int i=0;i<4;++i) CHECK(!faults(p+i*4096,0) && !faults(p+i*4096,1));
+    /* skipped while a kernel write is in flight, done after */
+    void *token=runtime_memory_io_begin((uintptr_t)q+100,4096);
+    CHECK(token && runtime_memory_compact_granule(phys)==-1);
+    runtime_memory_io_end(token);
+    CHECK(runtime_memory_compact_granule(phys)>=2);
+    /* an executable alias: left alone */
+    unsigned char *x=map_at(phys,gsz,7);
+    CHECK(runtime_memory_compact_granule(phys)==-1 && x[9*4096+1]==0x31);
+    CHECK(unmap_direct(x,gsz)==0);
+    /* by /proc/self/maps: a granule with split mappings is picked, then not again until it gains more */
+    const uint64_t sphys=alloc_direct(gsz);
+    unsigned char *r=map_at(sphys,gsz,3);
+    CHECK(runtime_memory_promote(sphys,gsz)==1);
+    runtime_memory_compact_shared(1<<20,1); /* everything split so far */
+    for (uint64_t i=1;i<pages;i+=2) runtime_memory_gpu_protect((uintptr_t)r+i*4096,4096,1,0); /* pages/2 more */
+    RuntimeUmaCompactStats c0, c1;
+    runtime_memory_uma_compact_stats(&c0);
+    CHECK(runtime_memory_compact_shared(1<<20,pages/4)==1);
+    runtime_memory_uma_compact_stats(&c1);
+    CHECK(c1.granules==c0.granules+1 && c1.maps_last>0 && runtime_memory_maps_count()==c1.maps_last);
+    CHECK(runtime_memory_compact_shared(1<<20,pages/4)==0);
+    for (uint64_t i=0;i<pages;++i) CHECK(!faults(r+i*4096,0) && faults(r+i*4096,1)==(int)(i&1));
+    free(before); free(after);
+
+    /* writers and kernel reads against compactions, over and over */
+    const uint64_t half=gsz*4>4*MIB ? gsz*4 : 4*MIB, region=2*half, hphys=alloc_direct(region);
+    unsigned char *a=map_at(hphys,region,3), *b=map_at(hphys,region,3);
+    const uint64_t hpages=half/4096;
+    uint64_t *expected=calloc(region/4096,sizeof(*expected));
+    CHECK(expected);
+    for (uint64_t i=0;i<hpages;++i) *(uint64_t *)(a+i*4096)=0;
+    CHECK(runtime_memory_promote(hphys,region)==1);
+    /* a read-only page in each granule of the writers' half, one neither writer uses through that alias:
+     * the compactions map those granules read-only for a moment, and the writers' faults wait */
+    for (uint64_t g=0;g<half/gsz;++g) {
+        runtime_memory_gpu_protect((uintptr_t)a+g*gsz+4096,4096,1,0); /* odd page: w1 writes it through b */
+        runtime_memory_gpu_protect((uintptr_t)b+g*gsz,4096,1,0);      /* even page: w0 writes it through a */
+    }
+    char path[]="/tmp/uma-test-XXXXXX";
+    const int fd=mkstemp(path);
+    CHECK(fd>=0);
+    unlink(path);
+    unsigned char *file=malloc(65536);
+    fill(file,65536,8);
+    CHECK(write(fd,file,65536)==65536);
+    free(file);
+    volatile int stop=0;
+    Writer w0={a,hpages,0,2,&stop,expected,0}, w1={b,hpages,1,2,&stop,expected,0};
+    /* kernel reads into the other half */
+    Reader rd={a+half,half,fd,&stop,0,0};
+    Compactor c={hphys,region/gsz,&stop,0,0};
+    pthread_t t0,t1,t2,t3;
+    const uint64_t stalled=stats().freeze_faults;
+    CHECK(pthread_create(&t0,NULL,writer,&w0)==0 && pthread_create(&t1,NULL,writer,&w1)==0 &&
+          pthread_create(&t2,NULL,reader,&rd)==0 && pthread_create(&t3,NULL,compact_thread,&c)==0);
+    usleep(400000);
+    stop=1;
+    CHECK(pthread_join(t0,NULL)==0 && pthread_join(t1,NULL)==0 && pthread_join(t2,NULL)==0 && pthread_join(t3,NULL)==0);
+    uint64_t lost=0;
+    for (uint64_t i=0;i<hpages;++i) {
+        if (!expected[i]) continue;
+        const uint64_t v=*(uint64_t *)(a+i*4096);
+        if (v!=expected[i] || *(uint64_t *)(b+i*4096)!=v || *(uint64_t *)gpu_view(hphys+i*4096)!=v) ++lost;
+    }
+    RuntimeUmaCompactStats c2;
+    runtime_memory_uma_compact_stats(&c2);
+    fprintf(stderr,"uma test: compaction: %" PRIu64 " + %" PRIu64 " writes, %" PRIu64 " kernel reads against %" PRIu64
+            " compactions (%" PRIu64 " skipped for I/O, %" PRIu64 " stalled writers), %.3f ms longest freeze, %" PRIu64 " lost writes\n",
+            w0.writes,w1.writes,rd.reads,c.compactions,c.skipped,stats().freeze_faults-stalled,(double)c2.compact_ns_max/1e6,lost);
+    CHECK(lost==0 && rd.short_reads==0 && rd.reads>0 && c.compactions>20 && w0.writes>1000 && w1.writes>1000);
+    free(expected);
+    close(fd);
+
+    /* protections and aliases changing while granules are compacted: every page ends as the last change left it */
+    const uint64_t granules=32, cphys=alloc_direct(granules*gsz);
+    unsigned char *ca=map_at(cphys,granules*gsz,3);
+    CHECK(runtime_memory_promote(cphys,granules*gsz)==1);
+    unsigned char *state=calloc(granules*CHAOS_PAGES,1), *trap_on=calloc(granules*CHAOS_PAGES,1), *bytes=calloc(granules,1);
+    CHECK(state && trap_on && bytes);
+    for (uint64_t g=0;g<granules;++g) ca[g*gsz+CHAOS_PAGES*4096+8]=0;
+    stop=0;
+    Chaos ch={ca,granules,&stop,state,trap_on,0};
+    Mapper m={cphys,granules,&stop,bytes,0};
+    Compactor cc={cphys,granules,&stop,0,0};
+    CHECK(pthread_create(&t0,NULL,chaos_protect,&ch)==0 && pthread_create(&t1,NULL,chaos_mapper,&m)==0 &&
+          pthread_create(&t3,NULL,compact_thread,&cc)==0);
+    usleep(300000);
+    stop=1;
+    CHECK(pthread_join(t0,NULL)==0 && pthread_join(t1,NULL)==0 && pthread_join(t3,NULL)==0);
+    CHECK(runtime_memory_compact_shared(1<<20,1)<=granules); /* and once more by the maps */
+    for (uint64_t page=0;page<granules*CHAOS_PAGES;++page) {
+        const unsigned char *pp=ca+chaos_offset(page);
+        CHECK(faults(pp,0)==(state[page]==2) && faults(pp,1)==(state[page]!=0));
+    }
+    for (uint64_t g=0;g<granules;++g) {
+        const unsigned char *byte=ca+g*gsz+CHAOS_PAGES*4096+8;
+        CHECK(*byte==bytes[g] && *gpu_view(cphys+g*gsz+CHAOS_PAGES*4096+8)==bytes[g]);
+    }
+    fprintf(stderr,"uma test: compaction chaos: %" PRIu64 " protection changes, %" PRIu64 " alias maps against %" PRIu64 " compactions\n",
+            ch.ops,m.maps,cc.compactions);
+    free(state); free(trap_on); free(bytes);
+}
+
+/* ---- demotion SHARED -> CPU (runtime_memory_demote) ---- */
+static RuntimeUmaDemoteStats demote_stats_now(void) { RuntimeUmaDemoteStats d; runtime_memory_uma_demote_stats(&d); return d; }
+/* Demotes [phys, phys+n*gsz) and drops the fake GPU side's handles of the granules that were shared. */
+static int demote(uint64_t phys, uint64_t n) {
+    int was[64];
+    CHECK(n<=64);
+    for (uint64_t g=0;g<n;++g) was[g]=runtime_memory_granule_shared(phys+g*gsz);
+    const int rc=runtime_memory_demote(phys,n*gsz);
+    for (uint64_t g=0;g<n;++g)
+        if (was[g] && !runtime_memory_granule_shared(phys+g*gsz)) gpu_forget_granule(phys+g*gsz);
+    return rc;
+}
+static void demotion(void) {
+    /* promote, write, demote: the data in every alias and the backing view, each page's protection,
+     * zero pages not copied back */
+    const uint64_t pages=gsz/4096, phys=alloc_direct(3*gsz);
+    unsigned char *a=map_at(phys,3*gsz,3), *b=map_at(phys,3*gsz,3), *c=map_at(phys+gsz,gsz,1);
+    fill(a,3*gsz,11);
+    memset(a+gsz+gsz/2,0,gsz/2); /* granule 1: its second half zeros */
+    const uintptr_t at=(uintptr_t)a;
+    runtime_memory_gpu_protect(at,4096,1,0);                    /* read-only (page manager) */
+    runtime_memory_gpu_protect(at+4096,4096,0,0);               /* no access */
+    runtime_memory_trap(at+2*4096,4096,1,1);                    /* trap, read-only */
+    runtime_memory_trap(at+3*4096,4096,16,1);                   /* trap, no access */
+    CHECK(guest_mprotect(a+2*PS4_PAGE,PS4_PAGE,1)==0);          /* the game's read-only */
+    runtime_memory_trap(at+gsz+5*4096,4096,4,1);                /* granule 1: a UmaWatch-like trap */
+    unsigned char *m0=malloc(3*pages), *m1=malloc(3*pages);
+    CHECK(m0 && m1);
+    fault_matrix(a,3*pages,m0);
+    CHECK(runtime_memory_promote(phys,2*gsz)==1 && runtime_memory_granule_shared(phys) && runtime_memory_granule_shared(phys+gsz));
+    fault_matrix(a,3*pages,m1);
+    CHECK(!memcmp(m0,m1,3*pages));
+    /* writes while shared: through both aliases and the backing view */
+    a[gsz+100]=0x71; b[gsz+200]=0x72;
+    unsigned char v=0x73;
+    CHECK(runtime_memory_write_backing(at+5*PS4_PAGE+7,&v,1)==1);
+    const RuntimeUmaStats s0=stats();
+    const RuntimeUmaDemoteStats d0=demote_stats_now();
+    CHECK(demote(phys,2)==1);
+    CHECK(!runtime_memory_granule_shared(phys) && !runtime_memory_granule_shared(phys+gsz));
+    const RuntimeUmaStats s1=stats();
+    const RuntimeUmaDemoteStats d1=demote_stats_now();
+    CHECK(s1.shared_granules==s0.shared_granules-2 && s1.shared_bytes==s0.shared_bytes-2*gsz);
+    CHECK(d1.demotions==d0.demotions+2 && d1.demoted_bytes==d0.demoted_bytes+2*gsz && d1.released==d0.released);
+    /* granule 0 is all non-zero; granule 1 half: kept at most 1.5 granules (a few zero pages of the pattern aside) */
+    CHECK(d1.kept_bytes-d0.kept_bytes<=gsz+gsz/2 && d1.kept_bytes-d0.kept_bytes>=gsz);
+    CHECK(d1.demote_ns_max>0 && d1.demote_ns_total>d0.demote_ns_total);
+    fault_matrix(a,3*pages,m1);
+    CHECK(!memcmp(m0,m1,3*pages));
+    unsigned char *back=runtime_memory_backing_pointer(phys);
+    CHECK(a[gsz+100]==0x71 && b[gsz+100]==0x71 && c[100]==0x71 && back[gsz+100]==0x71);
+    CHECK(a[gsz+200]==0x72 && c[200]==0x72 && back[gsz+200]==0x72);
+    CHECK(a[5*PS4_PAGE+7]==0x73 && b[5*PS4_PAGE+7]==0x73 && back[5*PS4_PAGE+7]==0x73);
+    a[gsz+100]=pattern(gsz+100,11); a[gsz+200]=pattern(gsz+200,11); a[5*PS4_PAGE+7]=pattern(5*PS4_PAGE+7,11);
+    CHECK(same(a+16*4096,gsz-16*4096,11,16*4096) && same(b+16*4096,gsz-16*4096,11,16*4096));
+    CHECK(same(a+gsz,gsz/2,11,gsz) && same(c,gsz/2,11,gsz) && same(back+gsz,gsz/2,11,gsz) && same(a+2*gsz,gsz,11,2*gsz));
+    for (uint64_t i=gsz+gsz/2;i<2*gsz;i+=512) CHECK(!a[i] && !b[i] && !back[i]);
+    /* one memory again (the memfd): writes show in every alias */
+    a[gsz+gsz/2+64]=0x55;
+    CHECK(b[gsz+gsz/2+64]==0x55 && c[gsz/2+64]==0x55 && back[gsz+gsz/2+64]==0x55);
+    /* the restrictions still belong to their owners */
+    runtime_memory_gpu_protect(at,2*4096,1,1);
+    runtime_memory_trap(at+2*4096,4096,1,0);
+    runtime_memory_trap(at+3*4096,4096,16,0);
+    for (int i=0;i<4;++i) CHECK(!faults(a+i*4096,0) && !faults(a+i*4096,1));
+    CHECK(faults(a+2*PS4_PAGE,1) && !faults(a+2*PS4_PAGE,0));
+    CHECK(faults(a+gsz+5*4096,1)); /* the trap stays (the GPU side lifts it on the write) */
+    runtime_memory_trap(at+gsz+5*4096,4096,4,0);
+    CHECK(!faults(a+gsz+5*4096,1));
+    fault_matrix(a,3*pages,m0);
+    /* a CPU granule: nothing to do */
+    const RuntimeUmaDemoteStats d2=demote_stats_now();
+    CHECK(demote(phys+2*gsz,1)==1 && demote_stats_now().demotions==d2.demotions);
+    /* re-promotion works as the first one: the data, the protections, the GPU's view */
+    CHECK(runtime_memory_promote(phys,2*gsz)==1 && runtime_memory_granule_shared(phys+gsz));
+    fault_matrix(a,3*pages,m1);
+    CHECK(!memcmp(m0,m1,3*pages));
+    CHECK(gpu_view(phys+gsz)[gsz/2+64]==0x55 && same(gpu_view(phys+gsz),gsz/2,11,gsz) && same(gpu_view(phys)+16*4096,gsz-16*4096,11,16*4096));
+    a[gsz+3]=0x66;
+    CHECK(gpu_view(phys+gsz)[3]==0x66 && c[3]==0x66);
+    /* a kernel write in flight: waited for, given up, nothing changed; then it goes */
+    void *token=runtime_memory_io_begin(at+gsz+8192,4096);
+    CHECK(token);
+    const RuntimeUmaDemoteStats d3=demote_stats_now();
+    CHECK(demote(phys+gsz,1)==0 && runtime_memory_granule_shared(phys+gsz) && demote_stats_now().busy==d3.busy+1);
+    CHECK(c[3]==0x66 && gpu_view(phys+gsz)[3]==0x66);
+    runtime_memory_io_end(token);
+    CHECK(demote(phys,2)==1 && c[3]==0x66 && b[gsz+3]==0x66);
+    /* released memory: nothing copied back; allocated again it reads zeros */
+    CHECK(runtime_memory_promote(phys,2*gsz)==1);
+    CHECK(release_direct(phys,3*gsz)==0 && runtime_memory_granule_shared(phys));
+    uint8_t info[MAX_GRANULES];
+    const size_t total=runtime_memory_granule_scan(info,MAX_GRANULES);
+    CHECK(total>phys/gsz+2 && info[phys/gsz]==RUNTIME_GRANULE_SHARED && info[phys/gsz+1]==RUNTIME_GRANULE_SHARED && !info[phys/gsz+2]);
+    const RuntimeUmaDemoteStats d4=demote_stats_now();
+    CHECK(demote(phys,2)==1);
+    const RuntimeUmaDemoteStats d5=demote_stats_now();
+    CHECK(d5.released==d4.released+2 && d5.kept_bytes==d4.kept_bytes && !runtime_memory_granule_shared(phys));
+    int64_t again=-1;
+    CHECK(allocate_direct((int64_t)phys,(int64_t)(phys+3*gsz),3*gsz,gsz,3,&again)==0 && (uint64_t)again==phys);
+    CHECK(runtime_memory_granule_scan(info,MAX_GRANULES)==total && info[phys/gsz]==RUNTIME_GRANULE_ALLOCATED);
+    unsigned char *e=map_at(phys,3*gsz,3);
+    CHECK(runtime_memory_granule_scan(info,MAX_GRANULES)==total && info[phys/gsz]==(RUNTIME_GRANULE_ALLOCATED|RUNTIME_GRANULE_MAPPED));
+    for (uint64_t i=0;i<3*gsz;i+=4096) CHECK(!e[i] && !e[i+4095]);
+    e[gsz+1]=0x44;
+    CHECK(runtime_memory_promote(phys+gsz,gsz)==1 && gpu_view(phys+gsz)[1]==0x44);
+    CHECK(demote(phys+gsz,1)==1 && e[gsz+1]==0x44);
+    free(m0); free(m1);
+    fprintf(stderr,"uma test: demotion: %" PRIu64 " demotions (%" PRIu64 " released), %.2f ms longest freeze\n",
+            demote_stats_now().demotions,demote_stats_now().released,(double)demote_stats_now().demote_ns_max/1e6);
+}
+/* Writers on two aliases and kernel reads, granules promoted and demoted back and forth: no write lost. */
+static void demotion_hammer(void) {
+    const uint64_t half=gsz*4>4*MIB ? gsz*4 : 4*MIB, region=2*half, phys=alloc_direct(region), granules=region/gsz;
+    unsigned char *a=map_at(phys,region,3), *b=map_at(phys,region,3);
+    const uint64_t pages=half/4096;
+    uint64_t *expected=calloc(region/4096,sizeof(*expected));
+    CHECK(expected && granules<=64);
+    for (uint64_t p=0;p<pages;++p) *(uint64_t *)(a+p*4096)=0;
+    char path[]="/tmp/uma-test-XXXXXX";
+    const int fd=mkstemp(path);
+    CHECK(fd>=0);
+    unlink(path);
+    unsigned char *file=malloc(65536);
+    fill(file,65536,8);
+    CHECK(write(fd,file,65536)==65536);
+    free(file);
+    volatile int stop=0;
+    Writer w0={a,pages,0,2,&stop,expected,0}, w1={b,pages,1,2,&stop,expected,0};
+    Reader r={a+half,half,fd,&stop,0,0};
+    pthread_t t0,t1,t2;
+    CHECK(pthread_create(&t0,NULL,writer,&w0)==0 && pthread_create(&t1,NULL,writer,&w1)==0 && pthread_create(&t2,NULL,reader,&r)==0);
+    usleep(20000);
+    const RuntimeUmaDemoteStats d0=demote_stats_now();
+    uint64_t promoted=0, demoted=0, refused=0;
+    for (int round=0;round<12;++round) {
+        for (uint64_t g=0;g<granules;++g) {
+            if (runtime_memory_promote(phys+g*gsz,gsz)==1) ++promoted; else ++refused;
+            usleep(200);
+        }
+        for (uint64_t g=round&1;g<granules;g+=1+(round&1)) {
+            if (demote(phys+g*gsz,1)==1) ++demoted; else ++refused;
+            usleep(200);
+        }
+    }
+    usleep(20000);
+    stop=1;
+    CHECK(pthread_join(t0,NULL)==0 && pthread_join(t1,NULL)==0 && pthread_join(t2,NULL)==0);
+    CHECK(r.short_reads==0 && r.reads>0 && !refused);
+    uint64_t lost=0;
+    unsigned char *backing=runtime_memory_backing_pointer(phys);
+    for (uint64_t p=0;p<pages;++p) {
+        if (!expected[p]) continue;
+        const uint64_t v=*(uint64_t *)(a+p*4096);
+        if (v!=expected[p] || *(uint64_t *)(b+p*4096)!=v || *(uint64_t *)(backing+p*4096)!=v) ++lost;
+        if (runtime_memory_granule_shared(phys+p*4096) && *(uint64_t *)gpu_view(phys+p*4096)!=v) ++lost;
+    }
+    const RuntimeUmaDemoteStats d1=demote_stats_now();
+    fprintf(stderr,"uma test: demotion hammer: %" PRIu64 " + %" PRIu64 " writes, %" PRIu64 " kernel reads, %" PRIu64 " promotions, %" PRIu64
+            " demotions (%.3f ms each, %.2f ms longest), %" PRIu64 " lost writes\n",
+            w0.writes,w1.writes,r.reads,promoted,demoted,
+            (double)(d1.demote_ns_total-d0.demote_ns_total)/1e6/(double)(demoted ? demoted : 1),(double)d1.demote_ns_max/1e6,lost);
+    CHECK(lost==0 && w0.writes>1000 && w1.writes>1000 && demoted==d1.demotions-d0.demotions && demoted>0);
+    CHECK(demote(phys,granules)==1);
+    for (uint64_t p=0;p<pages;++p) if (expected[p]) CHECK(*(uint64_t *)(a+p*4096)==expected[p]);
+    free(expected);
+    close(fd);
+}
+
 int main(int argc, char **argv) {
     gsz=(argc>1 ? strtoull(argv[1],NULL,10) : 256)<<10;
+    setenv("BB_UMA_COMPACT_AT","0",1); /* no compaction thread: the test compacts */
     if (!freopen("/dev/null","w",stdout)) return 1; /* the runtime logs every map; the test reports on stderr */
     struct sigaction sa={0};
     sa.sa_sigaction=on_segv; sa.sa_flags=SA_SIGINFO;
@@ -534,6 +874,9 @@ int main(int argc, char **argv) {
     protections();
     hammer();
     chaos();
+    compaction();
+    demotion();
+    demotion_hammer();
     RuntimeUmaStats s=stats();
     fprintf(stderr,"uma test: ok (granule %" PRIu64 " KiB: %" PRIu64 " promotions, %" PRIu64 " failures, %" PRIu64 " exec / %" PRIu64 " busy refusals)\n",
            gsz>>10,s.promotions,s.promotion_failures,s.refused_exec,s.refused_busy);
