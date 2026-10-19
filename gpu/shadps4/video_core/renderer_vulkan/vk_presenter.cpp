@@ -471,6 +471,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
         // Flush frame creation commands.
         BbStats::frame_number.fetch_add(1, std::memory_order_relaxed); // bbport: game frames shown
+        BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed);    // bbport: hot pages (RegionManager)
         frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
         frame->ready_tick = draw_scheduler.CurrentTick();
         SubmitInfo info{};
@@ -679,6 +680,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Recreate the swapchain if the window was resized (or was minimised at the last try).
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight() ||
         !swapchain.IsPresentable()) {
+        // bbport: recreating waits for the device (vkDeviceWaitIdle): no thread may submit to its
+        // queues meanwhile (upstream bloodborne_pc PR #211: device lost on resize). SendToApp's
+        // recreation already holds submit_mutex.
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.IsPresentable()) {
             free_frame();
@@ -729,7 +734,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 bool Presenter::SubmitToSwapchain(const PresentSource& source) {
     PresentTrace("acquire");
     if (!swapchain.AcquireNextImage()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        {
+            std::scoped_lock submit_lock{Scheduler::submit_mutex}; // bbport: as in Present
+            swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        }
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
@@ -967,7 +975,11 @@ void Presenter::ApplyLsfgState(const BbLsfgState::State& next) {
 }
 
 void Presenter::ApplyLsfgOutputMode() {
-    swapchain.SetFrameGeneration(lsfg ? lsfg->Multiplier() : 0);
+    {
+        // bbport: a new buffer count recreates the swapchain (vkDeviceWaitIdle): as in Present.
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        swapchain.SetFrameGeneration(lsfg ? lsfg->Multiplier() : 0);
+    }
     ApplyFramesCap();
 }
 

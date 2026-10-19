@@ -15,6 +15,7 @@
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
 #include "bbport_guest_memory.h"
+#include "bbport_uma.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/hash.h"
 #include "common/debug.h"
@@ -91,6 +92,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
+    // bbport: a program not whole in the CPU's view (a copy into place by the GPU): what the GPU
+    // wrote there, read back on the GPU command thread (as Liverpool::SyncForCpuRead).
+    pipeline_cache.program_memory_sync = [this](VAddr address, u64 size) {
+        DrainDrawPipe();
+        Finish();
+        ReadMemory(address, size, true);
+    };
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
@@ -1686,6 +1694,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (camera_motion->Enabled() && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
+        // bbport: proxies of targets the texture cache evicted, about once a second (upstream
+        // bloodborne_pc 0.6: they were never dropped).
+        static u64 last_cleanup_frame = 0;
+        if (const u64 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+            frame - last_cleanup_frame >= 60) {
+            last_cleanup_frame = frame;
+            scene_targets->CleanupStaleEntries();
+        }
+        upscaler->OnDisplayPassStart(); // bbport: a scaled frame without UI (cinematics)
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
@@ -1826,11 +1843,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
-    {
-        BB_SECTION(PipelineBind);
-        pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
-                                {buffer_infos.data(), buffer_infos.size()});
-    }
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -1841,6 +1853,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+    // bbport: the push constants after the pass has begun: what starting it records may be a
+    // compute dispatch (occlusion results, GPU profiler marks) with push constants of its own,
+    // and the driver keeps one set for compute and graphics (RADV, Turnip): a clip-disabled draw
+    // then got integers as its viewport transform (single frames shifted by half the screen or in
+    // a corner; upstream bloodborne_pc 0.6).
+    {
+        BB_SECTION(PipelineBind);
+        pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
+                                {buffer_infos.data(), buffer_infos.size()});
+    }
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -1952,14 +1974,18 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         BindIndexBuffer();
     }
 
-    const auto [buffer, base] =
-        buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
+    // bbport BB_UMA: what these bindings are (the buffer cache may share their memory).
+    const auto [buffer, base] = [&] {
+        const BbUma::ClassScope indirect_class{BbUma::Class::Indirect};
+        return buffer_cache.ObtainBuffer(indirect.args, stride * max_count, false);
+    }();
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
     hoist_notes.push_back({buffer, base, u64(stride) * max_count, false});
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
+        const BbUma::ClassScope count_class{BbUma::Class::Indirect};
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
         hoist_notes.push_back({count_buffer, count_offset, 4, false});
@@ -1975,8 +2001,6 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     push_data.xoffset *= target_scale[0];
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
-    pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
-                            {buffer_infos.data(), buffer_infos.size()});
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
@@ -1984,6 +2008,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+    // bbport: after the pass has begun (as in Draw).
+    pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
+                            {buffer_infos.data(), buffer_infos.size()});
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
@@ -2146,7 +2173,10 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         return;
     }
 
-    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
+    const auto [buffer, base] = [&] {
+        const BbUma::ClassScope indirect_class{BbUma::Class::Indirect}; // bbport BB_UMA
+        return buffer_cache.ObtainBuffer(address + offset, size, false);
+    }();
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
 
     if (needs_barrier) {
@@ -2761,6 +2791,7 @@ void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        const BbUma::ClassScope vertex_class{BbUma::Class::Vertex}; // bbport BB_UMA
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
@@ -2821,8 +2852,10 @@ void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
-    const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+    const auto [buffer, offset] = [&] {
+        const BbUma::ClassScope index_class{BbUma::Class::Index}; // bbport BB_UMA
+        return buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+    }();
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     // ResetBindings tracks graphics reads after the draw. Without this, an upload into a
     // mirrored index range could overtake the previous draw's fixed-function index fetches.
@@ -2960,8 +2993,14 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
     // Image copy must be valid
     VideoCore::Image& image0 = texture_cache.GetImage(image0_id);
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
-    if (image0.info.guest_size != image1.info.guest_size ||
-        image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.GetSize() ||
+    // bbport: the buffers may run past the images (padding up to the next one: the light shafts'
+    // 960x540 targets are copied as 0x241800 bytes of 0x240000, 5 times a frame): those bytes are
+    // copied as a buffer (upstream bloodborne_pc 0.6, #204). The shader otherwise ran and wrote
+    // 2.3 MiB a time, and the target was refreshed from there again.
+    constexpr u64 MaxTail = 64_KB;
+    const u64 image_size = image0.info.guest_size;
+    if (image_size != image1.info.guest_size || image0.info.pitch != image1.info.pitch ||
+        buf0.GetSize() < image_size || buf0.GetSize() - image_size > MaxTail ||
         image0.info.num_bits != image1.info.num_bits) {
         return false;
     }
@@ -2988,6 +3027,15 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
         return false;
     }
     runtime.CopyColorAndDepth(&src_image, &dst_image);
+    if (const u64 tail = buf0.GetSize() - image_size) {
+        const VAddr src_tail = src_image.info.guest_address + image_size;
+        const VAddr dst_tail = dst_image.info.guest_address + image_size;
+        const auto [src_buffer, src_offset] = buffer_cache.ObtainBuffer(src_tail, u32(tail), false);
+        const auto [dst_buffer, dst_offset] = buffer_cache.ObtainBuffer(dst_tail, u32(tail), true);
+        const vk::BufferCopy copy{src_offset, dst_offset, tail};
+        runtime.CopyBuffer(src_buffer, dst_buffer, {&copy, 1});
+        texture_cache.InvalidateMemoryFromGPU(dst_tail, tail, true);
+    }
     return true;
 }
 
@@ -3107,6 +3155,33 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                              Shader::PushData& push_data, u32& write_index) {
     BB_SECTION(BindBuffers);
     const u64 alignment = instance.StorageMinAlignment();
+    // bbport BB_UMA: a read-only binding of this stage over memory a written binding of the same
+    // stage also covers is never read in place: the write goes to copy mode's copy (written
+    // bindings are not shared), and a read of the game's memory beside it would miss what the
+    // shader writes during the dispatch (copy mode reads and writes the same copy). Later draws
+    // see the range GPU-modified and take the copy anyway.
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 4> uma_written;
+    if (VideoCore::UmaActive() &&
+        (BbUma::ClassAllowed(BbUma::Class::Constant) || BbUma::ClassAllowed(BbUma::Class::Texel))) {
+        for (u32 i = 0; i < stage.buffers.size(); ++i) {
+            const auto& d = stage.buffers[i];
+            if (!d.is_written || d.IsSpecial()) {
+                continue;
+            }
+            const auto sharp = prepared ? prepared->buffer_sharps[i] : d.GetSharp(stage);
+            if (sharp.base_address != 0 && sharp.GetSize() != 0) {
+                uma_written.emplace_back(sharp.base_address, sharp.base_address + sharp.GetSize());
+            }
+        }
+    }
+    const auto uma_overlaps_written = [&](VAddr address, u64 size) {
+        for (const auto& [from, to] : uma_written) {
+            if (address < to && from < address + size) {
+                return true;
+            }
+        }
+        return false;
+    };
     for (u32 buffer_index = 0; buffer_index < stage.buffers.size(); ++buffer_index) {
         const auto& desc = stage.buffers[buffer_index];
         const RingBinding* ring = num_ring_stages ? FindRingBinding(stage, buffer_index) : nullptr;
@@ -3246,6 +3321,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                // bbport BB_UMA: every guest buffer is a storage buffer descriptor here; by use:
+                // formatted = texel, written = storage, the rest (read-only) = constant.
+                const BbUma::ClassScope buffer_class{
+                    desc.is_written ? (desc.is_formatted ? BbUma::Class::Texel : BbUma::Class::Storage)
+                    : !uma_written.empty() && uma_overlaps_written(vsharp.base_address, size)
+                        ? BbUma::Class::None // see uma_written above
+                    : desc.is_formatted ? BbUma::Class::Texel
+                                        : BbUma::Class::Constant};
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 TraceShaderBinding(stage, vsharp.base_address, size, desc.is_written, buffer_cache);
@@ -3553,6 +3636,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 }
             }
             image.usage.storage |= is_storage;
+            if (is_storage) {
+                image.NoteGpuWritten(); // bbport BB_UMA
+            }
             image.usage.texture |= !is_storage;
             if (FrameCapture::Active()) {
                 FrameCapture::Sampled(image.info, is_storage);
@@ -3982,6 +4068,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             attachment.image_layout = target.layout;
         }
         image->usage.render_target = 1u;
+        image->NoteGpuWritten(); // bbport BB_UMA
         if (cb == 0 && upscaler->Enabled()) {
             color_redirected = upscaler->RedirectColor(image_id, desc.view_info, redirect);
             if (color_redirected) {
@@ -4056,6 +4143,7 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             attachment.image_layout = target.layout;
         }
         image.usage.depth_target = true;
+        image.NoteGpuWritten(); // bbport BB_UMA
         if (upscaler->Enabled()) {
             VulkanUpscalerTarget depth_redirect;
             depth_redirected = upscaler->RedirectDepth(image_id, depth_redirect);
@@ -4226,17 +4314,35 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
     ScopeMarkerEnd();
 }
 
+namespace {
+// bbport BB_UMA: whether a DMA into [dst, dst + size) lands in a shared granule: counted once the
+// path is known (BbUma::NoteSharedDma; the "DMA into shared" figures of the UMA status line).
+bool UmaDmaShared(VAddr dst, u64 size) {
+    return VideoCore::UmaActive() && VideoCore::BufferCache::UmaAnyShared(dst, size);
+}
+} // namespace
+
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     DrainDrawPipe();
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
+    bool shared = false;
     if (!is_gds) {
         texture_cache.ClearMeta(address);
+        shared = UmaDmaShared(address, num_bytes);
         // bbport BB_GUEST_IN_PLACE: memory the GPU uses in place is filled by the GPU in stream order
         // (a fill on the CPU now would land before earlier draws read the old data). Elsewhere
         // (VRAM copies, unbound memory: shader code, descriptors this thread reads) on the CPU in
         // decode order, as before; the VRAM copy follows through write tracking.
-        if (!buffer_cache.IsAnyInPlace(address, num_bytes) &&
+        // bbport BB_UMA: over a shared granule the CPU fills, like copy mode (DmaDstInPlace): the
+        // game reads what a DMA wrote with the CPU, and a GPU-only fill (the arena's copy) left its
+        // memory stale: the game's fatal error while streaming an area. Trade-off: draws recorded
+        // before that read the granule live through its buffer may see the new bytes early (a
+        // possible visual glitch, no corrupted CPU data); a CPU write into an armed block hits the
+        // UmaWatch trap and the block goes back to copies. BB_UMA_DMA_GPU=1: the old path, the GPU
+        // fills the arena's copy in stream order and the range is GPU-modified until the CPU's next
+        // access brings it back.
+        if (!buffer_cache.DmaDstInPlace(address, num_bytes) &&
             !buffer_cache.IsRegionGpuModified(address, num_bytes) &&
             !VideoCore::BufferCache::LayerMirrored(address, num_bytes)) {
             BbFreeCheck::Check(address, num_bytes, &value, BbFreeCheck::DmaFill);
@@ -4246,7 +4352,13 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
             if (!VideoCore::WriteTracking()) {
                 NoteAssetWrite(address, num_bytes);
             }
+            if (shared) {
+                BbUma::NoteSharedDma(address, num_bytes, true, true);
+            }
             return;
+        }
+        if (shared) {
+            BbUma::NoteSharedDma(address, num_bytes, true, false);
         }
     }
     const auto [buffer, offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
@@ -4264,15 +4376,17 @@ bool Rasterizer::DmaMayWriteOnCpu(VAddr dst, u32 num_bytes) {
     if (!VideoCore::GuestInPlace()) {
         return true;
     }
-    return !buffer_cache.IsAnyInPlace(dst, num_bytes) &&
+    return !buffer_cache.DmaDstInPlace(dst, num_bytes) &&
            !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
            !VideoCore::BufferCache::LayerMirrored(dst, num_bytes);
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     DrainDrawPipe();
-    // bbport BB_GUEST_IN_PLACE: see FillBuffer (in place: the GPU, in stream order).
-    if (!dst_gds && !buffer_cache.IsAnyInPlace(dst, num_bytes) &&
+    // bbport BB_GUEST_IN_PLACE: see FillBuffer (in place: the GPU, in stream order; BB_UMA: a
+    // shared granule is the CPU's too, unless BB_UMA_DMA_GPU=1).
+    const bool shared = !dst_gds && UmaDmaShared(dst, num_bytes);
+    if (!dst_gds && !buffer_cache.DmaDstInPlace(dst, num_bytes) &&
         !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
         !VideoCore::BufferCache::LayerMirrored(dst, num_bytes)) {
         // bbport BB_LAYER_MEMORY: a VRAM copy of the source may hold newer data than the game's memory.
@@ -4286,14 +4400,28 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             if (!VideoCore::WriteTracking()) {
                 NoteAssetWrite(dst, num_bytes);
             }
+            if (shared) {
+                BbUma::NoteSharedDma(dst, num_bytes, false, true);
+            }
             return;
         }
+    }
+    if (shared) {
+        BbUma::NoteSharedDma(dst, num_bytes, false, false);
     }
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {
             return {gds_buffer, src};
+        }
+        // bbport BB_UMA: a DMA source in a shared granule (IsAnyInPlace) is a CPU snapshot taken
+        // now, as the copy of copy mode was, without arena residency for it. Not when GPU data or
+        // an image is there: copy mode's path (the arena's copy, brought up to date there).
+        if (VideoCore::UmaActive() && buffer_cache.IsAnyInPlace(src, num_bytes) &&
+            !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
+            !texture_cache.FindImageFromRange(src, num_bytes)) {
+            return buffer_cache.ObtainSnapshot(src, num_bytes);
         }
         return buffer_cache.ObtainBuffer(src, num_bytes, false, true);
     }();
@@ -4335,6 +4463,11 @@ bool Rasterizer::InvalidateMemoryUndrained(VAddr addr, u64 size, bool assume_loc
 }
 
 void Rasterizer::NoteAssetWrite(VAddr addr, u64 size) {
+    // bbport BB_UMA: file reads and loaders (before the data lands too): blocks bound in place
+    // there are dynamic from now on, their write traps lifted before the kernel's copy.
+    if (VideoCore::UmaActive()) {
+        page_manager.UmaNoteWrite(addr, size);
+    }
     buffer_cache.NoteAssetWrite(addr, size);
     InvalidateAfterWrite(addr, size);
 }
@@ -4368,6 +4501,11 @@ void Rasterizer::NoteCommandWrite(VAddr addr, const void* data, u64 size, bool r
 }
 
 void Rasterizer::OnCpuWrite(VAddr addr, u64 size) {
+    // bbport BB_UMA: a libc copy about to land on pages with write traps
+    // (runtime_memory_prepare_cpu_write): UmaWatch traps go first, the block becomes dynamic.
+    if (VideoCore::UmaActive()) {
+        page_manager.UmaNoteWrite(addr, size);
+    }
     BbStats::cpu_write_notes.fetch_add(1, std::memory_order_relaxed);
     BbStats::cpu_write_note_bytes.fetch_add(size, std::memory_order_relaxed);
     if (IsMapped(addr, size)) {
@@ -4628,6 +4766,8 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    // bbport BB_UMA: a new mapping starts without traps (the runtime forgot them): without marks.
+    BbUma::Dynamic::Forget(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -4640,6 +4780,7 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    BbUma::Dynamic::Forget(addr, size); // bbport BB_UMA: the traps go with the mapping
     buffer_cache.NotePreuploadMapping(addr, size, false);
     buffer_cache.UnmapInPlace(addr, size);
     buffer_cache.DropTwins(addr, size);

@@ -2,6 +2,7 @@
 #include "bbport_game_menu.h"
 #include "bbport_display.h"
 #include "bbport_frame_rate.h"
+#include "bbport_guest_guards.h"
 #include "bbport_gnm_hooks.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
@@ -12,6 +13,7 @@
 #include "bbport_free_check.h"
 #include "bbport_toggles.h"
 #include "bbport_fault.h"
+#include "bbport_tex_home.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -193,6 +195,9 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     }
 }
 void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
+    // bbport BB_TEX_HOME: homed pages back first (on the GPU threads; a copy thread finds none,
+    // the GPU side cleared them before queuing the copy).
+    BbTexHome::BeforeAccess(source, size);
     // bbport: large uploads (streaming) are split across the copy threads.
     constexpr u64 Chunk = 512 * 1024;
     if (size < 4 * Chunk || !BbCopy::Enabled()) {
@@ -352,6 +357,11 @@ extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
     BbGameMenu::PatchImage(image, size);
     BbFrameRate::PatchImage(image, size);
     BbDisplay::PatchImage(image, size);
+    BbGuestGuards::PatchImage(image, size);
+}
+
+extern "C" void bbgpu_exit_report(void) {
+    BbGuestGuards::Report();
 }
 
 extern "C" int bbgpu_frame_hooks_installed(void) {

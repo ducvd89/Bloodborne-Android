@@ -22,6 +22,7 @@
 #include <memory>
 #include <thread>
 #include "bbport_cpu.h"
+#include "bbport_wait.h"
 
 #include "common/assert.h"
 #include "common/thread.h"
@@ -121,12 +122,19 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = BbCpu::Cycles();
-        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
-                BbCpu::Pause();
-            } else {
-                std::this_thread::yield();
+        if (BbWait::Spinning()) {
+            for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
+                if (spins < 4096) {
+                    BbCpu::Pause();
+                } else {
+                    std::this_thread::yield();
+                }
             }
+        } else {
+            // bbport: spin briefly, then sleep until stage B publishes `consumed`.
+            BbWait::SpinThenWait(consumed_event, [this] {
+                return consumed.load(std::memory_order_acquire) == head;
+            });
         }
         const u64 waited = BbCpu::Cycles() - start;
         drain_cycles += waited;
@@ -150,12 +158,17 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = BbCpu::Cycles();
-        for (u32 spins = 0; !ReachedPacket(number); ++spins) {
-            if (spins < 4096) {
-                BbCpu::Pause();
-            } else {
-                std::this_thread::yield();
+        if (BbWait::Spinning()) {
+            for (u32 spins = 0; !ReachedPacket(number); ++spins) {
+                if (spins < 4096) {
+                    BbCpu::Pause();
+                } else {
+                    std::this_thread::yield();
+                }
             }
+        } else {
+            // consumed_packets advances before `consumed`, whose store notifies.
+            BbWait::SpinThenWait(consumed_event, [this, number] { return ReachedPacket(number); });
         }
         const u64 waited = BbCpu::Cycles() - start;
         drain_cycles += waited;
@@ -199,9 +212,21 @@ private:
     }
 
     void WaitForSpace(u64 at, u64 size) {
-        while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
-            BbCpu::Pause();
+        if (BbWait::Spinning()) {
+            while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
+                BbCpu::Pause();
+            }
+            return;
         }
+        BbWait::SpinThenWait(consumed_event, [this, at, size] {
+            return at + size - consumed.load(std::memory_order_acquire) <= Capacity;
+        });
+    }
+
+    /// Stage B: publishes its position and wakes stage A when it sleeps in a wait above.
+    void PublishConsumed(u64 at) {
+        consumed.store(at, std::memory_order_release);
+        consumed_event.Notify();
     }
 
     void Run(std::stop_token stop) {
@@ -216,20 +241,31 @@ private:
             u64 available = published.load(std::memory_order_acquire);
             if (available == at) {
                 // With few hardware threads (Steam Deck: 8) a long spin takes time from the
-                // game's own threads. BB_PIPE_SPIN_US overrides.
+                // game's own threads. BB_PIPE_SPIN_US overrides. bbport: BB_SPIN_US by default
+                // (BB_SPIN_WAITS=1: the old 200/50 us), timed with the cycle counter (the clock
+                // call cost more than the spin hints between two reads).
+                static const bool spin_waits = BbWait::Spinning();
                 static const auto spin_time = std::chrono::microseconds([] {
                     if (const char* env = std::getenv("BB_PIPE_SPIN_US")) {
                         return std::max(0, std::atoi(env));
                     }
+                    if (!spin_waits) {
+                        return static_cast<int>(BbWait::SpinMicros());
+                    }
                     return BbThreads::Available() >= 12 ? 200 : 50;
                 }());
-                const auto spin_until = std::chrono::steady_clock::now() + spin_time;
+                static const u64 spin_cycles = BbCpu::MicrosToCycles(spin_time.count());
+                const auto spin_until = spin_waits ? std::chrono::steady_clock::now() + spin_time
+                                                   : std::chrono::steady_clock::time_point{};
+                const u64 spin_until_cycles = spin_waits ? 0 : BbCpu::Cycles() + spin_cycles;
                 for (u32 spins = 1; available == at; ++spins) {
                     if (stop.stop_requested()) {
                         return;
                     }
                     BbCpu::Pause();
-                    if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                    if (!(spins & 255) &&
+                        (spin_waits ? std::chrono::steady_clock::now() >= spin_until
+                                    : BbCpu::Cycles() >= spin_until_cycles)) {
                         const u32 seen = wake.load(std::memory_order_seq_cst);
                         sleeping.store(true, std::memory_order_seq_cst);
                         if (published.load(std::memory_order_seq_cst) == at &&
@@ -244,7 +280,7 @@ private:
             const auto* header = reinterpret_cast<const Header*>(ring.get() + at % Capacity);
             if (header->size == 0) {
                 at += Capacity - at % Capacity;
-                consumed.store(at, std::memory_order_release);
+                PublishConsumed(at);
                 continue;
             }
             const u64 start = BbCpu::Cycles();
@@ -256,7 +292,7 @@ private:
                 hook(idle_context);
             }
             consumed_packets.fetch_add(1, std::memory_order_release);
-            consumed.store(at, std::memory_order_release);
+            PublishConsumed(at);
         }
     }
 
@@ -269,6 +305,7 @@ private:
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};
     std::atomic<u64> consumed_packets{0}; ///< packets stage B has run (NextPacket numbers)
+    BbWait::Event consumed_event;         ///< stage A sleeps on it for `consumed` (Drain etc.)
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
     std::atomic<u32> stage_b_tid{0};

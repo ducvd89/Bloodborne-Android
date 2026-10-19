@@ -126,7 +126,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         return false;
     }
 
-    fetch_shader_data = spec.fetch_shader_data;
+    // bbport: only a stage with a fetch shader (the vertex stage's) sets it: a later stage
+    // without one (geometry) emptied it, and pipelines with a geometry shader loaded from the
+    // disk cache got no fetch shader (upstream bloodborne_pc 0.6-pre1).
+    if (spec.fetch_shader_data) {
+        fetch_shader_data = spec.fetch_shader_data;
+    }
     return true;
 }
 
@@ -222,6 +227,7 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    sel.fetch_shader.reset(); // bbport: set by its stages only (LoadShaderMeta)
     sel.graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};

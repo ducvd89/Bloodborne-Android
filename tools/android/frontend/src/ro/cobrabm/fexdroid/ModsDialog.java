@@ -586,15 +586,14 @@ final class ModsDialog {
         host.restart();
     }
     /** mods.json: every mod in load order, and the ones switched off (a mod that cannot be used is
-     *  never listed as off by the player). Written whole, then renamed. */
+     *  never listed as off by the player). Written whole and synced, then renamed. */
     private boolean writeConfig() {
         try {
             JSONArray order=new JSONArray(), disabled=new JSONArray();
             for (Mod m:mods) { order.put(m.name); if (m.valid && !m.enabled) disabled.put(m.name); }
             JSONObject o=new JSONObject(); o.put("order",order); o.put("disabled",disabled);
-            File file=new File(host.baseDir(),"mods.json"), temporary=new File(file.getPath()+".tmp");
-            try (Writer w=new OutputStreamWriter(new FileOutputStream(temporary),"UTF-8")) { w.write(o.toString()); }
-            return temporary.renameTo(file);
+            SafeWrite.write(new File(host.baseDir(),"mods.json"),o.toString());
+            return true;
         } catch (Exception e) {
             android.util.Log.e("Bloodborne","mods.json: "+e);
             return false;

@@ -176,7 +176,36 @@ export BB_DRAW_PIPE=${BB_DRAW_PIPE:-1}
 export BB_WINDOW_SIZE=$output
 export BB_OUTPUT_RES=$output BB_LIVE_RES=0
 if [ -n "$render" ]; then export BB_RENDER_RES=$render; else unset BB_RENDER_RES; fi
-export BB_DMEM_MB=$dmem_mb BB_PREUPLOAD=0 BB_GUEST_IN_PLACE=0 BB_UFFD=0
+# Unified memory v2 (on by default since the Thor long-route tests of 2026-10-19; Debug options -> Unified memory,
+# bbport.ini unified_memory=0 or BB_UMA=0 turns it off): the game's buffers (index and vertex buffers;
+# BB_UMA_CLASSES) live in dma-buf granules (BB_UMA_GRANULE_KB, 8192 here) the GPU binds through their own buffers,
+# instead of the game's copy plus a GPU copy; textures and every other copy stay CPU snapshots
+# (docs/ANDROID_UNIFIED_MEMORY_PLAN.md).
+# libbbgpu probes the driver (coherence, sparse binding of shared memory...) and falls back to copies by itself,
+# with one logged reason (Mali/PanVK always, a failed probe...). Writes by the game are caught by page protection
+# (BB_WRITE_TRACKING); BB_UMA_VERIFY=N reports data that changed while the GPU used it. BB_UNIFIED=1 (v1: whole
+# allocations through the layer memory module) stays for reference, only from the environment.
+# BB_UMA_DMA_GPU=1: DMA fills and copies into shared granules go to the GPU again (default: the CPU, as copy mode).
+if [ -z "${BB_UMA:-}" ] && [ "${BB_UNIFIED:-0}" != 1 ] && [ "$(setting unified_memory)" != 0 ]; then BB_UMA=1; fi
+if [ "${BB_UMA:-0}" = 1 ]; then
+    export BB_UMA=1 BB_GUEST_IN_PLACE=1 BB_LAYER_MEMORY=0 BB_WRITE_TRACKING=1 BB_CHUNK_UPLOADS=0
+    # The granule size the Thor tests ran with (the library's own default is 2048 KiB).
+    export BB_UMA_GRANULE_KB=${BB_UMA_GRANULE_KB:-8192}
+    unset BB_UNIFIED
+    for uma_var in BB_UMA_CLASSES BB_UMA_VERIFY BB_UMA_GRANULE_KB BB_UMA_DMA_GPU; do
+        eval "uma_val=\${$uma_var:-}"
+        [ -z "$uma_val" ] || export "$uma_var"
+    done
+    echo "Unified memory v2: requested (classes ${BB_UMA_CLASSES:-index,vertex}, granule ${BB_UMA_GRANULE_KB:-2048} KiB, verify ${BB_UMA_VERIFY:-0}; the driver is probed at start, falls back to copies with a logged reason)"
+elif [ "${BB_UNIFIED:-0}" = 1 ]; then
+    unset BB_UMA
+    export BB_UNIFIED=1 BB_GUEST_IN_PLACE=1 BB_LAYER_MEMORY=1 BB_WRITE_TRACKING=1
+    echo "Unified memory v1 (BB_UNIFIED=1): requested (the driver is probed at start; falls back to copies with a logged reason)"
+else
+    unset BB_UMA BB_UNIFIED BB_LAYER_MEMORY BB_WRITE_TRACKING
+    export BB_GUEST_IN_PLACE=0
+fi
+export BB_DMEM_MB=$dmem_mb BB_PREUPLOAD=0 BB_UFFD=0
 export BB_COPY_GPU_BUFFERS=1 BB_GPU_WRITE_TWINS=1 BB_GPU_WRITE_TWINS_MAX=65536
 # GPU memory is the phone's system RAM, shared with the game's direct memory ($dmem_mb, taken right
 # after launch) and Android: the texture collector works to a budget instead of the driver's heap
@@ -278,8 +307,8 @@ dbg_prepare=on; dbg_drain=on; dbg_lock=on; dbg_stats=off; dbg_profile=off
 if [ "$(setting debug_fault_prepare)" = 0 ]; then export BB_FAULT_PREPARE=0; dbg_prepare=off; fi
 if [ "$(setting debug_fault_smart_drain)" = 0 ]; then export BB_FAULT_DRAIN=always; dbg_drain=off; fi
 if [ "$(setting debug_fault_sleep_lock)" = 0 ]; then export BB_FAULT_SPINLOCK=1; dbg_lock=off; fi
-# Free old GPU memory (FIFO; on by default, debug_vram_copy_queue=0 turns it off; copy mode only):
-# BB_VRAM_COPY_QUEUE=1, with the cap (MB) of debug_vram_copy_cap_mb when it is a positive
+# Free old GPU memory (FIFO; on by default, debug_vram_copy_queue=0 turns it off; copy mode, and the copies that
+# unified memory v2 still makes: its shared blocks are never queued): BB_VRAM_COPY_QUEUE=1, with the cap (MB) of debug_vram_copy_cap_mb when it is a positive
 # integer, else 512 (tested on the AYN Thor: copies held ~480 MiB, 33-39 FPS in Central Yharnam).
 dbg_fifo=off
 if [ "$(setting debug_vram_copy_queue)" != 0 ]; then
@@ -369,6 +398,9 @@ if [ "${1:-game}" = game ]; then
     elif [ "$fps_limit" != 30 ]; then
         patch_args="$patch_args --patches $parts/fps=uncap.bin"
     fi
+    # The GX per-frame command heaps at 1 MiB (upstream #162; BB_GX_COMMAND_HEAP=0: the game's 256 KiB).
+    [ "${BB_GX_COMMAND_HEAP:-1}" != 0 ] && [ -f "$parts/gx-heap.bin" ] &&
+        patch_args="$patch_args --patches $parts/gx-heap.bin"
     # No PSN here: the title screen goes straight to the main menu offline.
     [ "$(setting skip_network_choice)" != 0 ] && [ -f "$parts/skip_network_choice=1.bin" ] &&
         patch_args="$patch_args --patches $parts/skip_network_choice=1.bin"

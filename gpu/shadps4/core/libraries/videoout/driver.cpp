@@ -10,11 +10,16 @@
 #include <time.h>
 #include <sys/resource.h>
 #include <cstring>
+#include <string>
+#include <fmt/format.h>
 #include <dirent.h>
 #include <unistd.h>
 #include "common/assert.h"
+#include "bbport_tex_home.h"
 #include "bbport_adpf.h"
 #include "bbport_toggles.h"
+#include "bbport_guest_memory.h"
+#include "bbport_uma.h"
 #include "bbport_fault.h"
 #include "bbport_heap_sites.h"
 #include "bbport_wait_trace.h"
@@ -358,10 +363,19 @@ static void PrintMemory() {
                       (unsigned long long)(BbStats::vram_copy_bytes.load() >> 20),
                       (unsigned long long)BbStats::vram_copies_returned.load());
     }
+    // bbport arena repack (BufferCache::RepackResidency): cumulative.
+    char repack_text[160] = "";
+    if (BbStats::arena_repack_on.load()) {
+        std::snprintf(repack_text, sizeof(repack_text),
+                      "; arena repack: %llu MiB of copies moved, %llu chunks emptied, %llu chunks freed",
+                      (unsigned long long)(BbStats::arena_repack_moved_bytes.load() >> 20),
+                      (unsigned long long)BbStats::arena_repack_emptied.load(),
+                      (unsigned long long)BbStats::residency_chunks_freed.load());
+    }
     std::printf("Memory: VRAM %llu MiB, GTT %llu MiB, RSS %llu MiB; Vulkan memory %llu MiB "
                 "allocated (VMA blocks %llu MiB, %llu MiB of them used); Vulkan images %llu MiB; "
                 "cached images %llu MiB in %llu; guest blocks in VRAM %llu MiB allocated, "
-                "%llu MiB of it unused (%llu MiB moved back idle, %llu MiB unmapped, %llu MiB freed; %llu chunks, %llu emptied, blocks kept: %llu GPU-written, %llu not direct memory); texture collector: usage %llu MiB, starts at %llu MiB, %llu images freed, %llu GPU-written kept%s\n",
+                "%llu MiB of it unused (%llu MiB moved back idle, %llu MiB unmapped, %llu MiB freed; %llu chunks, %llu emptied, blocks kept: %llu GPU-written, %llu not direct memory); texture collector: usage %llu MiB, starts at %llu MiB, %llu images freed, %llu GPU-written kept%s%s\n",
                 (unsigned long long)(vram_kib >> 10), (unsigned long long)(gtt_kib >> 10),
                 (unsigned long long)(rss >> 20), (unsigned long long)(device >> 20),
                 (unsigned long long)(vma_blocks >> 20), (unsigned long long)(vma_used >> 20),
@@ -380,10 +394,248 @@ static void PrintMemory() {
                 (unsigned long long)(BbStats::gc_used_bytes.load() >> 20),
                 (unsigned long long)(BbStats::gc_trigger_bytes.load() >> 20),
                 (unsigned long long)BbStats::gc_freed_images.exchange(0),
-                (unsigned long long)BbStats::gc_kept_images.exchange(0), fifo_text);
+                (unsigned long long)BbStats::gc_kept_images.exchange(0), fifo_text, repack_text);
     // bbport: what holds the Vulkan memory that is not images (the texture collector's usage
     // counts all of it).
     std::printf("Vulkan buffers: %s\n", VideoCore::DescribeBufferKinds().c_str());
+}
+
+/// bbport: where the memory goes, every ~10 s with BB_FRAME_STATS (phase 1 of the unified memory plan):
+/// Vulkan images, arena residency (VRAM/arena blocks), staging pool, direct memory chunks, and the
+/// kernel's own count for the process (/proc/self/smaps_rollup: one small file, no per-mapping walk).
+static void PrintMemorySplit() {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point last{};
+    const auto now = Clock::now();
+    if (last != Clock::time_point{} && now - last < std::chrono::seconds(10)) {
+        return;
+    }
+    last = now;
+    {
+        // bbport: the process's memory mappings against the kernel's limit (vm.max_map_count). At the
+        // limit every mmap fails: the driver's own (vkQueueSubmit -> VK_ERROR_MEMORY_MAP_FAILED, seen
+        // with unified memory on the Thor) and the game's. Page protections split mappings.
+        unsigned long long maps = 0, limit = 0;
+        if (FILE* file = std::fopen("/proc/self/maps", "r")) {
+            char chunk[65536];
+            size_t n;
+            while ((n = std::fread(chunk, 1, sizeof(chunk), file)) > 0) {
+                maps += static_cast<unsigned long long>(std::count(chunk, chunk + n, '\n'));
+            }
+            std::fclose(file);
+        }
+        // An app cannot read /proc/sys/vm/max_map_count on Android: the kernel's default then.
+        limit = BbUma::Maps::KernelLimit();
+        // BB_UMA: past BB_UMA_MAX_MAPS no new write-trap regions are armed (BbUma::Maps).
+        std::string uma_cap;
+        if (BbUma::Maps::Estimate() != 0 && BbUma::Maps::Cap() != 0) {
+            uma_cap = fmt::format(", UMA arming cap {}{}", BbUma::Maps::Cap(),
+                                  BbUma::Maps::Estimate() >= BbUma::Maps::Cap() ? " (reached)" : "");
+        }
+        std::printf("Memory mappings: %llu of %llu (vm.max_map_count)%s%s\n", maps, limit,
+                    uma_cap.c_str(),
+                    limit && maps * 10 > limit * 9 ? " -- NEAR THE LIMIT: mmap will start failing" : "");
+    }
+    unsigned long long rss = 0, pss = 0, anon = 0, shared = 0, priv_dirty = 0, swap = 0;
+    if (FILE* file = std::fopen("/proc/self/smaps_rollup", "r")) {
+        char line[160];
+        unsigned long long kib;
+        while (std::fgets(line, sizeof(line), file)) {
+            if (std::sscanf(line, "Rss: %llu", &kib) == 1) {
+                rss = kib;
+            } else if (std::sscanf(line, "Pss: %llu", &kib) == 1) {
+                pss = kib;
+            } else if (std::sscanf(line, "Anonymous: %llu", &kib) == 1) {
+                anon = kib;
+            } else if (std::sscanf(line, "Shared_Dirty: %llu", &kib) == 1) {
+                shared += kib;
+            } else if (std::sscanf(line, "Shared_Clean: %llu", &kib) == 1) {
+                shared += kib;
+            } else if (std::sscanf(line, "Private_Dirty: %llu", &kib) == 1) {
+                priv_dirty = kib;
+            } else if (std::sscanf(line, "Swap: %llu", &kib) == 1) {
+                swap = kib;
+            }
+        }
+        std::fclose(file);
+    }
+    std::printf("Memory split: images %llu MiB, arena residency %llu MiB, staging %llu MiB, direct "
+                "memory chunks %llu MiB%s; process Rss %llu MiB, Pss %llu MiB, anon %llu MiB, shared "
+                "%llu MiB, private dirty %llu MiB, swap %llu MiB\n",
+                (unsigned long long)(BbStats::vk_image_bytes.load() >> 20),
+                (unsigned long long)(BbStats::residency_alloc_bytes.load() >> 20),
+                (unsigned long long)(BbStats::staging_bytes.load() >> 20),
+                (unsigned long long)(BbGuestMemory::ChunkBytes() >> 20),
+                BbGuestMemory::Unified() ? " (unified: shared with the GPU)" : "", rss >> 10, pss >> 10,
+                anon >> 10, shared >> 10, priv_dirty >> 10, swap >> 10);
+    {
+        const auto mib = [](const std::atomic<std::uint64_t>& v) {
+            return (unsigned long long)(v.load(std::memory_order_relaxed) >> 20);
+        };
+        std::printf("Staging by type: device-local ring %llu / large %llu (held %llu) MiB, host-uncached "
+                    "ring %llu / large %llu (held %llu) MiB, host-cached ring %llu / large %llu (held "
+                    "%llu) MiB\n",
+                    mib(BbStats::staging_ring_bytes[0]), mib(BbStats::staging_large_bytes[0]),
+                    mib(BbStats::staging_held_bytes[0]), mib(BbStats::staging_ring_bytes[1]),
+                    mib(BbStats::staging_large_bytes[1]), mib(BbStats::staging_held_bytes[1]),
+                    mib(BbStats::staging_ring_bytes[2]), mib(BbStats::staging_large_bytes[2]),
+                    mib(BbStats::staging_held_bytes[2]));
+        std::printf("Staging upload ring: %llu blocks, %llu used in the last 3000 submissions, %llu GPU-busy, "
+                    "keep %llu, submission %llu\n",
+                    (unsigned long long)BbStats::staging_upload_blocks.load(),
+                    (unsigned long long)BbStats::staging_upload_recent.load(),
+                    (unsigned long long)BbStats::staging_upload_busy.load(),
+                    (unsigned long long)BbStats::staging_keep_blocks.load(),
+                    (unsigned long long)BbStats::staging_frame.load());
+    }
+    if (BbTexHome::Enabled()) {
+        // bbport BB_TEX_HOME: textures whose game copy was dropped (docs: "Plan A").
+        const auto& c = BbTexHome::counters;
+        std::string rebuilt, refused;
+        for (std::size_t k = 0; k < BbTexHome::RebuildKinds; ++k) {
+            if (const u64 n = c.rebuilt[k].load()) {
+                rebuilt += fmt::format("{}{} {}", rebuilt.empty() ? "" : ", ", BbTexHome::RebuildNames[k], n);
+            }
+        }
+        for (std::size_t k = 0; k < BbTexHome::RefusalKinds; ++k) {
+            if (const u64 n = c.refused[k].load()) {
+                refused += fmt::format("{}{} {}", refused.empty() ? "" : ", ", BbTexHome::RefusalNames[k], n);
+            }
+        }
+        u64 rebuilds = 0;
+        for (const auto& n : c.rebuilt) {
+            rebuilds += n.load();
+        }
+        std::printf("Texture home: %llu images, %llu MiB freed (%llu homed so far, %llu re-tiles "
+                    "verified; padding kept aside for %llu homes, %llu KiB now); "
+                    "rebuilt %llu (%.1f ms total / %.2f ms max; %s; %llu by the GPU thread for others, "
+                    "%llu timed out, %llu forgotten); verify failures: texels differ %llu, padding too "
+                    "large %llu, tiling holes %llu; refused (looks): %s\n",
+                    (unsigned long long)c.homed_images.load(),
+                    (unsigned long long)(runtime_memory_homed_pages() * 4096 >> 20),
+                    (unsigned long long)c.homes.load(), (unsigned long long)c.verifies.load(),
+                    (unsigned long long)c.patched_homes.load(),
+                    (unsigned long long)(c.patch_bytes.load() >> 10), (unsigned long long)rebuilds,
+                    double(c.rebuild_ns_total.load()) / 1e6, double(c.rebuild_ns_max.load()) / 1e6,
+                    rebuilt.empty() ? "none" : rebuilt.c_str(), (unsigned long long)c.forwarded.load(),
+                    (unsigned long long)c.timeouts.load(), (unsigned long long)c.lost.load(),
+                    (unsigned long long)c.verify_texel_failures.load(),
+                    (unsigned long long)c.verify_padding_failures.load(),
+                    (unsigned long long)c.verify_hole_failures.load(),
+                    refused.empty() ? "none" : refused.c_str());
+    }
+    if (BbGuestMemory::Uma()) {
+        // bbport BB_UMA: the shared granules (the runtime's counters) and what the GPU side did with them.
+        const auto runtime = BbGuestMemory::UmaRuntime();
+        const auto& uma = BbUma::counters;
+        const auto shared_dma = BbUma::SharedDma();
+        const auto demote = BbGuestMemory::UmaDemoteRuntime();
+        unsigned long long class_refusals = 0;
+        for (const auto& count : uma.refused_class) {
+            class_refusals += count.load();
+        }
+        std::printf("UMA: granule %llu KiB, shared %llu granules (%llu MiB), promotions %llu "
+                    "(requests %llu, failed %llu), refused: exec %llu busy %llu class %llu image %llu "
+                    "size %llu backoff %llu texture-first %llu written %llu cross-granule %llu mapping "
+                    "%llu gpu-data %llu "
+                    "dynamic %llu maps-cap %llu, dynamic blocks %llu (regions %llu, verify regions "
+                    "%llu; armed %llu in %llu regions, trap faults %llu, "
+                    "announced writes %llu), "
+                    "freeze faults %llu, io waits %llu, promote %.1f ms total / %.1f ms max, granule "
+                    "buffer bindings %llu (%llu MiB; verdict memo %llu hits / %llu misses), uma image "
+                    "writes %llu, verify %llu checked / %llu mismatches, DMA into shared: %llu "
+                    "(%.1f MiB; cpu %llu, gpu %llu), demotions %llu (%llu MiB; released %llu, "
+                    "idle-dynamic %llu, idle %llu; non-zero pages kept %llu MiB; retries %llu, given "
+                    "up %llu), demote %.1f ms max, re-promotions %llu, refused demoting %llu\n",
+                    (unsigned long long)(runtime.granule_bytes >> 10),
+                    (unsigned long long)runtime.shared_granules,
+                    (unsigned long long)(runtime.shared_bytes >> 20),
+                    (unsigned long long)runtime.promotions,
+                    (unsigned long long)uma.promote_requests.load(),
+                    (unsigned long long)(runtime.promotion_failures + uma.promote_failures.load()),
+                    (unsigned long long)runtime.refused_exec, (unsigned long long)runtime.refused_busy,
+                    class_refusals, (unsigned long long)uma.refused_image.load(),
+                    (unsigned long long)uma.refused_size.load(),
+                    (unsigned long long)uma.refused_backoff.load(),
+                    (unsigned long long)uma.refused_texture_first.load(),
+                    (unsigned long long)uma.refused_written.load(),
+                    (unsigned long long)uma.refused_cross.load(),
+                    (unsigned long long)uma.refused_mapping.load(),
+                    (unsigned long long)uma.refused_gpu_data.load(),
+                    (unsigned long long)uma.refused_dynamic.load(),
+                    (unsigned long long)uma.refused_maps_cap.load(),
+                    (unsigned long long)uma.dynamic_blocks.load(),
+                    (unsigned long long)uma.dynamic_regions.load(),
+                    (unsigned long long)uma.dynamic_verify.load(),
+                    (unsigned long long)uma.watch_armed.load(),
+                    (unsigned long long)uma.armed_regions.load(),
+                    (unsigned long long)uma.watch_faults.load(),
+                    (unsigned long long)uma.watch_notes.load(),
+                    (unsigned long long)runtime.freeze_faults, (unsigned long long)runtime.io_waits,
+                    runtime.promote_ns_total / 1e6, runtime.promote_ns_max / 1e6,
+                    (unsigned long long)uma.direct_bindings.load(),
+                    (unsigned long long)(uma.direct_bytes.load() >> 20),
+                    (unsigned long long)uma.memo_hits.load(),
+                    (unsigned long long)uma.memo_misses.load(),
+                    (unsigned long long)uma.image_writes.load(),
+                    (unsigned long long)uma.verify_checked.load(),
+                    (unsigned long long)uma.verify_mismatches.load(),
+                    (unsigned long long)shared_dma.count, double(shared_dma.bytes) / (1 << 20),
+                    (unsigned long long)shared_dma.cpu, (unsigned long long)shared_dma.gpu,
+                    (unsigned long long)demote.demotions,
+                    (unsigned long long)(demote.demoted_bytes >> 20),
+                    (unsigned long long)uma.demote_released.load(),
+                    (unsigned long long)uma.demote_idle_dynamic.load(),
+                    (unsigned long long)uma.demote_idle.load(),
+                    (unsigned long long)(demote.kept_bytes >> 20),
+                    (unsigned long long)uma.demote_retries.load(),
+                    (unsigned long long)uma.demote_given_up.load(), demote.demote_ns_max / 1e6,
+                    (unsigned long long)uma.repromotions.load(),
+                    (unsigned long long)uma.refused_demoting.load());
+        // bbport: DMA fills and copies into shared granules: where, the first 32 destinations, when
+        // there are new ones since the last time.
+        std::string dma_list;
+        if (BbUma::SharedDmaNewList(dma_list)) {
+            std::printf("UMA: DMA into shared granules, first destinations: %s\n", dma_list.c_str());
+        }
+        // Which class holds the VRAM copies, and whether the CPU had their pages (sharing saves
+        // those) or not (GPU-only data: sharing saves nothing).
+        std::string by_class;
+        u64 total = 0;
+        for (std::size_t c = 0; c < BbUma::ClassCount; ++c) {
+            const u64 cpu = uma.arena_bytes[c][1].load(), gpu = uma.arena_bytes[c][0].load();
+            total += cpu + gpu;
+            if (cpu + gpu != 0) {
+                by_class += fmt::format("{}{} {} MiB (CPU pages {}, GPU-only {})",
+                                        by_class.empty() ? "" : ", ",
+                                        BbUma::ClassName(static_cast<BbUma::Class>(c)),
+                                        (cpu + gpu) >> 20, cpu >> 20, gpu >> 20);
+            }
+        }
+        std::printf("Arena by class: %llu MiB: %s%s\n", (unsigned long long)(total >> 20),
+                    by_class.empty() ? "nothing" : by_class.c_str(),
+                    uma.arena_mincore_failures.load() ? " (mincore failed for some blocks)" : "");
+        // Refusals of the classes allowed, by reason.
+        static constexpr std::array<const char*, BbUma::Counters::RefusalKinds> reasons{
+            "mapping", "cross-granule", "dynamic", "gpu-data", "image", "written", "promotion",
+            "maps-cap", "demoting"};
+        std::string refusals;
+        for (std::size_t c = 0; c < BbUma::ClassCount; ++c) {
+            std::string row;
+            for (std::size_t k = 0; k < reasons.size(); ++k) {
+                if (const u64 n = uma.refused_by[c][k].load()) {
+                    row += fmt::format(" {} {}", reasons[k], n);
+                }
+            }
+            if (!row.empty()) {
+                refusals += fmt::format("{}{}:{}", refusals.empty() ? "" : "; ",
+                                        BbUma::ClassName(static_cast<BbUma::Class>(c)), row);
+            }
+        }
+        if (!refusals.empty()) {
+            std::printf("UMA refusals by class: %s\n", refusals.c_str());
+        }
+    }
 }
 
 void VideoOutDriver::Flip(const Request& req) {
@@ -628,16 +880,37 @@ void VideoOutDriver::Flip(const Request& req) {
             const double draws_per_frame = frames ? double(all_draws - window_draws) / frames : 0.0;
             window_draws = all_draws;
             window_gpu_us = gpu_us;
+            // Hot pages (RegionManager) and protection changes over this window.
+            static u64 win_promoted, win_expired, win_refused, win_protect, win_revoke;
+            static u32 win_epoch;
+            const u64 promoted = BbStats::hot_promoted.load(), expired = BbStats::hot_expired.load(),
+                      refused = BbStats::hot_refused.load(), protects = BbStats::protect_calls.load(),
+                      revokes = BbStats::protect_revoke_calls.load();
+            const u64 d_promoted = promoted - win_promoted, d_expired = expired - win_expired,
+                      d_refused = refused - win_refused, d_protects = protects - win_protect,
+                      d_revokes = revokes - win_revoke;
+            win_promoted = promoted;
+            win_expired = expired;
+            win_refused = refused;
+            win_protect = protects;
+            win_revoke = revokes;
+            const u32 epoch = BbStats::hot_epoch.load(), d_epochs = epoch - win_epoch; // u32 wraps
+            win_epoch = epoch;
+            const long long hot_pages = BbStats::hot_pages.load();
             std::printf("Frame stats: %.1f FPS, worst frame %.1f ms (vblank %u Hz); "
                         "%u shader/pipeline compiles, %.1f ms; %llu recorder syncs; "
-                        "%.0f write faults/s, %lld hot pages; GPU thread %.2f us/draw, "
+                        "%.0f write faults/s, %lld hot pages (%.1f MiB; +%llu/-%llu windows, %llu "
+                        "refused), %.0f protect calls/s (%.0f revoking), %.0f hot epochs/s; GPU thread %.2f us/draw, "
                         "%.0f draws/frame, idle %.1f%%; blocked: recorder %.1f%%, host copies "
                         "%.1f%% (%.0f/frame, %.0f/frame not needed), copy threads %.1f%%, GPU ticks %.1f%%; "
                         "reduced-size draws %.0f/frame of %.0f in the scene\n",
                         frames / window, worst_ms, EmulatorSettings.GetVblankFrequency(), compiles,
                         compile_ns / 1e6, static_cast<unsigned long long>(direct),
-                        faults / window, static_cast<long long>(BbStats::hot_pages.load()),
-                        us_per_draw, draws_per_frame,
+                        faults / window, hot_pages, hot_pages * 4096.0 / (1024.0 * 1024.0),
+                        static_cast<unsigned long long>(d_promoted),
+                        static_cast<unsigned long long>(d_expired),
+                        static_cast<unsigned long long>(d_refused), d_protects / window,
+                        d_revokes / window, d_epochs / window, us_per_draw, draws_per_frame,
                         BbStats::gpu_idle_ns.exchange(0) / (window * 1e7),
                         BbStats::sync_recording_ns.exchange(0) / (window * 1e7),
                         BbStats::host_copies_wait_ns.exchange(0) / (window * 1e7),
@@ -676,6 +949,7 @@ void VideoOutDriver::Flip(const Request& req) {
             }
             Vulkan::Breadcrumbs::PrintProgress();
             PrintMemory();
+            PrintMemorySplit();
             if (const u64 in_place = BbStats::bound_in_place_bytes.exchange(0)) {
                 std::printf("Buffer bindings: %.1f MB/frame in place (%.1f GPU-written), %.1f MB/frame "
                             "VRAM copies\n",

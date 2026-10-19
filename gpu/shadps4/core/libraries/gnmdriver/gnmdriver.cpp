@@ -3477,3 +3477,22 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 };
 
 } // namespace Libraries::GnmDriver
+
+// bbport: a zero fill of a small target as the GPU's own WRITE_DATA, submitted to the graphics
+// queue in order without touching any graphics context of the game (its command buffer, cursor or
+// registers): the effect-target initialization the game's main thread otherwise wrote into the
+// command buffer its render thread was building (bbport_guest_guards.cpp, FxInitClear). The queue
+// keeps its own copy of the commands (the vector ends here).
+bool BbSubmitFxInitZero(u64 address, u32 bytes) {
+    if (!liverpool || bytes == 0 || bytes > 32768 || (bytes & 3) || (address & 3)) {
+        return false;
+    }
+    const u32 words = bytes / 4;
+    std::vector<u32> commands(words + 4, 0);
+    commands[0] = (3u << 30) | ((words + 2) << 16) | (u32(AmdGpu::PM4ItOpcode::WriteData) << 8);
+    commands[1] = 5u << 8; // memory destination, consecutive addresses, graphics engine
+    commands[2] = u32(address);
+    commands[3] = u32(address >> 32);
+    liverpool->SubmitGfx(commands, {}, true);
+    return true;
+}

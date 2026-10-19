@@ -7,6 +7,8 @@
 #include <queue>
 #include "common/arch.h"
 #ifdef ARCH_X86_64
+#include <atomic>
+#include <ucontext.h>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 #else
@@ -91,46 +93,39 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
         return false; // Not in SRT code range
     }
 
-    // Patch instruction to zero register
+    // bbport: zero for this load of this thread only, without changing the shared code: patching
+    // the MOV raced with other threads' fault handlers (one saw the XOR and asserted) and discarded
+    // valid data for every later draw using the walker (upstream bloodborne_pc 0.6).
     ZydisDecodedInstruction instruction;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
     ZyanStatus status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
                                                                        const_cast<void*>(code), 15);
-
-    ASSERT(ZYAN_SUCCESS(status) && instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
-           operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-           operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
-
-    size_t len = instruction.length;
-    const size_t patch_size = 3;
-    u8* code_patch = const_cast<u8*>(reinterpret_cast<const u8*>(code));
-
+    if (!ZYAN_SUCCESS(status) || instruction.mnemonic != ZYDIS_MNEMONIC_MOV ||
+        operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+        return false;
+    }
+    auto& registers = static_cast<ucontext_t*>(context)->uc_mcontext.gregs;
     // We can only encounter rdi or r10d as the first operand in a
     // fault memory access for SRT walker.
     switch (operands[0].reg.value) {
     case ZYDIS_REGISTER_RDI:
-        // mov rdi, [rdi + (off_dw << 2)] -> xor rdi, rdi
-        code_patch[0] = 0x48;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xFF;
+        registers[REG_RDI] = 0;
         break;
     case ZYDIS_REGISTER_R10D:
-        // mov r10d, [rdi + (off_dw << 2)] -> xor r10d, r10d
-        code_patch[0] = 0x45;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xD2;
+        registers[REG_R10] = 0; // a 32-bit MOV clears the upper half too
         break;
     default:
-        UNREACHABLE_MSG("Unsupported register for SRT walker patch");
         return false;
     }
-
-    // Fill nops
-    memset(code_patch + patch_size, 0x90, len - patch_size);
-
-    LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
-                fault_address);
-
+    registers[REG_RIP] += instruction.length;
+    static std::atomic<u64> faults{0};
+    const u64 n = faults.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 5 || (n & (n - 1)) == 0) {
+        LOG_WARNING(Render_Recompiler,
+                    "SRT walker read unavailable memory at {} ({} reads so far); zero for this draw",
+                    fault_address, n);
+    }
     return true;
 }
 #else
@@ -161,7 +156,8 @@ enum SrtOp : u32 {
     OpUMax,
     OpBitFieldUExtract,
 };
-/// A load that faulted reads zero from then on (the x86-64 walker patches it to a xor).
+/// bbport: formerly set on a load that faulted, which then read zero for good; ignored now (a
+/// fault zeroes that load for the run it happened in only: RunSrtProgram).
 constexpr u32 OpZeroed = 0x80000000u;
 constexpr u32 SrtMagic = 0x42545253u; // "SRTB"
 constexpr u32 MaxDepth = 64, MaxValues = 32;
@@ -182,24 +178,53 @@ PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
 }
 
 void RunSrtProgram(const u32* program, const u32* user_data, u32* flat) {
-    u32* const code = const_cast<u32*>(program);
+    const u32* const code = program;
     sigjmp_buf* const previous = runtime_fault_recover;
     sigjmp_buf recover;
-    u32* volatile faulted = nullptr;
+    // bbport: the loads that faulted in this run read zero, in this run only. Marking the shared
+    // program (as before, and as the x86-64 walker patched its code) zeroed that load for every
+    // later draw too, with valid pointers then: its descriptors stayed empty for good (upstream
+    // bloodborne_pc 0.6 made the x86-64 handler per invocation for the same reason).
+    constexpr u32 MaxZeroed = 32;
+    volatile u32 zeroed_at[MaxZeroed];
+    volatile u32 zeroed_count = 0;
+    volatile bool zero_all = false; // more faults than that: every load of the run reads zero
+    volatile u32 faulted = 0;       // the load being made (its op's index)
     if (sigsetjmp(recover, 0)) {
         // Writes go to flat only, so the walk can start over with that load zeroed.
-        __atomic_fetch_or(faulted, OpZeroed, __ATOMIC_RELAXED);
-        LOG_WARNING(Render_Recompiler, "SRT walker load faulted, it reads zero from now on");
+        if (zeroed_count < MaxZeroed) {
+            zeroed_at[zeroed_count] = faulted;
+            zeroed_count = zeroed_count + 1;
+        } else {
+            zero_all = true;
+        }
+        static std::atomic<u64> faults{0};
+        const u64 n = faults.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 5 || (n & (n - 1)) == 0) {
+            LOG_WARNING(Render_Recompiler,
+                        "SRT walker read unavailable memory ({} reads so far); zero for this draw", n);
+        }
     }
     runtime_fault_recover = &recover;
+    const auto is_zeroed = [&](u32 op) {
+        if (zero_all) {
+            return true;
+        }
+        for (u32 i = 0; i < zeroed_count; ++i) {
+            if (zeroed_at[i] == op) {
+                return true;
+            }
+        }
+        return false;
+    };
     const u8* stack[MaxDepth];
     u32 values[MaxValues];
     u32 depth = 0, count = 0;
     const u8* pointer = reinterpret_cast<const u8*>(user_data);
     for (u32 pc = 1;;) {
-        u32* const at = &code[pc++];
-        const u32 word = __atomic_load_n(at, __ATOMIC_RELAXED);
-        const bool zeroed = (word & OpZeroed) != 0;
+        const u32 op = pc;
+        const u32 word = __atomic_load_n(&code[pc++], __ATOMIC_RELAXED);
+        const bool zeroed = zeroed_count != 0 && is_zeroed(op); // (loads only ask)
         switch (word & ~OpZeroed) {
         case OpEnd:
             runtime_fault_recover = previous;
@@ -209,7 +234,7 @@ void RunSrtProgram(const u32* program, const u32* user_data, u32* flat) {
             const u32 offset = ((word & ~OpZeroed) == OpPushImm ? code[pc++] : values[--count]) << 2;
             u64 next = 0;
             if (!zeroed) {
-                faulted = at;
+                faulted = op;
                 std::memcpy(&next, pointer + offset, sizeof(next));
             }
             stack[depth++] = pointer;
@@ -225,7 +250,7 @@ void RunSrtProgram(const u32* program, const u32* user_data, u32* flat) {
             const u32 offset = (imm ? code[pc++] : values[--count]) << 2;
             u32 value = 0;
             if (!zeroed) {
-                faulted = at;
+                faulted = op;
                 std::memcpy(&value, pointer + offset, sizeof(value));
             }
             flat[code[pc++]] = value;

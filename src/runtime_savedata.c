@@ -338,8 +338,10 @@ static int32_t memory_io(void *buffer, uint64_t size, int64_t offset, int write)
     if ((uint64_t)offset+size>memory_size) { pthread_mutex_unlock(&lock); return ERR_PARAMETER; }
     FILE *f=fopen(memory_path,"r+b");
     int32_t r=ERR_INTERNAL;
+    void *guard=write ? NULL : runtime_memory_io_begin((uintptr_t)buffer,size); /* the kernel reads into guest memory */
     if (f && !fseek(f,offset,SEEK_SET) &&
         (write ? fwrite(buffer,1,size,f) : fread(buffer,1,size,f))==size) r=0;
+    runtime_memory_io_end(guard);
     if (f) fclose(f);
     if (!r && write) ++memory_writes;
     pthread_mutex_unlock(&lock);

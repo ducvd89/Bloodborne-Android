@@ -112,7 +112,9 @@ final class ModLoader {
         List<String> available = discover(root);
         if (config == null || !config.isFile()) return available;
         Object settings;
-        try { settings = MiniJson.parse(new String(Files.readAllBytes(config.toPath()), "UTF-8")); }
+        String text = SafeWrite.readText(config); // NUL bytes only (a hard reset before it was synced): no mods.json
+        if (text == null) return available;
+        try { settings = MiniJson.parse(text); }
         catch (MiniJson.ParseException e) { throw new ModError(e.getMessage()); }
         if (!(settings instanceof Map)) throw new ModError("mods.json: expected an object");
         Map<?, ?> map = (Map<?, ?>)settings;

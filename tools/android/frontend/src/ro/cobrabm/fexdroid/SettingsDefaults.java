@@ -41,13 +41,8 @@ final class SettingsDefaults {
         int eq=line.indexOf('=');
         return eq>0 && !line.startsWith("#") ? line.substring(0,eq).trim() : null;
     }
-    private static List<String> lines(File file) throws IOException {
-        List<String> out=new ArrayList<>();
-        try (BufferedReader r=new BufferedReader(new InputStreamReader(new FileInputStream(file),"UTF-8"))) {
-            for (String line; (line=r.readLine())!=null;) out.add(line);
-        }
-        return out;
-    }
+    /** The lines of the file; none when it is NUL bytes only (see SafeWrite). */
+    private static List<String> lines(File file) throws IOException { return SafeWrite.readLines(file); }
     /** key=value pairs, the last of a key winning (as run-bionic.sh's setting()). */
     private static Map<String,String> values(List<String> lines) {
         Map<String,String> out=new LinkedHashMap<>();
@@ -57,16 +52,8 @@ final class SettingsDefaults {
         }
         return out;
     }
-    /** Written whole beside the file, then renamed over it. */
-    private static void write(File file,List<String> lines) throws IOException {
-        File temporary=new File(file.getPath()+".tmp");
-        try (FileOutputStream stream=new FileOutputStream(temporary);
-             Writer w=new OutputStreamWriter(stream,"UTF-8")) {
-            for (String line:lines) w.write(line+"\n");
-            w.flush(); stream.getFD().sync();
-        }
-        if (!temporary.renameTo(file)) { temporary.delete(); throw new IOException("Cannot write "+file); }
-    }
+    /** Written whole beside the file and synced, then renamed over it. */
+    private static void write(File file,List<String> lines) throws IOException { SafeWrite.writeLines(file,lines); }
     private static int revision(File marker) {
         try {
             List<String> lines=lines(marker);
@@ -125,6 +112,9 @@ final class SettingsDefaults {
      *  nothing, and writes no marker, while the defaults file is missing. Throws when the files cannot
      *  be written; the marker is last, so the next start tries again. */
     static void apply(File base) throws IOException {
+        // A hard reset can leave files of NUL bytes (written, never synced): settings and markers of that kind
+        // are taken as missing, so the defaults apply as on a first install.
+        for (String name:new String[]{"bbport.ini",MARKER,FAULT_MARKER,GSR2_MARKER}) SafeWrite.repair(new File(base,name));
         resetFaultSwitches(base);
         switchToGsr2(base);
         File marker=new File(base,MARKER), ini=new File(base,"bbport.ini"), defaults=new File(base,"bbport.default.ini");

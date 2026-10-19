@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
+#include <memory>
+#include <unordered_set>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -111,6 +113,36 @@ bool SceneTargets::SetSize(SceneResolution::Size next) {
     std::printf("Scene resolution: raster %ux%u, half-resolution targets %ux%u, UI 1920x1080 "
                 "(live)\n", size.width, size.height, size.width / 2, size.height / 2);
     return true;
+}
+void SceneTargets::CleanupStaleEntries() {
+    std::vector<std::unique_ptr<Entry>> gone;
+    for (auto it = entries.begin(); it != entries.end();) {
+        if (!lookup(it->second->source, it->second->uid)) {
+            gone.push_back(std::move(it->second));
+            it = entries.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (gone.empty()) {
+        return;
+    }
+    std::unordered_set<u64> live;
+    for (const auto& [key, entry] : entries) {
+        live.insert(entry->uid);
+    }
+    std::erase_if(tracked, [&](u64 uid) { return !live.contains(uid); });
+    ++generation; // views of the dropped proxies may be memoized (texture sets)
+    recent = {};
+    const size_t count = gone.size();
+    // Not scheduler.Finish(): command buffers recorded so far may still use them.
+    auto holder = std::make_shared<std::vector<std::unique_ptr<Entry>>>(std::move(gone));
+    scheduler.DeferOperation([holder] {});
+    static u32 told = 0;
+    if (told++ < 8) {
+        std::printf("Scene resolution: %zu proxies of evicted targets dropped (%zu kept)\n", count,
+                    entries.size());
+    }
 }
 void SceneTargets::ResolveAll() {
     for (auto& [key, entry] : entries) {

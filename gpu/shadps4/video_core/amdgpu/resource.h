@@ -491,7 +491,10 @@ struct Sampler {
         case AnisoRatio::Sixteen:
             return 16.0f;
         default:
-            UNREACHABLE();
+            // bbport: 3 bits, 0..4 valid: a stale S# read ahead (draw preparation) may hold 5..7;
+            // clamped like the hardware's 16x cap instead of ending the game (upstream
+            // bloodborne_pc 0.6).
+            return 16.0f;
         }
     }
 };

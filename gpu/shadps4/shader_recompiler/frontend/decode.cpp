@@ -140,6 +140,56 @@ GcnInst GcnDecodeContext::decodeInstruction(GcnCodeSlice& code) {
     return m_instruction;
 }
 
+bool GcnDecodeContext::tryDecodeInstruction(GcnCodeSlice& code, GcnInst& out) {
+    const uint32_t token = code.at(0);
+    const InstEncoding encoding = GetInstructionEncoding(token);
+    if (encoding == InstEncoding::ILLEGAL) {
+        return false;
+    }
+    // SDWA (0xF9) and DPP (0xFA) operands came with later GCN generations: in a PS4 program such
+    // a word is garbage, not an instruction.
+    if ((encoding == InstEncoding::VOP1 || encoding == InstEncoding::VOP2 ||
+         encoding == InstEncoding::VOPC) &&
+        ((token & 0x1FF) == 0xF9 || (token & 0x1FF) == 0xFA)) {
+        return false;
+    }
+    const uint32_t encodingLen = getEncodingLength(encoding);
+    m_instruction = GcnInst();
+    if (encodingLen == sizeof(uint32_t)) {
+        decodeInstruction32(encoding, code);
+    } else {
+        decodeInstruction64(encoding, code);
+    }
+    // updateInstructionMeta's assertion, asked first.
+    const InstFormat format = InstructionFormat(encoding, mapEncodingOp(encoding, m_instruction.opcode));
+    if (format.src_type == ScalarType::Undefined || format.dst_type == ScalarType::Undefined) {
+        return false;
+    }
+    updateInstructionMeta(encoding);
+    if (encodingLen == sizeof(u32)) {
+        decodeLiteralConstant(encoding, code);
+    }
+    repairOperandType();
+    out = m_instruction;
+    return true;
+}
+
+bool ProgramDecodes(std::span<const u32> code, size_t* bad) {
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
+    GcnInst inst;
+    while (!slice.atEnd() && slice.position() < code.data() + code.size()) {
+        const u32* at = slice.position();
+        if (!decoder.tryDecodeInstruction(slice, inst)) {
+            if (bad) {
+                *bad = size_t(at - code.data());
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 uint32_t GcnDecodeContext::getEncodingLength(InstEncoding encoding) {
     uint32_t instLength = 0;
 

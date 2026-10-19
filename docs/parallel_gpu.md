@@ -72,6 +72,15 @@ Rejected: "hot pages" (never re-protect pages written repeatedly, upload them on
 binding) — the set grew to ~14k pages, re-uploads dropped the frame rate to 33 FPS and a GPU
 ring timeout followed. Left opt-in behind BB_HOT_PAGES=1.
 
+Reworked for Android (CPU power; untested on PC): a fault window that takes write faults in 3
+consecutive frames becomes hot (`BB_HOT_STREAK`), the total is capped at 8 MiB over all regions
+(`BB_HOT_PAGES_MB`), hot pages are uploaded again once per epoch (a guest submission, a
+`WaitRegMem` on a label, a flip) instead of at every binding, GPU-written pages leave the set, and
+the set expires after 10 s (`BB_HOT_PERIOD_S`). On by default now; `BB_HOT_PAGES=0` switches it off
+(the live toggle 32768 too). The `BB_FRAME_STATS` line shows hot pages, windows promoted, expired
+and refused by the cap, and protect calls per second. See `RegionManager` in
+`gpu/shadps4/video_core/buffer_cache/region_manager.h`.
+
 Texture description cache 2-way/4096, same-target fast path, LRU touch skip, no per-texture
 meta lookup: other outdoor view, 93.9 FPS; with the texture memos off (mask 1056) 65.6 FPS.
 Close to the 100 Hz display cap (vblank-paced), so further gains need an uncapped test.

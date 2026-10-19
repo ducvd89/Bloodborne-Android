@@ -403,22 +403,79 @@ static void touch_for_write(void *buffer,uint64_t size) {
     }
 }
 /* A page protected again between the touch and the kernel's copy (the GPU side re-arms its write
- * traps): EFAULT with nothing read. Touched again, the read is tried again a few times. */
+ * traps): EFAULT with nothing read, or, when the page is past the start, a SHORT read without an
+ * error (the kernel returns what it copied). A short read reached the game as the end of its data
+ * (unified memory arms many more traps: the game stopped with its own exception, exit 23, while an
+ * area streamed in). So the rest is read too, the pages touched again, until the request is full,
+ * the file ends (0) or a real error; EFAULT with nothing read is retried a few times as before. */
 static ssize_t read_retrying(int h,void *buffer,uint64_t size,int64_t offset,int positional) {
-    ssize_t n=-1;
-    for (int attempt=0; attempt<8; ++attempt) {
-        n=positional ? pread(h,buffer,size,offset) : read(h,buffer,size);
-        if (n>=0 || errno!=EFAULT) break;
-        touch_for_write(buffer,size);
+    struct stat st;
+    /* Only a regular file is read to the end of the request: a pipe, socket or device returns what
+     * it has, and asking it for more would block. */
+    const int regular=!fstat(h,&st) && S_ISREG(st.st_mode);
+    uint64_t done=0;
+    int faults=0;
+    while (done<size) {
+        unsigned char *at=(unsigned char *)buffer+done;
+        const ssize_t n=positional ? pread(h,at,size-done,offset+(int64_t)done) : read(h,at,size-done);
+        if (n>0) { done+=(uint64_t)n; if (!regular) break; continue; }
+        if (n==0) break; /* the end of the file */
+        if (errno==EINTR) continue;
+        if (errno!=EFAULT || ++faults>8) {
+            if (done) break; /* what was read so far: the next read reports the error */
+            return -1;
+        }
+        touch_for_write(at,size-done);
     }
-    return n;
+    return (ssize_t)done;
+}
+/* bbport: reads the guest sees fail or come back short are always logged (logging only, nothing
+ * about the read changes): the first 50 lines of a run, then only counted (totals in
+ * runtime_file_report). Short: some bytes came back, fewer than asked, while the regular file has
+ * more (offset + got < size by fstat); the guest may take it for the end of the file. The trap
+ * reasons are those of the page of the first byte not copied (runtime_memory_trap_reasons).
+ * h < 0: the guest's descriptor is unknown (EBADF). errno is kept. */
+#define READ_LOG_LINES 50
+static size_t failed_reads, short_reads, read_log_lines;
+static void note_read(int fd,int h,const void *buffer,uint64_t size,int64_t offset,int positional,ssize_t n) {
+    const int err=errno;
+    long long at=-1,length=-1;
+    if (n>=0) {
+        struct stat st;
+        if (h<0 || fstat(h,&st) || !S_ISREG(st.st_mode)) { errno=err; return; }
+        at=positional ? (long long)offset+n : (long long)lseek(h,0,SEEK_CUR);
+        length=(long long)st.st_size;
+        if (at<0 || at>=length) { errno=err; return; } /* the end of the file: not short */
+        __atomic_add_fetch(&short_reads,1,__ATOMIC_RELAXED);
+    } else __atomic_add_fetch(&failed_reads,1,__ATOMIC_RELAXED);
+    const size_t line=__atomic_fetch_add(&read_log_lines,1,__ATOMIC_RELAXED);
+    if (line<READ_LOG_LINES) {
+        const File *f=get(fd);
+        char name[560],position[96]="";
+        if (f && f->path[0]) snprintf(name,sizeof(name),"fd %d \"%s\"",fd,f->path);
+        else snprintf(name,sizeof(name),"fd %d",fd);
+        if (n>=0) snprintf(position,sizeof(position),", file position %lld of %lld",at,length);
+        else if (positional) snprintf(position,sizeof(position),", @%lld",(long long)offset);
+        const uintptr_t first=(uintptr_t)buffer+(n>0 ? (uintptr_t)n : 0);
+        printf("Runtime: %s read #%zu: %s(%s%s) guest %#lx, requested %llu, got %lld, errno %d (%s); "
+               "trap reasons of the first byte not copied (%#lx): %#x\n",
+               n<0 ? "failed" : "short",line+1,positional ? "pread" : "read",name,position,
+               (unsigned long)(uintptr_t)buffer,(unsigned long long)size,(long long)n,n<0 ? err : 0,
+               n<0 ? strerror(err) : "none",(unsigned long)first,runtime_memory_trap_reasons(first));
+        if (line+1==READ_LOG_LINES)
+            printf("Runtime: %d read problems logged; further ones are only counted (failed/short reads in the report)\n",READ_LOG_LINES);
+    }
+    errno=err;
 }
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
-    if (h<0) return -EBADF;
+    if (h<0) { errno=EBADF; note_read(fd,-1,buffer,size,0,0,-1); return -EBADF; }
     runtime_memory_note_write((uintptr_t)buffer,size);
+    void *guard=runtime_memory_io_begin((uintptr_t)buffer,size); /* no granule promotion freezes the pages meanwhile */
     touch_for_write(buffer,size);
     ssize_t n=read_retrying(h,buffer,size,0,0);
+    if (n<0 || (n>0 && (uint64_t)n<size)) note_read(fd,h,buffer,size,0,0,n);
+    runtime_memory_io_end(guard);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -426,10 +483,13 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
-    if (h<0) return -EBADF;
+    if (h<0) { errno=EBADF; note_read(fd,-1,buffer,size,offset,1,-1); return -EBADF; }
     runtime_memory_note_write((uintptr_t)buffer,size);
+    void *guard=runtime_memory_io_begin((uintptr_t)buffer,size);
     touch_for_write(buffer,size);
     ssize_t n=read_retrying(h,buffer,size,offset,1);
+    if (n<0 || (n>0 && (uint64_t)n<size)) note_read(fd,h,buffer,size,offset,1,n);
+    runtime_memory_io_end(guard);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     if (n>0) runtime_memory_note_write((uintptr_t)buffer,(uint64_t)n); /* and once the data is there */
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -632,8 +692,8 @@ int64_t runtime_file_fstat(int fd,void *s) { return do_fstat(fd,s); }
 int64_t runtime_file_getdents(int fd,char *b,uint64_t n,int64_t *base) { return do_getdents(fd,b,n,base); }
 int runtime_file_translate(const char *guest,char *out,size_t size) { return translate(guest,out,size); }
 void runtime_file_report(void) {
-    printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
-           opens,reads,(unsigned long long)bytes_read,writes,missing);
+    printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu, failed reads=%zu, short reads=%zu\n",
+           opens,reads,(unsigned long long)bytes_read,writes,missing,failed_reads,short_reads);
 }
 #else
 uintptr_t runtime_file_resolve(const char *name) { (void)name; return 0; }

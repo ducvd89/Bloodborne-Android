@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include "bbport_toggles.h"
+#include "bbport_tex_home.h"
 
 #include <condition_variable>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -93,6 +95,11 @@ public:
     /// bbport (diagnostics): the images over [addr, addr + size), described briefly.
     std::string DescribeImagesIn(VAddr addr, u64 size);
 
+    /// bbport BB_UMA: an image the GPU writes (render or depth target, storage image, or GPU-modified)
+    /// overlaps [addr, addr + size): memory under it is not the game's data to share. True too when
+    /// the cache is busy (the lock is not taken for long): the answer that keeps a copy.
+    [[nodiscard]] bool OverlapsGpuImage(VAddr addr, u64 size);
+
     /// bbport: changes whenever an image is registered or unregistered.
     [[nodiscard]] u64 RegistryGeneration() const noexcept {
         return registry_generation.load(std::memory_order_acquire);
@@ -112,7 +119,9 @@ public:
     void InvalidateMemory(VAddr addr, size_t size);
 
     /// Marks an image as dirty if it exists at the provided address.
-    void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+    /// bbport: `whole_only`: only an image the write covers whole (a partial write must keep the
+    /// image's other GPU-only texels; upstream bloodborne_pc 0.6 makes that the rule).
+    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool whole_only = false);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -291,6 +300,19 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// bbport BB_TEX_HOME (bbport_tex_home.cpp, docs/ANDROID_UNIFIED_MEMORY_PLAN.md "Plan A"): the
+    /// homing pass of the collector (GPU command thread, the draw pipe drained): verifies re-tiles
+    /// started before and homes what matched, starts a few new ones.
+    void TexHomePass();
+    /// The home `ticket` back in the game's memory, from any thread: inline on the GPU threads,
+    /// else by the GPU command thread while this one waits (`context`: the signal's, or null).
+    /// True when the home is gone afterwards.
+    bool TexHomeRehydrateFrom(u32 ticket, const void* context, BbTexHome::Rebuild why);
+    /// Every home whose image overlaps guest [addr, addr + size) back (any thread, no lock held).
+    void TexHomeRehydrateRange(VAddr addr, u64 size, BbTexHome::Rebuild why);
+    /// A fault on a homed page (BbTexHome::fault_handler).
+    bool TexHomeOnFault(void* context, VAddr addr);
+
     /// bbport: VRAM ran out (BufferCache::AllocateResidency, any thread): for the next 30 s the
     /// collector evicts by submissions under pressure again, as before 0.5, instead of keeping
     /// textures unused for seconds.
@@ -388,6 +410,9 @@ private:
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
+        if (homes_count.load(std::memory_order_relaxed) != 0) {
+            TexHomeOnFree(image_id); // bbport BB_TEX_HOME: its bytes back first
+        }
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -395,6 +420,69 @@ private:
 
     void GarbageCollectImages();
     void GarbageCollectSamplers();
+
+    /// bbport BB_TEX_HOME (bbport_tex_home.cpp).
+    struct HomeRecord {
+        ImageId image_id{};
+        u64 image_uid = 0;
+        VAddr address = 0; ///< the homed pages: [address, address + size), inside the image
+        u64 size = 0;
+        /// The game's padding bytes the re-tile does not have (zeros there): {offset from the
+        /// image's start, length} runs and their bytes, put back on every rebuild.
+        std::vector<std::pair<u32, u32>> patch_runs;
+        std::vector<u8> patch_bytes;
+    };
+    struct HomeVerify {
+        ImageId image_id{};
+        u64 image_uid = 0;
+        u64 tick = 0; ///< the re-tile is in the staging once the GPU is past it
+        u32 stamp = 0;
+        Vulkan::StagingBufferRef staging{}; ///< padding zeros (what a rebuild makes)
+        /// A second re-tile, padding 0xff and tiled bytes no texel lands on 0x5a: bytes that differ
+        /// from the first are padding, or holes (the tiling is not one-to-one there: refused).
+        Vulkan::StagingBufferRef staging_ones{};
+    };
+    /// The home's image re-tiled into the game's memory (a GPU thread, stage B idle or on it).
+    bool TexHomeRehydrate(u32 ticket, BbTexHome::Rebuild why);
+    /// Its home back if the image has one (GPU thread).
+    void TexHomeRehydrateImage(ImageId image_id, BbTexHome::Rebuild why);
+    /// The ticket of the image's home, 0 none.
+    u32 TexHomeTicketOf(ImageId image_id);
+    void TexHomeOnFree(ImageId image_id);
+    /// A new image over [addr, addr + size) (`mutex` held): homed pages there back, on the GPU threads.
+    void TexHomeOnRegister(VAddr addr, u64 size);
+    /// Before UnmapMemory locks: the homes of every image it will free back (any thread).
+    void TexHomeBeforeUnmap(VAddr addr, u64 size);
+    bool TexHomeEligible(const Image& image, u32 now, BbTexHome::Refusal& why);
+    /// The image re-tiled into a host-cached staging buffer, once the commands recorded now have
+    /// run: `fill` where the linear copy has no texel (padding), `hole_fill` where no linear byte
+    /// lands in the tiled layout.
+    Vulkan::StagingBufferRef TexHomeTile(Image& image, bool deferred, u32 fill = 0,
+                                         u32 hole_fill = 0);
+    /// The re-tiles the GPU is done with: compared and homed (or refused).
+    void TexHomeFinish(HomeVerify& verify);
+    /// Homes [begin, end) of the image with `expected` (the re-tile with the patches applied).
+    void TexHomeCommit(HomeVerify& verify, Image& image, VAddr begin, VAddr end, const u8* expected,
+                       std::vector<std::pair<u32, u32>> patch_runs, std::vector<u8> patch_bytes);
+    /// BB_TEX_HOME_LOG=1: one line on an image whose re-tile differed.
+    void TexHomeLogDiff(const Image& image, VAddr begin, VAddr end, const u8* zeros, const u8* ones,
+                        const u8* guest, u64 holes, const char* verdict);
+
+public:
+    /// bbport BB_TEX_HOME_FIRST: the bytes of [addr, addr + size) under registered sampled textures
+    /// (any thread; nullopt when the cache is busy).
+    std::optional<u64> SampledTextureBytes(VAddr addr, u64 size);
+
+private:
+    /// After `mutex`, the runtime's lock after it. Recursive: a rebuild's Finish() may run deferred
+    /// work that writes guest memory, which may ask for another rebuild on this thread.
+    std::recursive_mutex home_mutex;
+    tsl::robin_map<u32, HomeRecord> homes;  ///< by ticket
+    tsl::robin_map<u32, u32> home_of_image; ///< ImageId index -> ticket
+    std::atomic<u32> homes_count{0};
+    std::vector<HomeVerify> home_verifies; ///< `mutex`
+    u32 home_cursor = 0;
+    std::chrono::steady_clock::time_point home_last_scan{};
 
 private:
     const Vulkan::Instance& instance;

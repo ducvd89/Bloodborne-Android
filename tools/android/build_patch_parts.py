@@ -111,6 +111,11 @@ def main():
     text = args.eboot.read_bytes()[0x4000:0x4000 + 0x50d96dc]  # the code segment (offset 0x4000, vaddr 0)
     write(args.out / 'cheats.bin', cheat_writes(text))
     count += 1
+    # The GX per-frame command heaps 256 KiB -> 1 MiB (upstream bloodborne_pc #162, PR #224): a full
+    # heap returned NULL to code that writes through it unchecked (a guest fault at 0x2199310).
+    write(args.out / 'gx-heap.bin',
+          patches.compile_patches(args.xml, ['Larger GX Per-Frame Command Heap'], args.app_version, segments))
+    count += 1
     write(args.out / 'res-scene.bin',
           patches.resolution_writes(args.xml, SCENE_TEMPLATE, args.app_version, segments))
     write(args.out / 'graphics-heap.bin',

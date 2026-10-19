@@ -20,6 +20,7 @@
 #include <queue>
 
 #include "bbport_toggles.h"
+#include "bbport_wait.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -1018,6 +1019,7 @@ public:
         RecordOrdered([copy = std::forward<Func>(copy), this, seq = ++host_copies_issued] {
             copy();
             host_copies_done.store(seq, std::memory_order_release);
+            host_copies_event.Notify();
         });
     }
 
@@ -1343,6 +1345,7 @@ private:
     std::unique_ptr<CommandPool> direct_pool; ///< used by the producer thread only
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
+    BbWait::Event host_copies_event; ///< WaitHostCopies sleeps on it for host_copies_done
     /// Host copy sources by 64 KiB granule in a direct-mapped table: a slot is pending while its
     /// note is newer than the last completed WaitHostCopies; a slot two granules share is a
     /// wildcard (any granule mapping there counts as pending).

@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <thread>
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
 #include "bbport_free_check.h"
 #include "bbport_gc_budget.h"
+#include "bbport_guest_memory.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -85,6 +87,27 @@ std::string TextureCache::DescribeImagesIn(VAddr addr, u64 size) {
         out += fmt::format(" +{} more", shown - 3);
     }
     return out;
+}
+
+bool TextureCache::OverlapsGpuImage(VAddr addr, u64 size) {
+    // The binding thread asks; the texture binding helper and the fault handlers hold the lock for
+    // short stretches, and no caller of this holds it: a bounded wait, then "can't tell".
+    std::unique_lock lock{mutex, std::defer_lock};
+    for (int attempt = 0; attempt < 256 && !lock.owns_lock(); ++attempt) {
+        if (!lock.try_lock()) {
+            std::this_thread::yield();
+        }
+    }
+    if (!lock.owns_lock()) {
+        return true;
+    }
+    bool overlaps = false;
+    ForEachImageInRegion(addr, size, [&](ImageId, Image& image) {
+        overlaps = True(image.flags & ImageFlagBits::GpuModified) || image.usage.render_target ||
+                   image.usage.depth_target || image.usage.storage || image.gpu_write_tick != 0;
+        return overlaps;
+    });
+    return overlaps;
 }
 
 void TextureCache::ProcessDownloadImages() {
@@ -242,7 +265,7 @@ void TextureCache::WatchImage(const Image& image, const char* what) {
     }
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool whole_only) {
     std::scoped_lock lock{mutex};
     // bbport: only an image starting at `address` is affected, so the images over its first byte
     // are all there is to look at (the whole range was walked for every GPU write binding).
@@ -260,7 +283,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
-        if (image.info.guest_address != address) {
+        if (image.info.guest_address != address || (whole_only && image.info.guest_size > max_size)) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
@@ -270,6 +293,12 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
+    // bbport BB_TEX_HOME: homes in the range back first, without the lock (from a guest thread the GPU
+    // command thread does it, and it may need the lock meanwhile). The memory may stay allocated and
+    // be mapped again; released memory comes here after its homes are gone (nothing to do then).
+    if (homes_count.load(std::memory_order_relaxed) != 0) {
+        TexHomeBeforeUnmap(cpu_addr, size);
+    }
     std::scoped_lock lk{mutex};
 
     ImageIds deleted_images;
@@ -772,8 +801,12 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
     Image& image = slot_images[image_id];
     WatchImage(image, refresh ? "texture (refresh)" : "texture (no refresh)");
     if (desc.type == BindingType::Storage) {
+        if (homes_count.load(std::memory_order_relaxed) != 0) {
+            TexHomeRehydrateImage(image_id, BbTexHome::ByGpuWrite);
+        }
         image.flags |= ImageFlagBits::GpuModified;
         image.gpu_write_tick = scheduler.CurrentTick();
+        image.NoteGpuWritten();
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
@@ -803,8 +836,12 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     WatchImage(image, "render target");
+    if (homes_count.load(std::memory_order_relaxed) != 0) {
+        TexHomeRehydrateImage(image_id, BbTexHome::ByGpuWrite);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     image.gpu_write_tick = scheduler.CurrentTick();
+    image.NoteGpuWritten();
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
@@ -832,8 +869,12 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     WatchImage(image, "depth target");
+    if (homes_count.load(std::memory_order_relaxed) != 0) {
+        TexHomeRehydrateImage(image_id, BbTexHome::ByGpuWrite);
+    }
     image.flags |= ImageFlagBits::GpuModified;
     image.gpu_write_tick = scheduler.CurrentTick();
+    image.NoteGpuWritten();
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
@@ -875,6 +916,10 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    // bbport BB_TEX_HOME: when the game's bytes were last taken (homing waits BB_TEX_HOME_IDLE_S).
+    image.tex_home_stamp = u32(std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count()) | 1u;
     BbStats::Timer timer{BbStats::t_refresh};
 
     RENDERER_TRACE;
@@ -958,10 +1003,15 @@ void TextureCache::RefreshImage(Image& image) {
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
 
         // Protect GPU modified resources from accidental CPU reuploads.
-        if (is_gpu_modified && !is_gpu_dirty) {
+        // bbport: every upload of such an image keeps the hashes, the first one too (a new image
+        // is GpuDirty): else the first refresh after the GPU wrote it (a CPU write elsewhere in
+        // its page) found no hash and uploaded unchanged memory over the GPU's data. The character
+        // creator's exposure (1x1, written by a compute shader) went to 0: no character (upstream
+        // bloodborne_pc #178).
+        if (is_gpu_modified) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
             const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
-            if (image.mip_hashes[m] == hash) {
+            if (!is_gpu_dirty && image.mip_hashes[m] == hash) {
                 continue;
             }
             image.mip_hashes[m] = hash;
@@ -1036,6 +1086,11 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.lru_touched_tick = gc_tick;
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+    // bbport BB_TEX_HOME: a new image over homed pages will read them (and homes have no other image
+    // over them): back first, on the GPU threads (elsewhere the reads themselves bring them back).
+    if (homes_count.load(std::memory_order_relaxed) != 0) {
+        TexHomeOnRegister(image.info.guest_address, image.info.guest_size);
+    }
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
@@ -1176,6 +1231,11 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
+        // bbport: memory shared with the CPU (BB_UMA granules; v1's chunks) is the game's data, not
+        // the textures' or buffers' VRAM: it would keep the usage over the trigger for good.
+        const u64 shared = BbGuestMemory::UmaSharedBytes() +
+                           (BbGuestMemory::Unified() ? BbGuestMemory::ChunkBytes() : 0);
+        total_used_memory = total_used_memory > shared ? total_used_memory - shared : 0;
         // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
         // much more than images (buffers backing guest memory), and the startup budget left
         // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
@@ -1274,6 +1334,14 @@ void TextureCache::GarbageCollectImages() {
             return true;
         }
         auto& image = slot_images[image_id];
+        // bbport BB_TEX_HOME: a homed image holds the only copy of its bytes: kept unless over the
+        // critical mark, where FreeImage re-tiles it into the game's memory first.
+        if (homes_count.load(std::memory_order_relaxed) != 0 && !aggresive &&
+            TexHomeTicketOf(image_id) != 0) {
+            lru_cache.Touch(image.lru_id, gc_tick);
+            BbStats::gc_kept_images.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
         // bbport: images that cannot go now (GPU-written: their contents exist only here, and
@@ -1394,6 +1462,7 @@ void TextureCache::RunGarbageCollector() {
 
     GarbageCollectImages();
     GarbageCollectSamplers();
+    TexHomePass(); // bbport BB_TEX_HOME
 }
 
 void TextureCache::TouchImage(const Image& image) {

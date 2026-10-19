@@ -16,12 +16,18 @@ namespace BbLayer::WriteTraps {
 enum Reason : unsigned {
     Mirror = 1, ///< a VRAM copy of the page (the layer's memory module)
     Image = 2,  ///< an image made from the page (the texture cache)
+    /// bbport BB_UMA: a one-shot trap on memory bound in place through a shared granule's buffer;
+    /// the first CPU write marks its 64 KiB block dynamic (copies) and lifts it (BbUma::Dynamic).
+    UmaWatch = 4,
     /// Reads too: occlusion counters, until the game's first access after an event there
     /// (BB_OCCLUSION_READ_TRACE, diagnostics).
     QueryReads = 16,
     /// Reads too: the GPU wrote the page's newest data into a VRAM copy only; copied back into
     /// the game's memory on the first CPU access (BB_LAYER_READ_TRAPS).
     VramData = 32,
+    /// Reads too: the page's bytes live only in a GPU image (BB_TEX_HOME, BbTexHome); re-tiled into
+    /// the game's memory on the first access (TextureCache::TexHomeOnFault).
+    TexHome = 64,
 };
 /// Reasons that make a page no access, not only read-only.
 inline constexpr unsigned NoAccess = 0xf0;

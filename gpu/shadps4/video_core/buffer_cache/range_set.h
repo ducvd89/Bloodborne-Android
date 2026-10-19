@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <mutex>
+#include <utility>
+#include <boost/container/small_vector.hpp>
 #include <boost/icl/discrete_interval.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/split_interval_map.hpp>
@@ -111,6 +114,64 @@ struct RangeSet {
     }
 
     IntervalSet m_ranges_set;
+};
+
+/// bbport: a RangeSet several threads use (BufferCache::gpu_modified_ranges: the draw recording
+/// thread adds GPU-written bindings while the GPU command thread reads and subtracts ranges,
+/// also from the write-fault handler). Every operation holds `mutex`, and only for the boost
+/// container itself: ForEachInRange copies the intervals under it and calls `func` after it is
+/// released, so the callbacks may use the set again, and the lock is never held while guest
+/// memory is touched (a fault on this thread then cannot find it held: no deadlock in the
+/// fault handler).
+struct LockedRangeSet {
+    void Add(VAddr base_address, size_t size) {
+        std::scoped_lock lk{mutex};
+        set.Add(base_address, size);
+    }
+    void Subtract(VAddr base_address, size_t size) {
+        std::scoped_lock lk{mutex};
+        set.Subtract(base_address, size);
+    }
+    bool Intersects(VAddr base_address, size_t size) const {
+        std::scoped_lock lk{mutex};
+        return set.Intersects(base_address, size);
+    }
+    bool Contains(VAddr base_address, size_t size) const {
+        std::scoped_lock lk{mutex};
+        return set.Contains(base_address, size);
+    }
+    /// `func(start, end)` for the parts of the set in the range, as it was when called.
+    template <typename Func>
+    void ForEachInRange(VAddr base_addr, size_t size, Func&& func) const {
+        Snapshot parts;
+        {
+            std::scoped_lock lk{mutex};
+            set.ForEachInRange(base_addr, size,
+                               [&](VAddr start, VAddr end) { parts.emplace_back(start, end); });
+        }
+        for (const auto& [start, end] : parts) {
+            func(start, end);
+        }
+    }
+    /// ForEachInRange and Subtract of the range as one step: no range added in between is lost.
+    template <typename Func>
+    void TakeInRange(VAddr base_addr, size_t size, Func&& func) {
+        Snapshot parts;
+        {
+            std::scoped_lock lk{mutex};
+            set.ForEachInRange(base_addr, size,
+                               [&](VAddr start, VAddr end) { parts.emplace_back(start, end); });
+            set.Subtract(base_addr, size);
+        }
+        for (const auto& [start, end] : parts) {
+            func(start, end);
+        }
+    }
+
+private:
+    using Snapshot = boost::container::small_vector<std::pair<VAddr, VAddr>, 16>;
+    mutable std::mutex mutex;
+    RangeSet set;
 };
 
 template <typename T>

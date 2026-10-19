@@ -87,6 +87,9 @@ struct ImageInfo {
     u32 guest_size{};
     u8 bank_swizzle{};
     bool alt_tile{};
+    /// bbport (BB_TEX_HOME_LOG diagnostics): the T#'s data and number formats (0 for targets).
+    u8 guest_data_format{};
+    u8 guest_number_format{};
 
     VAddr stencil_addr{};
     u32 stencil_size{};

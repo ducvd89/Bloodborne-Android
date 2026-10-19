@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
+#include <bit>
+#include <cstdlib>
+
 #include "common/bit_array.h"
 #include "common/types.h"
 
@@ -22,5 +26,17 @@ enum class Type {
 };
 
 using RegionBits = Common::BitArray<NUM_PAGES_PER_REGION>;
+
+/// bbport: BB_FAULT_WINDOW (KiB, default 256, power of two from 4 to 1024): the aligned window around
+/// a write fault that is unprotected at once (BufferCache::ExtendWriteFault), and the unit in which
+/// RegionManager promotes hot pages.
+inline u64 FaultWindowBytesFromEnv() {
+    static const u64 window = [] {
+        const char* env = std::getenv("BB_FAULT_WINDOW");
+        const u64 kib = env ? std::strtoull(env, nullptr, 10) : 256;
+        return std::bit_ceil(std::clamp<u64>(kib, 4, 1024)) * 1024;
+    }();
+    return window;
+}
 
 } // namespace VideoCore

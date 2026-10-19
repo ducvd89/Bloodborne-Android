@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_copy.h"
 #include "bbport_threads.h"
+#include "bbport_wait.h"
 
 #include <algorithm>
 #include <atomic>
@@ -57,6 +58,7 @@ public:
             ++epochs.back().pending;
             ++pending;
             async_tasks.push_back({std::move(task), epoch});
+            NoteChange(); // WaitAll() helps with it
         }
         cv.notify_one();
     }
@@ -75,6 +77,10 @@ public:
     }
 
     void WaitAll() {
+        if (!BbWait::Spinning()) {
+            WaitAllBlocking();
+            return;
+        }
         // The waiting thread helps instead of only spinning.
         while (true) {
             Task task;
@@ -108,8 +114,15 @@ public:
         cv.notify_all();
         Work(*job);
         // Workers only call the task for indices below count, all done before this returns.
-        while (job->done.load(std::memory_order_acquire) < count) {
-            std::this_thread::yield();
+        if (BbWait::Spinning()) {
+            while (job->done.load(std::memory_order_acquire) < count) {
+                std::this_thread::yield();
+            }
+        } else {
+            // bbport: spin briefly, then sleep until the worker finishing the last index wakes us.
+            BbWait::SpinThenWait(job->done_event, [&job, count] {
+                return job->done.load(std::memory_order_acquire) >= count;
+            });
         }
         std::scoped_lock lk{mutex};
         if (current == job) {
@@ -133,7 +146,55 @@ private:
         std::size_t count{};
         std::atomic<std::size_t> next{0};
         std::atomic<std::size_t> done{0};
+        BbWait::Event done_event; ///< Run() sleeps on it until done == count
     };
+
+    /// bbport: WaitAll() without yield loops: helps with queued tasks, spins briefly for a change
+    /// of the pool's state, then sleeps on idle_cv until one (Async, Complete) notifies.
+    void WaitAllBlocking() {
+        std::unique_lock lk{mutex};
+        std::uint64_t spin_until = 0;
+        while (true) {
+            if (pending == 0 && epochs.size() == 1 && !draining) {
+                return;
+            }
+            if (!async_tasks.empty()) {
+                Task task = std::move(async_tasks.front());
+                async_tasks.pop_front();
+                lk.unlock();
+                RunAsync(task);
+                lk.lock();
+                continue;
+            }
+            if (!spin_until) {
+                spin_until = BbCpu::Cycles() + BbWait::SpinCycles();
+            }
+            if (const std::uint64_t now = BbCpu::Cycles(); now < spin_until) {
+                // State changes are made under the mutex and counted in `changes`.
+                const std::uint32_t seen = changes.load(std::memory_order_relaxed);
+                lk.unlock();
+                BbWait::SpinFor(spin_until - now, [this, seen] {
+                    return changes.load(std::memory_order_acquire) != seen;
+                });
+                lk.lock();
+                continue;
+            }
+            ++idle_waiters;
+            idle_cv.wait(lk); // the loop re-checks the state
+            --idle_waiters;
+        }
+    }
+
+    /// Under the mutex, after a change WaitAllBlocking() waits for.
+    void NoteChange() {
+        if (BbWait::Spinning()) {
+            return;
+        }
+        changes.fetch_add(1, std::memory_order_release);
+        if (idle_waiters) {
+            idle_cv.notify_all();
+        }
+    }
 
     void RunAsync(Task& task) {
         const bool was = in_copy_thread;
@@ -172,6 +233,7 @@ private:
             lk.lock();
         }
         draining = false;
+        NoteChange();
     }
 
     static void Work(Job& job) {
@@ -179,7 +241,9 @@ private:
         in_copy_thread = true;
         for (std::size_t i; (i = job.next.fetch_add(1, std::memory_order_relaxed)) < job.count;) {
             (*job.task)(i);
-            job.done.fetch_add(1, std::memory_order_release);
+            if (job.done.fetch_add(1, std::memory_order_release) + 1 == job.count) {
+                job.done_event.Notify();
+            }
         }
         in_copy_thread = was;
     }
@@ -214,6 +278,9 @@ private:
     std::vector<std::thread> threads;
     std::mutex mutex;
     std::condition_variable cv;
+    std::condition_variable idle_cv;      ///< WaitAllBlocking() sleeps on it
+    unsigned idle_waiters = 0;            ///< threads in idle_cv.wait (under the mutex)
+    std::atomic<std::uint32_t> changes{0}; ///< NoteChange() count (spin phase of WaitAll)
     std::shared_ptr<Job> current;
     u64 generation = 0;
     bool stop = false;

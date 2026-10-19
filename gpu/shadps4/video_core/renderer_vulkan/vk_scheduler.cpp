@@ -17,6 +17,7 @@
 
 #include "bbport_copy.h"
 #include "bbport_cpu.h"
+#include "bbport_wait.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "bbport_toggles.h"
 #include "bbport_wait_trace.h"
@@ -786,6 +787,11 @@ std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
     return chunk;
 }
 
+namespace {
+/// WaitDeferredSignals sleeps on it for deferred_signals_done (notified by every signal).
+BbWait::Event deferred_signals_event;
+} // namespace
+
 void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
     // A direct segment queues it too: signals queued before it must not be overtaken.
     if (!IsRecordingDeferred() && !direct_segment) {
@@ -799,6 +805,7 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
         BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
             signal();
             done->fetch_add(1, std::memory_order_release);
+            deferred_signals_event.Notify();
         });
     });
     // bbport: an open hoist window keeps its chunks, and the signal stays queued with them (the
@@ -831,10 +838,18 @@ void Scheduler::WaitDeferredSignals() {
     }
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
     KickRecording(true);
-    while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
+    const auto signalled = [&] {
+        return deferred_signals_done->load(std::memory_order_acquire) >= issued;
+    };
+    while (!signalled()) {
         // Helps the copy threads the signals wait for.
         BbCopy::WaitAsync();
-        std::this_thread::yield();
+        if (BbWait::Spinning()) {
+            std::this_thread::yield();
+        } else if (!BbWait::SpinFor(BbWait::SpinCycles(), signalled)) {
+            // bbport: sleeps until a signal ran; after 1 ms helps the copy threads again.
+            deferred_signals_event.Wait(signalled, 1'000'000);
+        }
     }
 }
 
@@ -910,8 +925,15 @@ void Scheduler::WaitHostCopies() {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
-        while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-            std::this_thread::yield();
+        if (BbWait::Spinning()) {
+            while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+                std::this_thread::yield();
+            }
+        } else {
+            // bbport: spin briefly, then sleep until the recording thread ran the copies.
+            BbWait::SpinThenWait(host_copies_event, [this] {
+                return host_copies_done.load(std::memory_order_acquire) >= host_copies_issued;
+            });
         }
     }
     BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
@@ -1209,16 +1231,24 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
         // a wake-up syscall per kick. With few hardware threads (Steam Deck: 8) the spin would
         // take time from guest threads. The others sleep until a new segment reaches them.
         if (active_worker.load(std::memory_order_relaxed) == index) {
-            static const auto spin_time =
-                std::chrono::microseconds(BbThreads::Available() >= 12 ? 200 : 20);
-            const auto spin_until = std::chrono::steady_clock::now() + spin_time;
+            // bbport: BB_SPIN_US by default (BB_SPIN_WAITS=1: the old 200/20 us), timed with
+            // the cycle counter (clock_gettime showed up at ~6% of this thread).
+            static const bool spin_waits = BbWait::Spinning();
+            static const auto spin_time = std::chrono::microseconds(
+                spin_waits ? (BbThreads::Available() >= 12 ? 200 : 20) : BbWait::SpinMicros());
+            static const u64 spin_cycles = BbCpu::MicrosToCycles(spin_time.count());
+            const auto spin_until = spin_waits ? std::chrono::steady_clock::now() + spin_time
+                                               : std::chrono::steady_clock::time_point{};
+            const u64 spin_until_cycles = spin_waits ? 0 : BbCpu::Cycles() + spin_cycles;
             for (u32 spins = 1; worker.queued.load(std::memory_order_acquire) == 0 &&
                                 ordered_queued.load(std::memory_order_acquire) == 0;
                  ++spins) {
                 BbCpu::Pause();
                 // The clock is read every 256 pauses, not per iteration.
                 if (!(spins & 255) &&
-                    (stoken.stop_requested() || std::chrono::steady_clock::now() >= spin_until)) {
+                    (stoken.stop_requested() ||
+                     (spin_waits ? std::chrono::steady_clock::now() >= spin_until
+                                 : BbCpu::Cycles() >= spin_until_cycles))) {
                     break;
                 }
             }
@@ -1521,9 +1551,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Four like SubmitAsync: SubmitInfo takes up to four waits (the third and fourth are the extra
     // binary semaphores of the presenter, e.g. Lossless Scaling's batch-complete).
+    // bbport: every wait covers its earliest consumer whatever its index: a prepared frame is
+    // first read by the present blit (Transfer), which a wait at ColorAttachmentOutput did not
+    // hold back (single black or grey frames; upstream bloodborne_pc 0.6).
     static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eAllCommands,
     };
@@ -1605,9 +1638,10 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
         }
         recorded_segments.fetch_add(num_cmdbufs, std::memory_order_relaxed);
         recorded_submissions.fetch_add(1, std::memory_order_relaxed);
+        // bbport: AllCommands for every wait, as in SubmitExecution.
         static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
             vk::PipelineStageFlagBits::eAllCommands,
-            vk::PipelineStageFlagBits::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits::eAllCommands,
             vk::PipelineStageFlagBits::eAllCommands,
             vk::PipelineStageFlagBits::eAllCommands,
         };

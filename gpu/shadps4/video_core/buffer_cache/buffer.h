@@ -30,7 +30,8 @@ namespace VideoCore {
 
 namespace Detail {
 /// bbport: GuestInPlace() and WriteTracking() once known (every buffer binding asks): 0 not yet,
-/// 1 on, 2 off.
+/// 1 on, 2 off. guest_in_place 3: BB_UMA (UmaActive): the in-place model is off (copy mode),
+/// bindings in shared granules go through the granules' own buffers.
 inline std::atomic<u8> guest_in_place{0}, write_tracking{0};
 inline std::atomic<bool> non_sparse_arenas{false};
 bool ComputeGuestInPlace();
@@ -46,11 +47,28 @@ inline bool NonSparseArenas() {
 
 /// bbport BB_GUEST_IN_PLACE=1: the GPU uses the game's direct memory where it is (the arena is bound to
 /// the Vulkan chunks it lives in, gpu/shim/bbport_guest_memory.cpp) instead of copies in VRAM.
+/// Off under BB_UMA: unified memory v2 is copy mode except for its shared granules (UmaActive).
 inline bool GuestInPlace() {
     const u8 state = Detail::guest_in_place.load(std::memory_order_relaxed);
     return state != 0 ? state == 1 : Detail::ComputeGuestInPlace();
 }
-/// The driver cannot bind guest memory to the arena: BB_GUEST_IN_PLACE stays off from now on.
+/// bbport BB_UMA=1 (with BB_GUEST_IN_PLACE=1): the buffer cache is in copy mode (GuestInPlace() is
+/// false), and read-only bindings of an enabled class that lie in one granule shared with the GPU
+/// are bound through that granule's own buffer instead of the arena (ObtainBuffer, UmaDirect;
+/// docs/ANDROID_UNIFIED_MEMORY_PLAN.md). The arena never binds shared memory (sparse binding of
+/// dma-buf memory hard-reset the phone on KGSL). Before the buffer cache ran the UMA probes (Usable)
+/// this is "requested"; a failed probe or a refusal turns it off (DisableGuestInPlace) before
+/// anything is shared.
+inline bool UmaActive() {
+    u8 state = Detail::guest_in_place.load(std::memory_order_relaxed);
+    if (state == 0) {
+        (void)Detail::ComputeGuestInPlace();
+        state = Detail::guest_in_place.load(std::memory_order_relaxed);
+    }
+    return state == 3;
+}
+/// The driver cannot bind guest memory to the arena (or a UMA probe failed): BB_GUEST_IN_PLACE (and
+/// BB_UMA) stays off from now on.
 void DisableGuestInPlace();
 /// Whether CPU writes to GPU memory are caught by page protection. Off with BB_GUEST_IN_PLACE: the
 /// GPU side learns of writes from the writers (file reads, the game's resource loaders, its own

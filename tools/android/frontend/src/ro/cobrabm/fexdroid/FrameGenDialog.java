@@ -187,14 +187,13 @@ final class FrameGenDialog {
         return -1;
     }
 
-    /** "multiplier=2\nflow=0.75\nperformance=1\nfp16=1\n" (multiplier 0: off), written whole then renamed so the
-     *  game never reads half of it. */
+    /** "multiplier=2\nflow=0.75\nperformance=1\nfp16=1\n" (multiplier 0: off), written whole and synced, then renamed so
+     *  the game never reads half of it. */
     private static boolean writeState(File state,int multiplier,String flow,boolean performance,boolean fp16) {
-        File temporary=new File(state.getPath()+".tmp");
-        try (Writer w=new OutputStreamWriter(new FileOutputStream(temporary),"UTF-8")) {
-            w.write("multiplier="+multiplier+"\nflow="+flow+"\nperformance="+(performance ? 1 : 0)
+        try {
+            SafeWrite.write(state,"multiplier="+multiplier+"\nflow="+flow+"\nperformance="+(performance ? 1 : 0)
                 +"\nfp16="+(fp16 ? 1 : 0)+"\n");
         } catch (Exception ex) { android.util.Log.e("Bloodborne","lsfg state: "+ex); return false; }
-        return temporary.renameTo(state);
+        return true;
     }
 }

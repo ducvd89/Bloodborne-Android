@@ -10,6 +10,7 @@
 #include <chrono>
 #include <thread>
 #include "bbport_cpu.h"
+#include "bbport_wait.h"
 
 #include "common/thread.h"
 #include "common/types.h"
@@ -67,8 +68,15 @@ public:
         const u64 target = posted.load(std::memory_order_relaxed);
         if (done.load(std::memory_order_acquire) != target) {
             const u64 start = BbCpu::Cycles();
-            while (done.load(std::memory_order_acquire) != target) {
-                BbCpu::Pause();
+            if (BbWait::Spinning()) {
+                while (done.load(std::memory_order_acquire) != target) {
+                    BbCpu::Pause();
+                }
+            } else {
+                // bbport: spin briefly, then sleep until the helper publishes `done`.
+                BbWait::SpinThenWait(done_event, [this, target] {
+                    return done.load(std::memory_order_acquire) == target;
+                });
             }
             wait_cycles += BbCpu::Cycles() - start;
         }
@@ -87,11 +95,18 @@ private:
         while (!stop.stop_requested()) {
             // Draws arrive every few microseconds while a frame is recorded: spin, and sleep
             // only after a pause longer than that (between frames).
-            const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+            // bbport: BB_SPIN_US by default (BB_SPIN_WAITS=1: the old 100 us), timed with the
+            // cycle counter instead of the clock.
+            static const bool spin_waits = BbWait::Spinning();
+            const auto spin_until = spin_waits ? std::chrono::steady_clock::now() +
+                                                     std::chrono::microseconds(100)
+                                               : std::chrono::steady_clock::time_point{};
+            const u64 spin_until_cycles = spin_waits ? 0 : BbCpu::Cycles() + BbWait::SpinCycles();
             u64 now = posted.load(std::memory_order_acquire);
             for (u32 spins = 1; now == seen; ++spins) {
                 BbCpu::Pause();
-                if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                if (!(spins & 255) && (spin_waits ? std::chrono::steady_clock::now() >= spin_until
+                                                  : BbCpu::Cycles() >= spin_until_cycles)) {
                     sleeping.store(true, std::memory_order_seq_cst);
                     posted.wait(seen, std::memory_order_seq_cst);
                     sleeping.store(false, std::memory_order_relaxed);
@@ -106,6 +121,7 @@ private:
             task(context);
             task_cycles.fetch_add(BbCpu::Cycles() - start, std::memory_order_relaxed);
             done.store(seen, std::memory_order_release);
+            done_event.Notify();
         }
     }
 
@@ -115,6 +131,7 @@ private:
     bool active = false;
     alignas(64) std::atomic<u64> posted{0};
     alignas(64) std::atomic<u64> done{0};
+    BbWait::Event done_event; ///< Join() sleeps on it for `done`
     alignas(64) std::atomic<bool> sleeping{false};
     std::jthread thread;
 };

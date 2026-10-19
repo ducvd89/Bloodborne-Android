@@ -24,7 +24,8 @@ final class DebugDialog {
         {"debug_fault_smart_drain","Wait for the GPU only when needed","Off: wait for the GPU on every caught write.","1"},
         {"debug_fault_sleep_lock","Sleeping lock in the fault handler","Off: a spinning lock instead.","1"},
     };
-    private static final String[][] MEMORY={
+    private static final String[][] EXPERIMENTAL={
+        {"unified_memory","Unified memory","The game's buffers (vertex and index data) are shared with the GPU in place instead of copied: less RAM; textures stay copies. Adreno only; other GPUs and drivers that fail the start-up checks keep copies (see the log). Turn off if you see crashes or glitches.","1"},
         {"debug_vram_copy_queue","Free old GPU memory (FIFO)","Keeps GPU copies of game memory under a cap: once it is reached, throws away the oldest copies not used for 20 s, so memory stops growing on long sessions. Turn off if you see missing geometry or stutter.","1"},
     };
     /** The cap of the FIFO above, in MB: a single choice, used only while that switch is on. */
@@ -111,15 +112,15 @@ final class DebugDialog {
         heading(box,"Write-fault tracking");
         note(box,"How the game's writes to GPU memory are tracked.");
         add(box,FAULT,ini,switches);
-        heading(box,"GPU memory");
-        add(box,MEMORY,ini,switches);
+        heading(box,"Experimental");
+        add(box,EXPERIMENTAL,ini,switches);
         final RadioGroup cap=addCap(box,ini,switches.get(CAP_SWITCH));
         heading(box,"Diagnostics");
         add(box,DIAGNOSTICS,ini,switches);
 
         Button reset=new Button(activity); reset.setText("Reset to defaults"); reset.setAllCaps(false);
         reset.setOnClickListener(v -> {
-            for (String[][] group:new String[][][]{FAULT,MEMORY,DIAGNOSTICS})
+            for (String[][] group:new String[][][]{FAULT,EXPERIMENTAL,DIAGNOSTICS})
                 for (String[] item:group) switches.get(item[0]).setChecked(item[3].equals("1"));
             ((RadioButton)cap.getChildAt(capIndex(CAP_DEFAULT))).setChecked(true);
         });
@@ -149,7 +150,7 @@ final class DebugDialog {
     }
 
     private static String[] find(String key) {
-        for (String[][] group:new String[][][]{FAULT,MEMORY,DIAGNOSTICS})
+        for (String[][] group:new String[][][]{FAULT,EXPERIMENTAL,DIAGNOSTICS})
             for (String[] item:group) if (item[0].equals(key)) return item;
         throw new IllegalArgumentException(key);
     }

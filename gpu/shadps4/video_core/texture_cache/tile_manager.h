@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <boost/container_hash/hash.hpp>
@@ -46,8 +47,12 @@ public:
                          Vulkan::Runtime& runtime, StreamBuffer& stream_buffer);
     ~TileManager();
 
+    /// `linear_fill` (bbport BB_TEX_HOME): the linear copy of the image is filled with this 32-bit
+    /// value first, so bytes no texel covers (pitch and height padding, small mips) hold it, the same
+    /// on every re-tile.
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
-                   const VideoCore::Buffer* out_buffer, u64 out_offset);
+                   const VideoCore::Buffer* out_buffer, u64 out_offset,
+                   std::optional<u32> linear_fill = std::nullopt);
 
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
                                               const ImageInfo& info);

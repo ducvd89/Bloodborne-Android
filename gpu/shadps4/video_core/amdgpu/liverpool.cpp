@@ -12,6 +12,7 @@
 #include <utility>
 #include <time.h>
 #include "bbport_cpu.h"
+#include "bbport_wait.h"
 #include "bbport_threads.h"
 #include "bbport_ce_stats.h"
 #include "bbport_timeline.h"
@@ -124,6 +125,9 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    // bbport BB_GPUCOMM_CPUS (e.g. 7, the Thor's prime core): this thread is in every frame's
+    // critical path but light once it waits instead of spinning.
+    BbThreads::PinFromEnv("BB_GPUCOMM_CPUS", "the GPU command processor");
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
@@ -133,6 +137,7 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
 
     while (!stoken.stop_requested()) {
+        BbThreads::KeepPinned(); // BB_GPUCOMM_CPUS after Android moved the app between cpusets
         // BB_HONEST_LABELS: fences (and GPU idle) wait for work not submitted yet. Submitted once
         // this thread has had nothing to do for 0.2 ms: the guest may be waiting for them.
         // BB_PIPE_SIGNALS: signals may still be on their way to the recording thread (tasks).
@@ -162,20 +167,28 @@ void Liverpool::Process(std::stop_token stoken) {
             BbTimeline::Note(BbTimeline::DecoderIdleBegin);
             // bbport: the game submits a frame in ~20 parts: waking from the condition variable for
             // each took tens of microseconds on the way to the GPU. Spins first, with cores to spare
-            // (BB_GPU_SPIN_US, default 200 with 12+ hardware threads, else 0).
+            // (BB_GPU_SPIN_US, default 200 with 12+ hardware threads, else 0). bbport: BB_SPIN_US
+            // instead of 200 (BB_SPIN_WAITS=1: 200), timed with the cycle counter.
+            static const bool spin_waits = BbWait::Spinning();
             static const auto spin_time = std::chrono::microseconds([] {
                 if (const char* env = std::getenv("BB_GPU_SPIN_US")) {
                     return std::max(0, std::atoi(env));
                 }
-                return BbThreads::Available() >= 12 ? 200 : 0;
+                if (BbThreads::Available() < 12) {
+                    return 0;
+                }
+                return spin_waits ? 200 : static_cast<int>(BbWait::SpinMicros());
             }());
             if (spin_time.count() > 0) {
+                static const u64 spin_cycles = BbCpu::MicrosToCycles(spin_time.count());
                 const auto spin_until = idle_start + spin_time;
+                const u64 spin_until_cycles = BbCpu::Cycles() + spin_cycles;
                 for (u32 spins = 1; !(num_commands || num_submits || submit_done) &&
                                     !stoken.stop_requested();
                      ++spins) {
                     BbCpu::Pause();
-                    if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
+                    if (!(spins & 255) && (spin_waits ? std::chrono::steady_clock::now() >= spin_until
+                                                      : BbCpu::Cycles() >= spin_until_cycles)) {
                         break;
                     }
                 }
@@ -827,6 +840,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            // bbport: a finished nested task stays suspended at final_suspend and nothing else
+            // frees its coroutine frame (one leaked per nested buffer; shadPS4 #5258, upstream
+            // bloodborne_pc PR #226).
+            task.handle.destroy();
             break;
         }
         default:
@@ -1415,6 +1432,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 YIELD_GFX();
                 RESUME_GFX(task);
             }
+            task.handle.destroy(); // bbport: the finished nested task's frame (as IndirectBuffer)
         }
     }
 
@@ -2147,6 +2165,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         ++g_dcb_stats.wait_outcome[0];
                     }
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
                 // bbport: a fence handed to the draw recording thread counts as written: that
@@ -2159,6 +2178,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (dcb_stats) {
                         ++g_dcb_stats.wait_outcome[1];
                     }
+                    // bbport: no hot_epoch bump here: the value is a GPU-side fence, not a CPU store.
                     break;
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
@@ -2177,6 +2197,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     YIELD_GFX();
                 }
+                // bbport: a label the guest writes (CPU stores to hot pages are not trapped): the
+                // data it guards is read from here on, so hot pages are uploaded again (RefreshHot).
+                BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed);
                 if (dcb_stats) {
                     ++g_dcb_stats.wait_outcome[met ? 2 : 3];
                     g_dcb_stats.wait_ms += std::chrono::duration<double, std::milli>(
@@ -2198,6 +2221,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                // bbport: a finished nested task stays suspended at final_suspend and nothing else
+                // frees its coroutine frame (one leaked per nested buffer; shadPS4 #5258, upstream
+                // bloodborne_pc PR #226).
+                task.handle.destroy();
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -2273,6 +2300,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             YIELD_GFX();
             RESUME_GFX(task);
         }
+        task.handle.destroy(); // bbport: the finished nested task's frame (as IndirectBuffer)
     }
 
     if (ce_task.handle) {
@@ -2390,6 +2418,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            task.handle.destroy(); // bbport: the finished nested task's frame (as IndirectBuffer)
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -2578,6 +2607,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
                 YIELD_ASC(vqid);
             }
+            BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed); // bbport: as the graphics wait
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
@@ -2697,20 +2727,24 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
-void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool force_copy) {
+    // bbport: hot pages (RegionManager::RefreshHot): the guest may have written data this
+    // submission reads, to pages that are no longer trapped.
+    BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed);
     auto& queue = mapped_queues[GfxQueueId];
 
     // bbport: one copy per submission, alive until it is decoded (CopyCmdBuffers' shared buffer
     // is reset at sceGnmSubmitDone, while this thread may still be decoding earlier frames).
     std::shared_ptr<SubmittedCopy> copy;
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
+    if (force_copy || EmulatorSettings.IsCopyGpuBuffers()) {
         copy = std::make_shared<SubmittedCopy>();
         copy->data.resize(dcb.size() + ccb.size());
         std::memcpy(copy->data.data(), dcb.data(), dcb.size_bytes());
         std::memcpy(copy->data.data() + dcb.size(), ccb.data(), ccb.size_bytes());
-        copy->guest_dcb = dcb.data();
+        // bbport: the port's own commands have no guest storage to point back to.
+        copy->guest_dcb = force_copy ? copy->data.data() : dcb.data();
         copy->dcb_dwords = dcb.size();
-        copy->guest_ccb = ccb.data();
+        copy->guest_ccb = force_copy ? copy->data.data() + dcb.size() : ccb.data();
         copy->ccb_dwords = ccb.size();
         copy->submitted = std::chrono::steady_clock::now();
         dcb = std::span<const u32>{copy->data.data(), copy->dcb_dwords};
@@ -2795,6 +2829,7 @@ void Liverpool::SignalGpuIdle(u64 generation) {
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     BbStats::asc_submits.fetch_add(1, std::memory_order_relaxed);
+    BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed); // bbport: hot pages, as SubmitGfx
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;

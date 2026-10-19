@@ -64,6 +64,10 @@ public:
         return !copying && tracked.contains(image_uid);
     }
     void ResolveAll();
+    /// bbport: drops the proxies whose native image the texture cache no longer has (evicted while
+    /// areas load); they were kept for good, their memory leaked over a session (upstream
+    /// bloodborne_pc 0.6). Destroyed once the GPU is past the work recorded so far.
+    void CleanupStaleEntries();
     bool debug = false; ///< BB_SCENE_DEBUG frame: print resolves and fills
 private:
     struct Entry {

@@ -128,7 +128,13 @@ inline std::atomic<std::uint64_t> gnm_frame_waits{0}, gnm_frame_wait_ns{0};
 inline std::atomic<std::uint64_t> asc_submits{0};
 /// The game's GPU range allocators (seen at their collector, 0x26aa860): object, live ranges, bytes.
 inline std::array<std::atomic<std::uint64_t>, 4> range_allocators{}, range_live{}, range_bytes{};
+/// Hot pages (RegionManager): pages kept writable now (all regions; capped), and windows promoted,
+/// expired and refused by the cap since the start.
 inline std::atomic<std::int64_t> hot_pages{0};
+inline std::atomic<std::uint64_t> hot_promoted{0}, hot_expired{0}, hot_refused{0};
+/// Bumped wherever the guest may have written data the GPU reads next: a submission, a wait on a label
+/// the guest writes, a flip. A hot page is uploaded again once per epoch (RegionManager::RefreshHot).
+inline std::atomic<std::uint32_t> hot_epoch{0};
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};
@@ -203,9 +209,21 @@ inline std::atomic<std::uint32_t> coarse_second{0};
 inline std::atomic<std::uint64_t> vram_idle_bytes{0}, vram_unmapped_bytes{0}, vram_chunks_freed_bytes{0};
 /// Residency chunks, chunks sent away (ProcessIdleBlocks), and their blocks that had to stay.
 inline std::atomic<std::uint64_t> residency_chunk_count{0}, evacuations{0}, evac_kept_gpu{0}, evac_kept_other{0};
+/// Arena repack (BufferCache::RepackResidency): on, bytes of VRAM copies moved into fuller chunks,
+/// chunks it emptied; residency chunks given back to the driver (any cause). Cumulative.
+inline std::atomic<std::uint64_t> arena_repack_on{0}, arena_repack_moved_bytes{0}, arena_repack_emptied{0},
+    residency_chunks_freed{0};
 /// BB_VRAM_COPY_QUEUE (FIFO of VRAM copies): on, queue length, bytes of copies, copies returned.
 inline std::atomic<std::uint64_t> vram_copy_queue{0}, vram_copy_queue_length{0}, vram_copy_bytes{0},
     vram_copies_returned{0};
+/// Staging pool memory (ring blocks and large buffers), bytes; refreshed once a frame with BB_FRAME_STATS.
+inline std::atomic<std::uint64_t> staging_bytes{0};
+/// Staging by memory type (DeviceLocal, HostUncached, HostCached): ring bytes, large-buffer bytes, of
+/// them held (deferred, not freed yet); refreshed with staging_bytes.
+inline std::atomic<std::uint64_t> staging_ring_bytes[3]{}, staging_large_bytes[3]{}, staging_held_bytes[3]{};
+/// Upload (host-uncached) ring: blocks, of them used in the last 3000 submissions, idle but GPU-busy, keep floor.
+inline std::atomic<std::uint64_t> staging_upload_blocks{0}, staging_upload_recent{0}, staging_upload_busy{0},
+    staging_keep_blocks{0}, staging_frame{0};
 /// Images the collector passed over (GPU-written, not evictable without memory pressure).
 inline std::atomic<std::uint64_t> gc_kept_images{0};
 struct WaitTimer {
