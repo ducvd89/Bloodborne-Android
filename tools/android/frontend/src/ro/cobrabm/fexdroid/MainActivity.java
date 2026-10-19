@@ -53,11 +53,20 @@ public final class MainActivity extends Activity {
     private LinearLayout drawerItems;
     private TextView status;
     private View resume;
+    private LinearLayout pauseItem;
+    private TextView pausedChip;
     private LinearLayout gameSettingsItem, cheatsItem, modsItem, graphicsItem, frameGenItem, driverItem, controllerItem, folderItem;
     private TouchControllerOverlay controllerOverlay;
     private PadBridge pad;
     private AudioBridge audio;
     private volatile Process game;
+    /** Pausing: the game process is stopped (SIGSTOP, the arm64 number) while the player paused it, the app is in the
+     *  background or another window is on top, and continued (SIGCONT) when none of those holds. gamePid is the child's
+     *  pid (0: no game); pauseLock guards these fields and `stopped` (signals are sent only on a change of it). */
+    private static final int SIGSTOP=19, SIGCONT=18;
+    private final Object pauseLock=new Object();
+    private int gamePid;
+    private boolean userPaused, backgrounded, notTop, stopped;
     /** The display (BbPresent's listener) is running and the game may start. */
     private volatile boolean displayReady;
     private volatile boolean destroyed;
@@ -171,6 +180,15 @@ public final class MainActivity extends Activity {
         screen.addView(handle,frame(dp(4),dp(44),Gravity.LEFT|Gravity.CENTER_VERTICAL));
         handle.setOnClickListener(v -> openDrawer());
 
+        // Shown at the top while the player has paused the game (and the menu is closed); a tap plays on.
+        pausedChip=text("Paused \u00b7 tap to play",13,0xffe8dfc9); pausedChip.setPadding(dp(14),dp(7),dp(14),dp(7));
+        GradientDrawable chip=new GradientDrawable(); chip.setColor(0xcc121318); chip.setCornerRadius(dp(16));
+        chip.setStroke(dp(1),0x99c6ad76);
+        pausedChip.setBackground(chip); pausedChip.setVisibility(View.GONE);
+        pausedChip.setOnClickListener(v -> togglePause());
+        FrameLayout.LayoutParams chipParams=frame(-2,-2,Gravity.TOP|Gravity.CENTER_HORIZONTAL); chipParams.topMargin=dp(16);
+        screen.addView(pausedChip,chipParams);
+
         scrim=new View(this); scrim.setBackgroundColor(0x99000000);
         scrim.setVisibility(View.GONE); scrim.setOnClickListener(v -> closeDrawer());
         screen.addView(scrim,frame(-1,-1,Gravity.FILL));
@@ -207,7 +225,8 @@ public final class MainActivity extends Activity {
         drawerItems.addView(hint,new LinearLayout.LayoutParams(-1,-2));
 
         section("Game");
-        resume=menuItem("ic_play","Resume game",null,() -> closeDrawer());
+        resume=menuItem("ic_play","Back to game",null,() -> closeDrawer());
+        pauseItem=menuItem("ic_pause","Pause game","",() -> togglePause());
         gameSettingsItem=menuItem("ic_settings","Game settings","",() -> {
             closeDrawer();
             new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showGame();
@@ -340,14 +359,14 @@ public final class MainActivity extends Activity {
         states.addState(new int[]{},new android.graphics.drawable.ColorDrawable(0));
         row.setBackground(states);
 
-        android.widget.ImageView image=new android.widget.ImageView(this);
+        android.widget.ImageView image=new android.widget.ImageView(this); image.setTag("icon");
         int id=getResources().getIdentifier(icon,"drawable",getPackageName());
         if (id!=0) image.setImageResource(id);
         LinearLayout.LayoutParams ip=new LinearLayout.LayoutParams(dp(24),dp(24)); ip.rightMargin=dp(14);
         row.addView(image,ip);
 
         LinearLayout texts=new LinearLayout(this); texts.setOrientation(LinearLayout.VERTICAL);
-        TextView name=text(title,15,0xffe8dfc9);
+        TextView name=text(title,15,0xffe8dfc9); name.setTag("title");
         texts.addView(name);
         if (detail!=null) {
             TextView second=text(detail,12,0xff8e9097); second.setTag("detail");
@@ -392,6 +411,7 @@ public final class MainActivity extends Activity {
             : driver==null ? "Phone's own driver" : driver.title());
         setDetail(controllerItem,controllerEnabled() ? "On" : "Off");
         setDetail(folderItem,gameDir==null ? "Not chosen" : gameDir);
+        updatePauseUi();
     }
 
     private void openDrawer() {
@@ -409,6 +429,7 @@ public final class MainActivity extends Activity {
         if (!drawerOpen) return;
         drawerOpen=false; pad.reset();
         controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
+        updatePauseUi();
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.animate().alpha(0).setDuration(180).withEndAction(() -> scrim.setVisibility(View.GONE)).start();
         drawer.animate().translationX(-dp(320)).setDuration(200)
@@ -476,11 +497,13 @@ public final class MainActivity extends Activity {
             }
             return super.dispatchKeyEvent(e);
         }
+        if (userPaused) // no pad input reaches the stopped game; volume and other system keys still work
+            return e.isFromSource(android.view.InputDevice.SOURCE_GAMEPAD) || super.dispatchKeyEvent(e);
         if (pad.key(e)) return true;
         return super.dispatchKeyEvent(e);
     }
     @Override public boolean dispatchGenericMotionEvent(MotionEvent e) {
-        if (drawerOpen && e.isFromSource(android.view.InputDevice.SOURCE_JOYSTICK)) return true;
+        if ((drawerOpen || userPaused) && e.isFromSource(android.view.InputDevice.SOURCE_JOYSTICK)) return true;
         return pad.motion(e) || super.dispatchGenericMotionEvent(e);
     }
     private boolean controllerEnabled() {
@@ -489,12 +512,86 @@ public final class MainActivity extends Activity {
     @Override protected void onPause() {
         if (controllerOverlay!=null) controllerOverlay.release();
         if (pad!=null) pad.reset();
-        if (audio!=null) audio.pause();
+        synchronized (pauseLock) { backgrounded=true; }
+        applyPause();
         super.onPause();
     }
     @Override protected void onResume() {
-        super.onResume(); if (audio!=null) audio.resume();
+        super.onResume();
+        synchronized (pauseLock) { backgrounded=false; }
+        applyPause();
         if (updater!=null) updater.resumed(); // back from the "install unknown apps" setting
+    }
+    /** Multi-window (Android 10+; never called before): the game runs only in the window on top. Not the window
+     *  focus: the app's own dialogs (settings, cheats, Bloodframe) take that and the game keeps running behind them. */
+    @Override public void onTopResumedActivityChanged(boolean top) {
+        super.onTopResumedActivityChanged(top);
+        synchronized (pauseLock) { notTop=!top; }
+        applyPause();
+    }
+
+    /** Stops or continues the game process and pauses or resumes its sound, as the reasons for holding it now stand
+     *  (a player pause, the app in the background, another window on top). Main thread. */
+    private void applyPause() {
+        synchronized (pauseLock) {
+            boolean hold=userPaused || backgrounded || notTop, stop=hold && gamePid>0;
+            if (stop && !stopped) { pad.reset(); android.os.Process.sendSignal(gamePid,SIGSTOP); }
+            else if (!stop && stopped) android.os.Process.sendSignal(gamePid,SIGCONT);
+            stopped=stop;
+            if (audio!=null) { if (hold) audio.pause(); else audio.resume(); }
+        }
+        updatePauseUi();
+    }
+    private void togglePause() {
+        synchronized (pauseLock) {
+            if (gamePid<=0) return; // no game
+            userPaused=!userPaused;
+        }
+        applyPause();
+    }
+    /** The game ended or is about to be killed or started again: no pause outlives it. signal: it still runs, so it is
+     *  continued first (a stopped process is killed all the same; the order is for safety). Any thread. */
+    private void releasePause(boolean signal) {
+        synchronized (pauseLock) {
+            if (signal && stopped && gamePid>0) android.os.Process.sendSignal(gamePid,SIGCONT);
+            gamePid=0; userPaused=false; stopped=false;
+            if (audio!=null && !backgrounded && !notTop) audio.resume();
+        }
+        main.post(() -> { if (!destroyed) updatePauseUi(); });
+    }
+    /** The pause row (Pause game / Play game), the "Paused" chip and the on-screen controller, which a pause hides. */
+    private void updatePauseUi() {
+        boolean paused, running;
+        synchronized (pauseLock) { paused=userPaused; running=gamePid>0; }
+        if (pauseItem!=null) {
+            ((android.widget.ImageView)pauseItem.findViewWithTag("icon")).setImageResource(
+                getResources().getIdentifier(paused ? "ic_play" : "ic_pause","drawable",getPackageName()));
+            ((TextView)pauseItem.findViewWithTag("title")).setText(paused ? "Play game" : "Pause game");
+            setDetail(pauseItem,paused ? "Paused" : running ? "Freezes the game and its sound" : "The game is not running");
+        }
+        if (pausedChip!=null) pausedChip.setVisibility(paused && !drawerOpen ? View.VISIBLE : View.GONE);
+        if (controllerOverlay!=null) {
+            if (paused) { controllerOverlay.release(); controllerOverlay.setVisibility(View.GONE); }
+            else if (!drawerOpen) controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
+        }
+    }
+    /** The pid of a child process: Android's Process prints it ("Process[pid=1234, ...]"), else the "pid" field of its
+     *  class (any of its superclasses). 0 when neither works (the game then cannot be paused). */
+    private static int pidOf(Process p) {
+        String text=String.valueOf(p);
+        int at=text.indexOf("pid=");
+        if (at>=0) {
+            int end=at+4; while (end<text.length() && Character.isDigit(text.charAt(end))) ++end;
+            try { return Integer.parseInt(text.substring(at+4,end)); } catch (NumberFormatException ignored) {}
+        }
+        for (Class<?> c=p.getClass();c!=null;c=c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f=c.getDeclaredField("pid"); f.setAccessible(true);
+                return f.getInt(p);
+            } catch (ReflectiveOperationException | RuntimeException ignored) {}
+        }
+        android.util.Log.w("Bloodborne","game pid unknown: "+text);
+        return 0;
     }
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
@@ -1173,6 +1270,7 @@ public final class MainActivity extends Activity {
     private void startGame() {
         if (destroyed) return;
         hadError=false;
+        releasePause(false);
         playing=false; gameState(true);
         pickRefreshRate();
         new File(BASE,"ime.request").delete(); new File(BASE,"ime.request.result").delete();
@@ -1211,6 +1309,8 @@ public final class MainActivity extends Activity {
             if (gameLog.length()>0) { previous.delete(); gameLog.renameTo(previous); }
             final Process launched=launchScript(extra.toArray(new String[0]));
             game=launched;
+            synchronized (pauseLock) { gamePid=pidOf(launched); }
+            main.post(this::applyPause); // the app may be in the background already
             Thread log=new Thread(() -> {
                 try (BufferedReader r=new BufferedReader(new InputStreamReader(launched.getInputStream()));
                      PrintWriter out=new PrintWriter(gameLog)) {
@@ -1223,7 +1323,7 @@ public final class MainActivity extends Activity {
                     }
                     int code=launched.waitFor();
                     if (game==launched) {
-                        game=null;
+                        game=null; releasePause(false);
                         error("Game stopped ("+code+")."+(driverTrouble
                             ? " It looks like a GPU driver problem: Menu \u2192 GPU driver, pick another driver package"
                               +" (Download lists more), then restart."
@@ -1255,6 +1355,7 @@ public final class MainActivity extends Activity {
     }
     private void stopGame() {
         Process p=game; game=null;
+        releasePause(true);
         playing=false; gameState(false,android.app.GameState.MODE_NONE);
         if (p!=null) { p.destroyForcibly(); try { p.waitFor(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
