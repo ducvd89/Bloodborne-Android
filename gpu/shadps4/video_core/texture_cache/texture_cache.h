@@ -119,7 +119,9 @@ public:
     void InvalidateMemory(VAddr addr, size_t size);
 
     /// Marks an image as dirty if it exists at the provided address.
-    void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+    /// bbport: `whole_only`: only an image the write covers whole (a partial write must keep the
+    /// image's other GPU-only texels; upstream bloodborne_pc 0.6 makes that the rule).
+    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool whole_only = false);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);

@@ -49,6 +49,44 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+bool FetchShaderDecodes(const u32* code) {
+    if (!code) {
+        return false;
+    }
+    thread_local std::unordered_map<const u32*, std::vector<u32>> valid;
+    if (const auto it = valid.find(code);
+        it != valid.end() &&
+        std::memcmp(code, it->second.data(), it->second.size() * sizeof(u32)) == 0) {
+        return true;
+    }
+    GcnCodeSlice slice(code, code + std::numeric_limits<u32>::max());
+    GcnDecodeContext decoder;
+    GcnInst inst;
+    constexpr u32 MaxLoads = 104; // ParseFetchShader's table of V# loads
+    for (u32 i = 0; i < 512; ++i) {
+        if (!decoder.tryDecodeInstruction(slice, inst)) {
+            return false;
+        }
+        if (inst.opcode == Opcode::S_SETPC_B64) {
+            if (valid.size() >= 4096) {
+                valid.clear();
+            }
+            valid[code] = std::vector<u32>(code, slice.position());
+            return true;
+        }
+        if (inst.inst_class == InstClass::ScalarMemRd && inst.dst[0].code >= MaxLoads) {
+            return false;
+        }
+        if (inst.opcode == Opcode::V_ADD_I32 && inst.dst[0].code != 0 && inst.dst[0].code != 3) {
+            return false;
+        }
+        if (inst.inst_class == InstClass::VectorMemBufFmt && inst.src[2].code * 4 >= MaxLoads) {
+            return false;
+        }
+    }
+    return false;
+}
+
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;

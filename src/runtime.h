@@ -35,6 +35,8 @@ int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 void runtime_memory_note_write(uintptr_t address, uint64_t size);
 void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size);
 void runtime_memory_prepare_cpu_write(uintptr_t address, uint64_t size);
+/* bbport: the trap reasons (BbLayer::WriteTraps::Reason bits, e.g. 4 UmaWatch) the page holding `address` is trapped for; 0: none. */
+unsigned runtime_memory_trap_reasons(uintptr_t address);
 /* UMA granules (BB_UMA, src/runtime_memory.c): registering switches the runtime to lazy granules.
  * alloc(phys,size) returns a dma-buf fd of `size` bytes of GPU-visible memory for direct memory
  * [phys,phys+size), or -1 (the GPU side keeps its own record of it; the runtime owns the fd).
@@ -99,7 +101,10 @@ int runtime_thread_is_guest(const void *ucontext);
 /* File/IO reads the kernel performs into guest memory: no promotion may freeze those pages meanwhile. */
 void *runtime_memory_io_begin(uintptr_t address, uint64_t size);
 void runtime_memory_io_end(void *token);
-/* bbport (frame stats): a guest thread was blocked `ns` in the runtime (0 cond, 1 mutex, 2 sema, 3 sleep). */
+/* bbport (BB_WAIT_PROFILE=1, off by default: it costs CPU): a guest thread was blocked `ns` in the
+ * runtime (0 cond, 1 mutex, 2 sema, 3 sleep). Callers skip their clock reads unless
+ * runtime_wait_profiling() says the profiler is on. */
+int runtime_wait_profiling(void);
 void runtime_wait_note(int kind, uint64_t ns);
 void runtime_wait_report(double frames);
 void runtime_guest_call_sites(uint64_t out[3]);

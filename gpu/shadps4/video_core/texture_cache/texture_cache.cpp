@@ -265,7 +265,7 @@ void TextureCache::WatchImage(const Image& image, const char* what) {
     }
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool whole_only) {
     std::scoped_lock lock{mutex};
     // bbport: only an image starting at `address` is affected, so the images over its first byte
     // are all there is to look at (the whole range was walked for every GPU write binding).
@@ -283,7 +283,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
-        if (image.info.guest_address != address) {
+        if (image.info.guest_address != address || (whole_only && image.info.guest_size > max_size)) {
             return;
         }
         // Ensure image is reuploaded when accessed again.
@@ -1003,10 +1003,15 @@ void TextureCache::RefreshImage(Image& image) {
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
 
         // Protect GPU modified resources from accidental CPU reuploads.
-        if (is_gpu_modified && !is_gpu_dirty) {
+        // bbport: every upload of such an image keeps the hashes, the first one too (a new image
+        // is GpuDirty): else the first refresh after the GPU wrote it (a CPU write elsewhere in
+        // its page) found no hash and uploaded unchanged memory over the GPU's data. The character
+        // creator's exposure (1x1, written by a compute shader) went to 0: no character (upstream
+        // bloodborne_pc #178).
+        if (is_gpu_modified) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
             const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
-            if (image.mip_hashes[m] == hash) {
+            if (!is_gpu_dirty && image.mip_hashes[m] == hash) {
                 continue;
             }
             image.mip_hashes[m] = hash;

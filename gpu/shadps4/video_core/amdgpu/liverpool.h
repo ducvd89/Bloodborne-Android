@@ -115,7 +115,9 @@ public:
     explicit Liverpool();
     ~Liverpool();
 
-    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
+    /// bbport: `force_copy`: the commands are copied whatever BB_COPY_GPU_BUFFERS says (the port's
+    /// own transient commands: their storage ends with the call).
+    void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool force_copy = false);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
     /// `frame` (BB_SUBMIT_LOCK=frame): the guest's frame number, reported finished once the GPU

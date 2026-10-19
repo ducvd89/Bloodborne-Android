@@ -211,12 +211,25 @@ struct Info : InfoPersistent {
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
-        T data;
+        T data{};
         const auto ud = UserData();
         const u32* base = ud.data();
         if (ptr_index != IR::NumScalarRegs) {
+            // bbport: a pointer pair past the user data, or a null table (missing vertex tables can
+            // follow a failed game allocation while areas stream in), gives an empty descriptor,
+            // never a host read at null + offset (crash 139 in StageSpecialization; upstream
+            // bloodborne_pc 0.6).
+            if (ptr_index >= ud.size() || ud.size() - ptr_index < 2) {
+                return data;
+            }
             std::memcpy(&base, &ud[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
+            if (!base) {
+                return data;
+            }
+        } else if (dword_offset > ud.size() ||
+                   sizeof(T) > (ud.size() - dword_offset) * sizeof(u32)) {
+            return data; // bbport: past the user data itself
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
         return data;

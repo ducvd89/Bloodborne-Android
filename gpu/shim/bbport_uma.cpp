@@ -432,6 +432,87 @@ void Forget(u64 address, u64 size) {
 } // namespace Dynamic
 
 // ---------------------------------------------------------------------------------------------
+// DMA fills and copies into shared granules
+// ---------------------------------------------------------------------------------------------
+
+bool DmaGpu() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_UMA_DMA_GPU");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+namespace {
+struct SharedDmaState {
+    static constexpr u32 Listed = 32;
+    struct Entry {
+        u64 address = 0, size = 0;
+        bool fill = false, cpu = false; ///< of the first one there
+    };
+    std::atomic<u64> count{0}, bytes{0}, cpu{0}, gpu{0};
+    std::atomic<u32> listed{0};
+    std::mutex mutex; ///< entries, reported (only taken until the list is full)
+    std::array<Entry, Listed> entries{};
+    u32 reported = 0;
+};
+SharedDmaState shared_dma;
+} // namespace
+
+void NoteSharedDma(u64 address, u64 size, bool fill, bool cpu) {
+    auto& state = shared_dma;
+    state.count.fetch_add(1, std::memory_order_relaxed);
+    state.bytes.fetch_add(size, std::memory_order_relaxed);
+    (cpu ? state.cpu : state.gpu).fetch_add(1, std::memory_order_relaxed);
+    if (state.listed.load(std::memory_order_acquire) >= SharedDmaState::Listed) {
+        return;
+    }
+    std::scoped_lock lock{state.mutex};
+    const u32 listed = state.listed.load(std::memory_order_relaxed);
+    if (listed >= SharedDmaState::Listed) {
+        return;
+    }
+    for (u32 i = 0; i < listed; ++i) {
+        if (state.entries[i].address == address) {
+            return;
+        }
+    }
+    state.entries[listed] = {address, size, fill, cpu};
+    state.listed.store(listed + 1, std::memory_order_release);
+}
+
+SharedDmaTotals SharedDma() {
+    const auto& state = shared_dma;
+    return {state.count.load(std::memory_order_relaxed), state.bytes.load(std::memory_order_relaxed),
+            state.cpu.load(std::memory_order_relaxed), state.gpu.load(std::memory_order_relaxed)};
+}
+
+bool SharedDmaNewList(std::string& text) {
+    auto& state = shared_dma;
+    std::scoped_lock lock{state.mutex};
+    const u32 listed = state.listed.load(std::memory_order_relaxed);
+    if (listed == state.reported) {
+        return false;
+    }
+    state.reported = listed;
+    constexpr std::size_t MaxLine = 1500;
+    text.clear();
+    for (u32 i = 0; i < listed; ++i) {
+        const auto& entry = state.entries[i];
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s%s %#llx+%#llx %s", i ? ", " : "",
+                      entry.fill ? "fill" : "copy", (unsigned long long)entry.address,
+                      (unsigned long long)entry.size, entry.cpu ? "cpu" : "gpu");
+        if (text.size() + std::strlen(item) > MaxLine) {
+            text += ", ...";
+            break;
+        }
+        text += item;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Probes
 // ---------------------------------------------------------------------------------------------
 

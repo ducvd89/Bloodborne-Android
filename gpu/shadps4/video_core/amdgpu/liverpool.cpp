@@ -840,6 +840,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            // bbport: a finished nested task stays suspended at final_suspend and nothing else
+            // frees its coroutine frame (one leaked per nested buffer; shadPS4 #5258, upstream
+            // bloodborne_pc PR #226).
+            task.handle.destroy();
             break;
         }
         default:
@@ -1428,6 +1432,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 YIELD_GFX();
                 RESUME_GFX(task);
             }
+            task.handle.destroy(); // bbport: the finished nested task's frame (as IndirectBuffer)
         }
     }
 
@@ -2160,6 +2165,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         ++g_dcb_stats.wait_outcome[0];
                     }
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
                 // bbport: a fence handed to the draw recording thread counts as written: that
@@ -2172,6 +2178,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (dcb_stats) {
                         ++g_dcb_stats.wait_outcome[1];
                     }
+                    // bbport: no hot_epoch bump here: the value is a GPU-side fence, not a CPU store.
                     break;
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
@@ -2190,6 +2197,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     YIELD_GFX();
                 }
+                // bbport: a label the guest writes (CPU stores to hot pages are not trapped): the
+                // data it guards is read from here on, so hot pages are uploaded again (RefreshHot).
+                BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed);
                 if (dcb_stats) {
                     ++g_dcb_stats.wait_outcome[met ? 2 : 3];
                     g_dcb_stats.wait_ms += std::chrono::duration<double, std::milli>(
@@ -2211,6 +2221,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                // bbport: a finished nested task stays suspended at final_suspend and nothing else
+                // frees its coroutine frame (one leaked per nested buffer; shadPS4 #5258, upstream
+                // bloodborne_pc PR #226).
+                task.handle.destroy();
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -2286,6 +2300,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             YIELD_GFX();
             RESUME_GFX(task);
         }
+        task.handle.destroy(); // bbport: the finished nested task's frame (as IndirectBuffer)
     }
 
     if (ce_task.handle) {
@@ -2403,6 +2418,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            task.handle.destroy(); // bbport: the finished nested task's frame (as IndirectBuffer)
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -2591,6 +2607,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
                 YIELD_ASC(vqid);
             }
+            BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed); // bbport: as the graphics wait
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
@@ -2710,20 +2727,24 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
-void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bool force_copy) {
+    // bbport: hot pages (RegionManager::RefreshHot): the guest may have written data this
+    // submission reads, to pages that are no longer trapped.
+    BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed);
     auto& queue = mapped_queues[GfxQueueId];
 
     // bbport: one copy per submission, alive until it is decoded (CopyCmdBuffers' shared buffer
     // is reset at sceGnmSubmitDone, while this thread may still be decoding earlier frames).
     std::shared_ptr<SubmittedCopy> copy;
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
+    if (force_copy || EmulatorSettings.IsCopyGpuBuffers()) {
         copy = std::make_shared<SubmittedCopy>();
         copy->data.resize(dcb.size() + ccb.size());
         std::memcpy(copy->data.data(), dcb.data(), dcb.size_bytes());
         std::memcpy(copy->data.data() + dcb.size(), ccb.data(), ccb.size_bytes());
-        copy->guest_dcb = dcb.data();
+        // bbport: the port's own commands have no guest storage to point back to.
+        copy->guest_dcb = force_copy ? copy->data.data() : dcb.data();
         copy->dcb_dwords = dcb.size();
-        copy->guest_ccb = ccb.data();
+        copy->guest_ccb = force_copy ? copy->data.data() + dcb.size() : ccb.data();
         copy->ccb_dwords = ccb.size();
         copy->submitted = std::chrono::steady_clock::now();
         dcb = std::span<const u32>{copy->data.data(), copy->dcb_dwords};
@@ -2808,6 +2829,7 @@ void Liverpool::SignalGpuIdle(u64 generation) {
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     ASSERT_MSG(gnm_vqid > 0 && gnm_vqid < NumTotalQueues, "Invalid virtual ASC queue index");
     BbStats::asc_submits.fetch_add(1, std::memory_order_relaxed);
+    BbStats::hot_epoch.fetch_add(1, std::memory_order_relaxed); // bbport: hot pages, as SubmitGfx
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;

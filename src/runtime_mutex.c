@@ -82,10 +82,11 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     int r = pthread_mutex_trylock(&(*mutex)->native);
-    if (r == EBUSY) { /* contended: timed for the wait profile */
-        const uint64_t start = runtime_wait_clock();
+    if (r == EBUSY) { /* contended: timed for the wait profile (BB_WAIT_PROFILE) */
+        const int profile = runtime_wait_profiling();
+        const uint64_t start = profile ? runtime_wait_clock() : 0;
         r = pthread_mutex_lock(&(*mutex)->native);
-        runtime_wait_note(1, runtime_wait_clock() - start);
+        if (profile) runtime_wait_note(1, runtime_wait_clock() - start);
     }
     e = orbis_error(r);
     if (!e) ++locks;
@@ -186,9 +187,10 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     ++waits;
-    const uint64_t start = runtime_wait_clock();
+    const int profile = runtime_wait_profiling();
+    const uint64_t start = profile ? runtime_wait_clock() : 0;
     const int e2 = pthread_cond_wait(&c->native, &(*mutex)->native);
-    runtime_wait_note(0, runtime_wait_clock() - start);
+    if (profile) runtime_wait_note(0, runtime_wait_clock() - start);
     return orbis_error(e2);
 }
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end) {
@@ -197,9 +199,10 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
-    const uint64_t start = runtime_wait_clock();
+    const int profile = runtime_wait_profiling();
+    const uint64_t start = profile ? runtime_wait_clock() : 0;
     const int e2 = pthread_cond_timedwait(&c->native, &(*mutex)->native, end);
-    runtime_wait_note(0, runtime_wait_clock() - start);
+    if (profile) runtime_wait_note(0, runtime_wait_clock() - start);
     return timed_error(e2);
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {

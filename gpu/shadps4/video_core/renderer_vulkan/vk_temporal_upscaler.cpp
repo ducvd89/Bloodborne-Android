@@ -322,6 +322,35 @@ bool TemporalUpscaler::RasterScaling() const {
     return !scaled_session && scene_targets.Reduced() && !done_this_frame;
 }
 
+void TemporalUpscaler::OnDisplayPassStart() {
+    // bbport: cinematics can finish the LDR scene without drawing a Scaleform movie or the HUD.
+    // The camera already uses the output's aspect ratio (bbport_display.cpp), so showing the
+    // game's 16:9 display buffer squeezed the picture (a phone's ~20:9). The scene is finished here,
+    // at the display copy, while its camera and depth still exist: the display pass then reads
+    // the same output-size image as frames with a UI (upstream bloodborne_pc 0.6).
+    // BB_SCENE_WITHOUT_UI=0: as before.
+    static const bool finish_without_ui = [] {
+        const char* value = std::getenv("BB_SCENE_WITHOUT_UI");
+        return !(value && value[0] == '0');
+    }();
+    if (!finish_without_ui || !Scaled() || ui_phase || !ldr_target || !camera_motion.Ready()) {
+        return;
+    }
+    if (Active() && !failed) {
+        RunScaled();
+    }
+    if (!ui_phase) {
+        RunUiOnly(ldr_target, camera_motion.Depth());
+    }
+    if (ui_phase) {
+        static u64 count = 0;
+        if (++count <= 3 || (count & (count - 1)) == 0) {
+            std::printf("Scene output: frame without UI completed at %ux%u (%llu so far)\n", ui_width,
+                        ui_height, static_cast<unsigned long long>(count));
+        }
+    }
+}
+
 bool TemporalUpscaler::OnFrameStart() {
     // bbport: BB_PRESET_FILE=<file> holding a preset number, read about once a second: switches
     // the preset like the menu does (scripted tests of live preset changes).
@@ -2179,7 +2208,10 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eNone,
         .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        // bbport: the guest's render pass loads (LOAD), even for a full-screen display copy: its
+        // attachment load waits for this layout transition too (upstream bloodborne_pc 0.6).
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                         vk::AccessFlagBits2::eColorAttachmentWrite,
         .oldLayout = vk::ImageLayout::eUndefined,
         .newLayout = vk::ImageLayout::eGeneral,
         .image = vk::Image(display.image),

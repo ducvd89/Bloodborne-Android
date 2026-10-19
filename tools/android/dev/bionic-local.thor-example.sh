@@ -4,6 +4,7 @@ export BB_UMA=1 BB_GUEST_IN_PLACE=1 BB_LAYER_MEMORY=0 BB_WRITE_TRACKING=1 BB_CHU
 unset BB_UNIFIED BB_UMA_PROBES_ONLY
 export BB_UMA_CLASSES=index,vertex,constant BB_UMA_VERIFY=64 BB_UMA_GRANULE_KB=8192
 export BB_FRAME_STATS=1
+# export BB_WAIT_PROFILE=1  # per-site guest wait profile (costs CPU; off for power measurements)
 export BB_VRAM_COPY_QUEUE=1 BB_VRAM_COPY_CAP_MB=128
 export BB_STAGING_KEEP_MB=32
 # current: blocking waits (default) + GpuComm pinned to the prime core; unified memory v2 (8 MiB, index,vertex,constant)

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <shared_mutex>
@@ -165,7 +167,21 @@ public:
         return profile;
     }
 
+    /// bbport: makes what the GPU wrote to [address, address + size) visible to the CPU (the
+    /// rasterizer's: drain, finish, read back). Called on the GPU command thread for a program
+    /// that is not whole in the CPU's view (a copy into place by the GPU).
+    std::function<void(VAddr, u64)> program_memory_sync;
+
 private:
+    /// bbport: whether `code` is a whole program (its header where its first instruction says);
+    /// `may_sync` (GPU command thread): what the GPU wrote there is read back once first.
+    bool LooksLikeProgram(const u32* code, Shader::HwStage stage, bool may_sync);
+    /// bbport: whether a new program decodes whole (else read back once and tried again).
+    bool ProgramDecodes(const Shader::ShaderParams& params, Shader::HwStage stage);
+    /// bbport: program_memory_sync, at most once per address every 100 ms. False: not tried.
+    bool SyncProgramMemory(VAddr address, u64 size);
+    std::unordered_map<VAddr, std::chrono::steady_clock::time_point> program_sync_tried;
+
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
     bool RefreshComputeKey();

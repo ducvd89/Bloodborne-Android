@@ -20,6 +20,8 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/decode.h"
+#include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
@@ -447,6 +449,81 @@ struct CompileTimer {
 };
 } // namespace
 
+// bbport: programs that are not whole in the CPU's view (upstream bloodborne_pc 0.6, #144, #165):
+// the game copies some programs into place with the GPU (DMA), which in copy mode reaches the
+// game's memory only when read back, or the memory was reused. The header search found the next
+// program's header (or none: an assertion) and the translator decoded garbage (decode.cpp
+// assertions): the game ended with code 23 while areas streamed in. Now what the GPU wrote there is
+// read back once, and a draw whose program still is not one is skipped.
+bool PipelineCache::SyncProgramMemory(VAddr address, u64 size) {
+    if (!program_memory_sync) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (const auto tried = program_sync_tried.find(address);
+        tried != program_sync_tried.end() && now - tried->second < std::chrono::milliseconds(100)) {
+        return false;
+    }
+    if (program_sync_tried.size() >= 4096) {
+        program_sync_tried.clear();
+    }
+    program_sync_tried[address] = now;
+    program_memory_sync(address, size);
+    return true;
+}
+
+bool PipelineCache::LooksLikeProgram(const u32* code, Shader::HwStage stage, bool may_sync) {
+    // Its header where its first instruction says: a header found further on (the search) may be
+    // the next program's while this one is still being copied in.
+    if (AmdGpu::DirectBinaryInfo(code)) {
+        return true;
+    }
+    const u32 first = code[0];
+    if (may_sync && SyncProgramMemory(reinterpret_cast<VAddr>(code), 0x10000)) {
+        if (AmdGpu::DirectBinaryInfo(code)) {
+            static std::atomic<u32> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_INFO(Render_Vulkan, "stage {} program at {} arrived from the GPU's writes",
+                         u32(stage), fmt::ptr(code));
+            }
+            return true;
+        }
+        // Read back and still no header in place: a program laid out differently (the header
+        // searched for, as before), else not a program.
+        if (first == 0xBEEB03FF && code[0] == 0xBEEB03FF && AmdGpu::FindBinaryInfo(code)) {
+            return true;
+        }
+    }
+    static std::atomic<u32> reported{0};
+    if (may_sync && reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan,
+                    "stage {} program at {} is not a whole program ({:#010x} {:#010x} {:#010x} "
+                    "{:#010x}): draw skipped",
+                    u32(stage), fmt::ptr(code), code[0], code[1], code[2], code[3]);
+    }
+    return false;
+}
+
+bool PipelineCache::ProgramDecodes(const Shader::ShaderParams& params, Shader::HwStage stage) {
+    size_t bad = 0;
+    if (Shader::Gcn::ProgramDecodes(params.code, &bad)) {
+        return true;
+    }
+    const u32 word = params.code[bad];
+    const bool synced = SyncProgramMemory(params.Base(), params.code.size_bytes());
+    const bool decodes = synced && Shader::Gcn::ProgramDecodes(params.code, &bad);
+    static std::atomic<u32> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(Render_Vulkan,
+                    "stage {} program {:#x} at {:#x} ({} bytes): word {:#010x} at dword {} does not "
+                    "decode; {}",
+                    u32(stage), params.hash, params.Base(), params.code.size_bytes(), word, bad,
+                    decodes ? "decodes after reading back what the GPU wrote"
+                            : "draw skipped");
+    }
+    return decodes;
+}
+
 bool PipelineCache::PrepareGraphicsPipeline(PipelineSelection& worker_sel) {
     // Tessellation stages read constant buffers from memory at selection time: not prepared.
     if (worker_sel.regs->stage_enable.hs_en) {
@@ -467,7 +544,8 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
     for (u32 i = 0; i < prepared.num_stages; ++i) {
         const auto& stage = prepared.stages[i];
         const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage.hw_stage));
-        if (!pgm || !pgm->Address<u32*>()) {
+        // bbport: not a whole program now: the regular path decides (LooksLikeProgram).
+        if (!pgm || !pgm->Address<u32*>() || !AmdGpu::DirectBinaryInfo(pgm->Address<u32*>())) {
             return nullptr;
         }
         const auto params = AmdGpu::GetParams(*pgm);
@@ -908,6 +986,7 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
     sel.fetch_shader = std::nullopt;
 
     Shader::Backend::Bindings binding{};
+    bool not_a_program = false; // bbport: a stage's program is not one (yet): the draw is skipped
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -924,11 +1003,35 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
             return false;
         }
 
+        // bbport: a whole program (and, for a geometry stage, the copy shader its runtime info
+        // reads); new ones decode whole. A worker leaves such a draw to the GPU command thread.
+        const auto not_one = [&] {
+            key.stage_hashes[stage_out_idx] = 0;
+            sel.infos[stage_out_idx] = nullptr;
+            not_a_program = true;
+            if (sel.worker) {
+                sel.worker->failed = true;
+            }
+            return false;
+        };
+        if (!LooksLikeProgram(pgm->Address<u32*>(), stage_in, !sel.worker) ||
+            (stage_in == HwStage::Geometry &&
+             (!regs.vs_program.Address<u32*>() ||
+              !LooksLikeProgram(regs.vs_program.Address<u32*>(), HwStage::Vertex, !sel.worker)))) {
+            return not_one();
+        }
         const auto params = AmdGpu::GetParams(*pgm);
+        if (!sel.worker && program_cache.find(params.hash) == program_cache.end() &&
+            !ProgramDecodes(params, stage_in)) {
+            return not_one();
+        }
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(sel.infos[stage_out_idx], sel.modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
             GetProgram(sel, stage_in, stage_out, params, binding);
+        if (!sel.infos[stage_out_idx]) {
+            return not_one(); // its fetch shader is not one (GetProgram)
+        }
         if (fetch_shader_) {
             sel.fetch_shader = fetch_shader_;
         }
@@ -1008,6 +1111,9 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
         return false;
     }
 
+    if (not_a_program) {
+        return false;
+    }
     const auto* vs_info = sel.infos[static_cast<u32>(SwStage::Vertex)];
     if (vs_info && sel.fetch_shader && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
@@ -1029,10 +1135,18 @@ bool PipelineCache::RefreshGraphicsStages(PipelineSelection& sel) {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
+    // bbport: as for the graphics stages (LooksLikeProgram, ProgramDecodes): skipped otherwise.
+    if (!cs_pgm.Address<u32*>() || !LooksLikeProgram(cs_pgm.Address<u32*>(), HwStage::Compute, true)) {
+        return false;
+    }
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    if (program_cache.find(cs_params.hash) == program_cache.end() &&
+        !ProgramDecodes(cs_params, HwStage::Compute)) {
+        return false;
+    }
     std::tie(sel.infos[0], sel.modules[0], sel.fetch_shader, compute_key.value) =
         GetProgram(sel, HwStage::Compute, SwStage::Compute, cs_params, binding);
-    return true;
+    return sel.infos[0] != nullptr;
 }
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
@@ -1101,6 +1215,15 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         }
         runtime_fault_recover = &recover;
         info.RefreshFlatBuf();
+        // bbport: a fetch shader that does not decode: the GPU command thread reads back what
+        // the GPU wrote there, or skips the draw.
+        if (info.has_fetch_shader &&
+            !Shader::Gcn::FetchShaderDecodes(
+                Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base))) {
+            runtime_fault_recover = nullptr;
+            worker.failed = true;
+            return {};
+        }
         auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
         runtime_fault_recover = nullptr;
         const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
@@ -1147,6 +1270,25 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
+    // bbport: the fetch shader it calls (through a pointer in its user data) decodes up to its
+    // s_setpc_b64, or the draw is skipped (memory the game is still filling, or reused: the parse
+    // asserted, or indexed past its table). Read back once first (LooksLikeProgram).
+    if (info.has_fetch_shader) {
+        const u32* fetch = Shader::Gcn::GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+        if (!Shader::Gcn::FetchShaderDecodes(fetch)) {
+            if (!fetch || !SyncProgramMemory(reinterpret_cast<VAddr>(fetch), 4096) ||
+                !Shader::Gcn::FetchShaderDecodes(fetch)) {
+                static std::atomic<u32> reported{0};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "program {:#x}: its fetch shader at {} does not decode: draw "
+                                "skipped",
+                                params.hash, fmt::ptr(fetch));
+                }
+                return {};
+            }
+        }
+    }
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();

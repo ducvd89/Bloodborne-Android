@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <span>
+
 #include "shader_recompiler/frontend/instruction.h"
 
 namespace Shader::Gcn {
@@ -23,6 +25,10 @@ u32 GetEncodingLength(InstEncoding encoding);
 InstFormat InstructionFormat(InstEncoding encoding, u32 opcode);
 
 Opcode DecodeOpcode(u32 token);
+
+/// bbport: whether every word of a program decodes (tryDecodeInstruction); else the index of
+/// the first one that does not, in `bad`.
+bool ProgramDecodes(std::span<const u32> code, size_t* bad = nullptr);
 
 class GcnCodeSlice {
 public:
@@ -61,6 +67,11 @@ private:
 class GcnDecodeContext {
 public:
     GcnInst decodeInstruction(GcnCodeSlice& code);
+    /// bbport: decodeInstruction for words that may not be a program (memory the game is still
+    /// filling, or reused): false instead of an assertion for an illegal encoding, an SDWA/DPP
+    /// operand (not in a PS4 program) or an opcode the format table does not know; `out` and the
+    /// slice's position are valid only when true.
+    bool tryDecodeInstruction(GcnCodeSlice& code, GcnInst& out);
 
 private:
     uint32_t getEncodingLength(InstEncoding encoding);

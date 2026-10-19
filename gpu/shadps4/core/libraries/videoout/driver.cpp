@@ -402,6 +402,28 @@ static void PrintMemorySplit() {
         return;
     }
     last = now;
+    {
+        // bbport: the process's memory mappings against the kernel's limit (vm.max_map_count). At the
+        // limit every mmap fails: the driver's own (vkQueueSubmit -> VK_ERROR_MEMORY_MAP_FAILED, seen
+        // with unified memory on the Thor) and the game's. Page protections split mappings.
+        unsigned long long maps = 0, limit = 0;
+        if (FILE* file = std::fopen("/proc/self/maps", "r")) {
+            char chunk[65536];
+            size_t n;
+            while ((n = std::fread(chunk, 1, sizeof(chunk), file)) > 0) {
+                maps += static_cast<unsigned long long>(std::count(chunk, chunk + n, '\n'));
+            }
+            std::fclose(file);
+        }
+        if (FILE* file = std::fopen("/proc/sys/vm/max_map_count", "r")) {
+            if (std::fscanf(file, "%llu", &limit) != 1) {
+                limit = 0;
+            }
+            std::fclose(file);
+        }
+        std::printf("Memory mappings: %llu of %llu (vm.max_map_count)%s\n", maps, limit,
+                    limit && maps * 10 > limit * 9 ? " -- NEAR THE LIMIT: mmap will start failing" : "");
+    }
     unsigned long long rss = 0, pss = 0, anon = 0, shared = 0, priv_dirty = 0, swap = 0;
     if (FILE* file = std::fopen("/proc/self/smaps_rollup", "r")) {
         char line[160];
@@ -494,6 +516,7 @@ static void PrintMemorySplit() {
         // bbport BB_UMA: the shared granules (the runtime's counters) and what the GPU side did with them.
         const auto runtime = BbGuestMemory::UmaRuntime();
         const auto& uma = BbUma::counters;
+        const auto shared_dma = BbUma::SharedDma();
         unsigned long long class_refusals = 0;
         for (const auto& count : uma.refused_class) {
             class_refusals += count.load();
@@ -507,7 +530,8 @@ static void PrintMemorySplit() {
                     "announced writes %llu), "
                     "freeze faults %llu, io waits %llu, promote %.1f ms total / %.1f ms max, granule "
                     "buffer bindings %llu (%llu MiB; verdict memo %llu hits / %llu misses), uma image "
-                    "writes %llu, verify %llu checked / %llu mismatches\n",
+                    "writes %llu, verify %llu checked / %llu mismatches, DMA into shared: %llu "
+                    "(%.1f MiB; cpu %llu, gpu %llu)\n",
                     (unsigned long long)(runtime.granule_bytes >> 10),
                     (unsigned long long)runtime.shared_granules,
                     (unsigned long long)(runtime.shared_bytes >> 20),
@@ -538,7 +562,15 @@ static void PrintMemorySplit() {
                     (unsigned long long)uma.memo_misses.load(),
                     (unsigned long long)uma.image_writes.load(),
                     (unsigned long long)uma.verify_checked.load(),
-                    (unsigned long long)uma.verify_mismatches.load());
+                    (unsigned long long)uma.verify_mismatches.load(),
+                    (unsigned long long)shared_dma.count, double(shared_dma.bytes) / (1 << 20),
+                    (unsigned long long)shared_dma.cpu, (unsigned long long)shared_dma.gpu);
+        // bbport: DMA fills and copies into shared granules: where, the first 32 destinations, when
+        // there are new ones since the last time.
+        std::string dma_list;
+        if (BbUma::SharedDmaNewList(dma_list)) {
+            std::printf("UMA: DMA into shared granules, first destinations: %s\n", dma_list.c_str());
+        }
         // Which class holds the VRAM copies, and whether the CPU had their pages (sharing saves
         // those) or not (GPU-only data: sharing saves nothing).
         std::string by_class;
@@ -820,16 +852,37 @@ void VideoOutDriver::Flip(const Request& req) {
             const double draws_per_frame = frames ? double(all_draws - window_draws) / frames : 0.0;
             window_draws = all_draws;
             window_gpu_us = gpu_us;
+            // Hot pages (RegionManager) and protection changes over this window.
+            static u64 win_promoted, win_expired, win_refused, win_protect, win_revoke;
+            static u32 win_epoch;
+            const u64 promoted = BbStats::hot_promoted.load(), expired = BbStats::hot_expired.load(),
+                      refused = BbStats::hot_refused.load(), protects = BbStats::protect_calls.load(),
+                      revokes = BbStats::protect_revoke_calls.load();
+            const u64 d_promoted = promoted - win_promoted, d_expired = expired - win_expired,
+                      d_refused = refused - win_refused, d_protects = protects - win_protect,
+                      d_revokes = revokes - win_revoke;
+            win_promoted = promoted;
+            win_expired = expired;
+            win_refused = refused;
+            win_protect = protects;
+            win_revoke = revokes;
+            const u32 epoch = BbStats::hot_epoch.load(), d_epochs = epoch - win_epoch; // u32 wraps
+            win_epoch = epoch;
+            const long long hot_pages = BbStats::hot_pages.load();
             std::printf("Frame stats: %.1f FPS, worst frame %.1f ms (vblank %u Hz); "
                         "%u shader/pipeline compiles, %.1f ms; %llu recorder syncs; "
-                        "%.0f write faults/s, %lld hot pages; GPU thread %.2f us/draw, "
+                        "%.0f write faults/s, %lld hot pages (%.1f MiB; +%llu/-%llu windows, %llu "
+                        "refused), %.0f protect calls/s (%.0f revoking), %.0f hot epochs/s; GPU thread %.2f us/draw, "
                         "%.0f draws/frame, idle %.1f%%; blocked: recorder %.1f%%, host copies "
                         "%.1f%% (%.0f/frame, %.0f/frame not needed), copy threads %.1f%%, GPU ticks %.1f%%; "
                         "reduced-size draws %.0f/frame of %.0f in the scene\n",
                         frames / window, worst_ms, EmulatorSettings.GetVblankFrequency(), compiles,
                         compile_ns / 1e6, static_cast<unsigned long long>(direct),
-                        faults / window, static_cast<long long>(BbStats::hot_pages.load()),
-                        us_per_draw, draws_per_frame,
+                        faults / window, hot_pages, hot_pages * 4096.0 / (1024.0 * 1024.0),
+                        static_cast<unsigned long long>(d_promoted),
+                        static_cast<unsigned long long>(d_expired),
+                        static_cast<unsigned long long>(d_refused), d_protects / window,
+                        d_revokes / window, d_epochs / window, us_per_draw, draws_per_frame,
                         BbStats::gpu_idle_ns.exchange(0) / (window * 1e7),
                         BbStats::sync_recording_ns.exchange(0) / (window * 1e7),
                         BbStats::host_copies_wait_ns.exchange(0) / (window * 1e7),

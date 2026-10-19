@@ -119,6 +119,23 @@ void VerifyRecord(Class cls, std::uint64_t address, std::uint64_t size, std::uin
 /// cache's per-packet maintenance); a changed hash is logged and counted.
 void VerifyProcess(bool (*done)(void* context, std::uint64_t tick), void* context);
 
+// ---- DMA fills and copies into shared granules ----
+/// BB_UMA_DMA_GPU=1 (env, read once; default off): a DMA fill or copy (PM4 DMA_DATA, COPY_DATA) whose
+/// destination touches a shared granule goes to the GPU in stream order (the arena's copy, marked
+/// GPU-modified; the game's memory keeps the old bytes). Default: done as copy mode does it, by the
+/// CPU into the game's memory (BufferCache::DmaDstInPlace).
+bool DmaGpu();
+/// Counts a DMA fill (`fill`) or copy into a shared granule: done by the CPU (`cpu`) or recorded for the
+/// GPU. Any thread; the first 32 distinct destinations are remembered (SharedDmaNewList).
+void NoteSharedDma(std::uint64_t address, std::uint64_t size, bool fill, bool cpu);
+struct SharedDmaTotals {
+    std::uint64_t count = 0, bytes = 0, cpu = 0, gpu = 0;
+};
+SharedDmaTotals SharedDma();
+/// When destinations were remembered since the last call that returned true: `text` is the list
+/// ("fill 0x..+0x.. cpu, copy ..."), capped in length. For one reporting thread.
+bool SharedDmaNewList(std::string& text);
+
 // ---- dynamic blocks: memory the CPU rewrites while it is bound in place ----
 /// A binding bound in place (BufferCache::UmaDirect) arms a one-shot write trap
 /// (BbLayer::WriteTraps::UmaWatch) on its 64 KiB guest blocks; the first CPU write there (a fault,

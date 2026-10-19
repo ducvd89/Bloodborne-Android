@@ -72,6 +72,10 @@ public:
     /// Before a compute dispatch: the post-processing combine shader triggers the upscale.
     void OnDispatch(u64 cs_hash);
 
+    /// bbport: the display pass begins (before CameraMotion::OnDisplayPass clears the scene depth): a
+    /// scaled frame that drew no UI (cinematics) is finished at the output's size here.
+    void OnDisplayPassStart();
+
     /// Start of a frame in the command stream (display pass).
     bool OnFrameStart();
     bool RasterScaling() const;

@@ -184,11 +184,12 @@ if [ -n "$render" ]; then export BB_RENDER_RES=$render; else unset BB_RENDER_RES
 # with one logged reason (Mali/PanVK always, a failed probe...). Writes by the game are caught by page protection
 # (BB_WRITE_TRACKING); BB_UMA_VERIFY=N reports data that changed while the GPU used it. BB_UNIFIED=1 (v1: whole
 # allocations through the layer memory module) stays for reference, only from the environment.
+# BB_UMA_DMA_GPU=1: DMA fills and copies into shared granules go to the GPU again (default: the CPU, as copy mode).
 if [ -z "${BB_UMA:-}" ] && [ "$(setting unified_memory)" = 1 ]; then BB_UMA=1; fi
 if [ "${BB_UMA:-0}" = 1 ]; then
     export BB_UMA=1 BB_GUEST_IN_PLACE=1 BB_LAYER_MEMORY=0 BB_WRITE_TRACKING=1 BB_CHUNK_UPLOADS=0
     unset BB_UNIFIED
-    for uma_var in BB_UMA_CLASSES BB_UMA_VERIFY BB_UMA_GRANULE_KB; do
+    for uma_var in BB_UMA_CLASSES BB_UMA_VERIFY BB_UMA_GRANULE_KB BB_UMA_DMA_GPU; do
         eval "uma_val=\${$uma_var:-}"
         [ -z "$uma_val" ] || export "$uma_var"
     done
@@ -392,6 +393,9 @@ if [ "${1:-game}" = game ]; then
     elif [ "$fps_limit" != 30 ]; then
         patch_args="$patch_args --patches $parts/fps=uncap.bin"
     fi
+    # The GX per-frame command heaps at 1 MiB (upstream #162; BB_GX_COMMAND_HEAP=0: the game's 256 KiB).
+    [ "${BB_GX_COMMAND_HEAP:-1}" != 0 ] && [ -f "$parts/gx-heap.bin" ] &&
+        patch_args="$patch_args --patches $parts/gx-heap.bin"
     # No PSN here: the title screen goes straight to the main menu offline.
     [ "$(setting skip_network_choice)" != 0 ] && [ -f "$parts/skip_network_choice=1.bin" ] &&
         patch_args="$patch_args --patches $parts/skip_network_choice=1.bin"

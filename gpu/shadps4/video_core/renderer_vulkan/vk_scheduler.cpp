@@ -1551,9 +1551,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Four like SubmitAsync: SubmitInfo takes up to four waits (the third and fourth are the extra
     // binary semaphores of the presenter, e.g. Lossless Scaling's batch-complete).
+    // bbport: every wait covers its earliest consumer whatever its index: a prepared frame is
+    // first read by the present blit (Transfer), which a wait at ColorAttachmentOutput did not
+    // hold back (single black or grey frames; upstream bloodborne_pc 0.6).
     static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eAllCommands,
     };
@@ -1635,9 +1638,10 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
         }
         recorded_segments.fetch_add(num_cmdbufs, std::memory_order_relaxed);
         recorded_submissions.fetch_add(1, std::memory_order_relaxed);
+        // bbport: AllCommands for every wait, as in SubmitExecution.
         static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
             vk::PipelineStageFlagBits::eAllCommands,
-            vk::PipelineStageFlagBits::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits::eAllCommands,
             vk::PipelineStageFlagBits::eAllCommands,
             vk::PipelineStageFlagBits::eAllCommands,
         };

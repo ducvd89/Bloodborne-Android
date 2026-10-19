@@ -72,4 +72,9 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
 
+/// bbport: whether the fetch shader at `code` decodes up to its s_setpc_b64 as one (memory the game
+/// is still filling, or reused, holds garbage there: the parse asserts on it, or indexes past its
+/// tables). Results are kept per thread by address and contents.
+bool FetchShaderDecodes(const u32* code);
+
 } // namespace Shader::Gcn

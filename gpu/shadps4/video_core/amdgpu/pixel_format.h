@@ -356,7 +356,10 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // bbport: no real descriptor has it; a half-written one read ahead by a draw
+            // preparation worker can (upstream bloodborne_pc #166: "data_fmt = 7" ended the game).
+            // Nothing to convert: a specialization keyed by it never matches.
+            return NumberConversion::None;
         }
     }
     default:

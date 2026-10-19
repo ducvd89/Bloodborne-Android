@@ -3445,4 +3445,10 @@
             <Line Type="bytes" Address="0x01f39030" Value="554889e5534883ec184889fb488d05ed2d80034889042448897424084889e6e87c0c01004889d84883c4185b5dc3"/>
         </PatchList>
     </Metadata>
+    <Metadata Title="Bloodborne" Name="Larger GX Per-Frame Command Heap" Author="bbport" Note="Each GX swap-chain command buffer gets a 1 MiB per-frame heap instead of 256 KiB, covering the unchecked NULL command allocations at guest 0x2199310 and 0x21d5b40 (upstream bloodborne_pc #162, PR #224)." PatchVer="1.0" AppVer="01.09" AppElf="eboot.bin" isEnabled="false">
+        <PatchList>
+            <Line Type="bytes" Address="0x02595c0a" Value="00001000"/>
+            <Line Type="bytes" Address="0x02595c47" Value="00001000"/>
+        </PatchList>
+    </Metadata>
 </Patch>

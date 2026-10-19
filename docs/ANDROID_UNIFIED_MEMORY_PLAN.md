@@ -155,9 +155,16 @@ Now (`BufferCache::UmaDirect`, called by `ObtainBuffer` before copy mode's strea
   bindings at the cost of commit rounding (a promoted granule commits all of its pages).
 - The arena is exactly copy mode's: no external-memory flag, `in_place_blocks` stays empty,
   `IsInPlace()` is false, unmaps change nothing in it. `IsAnyInPlace()` answers "touches a shared
-  granule" (`runtime_memory_granule_shared`): DMA fills and copies into shared memory are done by the
-  GPU in stream order (into the arena's copy, then GPU-modified: earlier draws reading the granule live
-  see the old bytes, later ones the copy), DMA sources there are CPU snapshots (`ObtainSnapshot`).
+  granule" (`runtime_memory_granule_shared`): DMA sources there are CPU snapshots (`ObtainSnapshot`).
+  DMA fills and copies *into* shared memory (`Rasterizer::FillBuffer`/`CopyBuffer`, decided by
+  `BufferCache::DmaDstInPlace`) are done by the CPU, exactly as copy mode does them (2026-10-19): the
+  game reads DMA results with the CPU, and the earlier rule (the GPU, in stream order, into the arena's
+  copy, then GPU-modified) left the game's memory with the old bytes, which readbacks (relaxed by
+  default) never fixed: the game raised its own fatal exception a few minutes into streaming an area.
+  Trade-off: draws recorded earlier that read the granule live through its buffer may see the new bytes
+  early (a possible visual glitch, no corrupted CPU data); a CPU write into an armed block hits the
+  UmaWatch trap and the block goes back to copies. `BB_UMA_DMA_GPU=1` brings back the GPU path. The
+  `UMA:` line counts them (`DMA into shared: N (X MiB; cpu A, gpu B)`) and logs the first 32 destinations.
 - `GarlicInVram()` is false on phones; the copy FIFO (`BB_VRAM_COPY_QUEUE`) works as in copy mode.
 - Counters (the `UMA:` line): granule buffer bindings and MiB, refusals by class, written, cross-granule,
   mapping, GPU data, image, backoff.
@@ -301,6 +308,7 @@ guest address, size and frame. This replaces guessing which binding causes a gli
 | `BB_UMA_VERIFY` | verify one in N in-place bindings (0: off) | 0 |
 | `BB_UMA_ALLOW_NONCOHERENT=1` | debugging only: share even if the coherence probe fails | off |
 | `BB_UMA_ORDER=1` | phase 3: game writes wait for in-flight GPU reads of shared blocks | off |
+| `BB_UMA_DMA_GPU=1` | DMA fills and copies into shared granules go to the GPU (arena copy), not the CPU | off |
 | `BB_TEX_HOME=1` | Plan A: sampled textures the CPU left alone live only in the GPU (copy mode or `BB_UMA`) | off |
 | `BB_TEX_HOME_IDLE_S` | seconds since the last CPU write before a texture is homed (1..3600) | 10 |
 | `BB_TEX_HOME_LOG=1` | one `Texture home diff:` line per texture whose re-tiles differed (first 60) | off |

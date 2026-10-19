@@ -221,6 +221,30 @@ struct ComputeProgram {
     }
 };
 
+/// bbport: the program's header (OrbShdr) where its first instruction (s_mov_b32 vcc_hi, length)
+/// says, or null: not a whole program yet (the game copies programs into place with the GPU, or
+/// the memory was reused).
+inline const BinaryInfo* DirectBinaryInfo(const u32* code) {
+    constexpr u32 token_mov_vcchi = 0xBEEB03FF;
+    if (code[0] != token_mov_vcchi || code[1] > 0x40000) {
+        return nullptr;
+    }
+    const auto* info = std::bit_cast<const BinaryInfo*>(code + (code[1] + 1) * 2);
+    return info->Valid() ? info : nullptr;
+}
+/// bbport: SearchBinaryInfo without stopping the game: null when no header is found.
+inline const BinaryInfo* FindBinaryInfo(const u32* code) {
+    if (const auto* info = DirectBinaryInfo(code)) {
+        return info;
+    }
+    for (const u32* it = code; it < code + 0x4000; ++it) {
+        if (const auto* info = std::bit_cast<const BinaryInfo*>(it); info->Valid()) {
+            return info;
+        }
+    }
+    return nullptr;
+}
+
 static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] == token_mov_vcchi) {

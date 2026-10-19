@@ -128,7 +128,13 @@ inline std::atomic<std::uint64_t> gnm_frame_waits{0}, gnm_frame_wait_ns{0};
 inline std::atomic<std::uint64_t> asc_submits{0};
 /// The game's GPU range allocators (seen at their collector, 0x26aa860): object, live ranges, bytes.
 inline std::array<std::atomic<std::uint64_t>, 4> range_allocators{}, range_live{}, range_bytes{};
+/// Hot pages (RegionManager): pages kept writable now (all regions; capped), and windows promoted,
+/// expired and refused by the cap since the start.
 inline std::atomic<std::int64_t> hot_pages{0};
+inline std::atomic<std::uint64_t> hot_promoted{0}, hot_expired{0}, hot_refused{0};
+/// Bumped wherever the guest may have written data the GPU reads next: a submission, a wait on a label
+/// the guest writes, a flip. A hot page is uploaded again once per epoch (RegionManager::RefreshHot).
+inline std::atomic<std::uint32_t> hot_epoch{0};
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};

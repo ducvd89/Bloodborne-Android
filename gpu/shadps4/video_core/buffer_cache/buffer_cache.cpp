@@ -934,12 +934,7 @@ void BufferCache::SmallGuestCopy(const BbCopy::Item& item) {
 }
 
 u64 BufferCache::FaultWindowBytes() {
-    static const u64 window = [] {
-        const char* env = std::getenv("BB_FAULT_WINDOW");
-        const u64 kib = env ? std::strtoull(env, nullptr, 10) : 256;
-        return std::bit_ceil(std::clamp<u64>(kib, 4, 1024)) * 1024;
-    }();
-    return window;
+    return FaultWindowBytesFromEnv(); // shared with RegionManager's hot pages
 }
 
 void BufferCache::ExtendWriteFault(VAddr device_addr, u64 guest_rip) {
@@ -2012,8 +2007,14 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
         vk::DeviceMemory memory{};
         // FixedArena: no VRAM in the arena (system memory, as the guest chunks it is bound with).
         if (FixedArena() && arena_fallback_type_index) {
-            memory = Vulkan::Check(device.allocateMemory(
-                {.allocationSize = size, .memoryTypeIndex = *arena_fallback_type_index}));
+            // bbport: out of memory here too returns none (the caller waits and tries again):
+            // Vulkan::Check stopped the game (upstream bloodborne_pc #173, PR #206).
+            auto host = device.allocateMemory(
+                {.allocationSize = size, .memoryTypeIndex = *arena_fallback_type_index});
+            if (host.result != vk::Result::eSuccess) {
+                return vk::DeviceMemory{};
+            }
+            memory = host.value;
             BbStats::device_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
             BbStats::residency_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
             return memory;
@@ -2035,8 +2036,12 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
                             "go to system memory (slower)\n",
                             vk::to_string(result).c_str());
             }
-            memory = Vulkan::Check(device.allocateMemory(
-                {.allocationSize = size, .memoryTypeIndex = *arena_fallback_type_index}));
+            auto host = device.allocateMemory(
+                {.allocationSize = size, .memoryTypeIndex = *arena_fallback_type_index});
+            if (host.result != vk::Result::eSuccess) {
+                return vk::DeviceMemory{}; // as above
+            }
+            memory = host.value;
         } else {
             // No system-memory type for the arena (NVIDIA's sparse buffers take VRAM only):
             // AllocateResidency tries a smaller block and the other memory types.
@@ -2067,15 +2072,41 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
             size = bytes;
             memory = allocate(size);
         }
-        const auto& types = instance.GetMemoryProperties();
-        for (u32 i = 0; !memory && i < types.memoryTypeCount; ++i) {
-            if (((arena_memory_type_bits >> i) & 1) && i != arena_memory_type_index) {
-                auto other = instance.GetDevice().allocateMemory({.allocationSize = size, .memoryTypeIndex = i});
-                if (other.result == vk::Result::eSuccess) {
-                    memory = other.value;
-                    BbStats::device_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
-                    BbStats::residency_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+        // Just the request's size, then any other memory type the arena can be bound to.
+        const auto other_types = [&] {
+            const auto& types = instance.GetMemoryProperties();
+            vk::DeviceMemory any{};
+            for (u32 i = 0; !any && i < types.memoryTypeCount; ++i) {
+                if (((arena_memory_type_bits >> i) & 1) && i != arena_memory_type_index) {
+                    auto other = instance.GetDevice().allocateMemory({.allocationSize = size, .memoryTypeIndex = i});
+                    if (other.result == vk::Result::eSuccess) {
+                        any = other.value;
+                        BbStats::device_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+                        BbStats::residency_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+                    }
                 }
+            }
+            return any;
+        };
+        if (!memory) {
+            memory = other_types();
+        }
+        if (!memory) {
+            // bbport: still full (upstream bloodborne_pc #163, #173, PR #206): the images the
+            // collector evicted are destroyed only once the GPU is past them (deferred deletion),
+            // so their memory was still taken. Wait for the submitted work (not the one being
+            // recorded), run those deletions, try again before giving up.
+            scheduler.WaitSubmittedWork();
+            scheduler.PopPendingOperations();
+            memory = allocate(size);
+            if (!memory) {
+                memory = other_types();
+            }
+            static std::atomic<u32> waited{0};
+            if (memory && waited.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::printf("Guest memory: memory was full: waited for the GPU to free evicted "
+                            "textures (%llu MiB)\n",
+                            (unsigned long long)(size >> 20));
             }
         }
         ASSERT_MSG(memory, "Failed to allocate {} MiB for guest memory copies: VRAM is full", size >> 20);
@@ -2991,6 +3022,16 @@ bool BufferCache::UmaAnyShared(VAddr addr, u64 size) {
         at = std::min<VAddr>(static_cast<VAddr>(mapping_end), at + step);
     }
     return false;
+}
+
+bool BufferCache::DmaDstInPlace(VAddr addr, u64 size) const {
+    // bbport BB_UMA: the game reads what a DMA wrote with the CPU: a GPU-only write over a shared
+    // granule left its memory stale (the arena's copy had the data). So copy mode's choice, unless
+    // BB_UMA_DMA_GPU=1 (the GPU, in stream order).
+    if (UmaActive() && !LayerActive() && !BbUma::DmaGpu()) {
+        return false;
+    }
+    return IsAnyInPlace(addr, size);
 }
 
 void BufferCache::BindInPlace(u64 start, u64 end, std::vector<ResidentBind>& out,

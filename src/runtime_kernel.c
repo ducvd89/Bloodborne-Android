@@ -111,7 +111,7 @@ static int sleep_ns(uint64_t ns) {
     clock_gettime(CLOCK_MONOTONIC,&b);
     atomic_fetch_add(&sleep_calls,1);
     atomic_fetch_add(&sleep_total_ns,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
-    runtime_wait_note(3,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
+    if (runtime_wait_profiling()) runtime_wait_note(3,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
     return result;
 }
 static ABI int32_t kernel_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
@@ -156,8 +156,33 @@ static ABI __attribute__((noreturn)) void hard_exit(int status) {
     fflush(stdout);
     _exit(status);
 }
-static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t argument) {
-    fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
+/* bbport: the game's own assertion "GPUTextureUtil.cpp(18141): nSamples >= 2" in its motion blur's
+ * camera rotation parameters (code 0xa0020007, raised from +0xc33000..+0xc34200): the code after the
+ * check goes on with the value (a retail build had it compiled out), and the function it then calls
+ * gets its sample count raised to 3 (bbport_guest_guards.cpp). Logged, and the game goes on, as in
+ * upstream bloodborne_pc 0.6 (#207). BB_GAME_ASSERT_STOP=1: stops as before. */
+static void guest_call_sites(uint64_t out[3]);
+static int game_assert_ignored(uint32_t code) {
+    static int stop=-1;
+    if (stop<0) { const char *e=getenv("BB_GAME_ASSERT_STOP"); stop=e && e[0]=='1'; }
+    if (code!=0xa0020007u || stop) return 0;
+    uint64_t sites[3]={0,0,0};
+    guest_call_sites(sites);
+    if (sites[0]<0xc33000 || sites[0]>=0xc34200) return 0;
+    static _Atomic unsigned told;
+    if (atomic_fetch_add(&told,1)<5)
+        printf("Runtime: the game's blur-kernel assertion at +0x%llx ignored (BB_GAME_ASSERT_STOP=1: stop)\n",(unsigned long long)sites[0]);
+    return 1;
+}
+static ABI void raise_exception(uint32_t code,uint64_t argument) {
+    if (game_assert_ignored(code)) return; /* bbport: see above */
+    /* bbport: where in the game: its first three call sites (guest offsets; independent of BB_WAIT_PROFILE). */
+    uint64_t sites[3]={0,0,0};
+    char thread[32]="?";
+    runtime_guest_call_sites(sites);
+    pthread_getname_np(pthread_self(),thread,sizeof(thread));
+    fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx (thread %s, game +%#lx<+%#lx<+%#lx)\n",
+            code,(unsigned long long)argument,thread,(unsigned long)sites[0],(unsigned long)sites[1],(unsigned long)sites[2]);
     runtime_report();
     exit(23);
 }
@@ -313,9 +338,12 @@ void runtime_thread_keys_cleanup(void) {}
 static void sample_start(void);
 static void sample_report(void);
 
-/* bbport (frame stats): time guest threads spend blocked in the runtime (condition variables,
+/* bbport (BB_WAIT_PROFILE=1): time guest threads spend blocked in the runtime (condition variables,
  * mutexes, semaphores, sleeps), by thread and guest call site: the first return address into the
- * game's code on the stack. Shows where the game waits for the GPU (labels, frame pacing). */
+ * game's code on the stack. Shows where the game waits for the GPU (labels, frame pacing).
+ * Separate from BB_FRAME_STATS: every contended wait reads the guest stack (process_vm_readv) and
+ * probes a shared table, about 9% of a core, which distorts every other measurement. Reported with
+ * the frame stats; BB_WAIT_LOG=<path> also dumps the table. */
 typedef struct { _Atomic uint64_t key; uint64_t site, site2, site3; int tid, kind; char name[16]; _Atomic uint64_t count, ns; } WaitSite;
 static WaitSite wait_sites[512];
 static _Thread_local int wait_tid;
@@ -344,10 +372,13 @@ static void guest_call_sites(uint64_t out[3]) {
     for (int i=0;i<400 && found<3 && (uintptr_t)(sp+i+1)<=stack_hi;++i) if (sp[i]>=text_lo && sp[i]<text_hi) out[found++]=sp[i]-text_lo;
 #endif
 }
-void runtime_wait_note(int kind, uint64_t ns) {
+int runtime_wait_profiling(void) {
     static int enabled=-1;
-    if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL;
-    if (!enabled) return;
+    if (enabled<0) { const char *v=getenv("BB_WAIT_PROFILE"); enabled=v && *v && *v!='0'; }
+    return enabled;
+}
+void runtime_wait_note(int kind, uint64_t ns) {
+    if (!runtime_wait_profiling()) return;
     if (!wait_tid) wait_tid=(int)syscall(SYS_gettid);
     uint64_t sites[3];
     guest_call_sites(sites);
@@ -365,6 +396,7 @@ void runtime_wait_note(int kind, uint64_t ns) {
 void runtime_wait_report(double frames) {
     sample_start();
     sample_report();
+    if (!runtime_wait_profiling()) return;
     static const char *kinds[]={"cond","mutex","sema","sleep"};
     struct { WaitSite *w; uint64_t ns, count; } rows[512]; int n=0;
     for (int i=0;i<512;++i) {
@@ -390,8 +422,8 @@ void runtime_wait_report(double frames) {
     printf("\n");
 }
 
-/* bbport BB_SAMPLE_THREAD=<name> (with frame stats): where that thread runs, sampled with SIGPROF
- * every 0.5 ms; reported with the wait profile. A thread that never blocks but waits for the GPU
+/* bbport BB_SAMPLE_THREAD=<name> (with frame stats; independent of BB_WAIT_PROFILE): where that thread runs, sampled with SIGPROF
+ * every 0.5 ms; reported with the frame stats. A thread that never blocks but waits for the GPU
  * shows up spinning in its polling loop. */
 static _Atomic uint64_t sample_keys[1024], sample_counts[1024];
 static uint64_t sample_rips[1024], sample_callers[1024];

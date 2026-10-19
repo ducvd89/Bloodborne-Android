@@ -92,6 +92,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
+    // bbport: a program not whole in the CPU's view (a copy into place by the GPU): what the GPU
+    // wrote there, read back on the GPU command thread (as Liverpool::SyncForCpuRead).
+    pipeline_cache.program_memory_sync = [this](VAddr address, u64 size) {
+        DrainDrawPipe();
+        Finish();
+        ReadMemory(address, size, true);
+    };
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
@@ -1687,6 +1694,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (camera_motion->Enabled() && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
+        // bbport: proxies of targets the texture cache evicted, about once a second (upstream
+        // bloodborne_pc 0.6: they were never dropped).
+        static u64 last_cleanup_frame = 0;
+        if (const u64 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+            frame - last_cleanup_frame >= 60) {
+            last_cleanup_frame = frame;
+            scene_targets->CleanupStaleEntries();
+        }
+        upscaler->OnDisplayPassStart(); // bbport: a scaled frame without UI (cinematics)
         camera_motion->OnDisplayPass(cb_descs[0].first);
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
@@ -1827,11 +1843,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             });
         }
     }
-    {
-        BB_SECTION(PipelineBind);
-        pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
-                                {buffer_infos.data(), buffer_infos.size()});
-    }
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     draw_jitter = {};
@@ -1842,6 +1853,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+    // bbport: the push constants after the pass has begun: what starting it records may be a
+    // compute dispatch (occlusion results, GPU profiler marks) with push constants of its own,
+    // and the driver keeps one set for compute and graphics (RADV, Turnip): a clip-disabled draw
+    // then got integers as its viewport transform (single frames shifted by half the screen or in
+    // a corner; upstream bloodborne_pc 0.6).
+    {
+        BB_SECTION(PipelineBind);
+        pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
+                                {buffer_infos.data(), buffer_infos.size()});
+    }
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -1980,8 +2001,6 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     push_data.xoffset *= target_scale[0];
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
-    pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
-                            {buffer_infos.data(), buffer_infos.size()});
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
@@ -1989,6 +2008,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
+    // bbport: after the pass has begun (as in Draw).
+    pipeline->BindResources(set_writes, push_data, {image_infos.data(), image_infos.size()},
+                            {buffer_infos.data(), buffer_infos.size()});
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
@@ -2971,8 +2993,14 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
     // Image copy must be valid
     VideoCore::Image& image0 = texture_cache.GetImage(image0_id);
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
-    if (image0.info.guest_size != image1.info.guest_size ||
-        image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.GetSize() ||
+    // bbport: the buffers may run past the images (padding up to the next one: the light shafts'
+    // 960x540 targets are copied as 0x241800 bytes of 0x240000, 5 times a frame): those bytes are
+    // copied as a buffer (upstream bloodborne_pc 0.6, #204). The shader otherwise ran and wrote
+    // 2.3 MiB a time, and the target was refreshed from there again.
+    constexpr u64 MaxTail = 64_KB;
+    const u64 image_size = image0.info.guest_size;
+    if (image_size != image1.info.guest_size || image0.info.pitch != image1.info.pitch ||
+        buf0.GetSize() < image_size || buf0.GetSize() - image_size > MaxTail ||
         image0.info.num_bits != image1.info.num_bits) {
         return false;
     }
@@ -2999,6 +3027,15 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline, bool dry_run) {
         return false;
     }
     runtime.CopyColorAndDepth(&src_image, &dst_image);
+    if (const u64 tail = buf0.GetSize() - image_size) {
+        const VAddr src_tail = src_image.info.guest_address + image_size;
+        const VAddr dst_tail = dst_image.info.guest_address + image_size;
+        const auto [src_buffer, src_offset] = buffer_cache.ObtainBuffer(src_tail, u32(tail), false);
+        const auto [dst_buffer, dst_offset] = buffer_cache.ObtainBuffer(dst_tail, u32(tail), true);
+        const vk::BufferCopy copy{src_offset, dst_offset, tail};
+        runtime.CopyBuffer(src_buffer, dst_buffer, {&copy, 1});
+        texture_cache.InvalidateMemoryFromGPU(dst_tail, tail, true);
+    }
     return true;
 }
 
@@ -4277,20 +4314,35 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
     ScopeMarkerEnd();
 }
 
+namespace {
+// bbport BB_UMA: whether a DMA into [dst, dst + size) lands in a shared granule: counted once the
+// path is known (BbUma::NoteSharedDma; the "DMA into shared" figures of the UMA status line).
+bool UmaDmaShared(VAddr dst, u64 size) {
+    return VideoCore::UmaActive() && VideoCore::BufferCache::UmaAnyShared(dst, size);
+}
+} // namespace
+
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     DrainDrawPipe();
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
+    bool shared = false;
     if (!is_gds) {
         texture_cache.ClearMeta(address);
+        shared = UmaDmaShared(address, num_bytes);
         // bbport BB_GUEST_IN_PLACE: memory the GPU uses in place is filled by the GPU in stream order
         // (a fill on the CPU now would land before earlier draws read the old data). Elsewhere
         // (VRAM copies, unbound memory: shader code, descriptors this thread reads) on the CPU in
         // decode order, as before; the VRAM copy follows through write tracking.
-        // bbport BB_UMA: over a shared granule (draws recorded before may read it live through the
-        // granule's buffer) the GPU fills the arena's copy in stream order; the range is then
-        // GPU-modified (copy mode's tracking) until the CPU's next access brings it back.
-        if (!buffer_cache.IsAnyInPlace(address, num_bytes) &&
+        // bbport BB_UMA: over a shared granule the CPU fills, like copy mode (DmaDstInPlace): the
+        // game reads what a DMA wrote with the CPU, and a GPU-only fill (the arena's copy) left its
+        // memory stale: the game's fatal error while streaming an area. Trade-off: draws recorded
+        // before that read the granule live through its buffer may see the new bytes early (a
+        // possible visual glitch, no corrupted CPU data); a CPU write into an armed block hits the
+        // UmaWatch trap and the block goes back to copies. BB_UMA_DMA_GPU=1: the old path, the GPU
+        // fills the arena's copy in stream order and the range is GPU-modified until the CPU's next
+        // access brings it back.
+        if (!buffer_cache.DmaDstInPlace(address, num_bytes) &&
             !buffer_cache.IsRegionGpuModified(address, num_bytes) &&
             !VideoCore::BufferCache::LayerMirrored(address, num_bytes)) {
             BbFreeCheck::Check(address, num_bytes, &value, BbFreeCheck::DmaFill);
@@ -4300,7 +4352,13 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
             if (!VideoCore::WriteTracking()) {
                 NoteAssetWrite(address, num_bytes);
             }
+            if (shared) {
+                BbUma::NoteSharedDma(address, num_bytes, true, true);
+            }
             return;
+        }
+        if (shared) {
+            BbUma::NoteSharedDma(address, num_bytes, true, false);
         }
     }
     const auto [buffer, offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
@@ -4318,15 +4376,17 @@ bool Rasterizer::DmaMayWriteOnCpu(VAddr dst, u32 num_bytes) {
     if (!VideoCore::GuestInPlace()) {
         return true;
     }
-    return !buffer_cache.IsAnyInPlace(dst, num_bytes) &&
+    return !buffer_cache.DmaDstInPlace(dst, num_bytes) &&
            !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
            !VideoCore::BufferCache::LayerMirrored(dst, num_bytes);
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     DrainDrawPipe();
-    // bbport BB_GUEST_IN_PLACE: see FillBuffer (in place: the GPU, in stream order).
-    if (!dst_gds && !buffer_cache.IsAnyInPlace(dst, num_bytes) &&
+    // bbport BB_GUEST_IN_PLACE: see FillBuffer (in place: the GPU, in stream order; BB_UMA: a
+    // shared granule is the CPU's too, unless BB_UMA_DMA_GPU=1).
+    const bool shared = !dst_gds && UmaDmaShared(dst, num_bytes);
+    if (!dst_gds && !buffer_cache.DmaDstInPlace(dst, num_bytes) &&
         !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
         !VideoCore::BufferCache::LayerMirrored(dst, num_bytes)) {
         // bbport BB_LAYER_MEMORY: a VRAM copy of the source may hold newer data than the game's memory.
@@ -4340,8 +4400,14 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             if (!VideoCore::WriteTracking()) {
                 NoteAssetWrite(dst, num_bytes);
             }
+            if (shared) {
+                BbUma::NoteSharedDma(dst, num_bytes, false, true);
+            }
             return;
         }
+    }
+    if (shared) {
+        BbUma::NoteSharedDma(dst, num_bytes, false, false);
     }
     texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();

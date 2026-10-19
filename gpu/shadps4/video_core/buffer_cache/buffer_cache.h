@@ -266,8 +266,8 @@ public:
             return !IsInVramLayer(addr, size); // bbport BB_LAYER_MEMORY: not all in one mirror
         }
         // bbport BB_UMA: nothing is bound in place in the arena; "in place" is a granule shared
-        // with the GPU (bindings may read it live through the granule's buffer, UmaDirect): DMA
-        // fills and copies into it go to the GPU in stream order, its sources are CPU snapshots.
+        // with the GPU (bindings may read it live through the granule's buffer, UmaDirect): the
+        // sources of DMA copies there are CPU snapshots (for DMA destinations: DmaDstInPlace).
         if (UmaActive()) {
             return UmaAnyShared(addr, size);
         }
@@ -277,6 +277,11 @@ public:
     /// bbport BB_UMA: whether [addr, addr + size) touches direct memory in a granule shared with
     /// the GPU (runtime_memory_granule_shared).
     [[nodiscard]] static bool UmaAnyShared(VAddr addr, u64 size);
+    /// bbport: whether a DMA fill or copy into [addr, addr + size) is recorded for the GPU because of
+    /// where the memory is (Rasterizer::FillBuffer, CopyBuffer, DmaMayWriteOnCpu; their other
+    /// conditions apply on top). IsAnyInPlace, except under BB_UMA: a shared granule does not send it
+    /// to the GPU (the CPU does it into the game's memory, as copy mode) unless BB_UMA_DMA_GPU=1.
+    [[nodiscard]] bool DmaDstInPlace(VAddr addr, u64 size) const;
     /// bbport BB_LAYER_MEMORY: [addr, addr + size) whole in one VRAM mirror.
     [[nodiscard]] bool IsInVramLayer(VAddr addr, u64 size) const;
 
