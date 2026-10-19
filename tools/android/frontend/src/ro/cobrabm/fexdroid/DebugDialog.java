@@ -25,7 +25,7 @@ final class DebugDialog {
         {"debug_fault_sleep_lock","Sleeping lock in the fault handler","Off: a spinning lock instead.","1"},
     };
     private static final String[][] EXPERIMENTAL={
-        {"unified_memory","Unified memory (experimental)","The game's buffers (vertex and index data) are shared with the GPU in place instead of copied: less RAM; textures stay copies. Adreno only; other GPUs and drivers that fail the start-up checks keep copies (see the log).","0"},
+        {"unified_memory","Unified memory","The game's buffers (vertex and index data) are shared with the GPU in place instead of copied: less RAM; textures stay copies. Adreno only; other GPUs and drivers that fail the start-up checks keep copies (see the log). Turn off if you see crashes or glitches.","1"},
         {"debug_vram_copy_queue","Free old GPU memory (FIFO)","Keeps GPU copies of game memory under a cap: once it is reached, throws away the oldest copies not used for 20 s, so memory stops growing on long sessions. Turn off if you see missing geometry or stutter.","1"},
     };
     /** The cap of the FIFO above, in MB: a single choice, used only while that switch is on. */
