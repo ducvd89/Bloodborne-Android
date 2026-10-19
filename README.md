@@ -31,6 +31,8 @@ A port of Bloodborne (PS4, **v1.09**), not an emulator. Experimental. You need y
 - **Real game speed** down to 20 FPS, instead of slow motion below 30.
 - **GPU driver included**: Turnip for Adreno 6xx/7xx and 8xx, picked for you.
 - **Mods** (.zip, .7z, .pkg), **cheats** (infinite health and items), **on-screen controller**, physical controllers.
+- **Pause game** from the side menu; the game also pauses on its own when you leave the app or the screen turns off.
+- **Unified memory** (new in 1.0.0): vertex and index data is shared by the game and the GPU instead of kept twice, about 8% less RAM.
 - **Updates and bug reports from the app's menu.**
 
 ## Devices
@@ -56,11 +58,11 @@ On ColorOS / OxygenOS a "Security warning" may appear at launch: tap **Got it**.
 
 Swipe in from the left edge or press Back.
 
-- **Game**: Game settings (skip intros and the online screen, free camera, debug menu), Cheats, Mods.
+- **Game**: Back to game, **Pause game** / Play game, Game settings (skip intros and the online screen, free camera, debug menu), Cheats, Mods.
 - **Graphics**: aspect ratio, resolution, upscaler, FPS limit, effects; **Bloodframe**; GPU driver.
 - **Controls**: on-screen controller and its layout. Drag outside the buttons to turn the camera.
 - **Storage**: game folder, back up and restore saves.
-- **App**: Report a problem, Check for updates.
+- **App**: Report a problem, Check for updates, Debug options (turn off unified memory if you see new glitches or crashes).
 
 ## Settings and performance
 
@@ -83,11 +85,10 @@ On **Automatic** the app uses its bundled driver for your GPU:
 
 | GPU | Driver |
 |---|---|
-| Adreno 6xx / 7xx | Turnip, Mesa 26.3.0 |
-| Adreno 8xx | Turnip Gen8 V37 by StevenMXZ |
+| Adreno 6xx / 7xx / 8xx | Turnip Gen8 V37 by StevenMXZ |
 | Mali G610+ (Android 15+) | PanVK V3.2, **testing only** |
 
-The phone's own Adreno driver does not run the game yet (black screen). You can also download other drivers or install any adrenotools driver zip from the menu.
+The phone's own Adreno driver does not run the game yet (black screen). You can also download other drivers (our Turnip 26.3.0, StevenMXZ's 26.3.0-R6 and R6 One UI) or install any adrenotools driver zip from the menu.
 
 ## Reporting problems
 
