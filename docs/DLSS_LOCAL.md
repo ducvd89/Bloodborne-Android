@@ -24,7 +24,7 @@ reports unavailable. `BB_DLSS_DIR` overrides the runtime search directory.
 
 Set `BB_DLSS_SDK` to your SDK checkout before running `bash build.sh --test`.
 The normal Linux build dependencies must already be installed (see
-`README.linux.md`). Keep the SDK/runtime at that path while running the build.
+[bbport's README](https://github.com/deadinside28/bloodborne_pc)). Keep the SDK/runtime at that path while running the build.
 Select FSR 3.1 to return to the existing upscaler. DLSS is a Linux/NVIDIA feature;
 it is not supported on the Thor's Adreno GPU.
 

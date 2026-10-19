@@ -165,6 +165,11 @@ void Load() {
 
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
     auto& v = Get();
+#ifdef __ANDROID__
+    // Android offers FSR 3.1 and GSR 2 only: FSR 4 (INT8) took ~470 ms a frame with a black scene on the
+    // Adreno 740, and 4.1.1 needs an RX 7000/9000. Not offered, the menus leave them out.
+    fsr4 = fsr411 = false;
+#endif
     v.fsr4_supported = fsr4;
     v.fsr411_supported = fsr4 && fsr411;
     const int requested = v.upscaler;
@@ -179,6 +184,10 @@ void ConfigureUpscalerSupport(bool fsr4, bool fsr411) {
 
 void ConfigureDlssSupport(bool available, const char* problem) {
     auto& v = Get();
+#ifdef __ANDROID__
+    available = false; // NVIDIA RTX only: not offered on Android, the menus leave it out
+    problem = "not offered on Android";
+#endif
     v.dlss_supported = available;
     static std::string kept;
     kept = problem ? problem : "";
@@ -197,8 +206,15 @@ bool FixedRenderSession() {
 
 int RenderPreset() {
     const auto& v = Get();
-    return FixedRenderSession() ? v.startup_preset :
-        v.upscaler == UpscalerTaa ? NativeAA : v.preset.load();
+    if (FixedRenderSession()) return v.startup_preset;
+    if (v.upscaler == UpscalerTaa) return NativeAA;
+    const int preset = v.preset.load();
+    // Potato is FSR 3.1 and GSR 2 only (FSR 4 and DLSS have no model below Ultra Performance).
+    return preset == Potato && !PotatoAllowed(v.upscaler) ? UltraPerformance : preset;
+}
+
+bool PotatoAllowed(int upscaler) {
+    return upscaler == UpscalerFsr3 || upscaler == UpscalerGsr2;
 }
 
 bool ResolutionNeedsRestart() {
@@ -299,13 +315,13 @@ void Save() {
 }
 
 float PresetScale(int preset) {
-    static constexpr float scales[PresetCount] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f};
+    static constexpr float scales[PresetCount] = {1.0f, 1.5f, 1.7f, 2.0f, 3.0f, 4.0f};
     return scales[std::clamp(preset, 0, PresetCount - 1)];
 }
 
 const char* PresetName(int preset) {
     static constexpr const char* names[PresetCount] = {"Native AA", "Quality", "Balanced",
-                                                       "Performance", "Ultra Performance"};
+                                                       "Performance", "Ultra Performance", "Potato"};
     return names[std::clamp(preset, 0, PresetCount - 1)];
 }
 

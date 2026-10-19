@@ -7,12 +7,8 @@ GPU drivers bundled in the app (assets/drivers/)
 The app carries these Vulkan drivers as the zips they were published in, byte for
 byte (their sha256 is checked when the app is built: tools/android/fetch_bundled_drivers.sh):
 
-  Adreno 6xx/7xx   Turnip-android-main-26.3.0-35b085c.zip
-                   Mesa Turnip 26.3.0-devel (commit 35b085c4c067f198ce0b6437d94678e47b9c645f)
-                   built for Android with this project's patches (tools/android/mesa-patches
-                   in the source; the zip's meta.json lists them). Mesa: MIT License.
-  Adreno 8xx       Turnip_Gen8_V37.zip
-                   "Turnip for a8xx" (Mesa Turnip) built by StevenMXZ,
+  Adreno           Turnip_Gen8_V37.zip, for 6xx/7xx and 8xx alike
+                   "Turnip for a8xx" (Mesa Turnip, also runs Adreno 6xx/7xx) built by StevenMXZ,
                    https://github.com/StevenMXZ/Adreno-Tools-Drivers, tag v37 (the repository
                    with the build scripts is licensed GPL-3.0; the text is below). Mesa Turnip
                    itself: MIT License. Source: that repository and tag, and Mesa
@@ -27,7 +23,7 @@ byte (their sha256 is checked when the app is built: tools/android/fetch_bundled
                    License. The zip contains its own LICENSE-mesa.rst, NOTICE.md and LICENSES/
                    (MIT, GPL-2.0 with the Linux syscall note, bcn_layer MIT).
 
-The Mesa license text follows (LICENSE-mesa.txt of the Turnip zip above, verbatim), then the
+The Mesa license text follows (LICENSE-mesa.txt of this project's Turnip 26.3.0 zip, verbatim), then the
 GNU General Public License version 3 (https://www.gnu.org/licenses/gpl-3.0.txt), which covers
 StevenMXZ's build repository.
 

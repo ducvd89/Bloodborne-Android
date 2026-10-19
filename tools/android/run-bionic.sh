@@ -95,12 +95,12 @@ echo "Display: aspect ratio $aspect_setting ($an:$ad), output $output (surface $
 # 0.11.0); any other value means FSR 3.1.
 case $upscaler in off|gsr2|fsr3) ;; '') upscaler=gsr2 ;; *) upscaler=fsr3 ;; esac
 echo "Upscaler setting: $upscaler"
-case $preset in 0|1|2|3|4) ;; *) preset=3 ;; esac
-# The scene size: the output / the preset's scale (1, 1.5, 1.7, 2, 3), each side rounded to even, as
+case $preset in 0|1|2|3|4|5) ;; *) preset=3 ;; esac
+# The scene size: the output / the preset's scale (1, 1.5, 1.7, 2, 3, Potato 4), each side rounded to even, as
 # patches.py (scaled_sizes) does; any size, any ratio.
 scale10=10
 if [ "$upscaler" != off ]; then
-    case $preset in 1) scale10=15 ;; 2) scale10=17 ;; 3) scale10=20 ;; 4) scale10=30 ;; esac
+    case $preset in 1) scale10=15 ;; 2) scale10=17 ;; 3) scale10=20 ;; 4) scale10=30 ;; 5) scale10=40 ;; esac
 fi
 scene_w=$(( (output_w * 10 + scale10) / (2 * scale10) * 2 )); scene_h=$(( (output_h * 10 + scale10) / (2 * scale10) * 2 ))
 [ "$scene_w" -ge 2 ] || scene_w=2
@@ -207,8 +207,10 @@ export BB_COPY_GPU_BUFFERS=1 BB_GPU_WRITE_TWINS=1 BB_GPU_WRITE_TWINS_MAX=65536
 # GPU memory is the phone's system RAM, shared with the game's direct memory ($dmem_mb, taken right
 # after launch) and Android: the texture collector works to a budget instead of the driver's heap
 # (the app was killed for memory once the world loaded). Its start value is what is free now less
-# the direct memory and a 1536 MB reserve for Android and the app, 1024..4096 MB (4096 when
-# /proc/meminfo cannot be read); BB_GC_BUDGET_MB in the environment or bionic-local.sh overrides it.
+# the direct memory and a 1536 MB reserve for Android and the app, 3584..4096 MB (4096 when
+# /proc/meminfo cannot be read; the game needs a 12 GB phone, where the formula fell to the old
+# 1024 MB floor while the cache holds ~2.6 GB, so it evicted and reloaded all session, issue #52);
+# BB_GC_BUDGET_MB in the environment or bionic-local.sh overrides it.
 # libbbgpu then follows the free memory and swap while the game runs: it lowers the budget when the
 # system runs short, and raises it back (never above this start) when it recovers (BB_GC_ADAPT=0:
 # keep it fixed). Idle copies of game memory go after 20 s instead of 60 s.
@@ -220,7 +222,7 @@ if [ -z "${BB_GC_BUDGET_MB:-}" ]; then
     mem_total_mb=$(meminfo_mb MemTotal); mem_avail_mb=$(meminfo_mb MemAvailable)
     if [ "$mem_avail_mb" -gt 0 ]; then
         gc_budget_mb=$((mem_avail_mb - dmem_mb - 1536))
-        [ "$gc_budget_mb" -ge 1024 ] || gc_budget_mb=1024
+        [ "$gc_budget_mb" -ge 3584 ] || gc_budget_mb=3584
         [ "$gc_budget_mb" -le 4096 ] || gc_budget_mb=4096
     else
         gc_budget_mb=4096

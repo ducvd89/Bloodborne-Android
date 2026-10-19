@@ -135,6 +135,11 @@ add_custom_target(host_shaders DEPENDS ${SHADER_HEADERS})
 file(GLOB_RECURSE VIDEO_CORE CONFIGURE_DEPENDS shadps4/video_core/*.cpp)
 file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
 list(FILTER VIDEO_CORE EXCLUDE REGEX "renderdoc\\.cpp$")
+if (ANDROID)
+    # FSR 4.1.1 (fsr411/) and FSR 4 are PC only: the Android menus offer FSR 3.1 and GSR 2 (vk_fsr4.cpp and
+    # vk_dlss.cpp compile to stand-ins there).
+    list(FILTER VIDEO_CORE EXCLUDE REGEX "renderer_vulkan/fsr411/")
+endif()
 set(COMMON
     shadps4/common/decoder.cpp shadps4/common/error.cpp
     shadps4/common/io_file.cpp shadps4/common/native_clock.cpp shadps4/common/number_utils.cpp
@@ -211,8 +216,10 @@ if (ANDROID)
 endif()
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
 target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
-target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan
-    ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+if (NOT ANDROID)
+    target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr4-v07-vulkan) # FSR 4: PC only
+endif()
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 

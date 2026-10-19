@@ -40,8 +40,8 @@ if [[ ${BB_SKIP_DRIVERS:-} != 1 ]]; then
     bash tools/android/fetch_bundled_drivers.sh >/dev/null \
         || { echo "The bundled GPU drivers are missing or do not match their sha256: bash tools/android/fetch_bundled_drivers.sh (BB_SKIP_DRIVERS=1 builds without them)" >&2; exit 1; }
     mkdir -p "$out/assets/drivers"
-    cp "$drivers"/Turnip-android-main-26.3.0-35b085c.zip "$drivers"/Turnip_Gen8_V37.zip \
-       "$drivers"/PanVK-android-v3.2-universal-2a9358a.zip "$out/assets/drivers/"
+    cp "$drivers"/Turnip_Gen8_V37.zip "$drivers"/PanVK-android-v3.2-universal-2a9358a.zip "$out/assets/drivers/"
+    # Our Turnip 26.3.0 zip is not packed (V37 is the Adreno driver); it gives the Mesa license text.
     { cat tools/android/frontend/THIRD_PARTY_LICENSES.txt tools/android/frontend/DRIVERS_NOTICE.txt
       unzip -p "$drivers/Turnip-android-main-26.3.0-35b085c.zip" LICENSE-mesa.txt
       printf '\n--------------------------------------------------------------------------------\nGNU General Public License, version 3 (StevenMXZ/Adreno-Tools-Drivers)\n--------------------------------------------------------------------------------\n\n'

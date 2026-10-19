@@ -18,7 +18,7 @@
 #endif
 #include <windows.h>
 #include "../../../dlss_bridge/bbport_dlss_bridge.h"
-#elif defined(__linux__)
+#elif defined(__linux__) && !defined(__ANDROID__)
 #include <dlfcn.h>
 #include "../../../dlss_bridge/bbport_dlss_bridge.h"
 #endif
@@ -30,7 +30,8 @@ int Dlss::QualityForScale(float scale) {
     return scale >= 2.9f ? 4 : scale >= 1.95f ? 3 : scale >= 1.65f ? 2 : scale > 1.01f ? 1 : 0;
 }
 
-#if defined(_WIN32) || defined(__linux__)
+// bbport: not in the Android build (NVIDIA RTX only): there Get() is null, the stub below.
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 
 namespace {
 #ifdef _WIN32

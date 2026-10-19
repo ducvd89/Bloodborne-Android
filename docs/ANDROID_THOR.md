@@ -129,7 +129,7 @@ for the separate Wine integration.
 
 ## Building the experiment
 
-First install the normal Linux build dependencies from `README.linux.md`,
+First install the normal Linux build dependencies from [bbport's README](https://github.com/deadinside28/bloodborne_pc),
 then build with `bash build.sh`. The original build machine's
 CachyOS system libraries and CRT startup objects require x86-64-v4 (AVX-512),
 which caused SIGILL under FEX. Fetch generic Arch x86-64 libraries into an

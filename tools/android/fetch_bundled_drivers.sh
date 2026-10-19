@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The GPU drivers the app carries in its APK (assets/drivers/, tools/android/build_frontend.sh), which its
 # "Automatic" GPU driver choice installs on the first start (AutoDriver.java, BundledDrivers.java):
-#   Adreno 6xx/7xx  Turnip 26.3.0 (ours: tools/android/build_turnip_android.sh; Mesa, MIT)
-#   Adreno 8xx      Turnip Gen8 V37 by StevenMXZ (Mesa Turnip "for a8xx"; the build repository is GPL-3.0)
+#   Adreno          Turnip Gen8 V37 by StevenMXZ for 6xx/7xx and 8xx alike (Mesa Turnip; the build repository
+#                   is GPL-3.0); other Turnip builds are download options on this project's releases
 #   Mali            PanVK v3.2 (ours, a universal CSF build; Mesa, MIT; needs Android 15)
-# plus the GPL-3.0 text of the notices. Pinned: each file is checked against its sha256 on every run, a
+# plus the GPL-3.0 text of the notices and our Turnip 26.3.0 zip, not packed: build_frontend.sh takes the
+# Mesa license text from it. Pinned: each file is checked against its sha256 on every run, a
 # cached copy that does not match is downloaded again, a download that does not match fails the build.
 # Output: .local-deps/android/drivers/{*.zip,GPL-3.0.txt}; BundledDrivers.java names the same zips.
 set -euo pipefail
