@@ -473,17 +473,21 @@ static void PrintMemorySplit() {
             rebuilds += n.load();
         }
         std::printf("Texture home: %llu images, %llu MiB freed (%llu homed so far, %llu re-tiles "
-                    "verified); rebuilt %llu (%.1f ms total / %.2f ms max; %s; %llu by the GPU thread "
-                    "for others, %llu timed out, %llu forgotten); verify failures: bytes differ %llu; "
-                    "refused (looks): %s\n",
+                    "verified; padding kept aside for %llu homes, %llu KiB now); "
+                    "rebuilt %llu (%.1f ms total / %.2f ms max; %s; %llu by the GPU thread for others, "
+                    "%llu timed out, %llu forgotten); verify failures: texels differ %llu, padding too "
+                    "large %llu, tiling holes %llu; refused (looks): %s\n",
                     (unsigned long long)c.homed_images.load(),
                     (unsigned long long)(runtime_memory_homed_pages() * 4096 >> 20),
                     (unsigned long long)c.homes.load(), (unsigned long long)c.verifies.load(),
-                    (unsigned long long)rebuilds, double(c.rebuild_ns_total.load()) / 1e6,
-                    double(c.rebuild_ns_max.load()) / 1e6, rebuilt.empty() ? "none" : rebuilt.c_str(),
-                    (unsigned long long)c.forwarded.load(), (unsigned long long)c.timeouts.load(),
-                    (unsigned long long)c.lost.load(),
-                    (unsigned long long)c.refused[BbTexHome::Mismatch].load(),
+                    (unsigned long long)c.patched_homes.load(),
+                    (unsigned long long)(c.patch_bytes.load() >> 10), (unsigned long long)rebuilds,
+                    double(c.rebuild_ns_total.load()) / 1e6, double(c.rebuild_ns_max.load()) / 1e6,
+                    rebuilt.empty() ? "none" : rebuilt.c_str(), (unsigned long long)c.forwarded.load(),
+                    (unsigned long long)c.timeouts.load(), (unsigned long long)c.lost.load(),
+                    (unsigned long long)c.verify_texel_failures.load(),
+                    (unsigned long long)c.verify_padding_failures.load(),
+                    (unsigned long long)c.verify_hole_failures.load(),
                     refused.empty() ? "none" : refused.c_str());
     }
     if (BbGuestMemory::Uma()) {
@@ -496,7 +500,8 @@ static void PrintMemorySplit() {
         }
         std::printf("UMA: granule %llu KiB, shared %llu granules (%llu MiB), promotions %llu "
                     "(requests %llu, failed %llu), refused: exec %llu busy %llu class %llu image %llu "
-                    "size %llu backoff %llu written %llu cross-granule %llu mapping %llu gpu-data %llu "
+                    "size %llu backoff %llu texture-first %llu written %llu cross-granule %llu mapping "
+                    "%llu gpu-data %llu "
                     "dynamic %llu, dynamic blocks %llu (regions %llu, verify regions %llu; armed %llu, "
                     "trap faults %llu, "
                     "announced writes %llu), "
@@ -513,6 +518,7 @@ static void PrintMemorySplit() {
                     class_refusals, (unsigned long long)uma.refused_image.load(),
                     (unsigned long long)uma.refused_size.load(),
                     (unsigned long long)uma.refused_backoff.load(),
+                    (unsigned long long)uma.refused_texture_first.load(),
                     (unsigned long long)uma.refused_written.load(),
                     (unsigned long long)uma.refused_cross.load(),
                     (unsigned long long)uma.refused_mapping.load(),

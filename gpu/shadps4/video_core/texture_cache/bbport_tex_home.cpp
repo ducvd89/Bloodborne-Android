@@ -28,7 +28,9 @@
 #include <csetjmp>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
+#include <fmt/format.h>
 
 #include "bbport_fault.h"
 #include "bbport_guest_memory.h"
@@ -99,9 +101,13 @@ void Decide(VideoCore::TextureCache* texture_cache) {
     });
     active.store(true, std::memory_order_release);
     state.store(1, std::memory_order_release);
-    std::printf("Texture home: on (BB_TEX_HOME=1): sampled textures the CPU left alone for %llu s "
-                "live only in the GPU (host page %llu bytes)\n",
-                (unsigned long long)IdleSeconds(), (unsigned long long)runtime_memory_home_granule());
+    std::printf("Texture home: on (BB_TEX_HOME=1): sampled textures of %llu KiB and more the CPU left "
+                "alone for %llu s live only in the GPU (host page %llu bytes)%s\n",
+                (unsigned long long)(MinBytes() >> 10), (unsigned long long)IdleSeconds(),
+                (unsigned long long)runtime_memory_home_granule(),
+                First() ? fmt::format("; texture-first: UMA leaves granules over {}% textures to it",
+                                      FirstPercent()).c_str()
+                        : "");
 }
 
 /// A format whose texels are the guest's bytes (the host format substituted only by name).
@@ -137,6 +143,27 @@ std::uint64_t IdleSeconds() {
     return seconds;
 }
 
+std::uint64_t MinBytes() {
+    static const u64 bytes = [] {
+        const char* env = std::getenv("BB_TEX_HOME_MIN_KB");
+        return (env ? std::clamp<u64>(std::strtoull(env, nullptr, 10), 4, 65536) : u64{64}) * 1024;
+    }();
+    return bytes;
+}
+
+bool First() {
+    static const bool wanted = EnvOn("BB_TEX_HOME_FIRST") && EnvOn("BB_TEX_HOME");
+    return wanted && state.load(std::memory_order_relaxed) != 2;
+}
+
+std::uint64_t FirstPercent() {
+    static const u64 percent = [] {
+        const char* env = std::getenv("BB_TEX_HOME_FIRST_PCT");
+        return env ? std::clamp<u64>(std::strtoull(env, nullptr, 10), 1, 100) : u64{50};
+    }();
+    return percent;
+}
+
 } // namespace BbTexHome
 
 namespace VideoCore {
@@ -144,7 +171,6 @@ namespace VideoCore {
 using namespace BbTexHome;
 
 namespace {
-constexpr u64 MinHomeBytes = 256_KB;
 constexpr size_t MaxVerifies = 4;   ///< re-tiles in flight
 constexpr u32 VisitsPerScan = 256;  ///< images looked at per scan
 constexpr auto ScanPeriod = std::chrono::milliseconds(250);
@@ -159,6 +185,40 @@ bool HomePages(const Image& image, VAddr* begin, VAddr* end) {
 }
 } // namespace
 
+std::optional<u64> TextureCache::SampledTextureBytes(VAddr addr, u64 size) {
+    // The binding thread asks (UmaDirect); as OverlapsGpuImage: a bounded wait for the lock.
+    std::unique_lock lock{mutex, std::defer_lock};
+    for (int attempt = 0; attempt < 256 && !lock.owns_lock(); ++attempt) {
+        if (!lock.try_lock()) {
+            std::this_thread::yield();
+        }
+    }
+    if (!lock.owns_lock()) {
+        return std::nullopt;
+    }
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 32> parts;
+    const VAddr end = addr + size;
+    ForEachImageInRegion(addr, size, [&](ImageId, Image& image) {
+        if (!image.usage.texture || image.usage.render_target || image.usage.depth_target ||
+            image.usage.storage || image.usage.vo_surface) {
+            return;
+        }
+        parts.emplace_back(std::max(image.info.guest_address, addr),
+                           std::min<VAddr>(image.info.guest_address + image.info.guest_size, end));
+    });
+    std::sort(parts.begin(), parts.end());
+    u64 covered = 0;
+    VAddr reached = addr;
+    for (const auto& [from, to] : parts) {
+        const VAddr start = std::max(from, reached);
+        if (to > start) {
+            covered += to - start;
+            reached = to;
+        }
+    }
+    return covered;
+}
+
 bool TextureCache::TexHomeEligible(const Image& image, u32 now, Refusal& why) {
     const auto refuse = [&](Refusal reason) {
         why = reason;
@@ -171,7 +231,7 @@ bool TextureCache::TexHomeEligible(const Image& image, u32 now, Refusal& why) {
         return refuse(Mismatch);
     }
     VAddr begin = 0, end = 0;
-    if (image.info.guest_size < MinHomeBytes || !HomePages(image, &begin, &end)) {
+    if (image.info.guest_size < MinBytes() || !HomePages(image, &begin, &end)) {
         return refuse(Small);
     }
     if (!image.usage.texture || image.usage.storage || image.usage.render_target ||
@@ -228,7 +288,8 @@ bool TextureCache::TexHomeEligible(const Image& image, u32 now, Refusal& why) {
     return true;
 }
 
-Vulkan::StagingBufferRef TextureCache::TexHomeTile(Image& image, bool deferred) {
+Vulkan::StagingBufferRef TextureCache::TexHomeTile(Image& image, bool deferred, u32 fill,
+                                                   u32 hole_fill) {
     // The inverse of RefreshImage's upload: the same regions, re-tiled by TileManager.
     boost::container::small_vector<vk::BufferImageCopy, 14> copies;
     for (u32 m = 0; m < image.info.resources.levels; ++m) {
@@ -257,8 +318,12 @@ Vulkan::StagingBufferRef TextureCache::TexHomeTile(Image& image, bool deferred) 
         runtime.GetStagingPool().Request(bytes, MemoryType::HostCached, 256, deferred);
     runtime.BeforeImageAccess();
     scheduler.EndRendering();
-    runtime.FillBuffer(staging.buffer, staging.offset, bytes, 0);
-    tile_manager.TileImage(image, copies, staging.buffer, staging.offset, true);
+    // Tiled: the tiler writes the tiled bytes from the linear copy (`fill` where no texel is), and
+    // `hole_fill` stays where it writes nothing; a linear image is copied straight into the staging,
+    // around its padding.
+    runtime.FillBuffer(staging.buffer, staging.offset, bytes,
+                       image.info.props.is_tiled ? hole_fill : fill);
+    tile_manager.TileImage(image, copies, staging.buffer, staging.offset, fill);
     runtime.FlushBarriers();
     // The host reads it once the GPU is past this (no later command reads the staging).
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
@@ -293,6 +358,7 @@ bool TextureCache::TexHomeRehydrate(u32 ticket, Rebuild why) {
     }
     const HomeRecord record = it->second;
     const auto forget = [&] {
+        counters.patch_bytes.fetch_sub(record.patch_bytes.size(), std::memory_order_relaxed);
         homes.erase(ticket);
         home_of_image.erase(record.image_id.index);
         homes_count.fetch_sub(1, std::memory_order_relaxed);
@@ -314,6 +380,11 @@ bool TextureCache::TexHomeRehydrate(u32 ticket, Rebuild why) {
     const auto staging = TexHomeTile(*image, false);
     scheduler.Finish();
     staging.Invalidate();
+    // The game's padding bytes the re-tile has as zeros.
+    for (u64 at = 0; const auto& [offset, length] : record.patch_runs) {
+        std::memcpy(staging.mapped + offset, record.patch_bytes.data() + at, length);
+        at += length;
+    }
     const int restored = runtime_memory_home_restore(
         ticket, staging.mapped + (record.address - image->info.guest_address), record.size);
     if (restored < -1) {
@@ -462,6 +533,7 @@ void TextureCache::TexHomeOnFree(ImageId image_id) {
         }
     }
     if (const auto it = homes.find(ticket); it != homes.end()) {
+        counters.patch_bytes.fetch_sub(it->second.patch_bytes.size(), std::memory_order_relaxed);
         counters.homed_images.fetch_sub(1, std::memory_order_relaxed);
         counters.homed_bytes.fetch_sub(it->second.size, std::memory_order_relaxed);
         homes.erase(it);
@@ -489,35 +561,107 @@ void TextureCache::TexHomeFinish(HomeVerify& verify) {
     }
     VAddr begin = 0, end = 0;
     HomePages(*image, &begin, &end);
+    const VAddr base = image->info.guest_address;
+    const u64 size = image->info.guest_size;
     verify.staging.Invalidate();
+    verify.staging_ones.Invalidate();
+    u8* const zeros = verify.staging.mapped;
+    const u8* const ones = verify.staging_ones.mapped;
+    // The two re-tiles agree on texels. Where they differ it is padding (0x00 / 0xff: a linear byte
+    // no texel fills) or a hole (0x00 / 0x5a: a tiled byte no linear byte lands on). A hole means
+    // two linear bytes land on one tiled byte elsewhere: which one wins is a race, and a rebuild
+    // might not repeat this re-tile. Holes anywhere in the image: refused. Without them the tiling is
+    // one-to-one over the image (as many writes as bytes, all landed), so a rebuild repeats it.
+    u64 holes = 0;
+    if (image->info.props.is_tiled) {
+        for (u64 i = 0; i < size; ++i) {
+            holes += zeros[i] != ones[i] && ones[i] != 0xff;
+        }
+    }
+    // The game's bytes now, through the backing view (the runtime compares them again under its
+    // traps; this copy tells where they differ).
+    std::vector<u8> guest(size);
+    runtime_memory_read_backing(base, guest.data(), size);
+    const u64 from = begin - base, to = end - base;
+    u64 texel_diffs = 0;
+    std::vector<std::pair<u32, u32>> runs;
+    std::vector<u8> bytes;
+    for (u64 i = from; i < to; ++i) {
+        if (zeros[i] == guest[i]) {
+            continue;
+        }
+        if (zeros[i] == ones[i]) {
+            ++texel_diffs;
+            continue;
+        }
+        if (!runs.empty() && runs.back().first + runs.back().second == i) {
+            ++runs.back().second;
+        } else {
+            runs.emplace_back(u32(i), 1u);
+        }
+        bytes.push_back(guest[i]);
+    }
+    const bool too_much = bytes.size() > (to - from) / 4 || runs.size() > 65536;
+    const bool differs = texel_diffs != 0 || !bytes.empty();
+    const char* verdict = holes         ? "tiling not one-to-one: refused"
+                          : texel_diffs ? "texels differ: refused"
+                          : too_much    ? "padding only, too much: refused"
+                          : differs     ? "padding only: kept aside, homed"
+                                        : "equal";
+    if (std::getenv("BB_TEX_HOME_LOG") && (differs || holes)) {
+        TexHomeLogDiff(*image, begin, end, zeros, ones, guest.data(), holes, verdict);
+    }
+    if (holes || texel_diffs || too_much) {
+        image->tex_home_never = true;
+        const Refusal reason = holes ? Unmapped : texel_diffs ? Mismatch : Padding;
+        (reason == Padding ? counters.verify_padding_failures
+                           : reason == Mismatch ? counters.verify_texel_failures
+                                                : counters.verify_hole_failures)
+            .fetch_add(1, std::memory_order_relaxed);
+        counters.refused[reason].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // The re-tile with the game's padding is the game's bytes: what the runtime compares and drops.
+    for (u64 at = 0; const auto& [offset, length] : runs) {
+        std::memcpy(zeros + offset, bytes.data() + at, length);
+        at += length;
+    }
+    TexHomeCommit(verify, *image, begin, end, zeros + from, std::move(runs), std::move(bytes));
+}
+
+void TextureCache::TexHomeCommit(HomeVerify& verify, Image& image, VAddr begin, VAddr end,
+                                 const u8* expected, std::vector<std::pair<u32, u32>> patch_runs,
+                                 std::vector<u8> patch_bytes) {
+    const u32 now = NowSeconds();
     // Copies of guest memory still running on the copy threads may read these pages.
     scheduler.WaitHostCopies();
     std::scoped_lock lk{home_mutex};
     u32 ticket = 0;
-    const int rc = runtime_memory_home(
-        begin, end - begin, verify.staging.mapped + (begin - image->info.guest_address), &ticket);
+    const int rc = runtime_memory_home(begin, end - begin, expected, &ticket);
+    Refusal why{};
     switch (rc) {
-    case HomeOk:
-        homes.emplace(ticket, HomeRecord{verify.image_id, verify.image_uid, begin, end - begin});
+    case HomeOk: {
+        const bool patched = !patch_bytes.empty();
+        const u64 kept = patch_bytes.size();
+        homes.emplace(ticket, HomeRecord{verify.image_id, verify.image_uid, begin, end - begin,
+                                         std::move(patch_runs), std::move(patch_bytes)});
         home_of_image[verify.image_id.index] = ticket;
         homes_count.fetch_add(1, std::memory_order_relaxed);
         counters.homes.fetch_add(1, std::memory_order_relaxed);
         counters.homed_images.fetch_add(1, std::memory_order_relaxed);
         counters.homed_bytes.fetch_add(end - begin, std::memory_order_relaxed);
-        return;
-    case HomeMismatch: {
-        image->tex_home_never = true;
-        counters.refused[Mismatch].fetch_add(1, std::memory_order_relaxed);
-        static std::atomic<u32> logged{0};
-        if (std::getenv("BB_TEX_HOME_LOG") && logged.fetch_add(1) < 40) {
-            std::printf("Texture home: %#llx %ux%u fmt %u tile %u mips %u layers %u: re-tile differs\n",
-                        (unsigned long long)image->info.guest_address, image->info.size.width,
-                        image->info.size.height, u32(image->info.pixel_format),
-                        u32(image->info.tile_mode), image->info.resources.levels,
-                        image->info.resources.layers);
+        if (patched) {
+            counters.patched_homes.fetch_add(1, std::memory_order_relaxed);
+            counters.patch_bytes.fetch_add(kept, std::memory_order_relaxed);
         }
         return;
     }
+    case HomeMismatch:
+        // Changed between the copy above and the traps (or a re-tile that is not repeatable).
+        image.tex_home_never = true;
+        counters.verify_texel_failures.fetch_add(1, std::memory_order_relaxed);
+        counters.refused[Mismatch].fetch_add(1, std::memory_order_relaxed);
+        return;
     case HomeMapping:
         why = Mapping;
         break;
@@ -529,7 +673,85 @@ void TextureCache::TexHomeFinish(HomeVerify& verify) {
         break;
     }
     counters.refused[why].fetch_add(1, std::memory_order_relaxed);
-    image->tex_home_retry = now + 30;
+    image.tex_home_retry = now + 30;
+}
+
+void TextureCache::TexHomeLogDiff(const Image& image, VAddr begin, VAddr end, const u8* zeros,
+                                  const u8* ones, const u8* guest, u64 holes, const char* verdict) {
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 60) {
+        return;
+    }
+    const auto& info = image.info;
+    const VAddr base = info.guest_address;
+    u64 mips_bytes = 0;
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        mips_bytes += info.mips_layout[m].size;
+    }
+    // Where an offset lies: its mip, slice (layer x depth, padded to the tile thickness) and
+    // whether that mip is stored micro tiled inside a macro-tiled image (the small mips).
+    const auto where = [&](u64 offset) {
+        u32 mip = 0;
+        while (mip + 1 < info.resources.levels && offset >= info.mips_layout[mip + 1].offset) {
+            ++mip;
+        }
+        const auto& m = info.mips_layout[mip];
+        const u32 bpe = info.num_bits / 8;
+        const u64 pitch = info.props.is_block ? std::max((m.pitch + 3) / 4, 1u) : m.pitch;
+        const u64 height = info.props.is_block ? std::max((m.height + 3) / 4, 1u) : m.height;
+        const u64 slice_bytes = std::max<u64>(pitch * height * bpe, 1);
+        const u64 inside = offset - m.offset;
+        const u32 mw = std::max(info.size.width >> mip, 1u), mh = std::max(info.size.height >> mip, 1u);
+        return fmt::format("+{:#x} (mip {} {}x{} in {}x{}{}, slice {} of {})", offset, mip, mw, mh,
+                           m.pitch, m.height,
+                           (info.micro_tiled_mips >> mip) & 1 ? ", micro-tiled tail mip" : "",
+                           inside / slice_bytes, m.size / slice_bytes);
+    };
+    u64 texel = 0, padding = 0, first_texel = ~u64{0}, first_padding = ~u64{0};
+    for (u64 i = begin - base; i < end - base; ++i) {
+        if (zeros[i] == guest[i]) {
+            continue;
+        }
+        if (zeros[i] == ones[i]) {
+            first_texel = std::min(first_texel, i);
+            ++texel;
+        } else {
+            first_padding = std::min(first_padding, i);
+            ++padding;
+        }
+    }
+    u64 padding_bytes = 0, first_hole = ~u64{0};
+    for (u64 i = 0; i < info.guest_size; ++i) {
+        const bool differ = zeros[i] != ones[i];
+        padding_bytes += differ && ones[i] == 0xff;
+        if (differ && ones[i] != 0xff && first_hole == ~u64{0}) {
+            first_hole = i;
+        }
+    }
+    const auto describe = [&](u64 first, const char* kind) -> std::string {
+        if (first == ~u64{0}) {
+            return fmt::format("no {} byte differs", kind);
+        }
+        return fmt::format("first {} diff {} guest {:#04x} re-tile {:#04x}", kind, where(first),
+                           guest[first], zeros[first]);
+    };
+    std::printf("Texture home diff: %#llx %s (dfmt %u nfmt %u) tile %s array %u %ux%ux%u layers %u "
+                "mips %u pitch %u bits %u%s%s bank swizzle %u; guest %u bytes, re-tiled %llu (padding "
+                "%llu, holes %llu%s), pages %#llx+%#llx; differing: texel %llu, padding %llu; %s; %s; "
+                "%s\n",
+                (unsigned long long)base, vk::to_string(info.pixel_format).c_str(),
+                info.guest_data_format, info.guest_number_format,
+                std::string(AmdGpu::NameOf(info.tile_mode)).c_str(), u32(info.array_mode),
+                info.size.width, info.size.height, info.size.depth, info.resources.layers,
+                info.resources.levels, info.pitch, info.num_bits, info.props.is_block ? " block" : "",
+                info.props.is_pow2 ? " pow2" : "", info.bank_swizzle, info.guest_size,
+                (unsigned long long)mips_bytes, (unsigned long long)padding_bytes,
+                (unsigned long long)holes,
+                first_hole == ~u64{0} ? "" : (", first " + where(first_hole)).c_str(),
+                (unsigned long long)(begin - base), (unsigned long long)(end - begin),
+                (unsigned long long)texel, (unsigned long long)padding,
+                describe(first_texel, "texel").c_str(), describe(first_padding, "padding").c_str(),
+                verdict);
 }
 
 void TextureCache::TexHomePass() {
@@ -553,6 +775,7 @@ void TextureCache::TexHomePass() {
         }
         TexHomeFinish(verify);
         runtime.GetStagingPool().FreeDeferred(verify.staging);
+        runtime.GetStagingPool().FreeDeferred(verify.staging_ones);
         home_verifies[i] = home_verifies.back();
         home_verifies.pop_back();
     }
@@ -569,6 +792,7 @@ void TextureCache::TexHomePass() {
                 ++it;
                 continue;
             }
+            counters.patch_bytes.fetch_sub(it->second.patch_bytes.size(), std::memory_order_relaxed);
             counters.homed_images.fetch_sub(1, std::memory_order_relaxed);
             counters.homed_bytes.fetch_sub(it->second.size, std::memory_order_relaxed);
             home_of_image.erase(it->second.image_id.index);
@@ -610,8 +834,9 @@ void TextureCache::TexHomePass() {
         if (pending) {
             continue;
         }
-        HomeVerify verify{image_id, image.image_uid, 0, image.tex_home_stamp, {}};
+        HomeVerify verify{image_id, image.image_uid, 0, image.tex_home_stamp, {}, {}};
         verify.staging = TexHomeTile(image, true);
+        verify.staging_ones = TexHomeTile(image, true, 0xffffffffu, 0x5a5a5a5au);
         verify.tick = scheduler.CurrentTick();
         home_verifies.push_back(verify);
         counters.verifies.fetch_add(1, std::memory_order_relaxed);

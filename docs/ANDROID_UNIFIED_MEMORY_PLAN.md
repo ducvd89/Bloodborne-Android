@@ -303,7 +303,10 @@ guest address, size and frame. This replaces guessing which binding causes a gli
 | `BB_UMA_ORDER=1` | phase 3: game writes wait for in-flight GPU reads of shared blocks | off |
 | `BB_TEX_HOME=1` | Plan A: sampled textures the CPU left alone live only in the GPU (copy mode or `BB_UMA`) | off |
 | `BB_TEX_HOME_IDLE_S` | seconds since the last CPU write before a texture is homed (1..3600) | 10 |
-| `BB_TEX_HOME_LOG=1` | names the textures whose re-tile differed (first 40) | off |
+| `BB_TEX_HOME_LOG=1` | one `Texture home diff:` line per texture whose re-tiles differed (first 60) | off |
+| `BB_TEX_HOME_MIN_KB` | the smallest texture homed (4..65536; it needs a whole host page too) | 64 |
+| `BB_TEX_HOME_FIRST=1` | with `BB_UMA`: granules mostly under sampled textures are left to Plan A, not promoted | off |
+| `BB_TEX_HOME_FIRST_PCT` | "mostly" for `BB_TEX_HOME_FIRST`, percent of the granule's bytes (1..100) | 50 |
 
 `BB_UNIFIED=1` (v1, layer mode) stays in the code for reference but is no longer wired to the Debug
 option.
@@ -354,7 +357,8 @@ All of these, else the reason is counted (`refused (looks)` in the stats line):
 - one sample (no MSAA backing), no depth or stencil, no CMASK/FMASK/HTILE;
 - host format equal to the guest's, or a bitwise reinterpretation (`R8_SRGB`/`R8_UNORM`,
   `R8G8_SRGB`/`R8G8_UNORM`, `Instance::GetSupportedFormat`'s substitutions that keep the bytes);
-- `guest_size` >= 256 KiB and at least one whole host page inside it; only the whole host pages
+- `guest_size` >= `BB_TEX_HOME_MIN_KB` (64 KiB; 256 KiB until 2026-10-19) and at least one whole
+  host page inside it; only the whole host pages
   inside the texture are dropped (edge pages stay);
 - uploaded and clean (no `Dirty` bit), tracked whole, and its last refresh from the game's memory
   (`tex_home_stamp`, set in `RefreshImage`) at least `BB_TEX_HOME_IDLE_S` (10) seconds ago: a CPU
@@ -369,23 +373,40 @@ are not looked at again for 5 s (60 s for lasting reasons, until 10 s after the 
 
 ### Homing
 
-1. **Re-tile** (`TexHomeTile`): `TileManager::TileImage` (with a zeroed linear copy:
-   `zero_linear`) into a zeroed host-cached staging buffer, the regions of `RefreshImage`'s upload,
-   then a barrier to host reads. Recorded in the pass; no wait.
-2. **Verify and drop**, at a later pass once the GPU is past it (`TexHomeFinish`): the conditions
-   again (and the refresh stamp unchanged), the copy threads' copies waited for
-   (`WaitHostCopies`), then `runtime_memory_home` under the runtime's lock: every guest alias of
-   the pages gets the trap reason `TexHome` (64, no access), the pages are compared with the re-tile
-   through the backing view, and when equal the memfd range is punched out
-   (`FALLOC_FL_PUNCH_HOLE`). Different bytes: traps lifted, nothing changed, the image is never
-   tried again (`bytes differ`, `BB_TEX_HOME_LOG=1` names them).
+1. **Two re-tiles** (`TexHomeTile`, recorded in the pass, no wait), the regions of `RefreshImage`'s
+   upload through `TileManager::TileImage` (`linear_fill`) into host-cached staging, then a barrier
+   to host reads:
+   - **zeros**: the linear copy filled with 0 before the image is copied in (bytes no texel covers:
+     pitch and height padding, the padded small mips, BC padding blocks), the tiled output with 0;
+     this is what every rebuild makes;
+   - **ones**: linear fill 0xff, tiled output 0x5a (a "hole": a tiled byte no linear byte lands on).
+2. **Verify** at a later pass once the GPU is past both (`TexHomeFinish`), the conditions again (and
+   the refresh stamp unchanged). Bytes where the two agree are texels; 0x00/0xff is padding;
+   0x00/0x5a a hole.
+   - **Holes anywhere in the image: refused for good** (`tiling holes`). The tiler writes exactly as
+     many elements as the image has; a hole means two of them landed on one tiled element, and which
+     wins is a race a rebuild may not repeat. No hole proves the mapping one-to-one over the image
+     (every write landed, each on its own element), so a rebuild repeats the zeros re-tile exactly.
+     (Phase 1 trusted it after one equal compare; a hole of zeros could hide there.)
+   - The pages to drop compared with the game's bytes (read through the backing view): equal, or
+     differing **only in padding** — those bytes are kept aside (offset runs and bytes, in the home
+     record; `padding kept aside` in the stats) and put back on every rebuild, as long as they are at
+     most a quarter of the pages dropped. **Any texel byte different: refused for good**
+     (`texels differ`), as is too much padding (`padding too large`). `BB_TEX_HOME_LOG=1`: one
+     `Texture home diff:` line per image that differed (first 60), below.
+   - Then the copy threads' copies are waited for (`WaitHostCopies`) and `runtime_memory_home`
+     runs under the runtime's lock: every guest alias of the pages gets the trap reason `TexHome`
+     (64, no access), the pages are compared byte for byte with the zeros re-tile **with the padding
+     put back** (the safety net: never relaxed), and when equal the memfd range is punched out
+     (`FALLOC_FL_PUNCH_HOLE`). Different: traps lifted, nothing changed, refused for good.
 3. The runtime keeps a record per home (ticket) and the ticket of every homed 4 KiB page; new
    mappings of homed pages get the trap; the game's `mprotect` and the GPU page manager's
    protections keep homed pages without access; released pages leave their home (no rebuild).
 
 ### Rebuilding
 
-The image is re-tiled again, the GPU waited for (`Scheduler::Finish`), the bytes written into the
+The image is re-tiled again (zeros), the GPU waited for (`Scheduler::Finish`), the padding kept
+aside put back, the bytes written into the
 memfd through the backing view, then the traps lifted (`runtime_memory_home_restore`); pages the GPU
 page manager write-protects (BB_FAULT_PREPARE's map) stay read-only, so the texture's own write
 tracking goes on. The image stays valid (it equals the data) and is not homed again before it was
@@ -429,7 +450,14 @@ Per thread (`TextureCache::TexHomeRehydrateFrom`):
 ### UMA
 
 `runtime_memory_promote` refuses granules with homed pages (counted in the runtime's report);
-homing refuses shared granules. A binding over homed pages is rebuilt before `UmaDirect` is asked
+homing refuses shared granules (`shared` in the refusals: 1023 looks on the Thor run of 2026-10-19,
+UMA had taken the granules first). **`BB_TEX_HOME_FIRST=1`** (with `BB_TEX_HOME=1`, off by default)
+turns that around for an A/B: before `UmaDirect` asks for a promotion it measures the granule's bytes
+under registered sampled textures (`TextureCache::SampledTextureBytes`: the union of their ranges,
+over the granule's guest addresses in the binding's mapping; render/depth targets, storage and video
+out images do not count); over `BB_TEX_HOME_FIRST_PCT` (50) % the granule stays CPU and is left to
+Plan A, the binding takes copy mode's path (`texture-first` in the `UMA:` line; the granule is not
+asked again for 5 s, `backoff`). A busy texture cache counts as covered. A binding over homed pages is rebuilt before `UmaDirect` is asked
 (the check is at the top of `ObtainBuffer`).
 
 ### Requirements (else `Texture home: off: ...` once)
@@ -440,11 +468,38 @@ map of the page manager's write protections is how a rebuild keeps them), signal
 
 ### Stats (`BB_FRAME_STATS`, the 10 s block)
 
-`Texture home: N images, X MiB freed (homed so far, re-tiles verified); rebuilt N (ms total / max;
-by fault, access, runtime, collector, free/unmap, gpu-write, new image; by the GPU thread for
-others, timed out, forgotten); verify failures: bytes differ N; refused (looks): ...`. The
-runtime's report at exit adds its own counters (restores, released pages, refusals by code,
-promotions refused).
+`Texture home: N images, X MiB freed (H homed so far, V re-tiles verified; padding kept aside for P
+homes, K KiB now); rebuilt N (ms total / max; by fault, access, runtime, collector, free/unmap,
+gpu-write, new image; by the GPU thread for others, timed out, forgotten); verify failures: texels
+differ N, padding too large N, tiling holes N; refused (looks): ...` (looks: every evaluation of a
+candidate, `bytes differ` there is an image refused for good earlier). The runtime's report at exit
+adds its own counters (restores, released pages, refusals by code, promotions refused).
+
+`BB_TEX_HOME_LOG=1`, per image that differed:
+
+```
+Texture home diff: <address> <vk format> (dfmt <T# data format> nfmt <number format>) tile <tile mode>
+  array <array mode> <w>x<h>x<d> layers <n> mips <n> pitch <texels> bits <per element>[ block][ pow2]
+  bank swizzle <n>; guest <bytes> bytes, re-tiled <sum of the mips' sizes> (padding <bytes>, holes
+  <bytes>[, first +<offset> (...)]), pages <offset>+<size>; differing: texel <n>, padding <n>;
+  first texel diff +<offset> (mip <m> <w>x<h> in <pitch>x<height>[, micro-tiled tail mip], slice <s>
+  of <n>) guest <byte> re-tile <byte>; first padding diff ... ; <verdict>
+```
+
+(one line; offsets from the texture's start; the verdict: `tiling not one-to-one: refused`, `texels
+differ: refused`, `padding only, too much: refused`, `padding only: kept aside, homed`).
+
+Code review of the likely causes (2026-10-19): `ImageInfo::UpdateSize` lays the mips out back to
+back (`offset` = the sum of the sizes before), each mip padded to whole micro or macro tiles and its
+slices to the tile thickness, so the tiler's dispatch (guest size / element size / 64 groups) covers
+every element exactly once and the linear and tiled offsets agree; the pipe configs base PS4 tile
+modes use (P2, P8_32x32_8x16, P8_32x32_16x16) are all in the shader, and the bank swizzle is an XOR
+per slice: one-to-one by construction. What the image cannot hold is padding: pitch over the width,
+height over the height, small mips padded to 8x8 elements (32x32 texels for BC), whose bytes the
+game's files need not leave zero. That is what the padding kept aside covers. Anything else (a
+tiling the shader gets wrong for a mode: holes; texels that do not survive the upload and re-tile)
+stays refused, and the diff lines say which.
+
 
 ### Risks
 
@@ -460,8 +515,8 @@ promotions refused).
   runtime's lock (shared); a thread faulting on a homed page while it holds the lock exclusively
   would ask the GPU thread for a rebuild that needs the lock (not seen: nothing writes guest memory
   under it).
-- **Memory**: up to 4 re-tiles in host-cached staging at a time (the textures' sizes), returned to
-  the staging pool.
+- **Memory**: up to 4 verifications at a time, two re-tiles each in host-cached staging (the
+  textures' sizes), returned to the staging pool; the padding kept aside stays in RAM while homed.
 - **x86-64 hosts** count every thread as the game's (no 250 ms limit); not a target.
 - Untested on a device (phase 1: builds, host test `tests/test_tex_home.c` for the runtime side).
 

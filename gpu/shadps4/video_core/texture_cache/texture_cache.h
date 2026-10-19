@@ -425,13 +425,20 @@ private:
         u64 image_uid = 0;
         VAddr address = 0; ///< the homed pages: [address, address + size), inside the image
         u64 size = 0;
+        /// The game's padding bytes the re-tile does not have (zeros there): {offset from the
+        /// image's start, length} runs and their bytes, put back on every rebuild.
+        std::vector<std::pair<u32, u32>> patch_runs;
+        std::vector<u8> patch_bytes;
     };
     struct HomeVerify {
         ImageId image_id{};
         u64 image_uid = 0;
         u64 tick = 0; ///< the re-tile is in the staging once the GPU is past it
         u32 stamp = 0;
-        Vulkan::StagingBufferRef staging{};
+        Vulkan::StagingBufferRef staging{}; ///< padding zeros (what a rebuild makes)
+        /// A second re-tile, padding 0xff and tiled bytes no texel lands on 0x5a: bytes that differ
+        /// from the first are padding, or holes (the tiling is not one-to-one there: refused).
+        Vulkan::StagingBufferRef staging_ones{};
     };
     /// The home's image re-tiled into the game's memory (a GPU thread, stage B idle or on it).
     bool TexHomeRehydrate(u32 ticket, BbTexHome::Rebuild why);
@@ -445,10 +452,26 @@ private:
     /// Before UnmapMemory locks: the homes of every image it will free back (any thread).
     void TexHomeBeforeUnmap(VAddr addr, u64 size);
     bool TexHomeEligible(const Image& image, u32 now, BbTexHome::Refusal& why);
-    /// The image re-tiled into a host-cached staging buffer (zeros where no texel is), once the
-    /// commands recorded now have run.
-    Vulkan::StagingBufferRef TexHomeTile(Image& image, bool deferred);
+    /// The image re-tiled into a host-cached staging buffer, once the commands recorded now have
+    /// run: `fill` where the linear copy has no texel (padding), `hole_fill` where no linear byte
+    /// lands in the tiled layout.
+    Vulkan::StagingBufferRef TexHomeTile(Image& image, bool deferred, u32 fill = 0,
+                                         u32 hole_fill = 0);
+    /// The re-tiles the GPU is done with: compared and homed (or refused).
     void TexHomeFinish(HomeVerify& verify);
+    /// Homes [begin, end) of the image with `expected` (the re-tile with the patches applied).
+    void TexHomeCommit(HomeVerify& verify, Image& image, VAddr begin, VAddr end, const u8* expected,
+                       std::vector<std::pair<u32, u32>> patch_runs, std::vector<u8> patch_bytes);
+    /// BB_TEX_HOME_LOG=1: one line on an image whose re-tile differed.
+    void TexHomeLogDiff(const Image& image, VAddr begin, VAddr end, const u8* zeros, const u8* ones,
+                        const u8* guest, u64 holes, const char* verdict);
+
+public:
+    /// bbport BB_TEX_HOME_FIRST: the bytes of [addr, addr + size) under registered sampled textures
+    /// (any thread; nullopt when the cache is busy).
+    std::optional<u64> SampledTextureBytes(VAddr addr, u64 size);
+
+private:
     /// After `mutex`, the runtime's lock after it. Recursive: a rebuild's Finish() may run deferred
     /// work that writes guest memory, which may ask for another rebuild on this thread.
     std::recursive_mutex home_mutex;

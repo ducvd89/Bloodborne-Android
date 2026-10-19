@@ -2861,6 +2861,18 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::UmaDirect(VAddr device
             by_class(6);
             return std::nullopt;
         }
+        // bbport BB_TEX_HOME_FIRST: a granule mostly under sampled textures is left to Plan A
+        // (textures homed in the GPU free more there than a shared buffer saves); copy mode here.
+        if (BbTexHome::First()) {
+            const VAddr granule_va = device_addr - (phys - first);
+            const auto textured = texture_cache.SampledTextureBytes(granule_va, granule);
+            if (!textured || *textured * 100 > granule * BbTexHome::FirstPercent()) {
+                counters.refused_texture_first.fetch_add(1, std::memory_order_relaxed);
+                by_class(6);
+                uma_failed_granules[first / granule] = now;
+                return std::nullopt;
+            }
+        }
         counters.promote_requests.fetch_add(1, std::memory_order_relaxed);
         if (!BbGuestMemory::UmaPromote(first, granule) ||
             (chunk = BbGuestMemory::Find(phys)) == nullptr) {

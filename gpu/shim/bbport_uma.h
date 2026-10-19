@@ -63,6 +63,8 @@ struct Counters {
     std::atomic<std::uint64_t> refused_image{0};     ///< range over a GPU-modified image
     std::atomic<std::uint64_t> refused_size{0};      ///< binding over BB_UMA_MAX_PROMOTE_MB
     std::atomic<std::uint64_t> refused_backoff{0};   ///< granule failed a moment ago, not asked again
+    /// BB_TEX_HOME_FIRST: granule mostly under sampled textures, left to Plan A (not promoted).
+    std::atomic<std::uint64_t> refused_texture_first{0};
     std::array<std::atomic<std::uint64_t>, ClassCount> refused_class{}; ///< class off, or None
     std::atomic<std::uint64_t> refused_written{0};   ///< written binding (not shared yet): a copy
     std::atomic<std::uint64_t> refused_cross{0};     ///< binding crosses a granule: a copy

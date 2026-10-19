@@ -27,6 +27,7 @@ std::uint64_t runtime_memory_home_granule(void);
 std::uint64_t runtime_memory_homed_pages(void);
 void runtime_memory_set_home_hook(int (*rehydrate)(std::uint32_t ticket));
 int runtime_thread_is_guest(const void* ucontext);
+void runtime_memory_read_backing(std::uintptr_t address, void* data, std::uint64_t size);
 }
 
 namespace BbTexHome {
@@ -42,6 +43,14 @@ enum HomeResult : int { HomeOk, HomeArgs, HomeMapping, HomeShared, HomeHomed, Ho
 bool Enabled();
 /// BB_TEX_HOME_IDLE_S (10): seconds since the last CPU write (upload) before a texture may be homed.
 std::uint64_t IdleSeconds();
+/// BB_TEX_HOME_MIN_KB (64, 4..65536): the smallest texture homed (it needs a whole host page too).
+std::uint64_t MinBytes();
+/// BB_TEX_HOME_FIRST=1 (with BB_TEX_HOME=1 and BB_UMA=1): a UMA granule mostly covered by sampled
+/// textures (over BB_TEX_HOME_FIRST_PCT, 50, of its bytes) is not promoted, left to Plan A; the buffer
+/// bindings there take copies as in copy mode. False once BB_TEX_HOME turned out to be off.
+bool First();
+/// BB_TEX_HOME_FIRST_PCT (1..100).
+std::uint64_t FirstPercent();
 
 /// Something may be homed: set before the first home (so the fault handler looks from then on).
 inline std::atomic<bool> active{false};
@@ -74,7 +83,7 @@ inline std::atomic<FaultHandler> fault_handler{nullptr};
 
 /// Why a texture is not homed (candidates the collector looked at), and why a home failed.
 enum Refusal : std::size_t {
-    Small,       ///< under 256 KiB, or no whole host page inside it
+    Small,       ///< under BB_TEX_HOME_MIN_KB (64), or no whole host page inside it
     Usage,       ///< not only sampled (render/depth target, storage, video out, proxy)
     GpuWritten,  ///< GPU-modified or GPU-dirty, written by the GPU once
     Msaa,        ///< multisampled
@@ -86,13 +95,15 @@ enum Refusal : std::size_t {
     Shared,      ///< in a shared UMA granule (or a v1 chunk)
     Overlap,     ///< another image overlaps it
     GpuData,     ///< the buffer cache has GPU data on its pages
-    Mismatch,    ///< its re-tile differs from the game's bytes (never tried again)
+    Mismatch,    ///< its re-tile differs from the game's bytes in texels (never tried again)
     Runtime,     ///< refused by the runtime otherwise (aliases, records, already homed)
+    Padding,     ///< only its padding differs, but too much of it to keep aside (never again)
+    Unmapped,    ///< the tiling is not one-to-one over it (holes): a re-tile may not repeat (never)
     RefusalKinds
 };
 inline constexpr std::array<const char*, RefusalKinds> RefusalNames{
     "small", "usage", "gpu-written", "msaa", "depth/stencil", "format", "dirty", "recent",
-    "mapping", "shared", "overlap", "gpu-data", "bytes differ", "runtime"};
+    "mapping", "shared", "overlap", "gpu-data", "bytes differ", "runtime", "padding", "holes"};
 
 /// How a home came back.
 enum Rebuild : std::size_t { ByFault, ByAccess, ByRuntime, ByCollector, ByFree, ByGpuWrite, ByOverlap, RebuildKinds };
@@ -108,6 +119,13 @@ struct Counters {
     std::atomic<std::uint64_t> forwarded{0};   ///< rebuilds a guest/host thread asked the GPU thread for
     std::atomic<std::uint64_t> timeouts{0};    ///< ... that it could not wait for
     std::atomic<std::uint64_t> lost{0};        ///< homes forgotten without their bytes (see the docs)
+    /// Homes whose padding (bytes no texel covers) differed from the re-tile's zeros: those bytes are
+    /// kept aside and put back on every rebuild. patch_bytes: kept now.
+    std::atomic<std::uint64_t> patched_homes{0}, patch_bytes{0};
+    /// Verifications that failed: texel bytes differ / only padding, too much of it / holes in the
+    /// tiling (two re-tiles with different fills, see TexHomeFinish).
+    std::atomic<std::uint64_t> verify_texel_failures{0}, verify_padding_failures{0},
+        verify_hole_failures{0};
 };
 inline Counters counters;
 
