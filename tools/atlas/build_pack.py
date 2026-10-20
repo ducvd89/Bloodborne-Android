@@ -13,6 +13,8 @@ license. Output: a zip whose single root is atlas/:
   maps/catalog.bin          little-endian float32
   maps/<id>.json            version 3: the area's metadata; its geometry is in <id>.bin
   maps/<id>.bin             little-endian float32 arrays, offsets in the layers of <id>.json
+  maps/nav/<id>.bnv         pack version 2: the area's route graph (BNV1, tools/atlas/nav/pack.py)
+  maps/nav/<id>.gates.json  pack version 2: the gates / mechanisms of that graph (see gate_table)
   art/                      Hunter's Atlas art (PNG) and the DejaVu font
   NOTICE.txt, LICENSE-HuntersAtlas.txt
 
@@ -21,9 +23,20 @@ x0,z0,x1,z1,x2,z2), heights:[byteOffset,count] (count×3 floats y0,y1,y2), walls
 (count×4 floats x0,z0,x1,z1), outline:[byteOffset,floatCount] (x,z pairs), rings:[points,...]}.
 The game-extracted font and the generator's build manifest are left out.
 
-Usage: build_pack.py --generated DIR --hunters-atlas DIR --output ZIP [--pack-version N]
+Pack version 2 adds maps/nav/ (route finding); everything of version 1 is unchanged and schema stays 1, so an older
+app ignores the folder. Usage:
+  build_pack.py --generated DIR --hunters-atlas DIR --output ZIP [--nav DIR] [--pack-version N]
+--nav is the output of nav/pack.py (<id>.bnv per area); with it the pack version defaults to 2, without to 1.
+
+Gate table (maps/nav/<id>.gates.json, {"version":1,"area":id,"gates":[...]}), gate i = mechanism i of the .bnv (the
+index the graph's gated links carry): {i, type, entity, model, name (designer text, Japanese), pos [x,y,z],
+default ("open" | "closed" | "oneway": the state when no candidate flag is set), flags [{id, kind, means, conf}],
+seg [x0,z0,x1,z1] and y [lo,hi] (door / fog wall aperture, for drawing), operable [[x,z]..] (one-way and lever doors:
+the points the door is opened from), stops [[x,y,z]..] (lifts)}. type: door (ordinary), key (key item), oneway,
+lever (opened by a lever elsewhere), scripted (opened by story events), special, static (never opens), fog (boss or
+multiplayer fog wall, passable), lift, ladder (kick-down ladder). A gate is open when ANY of its candidate flags is set.
 """
-import argparse, hashlib, json, shutil, stat, struct, sys, tempfile, zipfile
+import argparse, hashlib, json, shutil, stat, struct, sys, tempfile, zipfile, zlib
 from pathlib import Path
 
 EBOOT = 'd65f0b4f01d59166aed16f8604196d8b7dd805abbf0758b356e8f1354c9429f9'
@@ -81,6 +94,100 @@ def area(source, maps):
     (maps / (a['id'] + '.bin')).write_bytes(bytes(blob))
 
 
+GATE_TYPE = {'normal': 'door', 'key': 'key', 'oneway': 'oneway', 'lever': 'lever', 'scripted': 'scripted',
+             'unknown': 'scripted', 'special': 'special', 'static': 'static'}
+
+
+def bnv_extra(path):
+    """The JSON block (virtual nodes, extra edges, mechanism table) of a BNV1 file; checks the container on the way."""
+    buf = Path(path).read_bytes()
+    if buf[:4] != b'BNV1':
+        sys.exit(f'{path}: not a BNV1 file')
+    version, count = struct.unpack_from('<BI', buf, 4)
+    if version != 1:
+        sys.exit(f'{path}: BNV version {version}')
+    heads, off = [], 9
+    for _ in range(count):
+        heads.append(struct.unpack_from('<BII', buf, off)); off += 9
+    sections = {}
+    for sid, comp, raw in heads:
+        data = zlib.decompress(buf[off:off + comp]); off += comp
+        if len(data) != raw:
+            sys.exit(f'{path}: section {sid} has {len(data)} bytes, expected {raw}')
+        sections[sid] = data
+    if off != len(buf) or set(sections) != set(range(1, 9)):
+        sys.exit(f'{path}: unexpected container layout')
+    return json.loads(sections[7].decode('utf-8'))
+
+
+def _region(r):
+    out = {'kind': r['kind'], 'x': r['x'], 'y': r['y'], 'z': r['z'], 'fx': r['fx'], 'fz': r['fz'], 'y0': r['y0'], 'y1': r['y1'],
+           'src': r.get('source', 'button')}
+    if r['kind'] == 'box':
+        out.update(depth=r['depth'], width=r['width'])
+    else:
+        out.update(radius=r['radius'], angle=r['angle'])
+    return out
+
+
+def gate_table(mechs):
+    out = []
+    for i, m in enumerate(mechs):
+        kind, behavior = m['kind'], m.get('behavior')
+        gtype = 'fog' if kind == 'fog' else GATE_TYPE.get(behavior, 'scripted') if kind == 'door' else kind
+        operable = [[round(a, 2), round(b, 2)] for a, b in m.get('operable_points') or []]
+        side = m.get('side', 'unknown')
+        known = side in ('front', 'back') or bool(operable)
+        if gtype == 'fog':
+            default = 'open'
+        elif gtype in ('door', 'oneway'):
+            default = 'oneway' if known else 'open'
+        elif gtype == 'lever':
+            default = 'oneway' if known else ('open' if side == 'both' else 'closed')
+        elif gtype in ('lift', 'ladder'):
+            default = 'oneway' if m.get('levers') else 'closed'
+        else:
+            default = 'closed'     # key, scripted, special, static
+        flags = [{'id': f['flag'], 'kind': f['kind'], 'means': f['enabled_means'], 'conf': f['conf']} for f in m.get('flags', [])]
+        gate = {'i': i, 'type': gtype, 'entity': m.get('entity', -1), 'model': m.get('model', ''), 'name': m.get('desc', ''),
+                'pos': [round(v, 2) for v in m['pos']], 'default': default, 'side': side, 'flags': flags}
+        frame = m.get('frame')
+        if frame:
+            ax, az, bx, bz = frame['segment']
+            length = ((bx - ax) ** 2 + (bz - az) ** 2) ** .5
+            cut = min(1.0, length * .25) / length if length > 0 else 0   # the aperture reaches 1 m into the wall frame on each side
+            gate['seg'] = [round(ax + (bx - ax) * cut, 2), round(az + (bz - az) * cut, 2),
+                           round(bx - (bx - ax) * cut, 2), round(bz - (bz - az) * cut, 2)]
+            gate['y'] = [round(frame['y_lo'], 2), round(frame['y_hi'], 2)]
+            gate['center'] = [round(v, 3) for v in frame['center']]
+            gate['normal'] = [round(v, 4) for v in frame['normal']]
+        if operable:
+            gate['operable'] = operable
+        if m.get('regions'):
+            gate['regions'] = [_region(r) for r in m['regions']]
+        if m.get('key'):
+            gate['key'] = {'id': m['key']['id'], 'name': m['key'].get('name', '')}
+        if m.get('levers'):
+            gate['levers'] = [{'entity': lv['entity'], 'pos': [round(v, 2) for v in lv['pos']], 'stop': lv.get('stop', -1),
+                               'regions': [_region(r) for r in lv.get('regions', [])]} for lv in m['levers']]
+        if m.get('stops'):
+            gate['stops'] = [[round(v, 2) for v in p] for p in m['stops']]
+        out.append(gate)
+    return out
+
+
+def nav_area(source, nav):
+    """Copies <id>.bnv into maps/nav/ and writes its gate table. -> (gates, flag count)."""
+    extra = bnv_extra(source)
+    gates = gate_table(extra['mechs'])
+    if len(gates) > 254:
+        sys.exit(f'{source.name}: {len(gates)} gates do not fit the one-byte gate index')
+    area_id = source.stem
+    shutil.copyfile(source, nav / source.name)
+    dump(nav / (area_id + '.gates.json'), {'version': 1, 'area': area_id, 'gates': gates})
+    return gates, len({f['id'] for g in gates for f in g['flags']})
+
+
 def catalog(source, maps):
     c = json.loads(source.read_text(encoding='utf-8'))
     out, blob = {}, bytearray()
@@ -106,8 +213,12 @@ def main():
     parser.add_argument('--generated', type=Path, required=True)
     parser.add_argument('--hunters-atlas', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--pack-version', type=int, default=1)
+    parser.add_argument('--nav', type=Path, help='directory with <id>.bnv per area (nav/pack.py output): makes a version 2 pack')
+    parser.add_argument('--pack-version', type=int)
     args = parser.parse_args()
+    pack_version = args.pack_version or (2 if args.nav else 1)
+    if pack_version >= 2 and not args.nav:
+        sys.exit('pack version 2 needs --nav')
     generated = args.generated / 'maps'
     manifest = json.loads((generated / 'generated-assets.json').read_text(encoding='utf-8'))
     if manifest.get('game_eboot_sha256') != EBOOT:
@@ -127,6 +238,19 @@ def main():
         ids = [m['id'] for m in json.loads((generated / 'atlas.json').read_text(encoding='utf-8'))['maps']]
         for area_id in ids:
             area(generated / (area_id + '.json'), maps)
+        nav_info = None
+        if args.nav:
+            nav = maps / 'nav'
+            nav.mkdir()
+            listed, flag_ids = [], set()
+            for area_id in ids:
+                source = args.nav / (area_id + '.bnv')
+                if not source.is_file():
+                    sys.exit(f'no route graph for {area_id}: {source}')
+                gates, _ = nav_area(source, nav)
+                listed.append(area_id)
+                flag_ids |= {f['id'] for g in gates for f in g['flags']}
+            nav_info = {'version': 1, 'areas': listed, 'gate_flags': len(flag_ids)}
         for name in ART:
             shutil.copyfile(args.hunters_atlas / 'source/art' / name, art / name)
         shutil.copyfile(args.hunters_atlas / 'LICENSE', root / 'LICENSE-HuntersAtlas.txt')
@@ -135,9 +259,12 @@ def main():
             "from the CUSA03173 1.09 game files. Art by Hunter's Atlas; DejaVu font license in art/.\n",
             encoding='utf-8')
         files = {p.relative_to(root).as_posix(): sha(p) for p in sorted(root.rglob('*')) if p.is_file()}
-        dump(root / 'pack.json', {'schema': 1, 'pack_version': args.pack_version,
-                                  'generator': manifest.get('generator_version'), 'eboot_sha256': EBOOT,
-                                  'areas': ids, 'files': files})
+        info = {'schema': 1, 'pack_version': pack_version, 'generator': manifest.get('generator_version'),
+                'eboot_sha256': EBOOT, 'areas': ids}
+        if nav_info:
+            info['nav'] = nav_info
+        info['files'] = files
+        dump(root / 'pack.json', info)
         names = sorted(p.relative_to(pack).as_posix() for p in root.rglob('*') if p.is_file())
         args.output.unlink(missing_ok=True)
         with zipfile.ZipFile(args.output, 'w') as z:

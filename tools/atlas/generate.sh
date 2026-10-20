@@ -1,8 +1,9 @@
 #!/bin/sh
 # Hunter's Atlas map pack: runs Hunter's Atlas's generator on the 1.09 game files and builds the
-# pack the Android app downloads (build_pack.py). PC only, no game data is committed.
+# pack the Android app downloads (build_pack.py), with the route graphs of nav/ (pack version 2). PC only, no game
+# data is committed.
 # Usage: tools/atlas/generate.sh WORK_DIR GAME_DIR OUTPUT_ZIP
-#   WORK_DIR    scratch directory: the HuntersAtlas checkout, a Python 3.12 venv, the generator output
+#   WORK_DIR    scratch directory: the HuntersAtlas checkout, a Python 3.12 venv, the generator output, the route graphs
 #   GAME_DIR    the CUSA03173 1.09 game folder (dvdroot_ps4/, eboot.bin); only read
 set -e
 work=$(realpath -m "$1"); game=$(realpath "$2"); output=$(realpath -m "$3")
@@ -27,4 +28,10 @@ cp -r "$work/ha/source/generator/src" "$work/generator"
 # generate_atlas.py has CRLF line endings.
 sed "s/$/\r/" "$here/linux-binderentry.patch" | patch -s --binary -d "$work/generator" generate_atlas.py
 nice -n 19 "$work/venv/bin/python" "$work/generator/generate_atlas.py" --game-dir "$game" --output-dir "$work/generated" > "$work/generate.log"
-python3 -I "$here/build_pack.py" --generated "$work/generated" --hunters-atlas "$work/ha" --output "$output"
+# Route graphs: a walkable grid, ladders, lifts and gates per area from the game's own collision and event data
+# (nav/README.md). pack.py builds every area, checks that its BNV1 file decodes to the same graph and fails if not.
+nav="$work/nav"
+rm -rf "$nav"; mkdir -p "$nav"
+(cd "$here/nav" && PYTHONDONTWRITEBYTECODE=1 NAV_MAPS="$work/generated/maps" NAV_GAME="$game" NAV_OUT="$nav" NAV_GENSRC="$work/generator" \
+    nice -n 19 "$work/venv/bin/python" pack.py > "$work/nav.log")
+python3 -I "$here/build_pack.py" --generated "$work/generated" --hunters-atlas "$work/ha" --nav "$nav/pack" --output "$output"
