@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.ducvd89.bloodborne" android:versionCode="32" android:versionName="1.0.0">
+    package="com.ducvd89.bloodborne" android:versionCode="33" android:versionName="1.1.0">
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="28" />
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Hunter's Atlas on a display without presentation windows (AtlasActivity): the game's task is brought back to the top. -->
