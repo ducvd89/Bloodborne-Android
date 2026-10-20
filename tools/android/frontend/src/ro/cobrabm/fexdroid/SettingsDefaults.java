@@ -108,15 +108,44 @@ final class SettingsDefaults {
         write(marker,mark);
     }
 
+    /** 1.2.0: online play exists, so "Skip the online/offline screen" (skip_network_choice) is off by default (the game shows
+     *  its screen). Once, every bbport.ini from before it gets skip_network_choice=0, even where the player had it on; the
+     *  player may turn it back on afterwards. The marker holds 1 and is written last (a crash before it repeats the step). */
+    private static final String SKIP_MARKER="skip_network_choice_off";
+    static void switchOffSkipNetworkChoice(File base) throws IOException {
+        File marker=new File(base,SKIP_MARKER), ini=new File(base,"bbport.ini");
+        if (revision(marker)>=1) return;
+        if (ini.isFile()) {
+            List<String> out=new ArrayList<>();
+            boolean changed=false;
+            for (String line:lines(ini)) {
+                if ("skip_network_choice".equals(keyOf(line))) { // the last line of a key wins: every one is set
+                    String fixed="skip_network_choice=0";
+                    if (!fixed.equals(line.trim())) changed=true;
+                    out.add(fixed);
+                    continue;
+                }
+                out.add(line);
+            }
+            if (changed) {
+                write(ini,out);
+                android.util.Log.i("Bloodborne","online/offline screen shown by default (skip_network_choice set to 0, 1.2.0)");
+            }
+        }
+        List<String> mark=new ArrayList<>(); mark.add("1");
+        write(marker,mark);
+    }
+
     /** Applies the defaults in base (the bbport directory) when this revision has not been yet. Does
      *  nothing, and writes no marker, while the defaults file is missing. Throws when the files cannot
      *  be written; the marker is last, so the next start tries again. */
     static void apply(File base) throws IOException {
         // A hard reset can leave files of NUL bytes (written, never synced): settings and markers of that kind
         // are taken as missing, so the defaults apply as on a first install.
-        for (String name:new String[]{"bbport.ini",MARKER,FAULT_MARKER,GSR2_MARKER}) SafeWrite.repair(new File(base,name));
+        for (String name:new String[]{"bbport.ini",MARKER,FAULT_MARKER,GSR2_MARKER,SKIP_MARKER}) SafeWrite.repair(new File(base,name));
         resetFaultSwitches(base);
         switchToGsr2(base);
+        switchOffSkipNetworkChoice(base);
         File marker=new File(base,MARKER), ini=new File(base,"bbport.ini"), defaults=new File(base,"bbport.default.ini");
         if (revision(marker)>=REVISION || !defaults.isFile()) return;
         List<String> wantedLines=lines(defaults);

@@ -78,9 +78,10 @@ final class LogReport {
             String logcatNote=logcat(zip,removed);
             tail(zip,new File(base,"logs/android-game.log"),"android-game.log",LOG_CAP,removed);
             tail(zip,new File(base,"logs/android-game.prev.log"),"android-game.prev.log",LOG_CAP,removed);
+            tail(zip,AtlasDoorLog.file(base),"atlas-doors.log",LOG_CAP,removed); // the map's door-flag calibration log (Atlas, Debug), when it was on
             String settings=settings(zip,new File(base,"bbport.ini"));
             String shaders=shaders(zip,new File(base,"logs/failed-shaders"));
-            summary.append(deviceLines(activity,facts,chip));
+            summary.append(deviceLines(activity,facts,chip,base));
             StringBuilder text=new StringBuilder(summary);
             text.append("Settings: ").append(settings).append('\n');
             text.append("Logcat: ").append(logcatNote).append('\n');
@@ -108,7 +109,7 @@ final class LogReport {
     }
 
     // ---- report.txt ----
-    private static String deviceLines(Activity a,Facts f,GpuFamily chip) {
+    private static String deviceLines(Activity a,Facts f,GpuFamily chip,File base) {
         StringBuilder s=new StringBuilder();
         try {
             PackageInfo p=a.getPackageManager().getPackageInfo(a.getPackageName(),0);
@@ -138,6 +139,14 @@ final class LogReport {
         line(s,"Game folder",f.gameFolder==null ? "not chosen" : f.gameFolder+(f.ebootFound ? " (eboot.bin found)" : " (no eboot.bin)"));
         line(s,"Mods",f.modsLine);
         line(s,"Lossless.dll",f.losslessDll ? "present" : "not present");
+        try { line(s,"Online",new OnlineSettings(a).summary()); } // the pool only: never the account, password or token
+        catch (Exception e) { line(s,"Online","unknown"); }
+        // The online session's last state (net-status.txt of the last online game), without the account name.
+        try {
+            OnlineSettings online=new OnlineSettings(a);
+            File status=OnlineStatus.file(base);
+            line(s,"Online status",OnlineStatus.forReport(status.isFile() ? OnlineStatus.read(status) : null,online.npid(),online.thdOnlineId()));
+        } catch (Exception e) { line(s,"Online status","unknown"); }
         return s.toString();
     }
     private static void line(StringBuilder s,String key,String value) { s.append(key).append(": ").append(value).append('\n'); }
@@ -197,7 +206,7 @@ final class LogReport {
     private static void copyLines(BufferedReader r,Writer w,int[] removed) throws IOException {
         for (String line; (line=r.readLine())!=null;) {
             if (SECRET_LINE.matcher(line).find()) { ++removed[0]; w.write("[line left out: looks like a secret]\n"); }
-            else { w.write(line); w.write('\n'); }
+            else { w.write(OnlineSettings.scrub(line)); w.write('\n'); } // the online account's password and token, if one got in
         }
     }
 
@@ -212,6 +221,7 @@ final class LogReport {
             try (BufferedReader r=new BufferedReader(new InputStreamReader(p.getInputStream(),StandardCharsets.UTF_8))) {
                 for (String line; (line=r.readLine())!=null;) {
                     if (SECRET_LINE.matcher(line).find()) { ++removed[0]; continue; }
+                    line=OnlineSettings.scrub(line);
                     lines.addLast(line); bytes+=line.length()+1;
                     while (bytes>LOGCAT_CAP && lines.size()>1) { bytes-=lines.pollFirst().length()+1; cut=true; }
                 }

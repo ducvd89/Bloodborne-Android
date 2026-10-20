@@ -23,6 +23,18 @@ and volk (MIT, Copyright (c) 2018-2025 Arseny Kapoulkine); the licenses are in
 bbport/licenses/. Lossless Scaling and its Lossless.dll are not included: the app
 downloads the player's own copy from Steam, or the player copies it.
 
+Online play (bbport/bionic/lib/libbbnet20.so): the network, NP and shadNet code of
+shadPS4 v0.20.0 (GPL-2.0-or-later, https://github.com/shadps4-emu/shadPS4) as ported by
+bloodborne_pc 0.6 (GPL-2.0-or-later, https://github.com/deadinside28/bloodborne_pc),
+BBSC seamless co-op (GPL-2.0-or-later, https://github.com/CLSAMG22/BBSC) and The
+Hunter's Dream backend adapted from droogie/bbhost (GPL-3.0-or-later,
+https://github.com/droogie/bbhost), so the module as a whole is GPL-3.0-or-later, with
+this port's changes (gpu/bbnet20/android-changes.diff in the source). It links OpenSSL
+3.5 (Apache-2.0), Protocol Buffers 3.21 (BSD-3-Clause), miniupnpc (BSD-3-Clause),
+nlohmann/json (MIT) and cpp-httplib (MIT); their licenses are in bbport/licenses/. The
+CA certificates (bbport/bionic/share/cacert.pem) are Mozilla's bundle as published by
+curl.se (MPL-2.0; bbport/licenses/cacert-source.txt).
+
 Steam sign-in (downloads Lossless.dll from the player's own Lossless Scaling):
 JavaSteam 1.8.0 (MIT, https://github.com/Longi94/JavaSteam), with Kotlin and
 kotlinx.coroutines/io/serialization (Apache-2.0, JetBrains), Ktor (Apache-2.0,

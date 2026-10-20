@@ -19,6 +19,7 @@ final class AudioBridge {
     private final File fifo;
     private volatile boolean running;
     private volatile AudioTrack track;
+    private volatile boolean muted;
 
     AudioBridge(File fifo) { this.fifo=fifo; }
 
@@ -31,6 +32,13 @@ final class AudioBridge {
     void stop() { running=false; AudioTrack t=track; if (t!=null) t.pause(); }
     void pause() { AudioTrack t=track; if (t!=null) t.pause(); }
     void resume() { AudioTrack t=track; if (t!=null) t.play(); }
+    /** Silence without stopping the flow: the track keeps playing at volume 0, so the game's audio thread (paced by the
+     *  FIFO this drains) never blocks. Pausing the track would fill the FIFO and stall the game. */
+    void mute(boolean muted) {
+        this.muted=muted;
+        AudioTrack t=track;
+        if (t!=null) t.setVolume(muted ? 0f : 1f);
+    }
 
     private void run() {
         try {
@@ -50,7 +58,7 @@ final class AudioBridge {
                     .setBufferSizeInBytes(Math.max(min,RATE*FRAME/20))
                     .setTransferMode(AudioTrack.MODE_STREAM)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY).build();
-                track=t; t.play();
+                t.setVolume(muted ? 0f : 1f); track=t; t.play();
                 byte[] buffer=new byte[4096];
                 int carry=0;
                 while (running) {

@@ -32,6 +32,8 @@ final class AtlasDialog {
         /** The game runs, but was started without the map's files: it needs a restart for the map. */
         boolean needsRestart();
         void restart();
+        /** The game process is running (a new pack's flags reach it only after a restart). */
+        default boolean gameRunning() { return false; }
         /** Closes this dialog and opens the layout editor on the mini map's place. */
         void editMiniMap();
         /** The floating map's side in percent of the game screen's shorter side (the layout editor's own size), and its setter. */
@@ -47,12 +49,12 @@ final class AtlasDialog {
     private Switch enable;
     private TextView status;
     private Button delete, editMini;
-    private LinearLayout floatBox, whereBox;
+    private LinearLayout floatBox, whereBox, updateBox;
     private DisplayManager displayManager;
     private boolean watching;
     private TextView editNote;
     private boolean setting; // the switch is being set by the code
-    private volatile AtlasPack.Install install;
+    private AtlasScreen.UpdateListener following;
 
     AtlasDialog(Activity activity,AtlasScreen screen,Host host) { this.activity=activity; this.screen=screen; this.host=host; }
 
@@ -78,7 +80,8 @@ final class AtlasDialog {
         box.setPadding(dp(24),dp(4),dp(24),dp(8));
         note(box,"Hunter's Atlas shows a live map: on the second screen (the bottom one of a dual-screen handheld), as a small "
             +"floating map over the game, or both. It shows where you are and which way you face, the floor you are on, lamps you have lit, "
-            +"and, if you choose, remaining pickups and conversations. Touch the second-screen map to pan, zoom and browse the areas. "
+            +"and, if you choose, remaining pickups and conversations. Touch the second-screen map to pan, zoom and browse the areas; "
+            +"tap a lamp, pickup, conversation or any spot and choose Navigate for a route. "
             +"It needs the map data (a download) and a restart of the game the first time.",0.8f);
         enable=new Switch(activity); enable.setText("Map"); enable.setTextSize(16);
         enable.setPadding(0,dp(8),0,dp(8));
@@ -86,6 +89,8 @@ final class AtlasDialog {
         enable.setOnCheckedChangeListener((b,on) -> { if (!setting) toggled(on); });
         box.addView(enable);
         status=note(box,"",0.9f); status.setTextColor(0xffc6ad76);
+        updateBox=new LinearLayout(activity); updateBox.setOrientation(LinearLayout.VERTICAL);
+        box.addView(updateBox);
 
         whereBox=new LinearLayout(activity); whereBox.setOrientation(LinearLayout.VERTICAL);
         box.addView(whereBox);
@@ -127,8 +132,8 @@ final class AtlasDialog {
         editMini=new Button(activity); editMini.setAllCaps(false); editMini.setText("Edit mini map position");
         editMini.setOnClickListener(v -> host.editMiniMap());
         floatBox.addView(editMini,new LinearLayout.LayoutParams(-2,-2));
-        editNote=note(floatBox,"Drag the map to move it, pinch (or − / +) to resize it. It is top right by default and never takes touches: "
-            +"the on-screen controller and the camera work through it. It appears once the game is in a mapped place and hides while the game is paused.",0.65f);
+        editNote=note(floatBox,"Drag the map to move it, pinch (or − / +) to resize it. It is top right by default; the on-screen controller and the camera work through it. "
+            +"Touch and hold it for 2 seconds to open the full map (set a destination there; Close returns here). It appears once the game is in a mapped place and hides while the game is paused.",0.65f);
         box.addView(floatBox);
 
         TextView heading=new TextView(activity); heading.setText("Show on the map"); heading.setTextSize(15);
@@ -152,6 +157,25 @@ final class AtlasDialog {
         fog.setOnCheckedChangeListener((b,on) -> screen.setOption(AtlasScreen.PREF_FOG,on));
         box.addView(fog);
         note(box,"Hides an area's map until its boss is beaten (as in Hunter's Atlas), to avoid spoilers. Off by default.",0.65f);
+        TextView printHead=new TextView(activity); printHead.setText("Footprint size"); printHead.setTextSize(15); printHead.setPadding(0,dp(8),0,dp(2)); box.addView(printHead);
+        String[] printNames={"Small","Medium","Large"};
+        RadioGroup printGroup=new RadioGroup(activity); printGroup.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i=0;i<printNames.length;++i) {
+            RadioButton r=new RadioButton(activity); r.setId(View.generateViewId()); r.setText(printNames[i]); r.setTextSize(15); r.setPadding(0,0,dp(14),0); printGroup.addView(r);
+            if (i==screen.printSize()) printGroup.check(r.getId());
+        }
+        printGroup.setOnCheckedChangeListener((g,id) -> { for (int i=0;i<g.getChildCount();++i) if (g.getChildAt(i).getId()==id) screen.setPrintSize(i); });
+        box.addView(printGroup);
+        note(box,"The size of the route's footprints on the maps.",0.65f);
+
+        TextView debug=new TextView(activity); debug.setText("Debug"); debug.setTextSize(15);
+        debug.setTypeface(Typeface.DEFAULT,Typeface.BOLD); debug.setPadding(0,dp(12),0,dp(2)); box.addView(debug);
+        Switch doors=new Switch(activity); doors.setText("Log door flags"); doors.setTextSize(15); doors.setPadding(0,dp(6),0,dp(6));
+        doors.setChecked(screen.doorLog());
+        doors.setOnCheckedChangeListener((b,on) -> screen.setDoorLog(on));
+        box.addView(doors);
+        note(box,"While on, every change of a door, lever or lift state flag is written to atlas-doors.log (time, area, door, flag, old and new "
+            +"value, your position) and included in Report a problem. Open a door in the game to see which flag flips. Needs the map data with route finding.",0.65f);
 
         delete=new Button(activity); delete.setAllCaps(false);
         delete.setOnClickListener(v -> askDelete());
@@ -165,6 +189,7 @@ final class AtlasDialog {
         refreshUi();
         watchDisplays();
         dialog.show();
+        if (screen.updating()) attachProgress(screen.enabled() || screen.installed());
     }
 
     /** While the dialog is open a display that comes or goes updates the choices at once (and AtlasScreen, which has its own
@@ -252,12 +277,25 @@ final class AtlasDialog {
             boolean floating=mode.equals(AtlasScreen.MODE_FLOAT) || mode.equals(AtlasScreen.MODE_BOTH);
             floatBox.setVisibility(floating ? View.VISIBLE : View.GONE);
             editMini.setEnabled(screen.floatOn());
-            editNote.setText(screen.floatOn() ? "Drag the map to move it, pinch (or − / +) to resize it. It is top right by default and never takes touches: "
-                +"the on-screen controller and the camera work through it. It appears once the game is in a mapped place and hides while the game is paused."
+            editNote.setText(screen.floatOn() ? "Drag the map to move it, pinch (or − / +) to resize it. It is top right by default; the on-screen controller and the camera work through it. "
+                +"Touch and hold it for 2 seconds to open the full map (set a destination there; Close returns here). It appears once the game is in a mapped place and hides while the game is paused."
                 : "Turn the map on to place the mini map.");
         }
+        refreshUpdate();
         delete.setVisibility(installed ? View.VISIBLE : View.GONE);
         if (installed) delete.setText("Delete map data ("+AtlasDialog.megabytes(AtlasPack.size(screen.base()))+")");
+    }
+    /** An installed pack without route data (version 1): a note and an Update button; the map works as it is without them. */
+    private void refreshUpdate() {
+        if (updateBox==null) return;
+        updateBox.removeAllViews();
+        if (!AtlasPack.updateAvailable(screen.base())) return;
+        TextView t=note(updateBox,"Map update available (route finding)",1f); t.setTextColor(0xffc6ad76); t.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
+        note(updateBox,"Adds routes to lamps, pickups and any spot you tap, and shows doors and whether you can open them from where you are. "
+            +"Until you update, the map works as before.",0.7f);
+        Button update=new Button(activity); update.setAllCaps(false); update.setText("Update");
+        update.setOnClickListener(v -> download(true));
+        updateBox.addView(update,new LinearLayout.LayoutParams(-2,-2));
     }
     private static String megabytes(long bytes) { return String.format(java.util.Locale.ROOT,"%.1f MB",bytes/1048576.0); }
 
@@ -265,55 +303,65 @@ final class AtlasDialog {
 
     private void toggled(boolean on) {
         if (!on) { screen.setEnabled(false); screen.refresh(); refreshUi(); return; }
-        if (screen.installed()) { screen.setEnabled(true); screen.refresh(); refreshUi(); offerRestart(); return; }
-        download();
+        if (screen.installed()) {
+            screen.setEnabled(true); screen.refresh(); refreshUi();
+            if (screen.updating()) attachProgress(true); // a download of the update runs already
+            else if (AtlasPack.needsUpdate(screen.base())) screen.autoUpdate(); // an older pack: updated in the background (Wi-Fi), the same way as at the game's start
+            else offerRestart();
+            return;
+        }
+        download(false);
     }
 
     private void offerRestart() {
-        if (!host.needsRestart()) return;
+        if (!host.needsRestart() && !(host.gameRunning() && screen.flagsStale())) return;
         new AlertDialog.Builder(activity).setTitle("Restart Bloodborne?")
             .setMessage("The map reads the game's state: the game starts sharing it after a restart. Any unsaved progress will be lost.")
             .setNegativeButton("Later",null).setPositiveButton("Restart",(d,w) -> host.restart()).show();
     }
 
-    private void download() {
+    /** update: an installed pack is being replaced; the map stays on and the old pack stays if this fails or is cancelled. The
+     *  download is AtlasScreen's (one at a time): this starts it, or follows the one that runs. */
+    private void download(final boolean update) {
+        if (!screen.updating() && !screen.startUpdate()) return;
+        attachProgress(update);
+    }
+
+    /** The progress dialog of the download AtlasScreen runs (started here or at the game's start). */
+    private void attachProgress(final boolean update) {
+        if (following!=null || !screen.updating()) return;
         LinearLayout box=new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(24),dp(12),dp(24),dp(8));
         final TextView message=new TextView(activity); message.setTextSize(15); message.setText("Starting the download…");
         final ProgressBar bar=new ProgressBar(activity,null,android.R.attr.progressBarStyleHorizontal); bar.setMax(1000);
         box.addView(message); box.addView(bar,new LinearLayout.LayoutParams(-1,-2));
-        final AtlasPack.Install job=new AtlasPack.Install(); install=job;
         progress=new AlertDialog.Builder(activity).setTitle("Map data").setView(box).setCancelable(false)
-            .setNegativeButton("Cancel",(d,w) -> job.cancel()).create();
-        progress.show();
-        Thread t=new Thread(() -> {
-            String failure=null; boolean cancelled=false;
-            try {
-                job.run(screen.base(),(done,total) -> main.post(() -> {
-                    if (total>0) { message.setText((done*100/total)+"% · "+megabytes(done)+" of "+megabytes(total)); bar.setIndeterminate(false); bar.setProgress((int)(done*1000/total)); }
-                    else { message.setText(megabytes(done)); bar.setIndeterminate(true); }
-                }),() -> main.post(() -> { message.setText("Unpacking…"); bar.setIndeterminate(true); }));
-            } catch (CancellationException e) { cancelled=true; }
-            catch (Exception e) {
-                failure=AtlasPack.message(e);
-                android.util.Log.e("Bloodborne","map pack: "+e);
+            .setNegativeButton("Cancel",(d,w) -> screen.cancelUpdate()).create();
+        final AtlasScreen.UpdateListener listener=new AtlasScreen.UpdateListener() {
+            @Override public void progress(long done,long total,boolean unpacking) {
+                if (unpacking) { message.setText("Unpacking…"); bar.setIndeterminate(true); }
+                else if (total>0) { message.setText((done*100/total)+"% · "+megabytes(done)+" of "+megabytes(total)); bar.setIndeterminate(false); bar.setProgress((int)(done*1000/total)); }
+                else { message.setText(megabytes(done)); bar.setIndeterminate(true); }
             }
-            final String problem=failure; final boolean stopped=cancelled;
-            main.post(() -> {
+            @Override public void finished(String problem,boolean cancelled) {
+                screen.removeUpdateListener(this); following=null;
                 try { progress.dismiss(); } catch (Exception ignored) {}
-                install=null;
                 if (host.destroyed()) return;
-                if (problem!=null || stopped) {
-                    switchTo(false); screen.setEnabled(false); screen.refresh(); refreshUi();
-                    if (problem!=null) new AlertDialog.Builder(activity).setTitle("Map data not installed").setMessage(problem)
+                if (problem!=null || cancelled) {
+                    if (!update) { switchTo(false); screen.setEnabled(false); screen.refresh(); }
+                    refreshUi();
+                    if (problem!=null) new AlertDialog.Builder(activity).setTitle(update ? "Map update failed" : "Map data not installed").setMessage(problem)
                         .setPositiveButton("OK",null).show();
                     return;
                 }
-                screen.setEnabled(true); screen.packChanged(); refreshUi();
+                if (!update) screen.setEnabled(true);
+                screen.refresh(); refreshUi(); // AtlasScreen swapped the new data in already (and renewed the running game's flags)
                 offerRestart();
-            });
-        },"Atlas-download");
-        t.setDaemon(true); t.start();
+            }
+        };
+        following=listener; screen.addUpdateListener(listener);
+        listener.progress(screen.updateDone(),screen.updateTotal(),screen.updateUnpacking());
+        progress.show();
     }
 
     private void askDelete() {
@@ -321,15 +369,16 @@ final class AtlasDialog {
             .setMessage("The map is turned off. It is downloaded again when you turn it on.")
             .setNegativeButton("Cancel",null)
             .setPositiveButton("Delete",(d,w) -> {
+                screen.cancelUpdate();
                 screen.setEnabled(false); switchTo(false);
                 screen.packChanged(); AtlasPack.delete(screen.base());
                 screen.refresh(); refreshUi();
             }).show();
     }
 
-    /** Ends everything: cancels a download, closes the dialogs (also when the activity is destroyed). */
+    /** Closes the dialogs (also when the activity is destroyed); a download goes on (AtlasScreen's, it ends with the activity). */
     void close() {
-        AtlasPack.Install i=install; if (i!=null) i.cancel();
+        if (following!=null) { screen.removeUpdateListener(following); following=null; }
         unwatchDisplays();
         for (AlertDialog d:new AlertDialog[]{progress,dialog}) { try { if (d!=null && d.isShowing()) d.dismiss(); } catch (Exception ignored) {} }
     }

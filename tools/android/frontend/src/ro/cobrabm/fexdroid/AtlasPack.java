@@ -22,9 +22,12 @@ import java.util.zip.ZipFile;
 final class AtlasPack {
     private AtlasPack() {}
 
-    /** Where the pack comes from and its SHA-256. "TODO": not published yet, the check is skipped (and logged). */
-    static final String ATLAS_PACK_URL="https://github.com/ducvd89/Bloodborne-Android/releases/download/atlas-maps-1/hunters-atlas-maps-1.zip";
-    static final String ATLAS_PACK_SHA256="6fa5bfcba80c34f60981f76e05d95923a43f1901d3b3626b1125e94b13eecc94";
+    /** Where the pack comes from and its SHA-256. "TODO": not published yet, the check is skipped (and logged). Pack version 2
+     *  (atlas-maps-2) is version 1 plus the route graphs and gate tables of maps/nav/; atlas-maps-1 (v1, still readable:
+     *  the map works on it without route finding) is no longer downloaded. */
+    static final int PACK_VERSION=2;
+    static final String ATLAS_PACK_URL="https://github.com/ducvd89/Bloodborne-Android/releases/download/atlas-maps-2/hunters-atlas-maps-2.zip";
+    static final String ATLAS_PACK_SHA256="8d8c3f2a8aa46fbb4626ce0524a94a77d8c87fe7ce79b6c017bd889d99a84efc";
 
     private static final long MAX_UNPACKED=1536L*1024*1024;
     private static final int MAX_ENTRIES=20000;
@@ -34,6 +37,21 @@ final class AtlasPack {
         File d=dir(base);
         return new File(d,"pack.json").isFile() && new File(d,"maps/atlas.json").isFile();
     }
+    /** pack.json's pack_version of the installed pack (1 when it says none), 0 when nothing is installed. */
+    static int installedVersion(File base) {
+        if (!installed(base)) return 0;
+        try {
+            String text=new String(java.nio.file.Files.readAllBytes(new File(dir(base),"pack.json").toPath()),java.nio.charset.StandardCharsets.UTF_8);
+            return new org.json.JSONObject(text).optInt("pack_version",1);
+        } catch (Exception e) { return 1; }
+    }
+    /** A pack without route data is installed: the dialog offers the update. */
+    static boolean updateAvailable(File base) { int v=installedVersion(base); return v>0 && v<PACK_VERSION; }
+    /** Nothing usable is installed (none, or pack.json / maps/atlas.json missing) or the pack is older than this app expects (also a
+     *  pack.json that cannot be read, which installedVersion counts as 1): the map pack should be (re)downloaded. */
+    static boolean needsUpdate(File base) { return installedVersion(base)<PACK_VERSION; }
+    /** The download's size for the player's notices (MB, rounded). */
+    static final int APPROX_MB=34;
     static long size(File base) { return treeSize(dir(base)); }
     private static long treeSize(File f) {
         if (f.isFile()) return f.length();

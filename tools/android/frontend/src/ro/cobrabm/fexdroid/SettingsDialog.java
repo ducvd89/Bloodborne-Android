@@ -99,7 +99,7 @@ final class SettingsDialog {
     /** Game settings: the game patches run-bionic.sh applies at start (patch-parts), as upstream's
      *  System menu pages and launcher offer them: {key, title, note, default}. */
     private static final String[][] GAME_PATCHES={
-        {"skip_network_choice","Skip the online/offline screen","Start straight at the main menu, offline (there is no PSN here)","1"},
+        {"skip_network_choice","Skip the online/offline screen","Start straight at the main menu, offline. Leave off to choose online play at the title screen.","0"},
         {"skip_intro","Skip startup intros","The logos and intro movie at start","0"},
         {"debug_camera","Free camera","Toggle it with Cross + L3","0"},
         {"debug_menu","Debug menu","The game's own debug menu; needs its font files","0"},
@@ -420,12 +420,21 @@ final class SettingsDialog {
     }
 
     /** Game settings: the game's patches (applied when the game starts: Apply restarts it). */
-    void showGame() {
+    void showGame(boolean online) {
         load();
         LinearLayout box=new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(24),dp(4),dp(24),dp(8));
         final Switch[] toggles=new Switch[GAME_PATCHES.length];
         for (int i=0;i<GAME_PATCHES.length;++i) {
+            if (online && "skip_network_choice".equals(GAME_PATCHES[i][0])) {
+                // Online play needs the title screen's online choice: the patch never applies (run-bionic.sh); the saved
+                // choice stays in bbport.ini and applies again once online play is off.
+                TextView title=new TextView(activity); title.setTextSize(16); title.setText(GAME_PATCHES[i][1]);
+                box.addView(title);
+                TextView off=new TextView(activity); off.setTextSize(16); off.setText("Off while playing online");
+                off.setTextColor(0xffc6ad76); off.setPadding(0,dp(2),0,dp(6)); box.addView(off);
+                continue;
+            }
             toggles[i]=toggle(box,GAME_PATCHES[i][1],"1".equals(get(GAME_PATCHES[i][0],GAME_PATCHES[i][3])));
             TextView note=new TextView(activity); note.setTextSize(12); note.setAlpha(0.65f);
             note.setText(GAME_PATCHES[i][2]); note.setPadding(0,0,0,dp(6));
@@ -440,16 +449,29 @@ final class SettingsDialog {
             .setNegativeButton("Cancel",null)
             .setPositiveButton("Apply",(d,w) -> {
                 Map<String,String> changed=new LinkedHashMap<>();
-                for (int i=0;i<GAME_PATCHES.length;++i) changed.put(GAME_PATCHES[i][0],toggles[i].isChecked() ? "1" : "0");
+                for (int i=0;i<GAME_PATCHES.length;++i)
+                    if (toggles[i]!=null) changed.put(GAME_PATCHES[i][0],toggles[i].isChecked() ? "1" : "0");
                 apply(changed);
             }).show();
     }
 
     /** Cheats (applied when the game starts: Apply restarts it). */
-    void showCheats() {
+    void showCheats(boolean online) {
         load();
         LinearLayout box=new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(24),dp(4),dp(24),dp(8));
+        if (online) {
+            // Online play: the game starts with the cheats off (run-bionic.sh) and they cannot be turned on; the saved choice
+            // stays in bbport.ini and applies again once online play is off.
+            TextView off=new TextView(activity); off.setTextSize(16); off.setText("Off while playing online");
+            off.setTextColor(0xffc6ad76); off.setPadding(0,dp(8),0,dp(8)); box.addView(off);
+            TextView why=new TextView(activity); why.setTextSize(13); why.setAlpha(0.75f);
+            why.setText("Cheats would change the game for the other hunters too, so they are switched off while Online is on. "
+                +"Your choice is kept and comes back when you turn Online off (Menu \u2192 Online).");
+            box.addView(why);
+            new AlertDialog.Builder(activity).setTitle("Cheats").setView(box).setPositiveButton("Close",null).show();
+            return;
+        }
         final Switch[] toggles=new Switch[CHEATS.length];
         for (int i=0;i<CHEATS.length;++i) {
             toggles[i]=toggle(box,CHEATS[i][1],"1".equals(get(CHEATS[i][0],CHEATS[i][3])));

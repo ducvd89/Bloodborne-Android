@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android blocks cleartext HTTP for the app's Java HTTP clients (targetSdk 28+). Seamless Hunt's servers (the game server
+     and the shadNet WebAPI) only speak plain http, so it is permitted for their host alone; everything else stays https.
+     The Online menu's own probes use raw sockets for any http:// address (OnlineNet.request), so another host entered in
+     Advanced is not affected by this policy. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">seamlesshunt.com</domain>
+    </domain-config>
+</network-security-config>

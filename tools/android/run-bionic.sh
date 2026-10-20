@@ -324,6 +324,41 @@ fi
 if [ "$(setting debug_frame_stats)" = 1 ]; then export BB_FRAME_STATS=1; dbg_stats=on; fi
 if [ "$(setting debug_gpu_profile)" = 1 ]; then export BB_GPU_PROFILE=1; dbg_profile=on; fi
 echo "Debug: fault prepare $dbg_prepare, smart drain $dbg_drain, sleeping lock $dbg_lock, FIFO VRAM copies $dbg_fifo, frame stats $dbg_stats, GPU profile $dbg_profile"
+# ---- Online play ----
+# The app (OnlineSettings.java, Menu -> Online) passes BB_ONLINE=1 and the chosen pool's variables in this process's environment
+# (BB_NET_GEN=20, BB_NET_DEVICE_ID, BB_USER_NAME, BB_ONLINE_LOG=1 for the detailed log, BB_NET_BACKEND=thd for The Hunter's Dream, BB_SHADNET_* / BB_BBSC / BB_COMMUNITY_SERVER for Seamless Hunt,
+# BB_THD_*, BB_UPNP, BB_P2P_PORT, SHADPS4_P2P_RELAY, SHADPS4_HTTP_HOST_OVERRIDES_JSON, BB_NET_BANNER_FILE, BB_NET_STATUS_FILE). The account's password
+# and token come only that way: they are not in bbport.ini and this script never prints them. The online module is
+# libbbnet20.so beside the other libraries (bionic/lib); without it, or without BB_ONLINE=1, every online variable is dropped
+# and the game plays offline (the module is then never loaded).
+online_vars="BB_ONLINE BB_NET_GEN BB_NET_BACKEND BB_NET_MODULE BB_NET_BANNER_FILE BB_NET_STATUS_FILE BB_NET_DEVICE_ID BB_USER_NAME BB_ONLINE_LOG BB_CA_BUNDLE BB_BBSC BB_COMMUNITY_SERVER BB_SHADNET_SERVER BB_SHADNET_WEBAPI BB_SHADNET_NPID BB_SHADNET_PASSWORD BB_SHADNET_TOKEN BB_THD_SERVER BB_THD_AUTH BB_THD_STUN BB_THD_RULESET BB_THD_ONLINE_ID BB_THD_TOKEN BB_THD_VERIFY_TLS BB_THD_P2P_ADDR BB_UPNP BB_P2P_PORT SHADPS4_HTTP_HOST_OVERRIDES_JSON SHADPS4_P2P_RELAY SHADPS4_P2P_RELAY_PORT"
+if [ "${BB_ONLINE:-0}" = 1 ]; then
+    if [ -f "$bionic/lib/libbbnet20.so" ]; then
+        export BB_NET_MODULE="$bionic/lib/libbbnet20.so" BB_NET_GEN=20
+        # The Hunter's Dream (BB_NET_BACKEND=thd): no BBSC, no shadNet account (bbport_launcher: game_environment).
+        if [ "${BB_NET_BACKEND:-}" = thd ]; then
+            unset BB_BBSC BB_SHADNET_SERVER BB_SHADNET_WEBAPI BB_SHADNET_NPID BB_SHADNET_PASSWORD BB_SHADNET_TOKEN
+            echo "Online play: The Hunter's Dream (${BB_THD_AUTH:-?}), cheats off"
+        else
+            echo "Online play: Seamless Hunt (shadNet ${BB_SHADNET_SERVER:-?}, game server ${BB_COMMUNITY_SERVER:-?}$([ "${BB_BBSC:-0}" = 1 ] && echo ', seamless co-op')), cheats off"
+        fi
+        # HTTPS: the module uses the shipped CA bundle (Android's cacerts are old-style hashed names OpenSSL 3 cannot use).
+        [ -f "$bionic/share/cacert.pem" ] && export BB_CA_BUNDLE="${BB_CA_BUNDLE:-$bionic/share/cacert.pem}"
+        # "Detailed online log" (app): the module logs at info; a more verbose BB_GPU_LOG already set is kept.
+        if [ "${BB_ONLINE_LOG:-0}" = 1 ]; then
+            case "${BB_GPU_LOG:-}" in trace|debug) ;; *) export BB_GPU_LOG=info ;; esac
+        fi
+    else
+        echo "Online play: $bionic/lib/libbbnet20.so is missing: the game starts offline"
+        # The app's badge says so (BB_NET_STATUS_FILE is dropped below with the other online variables).
+        [ -n "${BB_NET_STATUS_FILE:-}" ] && echo "offline|This runtime has no online module: the game started offline" > "$BB_NET_STATUS_FILE" 2>/dev/null
+        BB_ONLINE=0
+    fi
+fi
+if [ "${BB_ONLINE:-0}" != 1 ]; then
+    # shellcheck disable=SC2086
+    unset $online_vars
+fi
 # Local overrides for this device (experiments, tuning): sourced last, not part of the runtime.
 [ -f "$base/bionic-local.sh" ] && . "$base/bionic-local.sh"
 # FPS limit (fps_limit: 30, 40, 45, 60 or 0 for none) and the game's frame rate. Hooks in the game's code
@@ -401,16 +436,23 @@ if [ "${1:-game}" = game ]; then
     # The GX per-frame command heaps at 1 MiB (upstream #162; BB_GX_COMMAND_HEAP=0: the game's 256 KiB).
     [ "${BB_GX_COMMAND_HEAP:-1}" != 0 ] && [ -f "$parts/gx-heap.bin" ] &&
         patch_args="$patch_args --patches $parts/gx-heap.bin"
-    # No PSN here: the title screen goes straight to the main menu offline.
-    [ "$(setting skip_network_choice)" != 0 ] && [ -f "$parts/skip_network_choice=1.bin" ] &&
+    # "Skip the online/offline screen" (off by default): the title screen goes straight to the main menu offline.
+    # Never while playing online: that needs the title screen's online choice.
+    [ "$(setting skip_network_choice)" = 1 ] && [ "${BB_ONLINE:-0}" != 1 ] && [ -f "$parts/skip_network_choice=1.bin" ] &&
         patch_args="$patch_args --patches $parts/skip_network_choice=1.bin"
     # Cheats (the app's Cheats menu): their hooks are always in, switched live by the flags
     # BB_CHEATS_FILE holds (the app rewrites it; here its start, from bbport.ini).
     if [ -f "$parts/cheats.bin" ]; then
         patch_args="$patch_args --patches $parts/cheats.bin"
         export BB_CHEATS_FILE="$base/cheats.state"
-        printf '%s%s\n' "$([ "$(setting cheat_health)" = 1 ] && echo 1 || echo 0)" \
-            "$([ "$(setting cheat_items)" = 1 ] && echo 1 || echo 0)" > "$BB_CHEATS_FILE"
+        if [ "${BB_ONLINE:-0}" = 1 ]; then
+            # Online play: cheats off (the app's Cheats menu shows "Off while playing online"); the player's choice stays in
+            # bbport.ini and applies again at the next offline start.
+            printf '00\n' > "$BB_CHEATS_FILE"
+        else
+            printf '%s%s\n' "$([ "$(setting cheat_health)" = 1 ] && echo 1 || echo 0)" \
+                "$([ "$(setting cheat_items)" = 1 ] && echo 1 || echo 0)" > "$BB_CHEATS_FILE"
+        fi
     fi
 fi
 

@@ -5,6 +5,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Matrix;
 import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -14,12 +15,16 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.os.Build;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.view.GestureDetector;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
+import android.view.ViewConfiguration;
+import android.view.WindowInsets;
 import android.view.ViewOutlineProvider;
 import android.widget.OverScroller;
 import java.util.HashSet;
@@ -40,11 +45,25 @@ import java.util.concurrent.Executor;
  *  the side buttons choose the floor (Auto follows the player), the Recenter button resumes everything. The view
  *  never takes focus. It is drawn when the game's tick changes, on touch and while a fling runs.
  *
+ *  Route finding (pack version 2, AtlasNav): a tap on a lamp, pickup or conversation marker opens its card with a Navigate
+ *  button; a tap on an empty spot offers "Set destination here" (snapped to the nearest walkable spot of the floor shown,
+ *  within 6 m); a chip at the top shows the destination, the remaining distance and a cross to clear it. The route is drawn
+ *  as footprints like the Marauder's Map (alternating left and right shoe prints one stride apart, a walker that prints them
+ *  one after another from the player toward the destination while the older prints fade, the rest of the route as faint
+ *  prints, parts on other floors fainter) with marks where it climbs, rides a lift, drops or needs a lever; doors are small
+ *  bars (green open, red closed, amber crossed from one side only, a key for key doors), a tap on one opens a card that
+ *  says whether it can be opened from where the player is. The mini map draws the route too and an arrow at its edge toward
+ *  the part of the route that is outside it.
+ *
+ *  A view made with setCloseHandler (the full-screen map over the game) is the same map with a Close button at the top
+ *  right and its controls kept inside the display cutout's safe area.
+ *
  *  Mini mode (the floating map over the game): a small square that always follows the player (area and floor chosen
  *  by the game's state, one fixed zoom), with a title line at the top, the player, lamps, pickups and markers, a
- *  rounded clip and a thin border. It has no buttons or pickers, does not react to touch (onTouchEvent returns false
- *  and the view is not clickable: the touch controller and the camera under it keep working), keeps its last frame
- *  while the game loads, and draws only what falls inside its own small viewport. */
+ *  rounded clip and a thin border. It has no buttons or pickers and no navigation: it is not clickable, and the game
+ *  gets the touches under it; MainActivity.dispatchTouchEvent sees a touch that lands in it and runs the 2 s hold that opens
+ *  the full map (a ring fills on it after 300 ms, see holdBegin). It keeps
+ *  its last frame while the game loads, and draws only what falls inside its own small viewport. */
 final class AtlasView extends View {
     /** What the screen controller does for the view. */
     interface Host { void changed(); }
@@ -66,6 +85,7 @@ final class AtlasView extends View {
     private BitmapShader parchmentShader, backgroundShader;
     private Typeface titleFace, bodyFace;
     private boolean artSet;
+    private String banner;
 
     // ---- view state ----
     private int selected=-1, current=-1, manualFloor=-1, autoActive=-1;
@@ -108,10 +128,51 @@ final class AtlasView extends View {
 
     // ---- tap targets of the last frame ----
     private static final int MAX_TARGETS=1024;
-    private final float[] tx=new float[MAX_TARGETS], ty=new float[MAX_TARGETS], twx=new float[MAX_TARGETS], twz=new float[MAX_TARGETS];
+    private final float[] tx=new float[MAX_TARGETS], ty=new float[MAX_TARGETS], twx=new float[MAX_TARGETS], twy=new float[MAX_TARGETS], twz=new float[MAX_TARGETS];
     private final String[] tTitle=new String[MAX_TARGETS], tSub=new String[MAX_TARGETS];
+    private final int[] tKind=new int[MAX_TARGETS]; // T_LABEL, T_NAV (can be navigated to), T_GATE (tGate = gate index)
+    private final int[] tGate=new int[MAX_TARGETS];
+    private static final int T_LABEL=0, T_NAV=1, T_GATE=2;
     private int targets;
     private String cardTitle, cardSub; private float cardX, cardZ; private long cardUntil;
+    // the card's Navigate button: where it leads (a marker, or the snapped point of a tap), shown while cardNav
+    private boolean cardNav; private float cardNavX, cardNavY, cardNavZ; private String cardName=""; private boolean cardMarked; private String cardArea="";
+    private final RectF cardRect=new RectF(), cardBtn=new RectF(), chipRect=new RectF(), chipClear=new RectF();
+    private int cardSeq;
+
+    // ---- route finding ----
+    private AtlasNav nav;
+    private NavData.Route pathRoute; private int pathLayer=-2; private float pathLo, pathHi;
+    // footprints: the prints are placed by arc length along the route polyline for the zoom bucket shown (made when the route,
+    // the floor shown or the zoom bucket changes); the exact polyline is drawn under them as a dotted line
+    private static final float STRIDE=.75f;          // metres between two prints (at least; more when zoomed out, see FOOT_GAP)
+    private static final float FOOT_RATE=2.5f;       // steps per second of the walker
+    private static final float FOOT_TRAIL=16f;       // prints that stay bright behind the walker
+    private static final float FOOT_BASE=.5f, FOOT_STATIC=.75f, FOOT_OFF=.55f; // the prints not being walked, those of a paused map, of other floors (times)
+    private static final float FOOT_LEN_MINI=9f, FOOT_LEN_FULL=12f;    // dp: the print's length on screen (medium size)
+    private static final float FOOT_UP=1.4f;         // the most the prints grow when zoomed in (the bitmaps are drawn at that size)
+    private static final float FOOT_GAP=1.6f;        // the least on-screen distance between two prints, in print lengths
+    private static final float FOOT_LAT=.18f;        // a print's offset left / right of the path, in print lengths
+    private static final float ZOOM_BUCKET=1.15f;    // factor between the zoom buckets the placement is made for
+    private static final float FOOT_SHAPE=.96f;      // the print shape's length in its own units (see makeFoot)
+    private static final int FOOT_INK=Color.rgb(43,29,16), FOOT_HALO=Color.argb(217,243,230,200);
+    private float footMul=1f;                        // Footprint size: small .75, medium 1, large 1.35
+    private int footKeyLen, footKeyHalo;             // what the cached bitmaps were drawn for (px)
+    private float stepStride;                        // the world stride the placement was made for
+    private float[] stepX=new float[256], stepZ=new float[256], stepAng=new float[256], stepSin=new float[256], stepCos=new float[256], stepCum=new float[256];
+    private byte[] stepOn=new byte[256]; private int stepCount;
+    private float[] dashOn=new float[256], dashOff=new float[256]; private int dashOnN, dashOffN; // the dotted path line's dashes (x0,y0,x1,y1)
+    private final Paint dotPaint=new Paint(Paint.ANTI_ALIAS_FLAG);
+    private Bitmap footL, footR; private final Matrix footMatrix=new Matrix();
+    private final Paint footPaint=new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+    private boolean footAnimate=true; private long animDelay;
+    private final Runnable animRun=new Runnable() { @Override public void run() { invalidate(); } };
+    private static final long MINI_ANIM_MS=83, ANIM_MS=33;
+    // the hold that opens the full map (mini mode): MainActivity detects it, this view only draws the ring
+    private static final long HOLD_MS=2000, RING_AFTER_MS=300;
+    private boolean ringOn; private long ringStart;
+    // the full-screen map's Close button and the display cutout's safe insets
+    private Runnable closeHandler; private final RectF btnClose=new RectF(); private int insL, insT, insR, insB;
 
     AtlasView(Context context,Executor jobs,Typeface titleFace,Typeface bodyFace) { this(context,jobs,titleFace,bodyFace,false); }
 
@@ -169,8 +230,31 @@ final class AtlasView extends View {
     }
     void setModel(AtlasModel model,String error) { this.model=model; this.modelError=error; seenFlagsVersion=-1; selected=-1; current=-1; onState(); invalidate(); }
     void setState(AtlasState state) { this.state=state; }
+    void setNav(AtlasNav nav) { this.nav=nav; }
+    /** The Close button (a full-screen map over the game): null for the second screen's and the mini map. */
+    void setCloseHandler(Runnable r) { closeHandler=r; if (getWidth()>0) { relayout(getWidth(),getHeight()); } invalidate(); }
+    /** Footprint size (0 small, 1 medium, 2 large): the prints' size on screen, applied at once. */
+    void setPrintSize(int size) {
+        float m=size<=0 ? .75f : size>=2 ? 1.35f : 1f;
+        if (m!=footMul) { footMul=m; invalidate(); }
+    }
+    /** The footprints' walker moves (it stands still, with the whole route as plain prints, when off: the game is paused). */
+    void setFootAnimation(boolean on) { if (footAnimate!=on) { footAnimate=on; invalidate(); } }
+    /** The hold on the mini map has begun (MainActivity saw the touch land in its rect): the ring fills from 300 ms. */
+    void holdBegin() { ringOn=true; ringStart=SystemClock.uptimeMillis(); invalidate(); }
+    /** The hold ended (finished, moved or lifted). */
+    void holdEnd() { ringOn=false; invalidate(); }
+    /** Follow the player again at the default zoom (the full map when it opens). */
+    void resetView() { pickerOpen=false; cardTitle=null; cardNav=false; recenter(); }
+    private boolean navOn() { return nav!=null && nav.available(); }
     boolean isMini() { return mini; }
     boolean artSet() { return artSet; }
+    /** A small line at the bottom of the second-screen map (the map pack's update; null: none). */
+    void setBanner(String text) {
+        if (mini) return;
+        if (text==null ? banner==null : text.equals(banner)) return;
+        banner=text; invalidate();
+    }
     void setBodyFace(Typeface face) { if (face!=null && face!=bodyFace) { bodyFace=face; invalidate(); } }
     AtlasModel model() { return model; }
     private static float miniRadius(Context context) { return 10*context.getResources().getDisplayMetrics().density; }
@@ -278,6 +362,22 @@ final class AtlasView extends View {
         super.onSizeChanged(w,h,ow,oh);
         relayout(w,h);
     }
+    @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); readInsets(); }
+    @Override protected void onDetachedFromWindow() { removeCallbacks(animRun); ringOn=false; super.onDetachedFromWindow(); }
+    @Override public WindowInsets onApplyWindowInsets(WindowInsets insets) { readInsets(insets); return super.onApplyWindowInsets(insets); }
+    private void readInsets() { readInsets(getRootWindowInsets()); }
+    /** The display cutout's safe insets (only a view with a Close button, that is on the game's own screen, keeps off them). */
+    private void readInsets(WindowInsets wi) {
+        if (closeHandler==null || mini) return;
+        int l=0, t=0, r=0, b=0;
+        if (wi!=null && Build.VERSION.SDK_INT>=28 && wi.getDisplayCutout()!=null) {
+            android.view.DisplayCutout dc=wi.getDisplayCutout();
+            l=dc.getSafeInsetLeft(); t=dc.getSafeInsetTop(); r=dc.getSafeInsetRight(); b=dc.getSafeInsetBottom();
+        }
+        if (l==insL && t==insT && r==insR && b==insB) return;
+        insL=l; insT=t; insR=r; insB=b;
+        if (getWidth()>0 && getHeight()>0) { relayout(getWidth(),getHeight()); invalidate(); }
+    }
     /** The display's metrics or configuration changed (another mode, a density change): laid out again at once. */
     @Override protected void onConfigurationChanged(android.content.res.Configuration config) {
         super.onConfigurationChanged(config);
@@ -300,9 +400,14 @@ final class AtlasView extends View {
         float shorter=Math.min(w,h);
         scale=Math.max(Math.min(w/1280f,h/600f),.25f*dens);
         ms=scale*1.4f; ls=scale*1.3f;
-        headerH=Math.max(114*scale,56*dens); footerH=Math.max(46*scale,28*dens);
+        headerH=Math.max(114*scale,56*dens); footerH=Math.max(Math.max(46*scale,28*dens),insB);
         float side=Math.max(18*scale,6*dens);
-        canvasRect.set(side,headerH,w-side,h-footerH);
+        if (closeHandler!=null) { // the full-screen map: Close at the top right, inside the safe area
+            float bh=Math.max(48*dens,34*scale), bw=Math.max(116*dens,100*scale);
+            btnClose.set(w-insR-10*dens-bw,insT+8*dens,w-insR-10*dens,insT+8*dens+bh);
+            headerH=Math.max(headerH,btnClose.bottom+6*dens);
+        } else btnClose.setEmpty();
+        canvasRect.set(Math.max(side,insL),headerH,w-Math.max(side,insR),h-footerH);
         ccx=canvasRect.centerX(); ccy=canvasRect.centerY();
         float b=Math.min(Math.max(52*dens,44*scale),.16f*shorter), gap=6*dens;
         float right=canvasRect.right-10*dens, midY=canvasRect.centerY();
@@ -378,13 +483,69 @@ final class AtlasView extends View {
         zoomAt(1.9f,x,y);
     }
 
+    /** A single confirmed tap (a short touch with no movement; a double tap zooms instead): the card's button, a marker, a
+     *  gate, or an empty spot of the map (Set destination here). */
     private void tap(float x,float y) {
         if (!canvasRect.contains(x,y)) return;
+        boolean cardUp=cardTitle!=null && SystemClock.uptimeMillis()<=cardUntil;
+        if (cardUp) {
+            if (cardNav && !cardBtn.isEmpty() && cardBtn.contains(x,y)) { navigateCard(); return; }
+            if (cardRect.contains(x,y)) return;                  // a tap on the card itself keeps it
+        }
+        if (chipRect.contains(x,y)) return;
         float radius=40*dens, best=radius*radius; int hit=-1;
         for (int i=0;i<targets;++i) { float dx=tx[i]-x, dy=ty[i]-y, d=dx*dx+dy*dy; if (d<=best) { best=d; hit=i; } }
-        if (hit<0) { cardTitle=null; invalidate(); return; }
+        if (hit<0) {
+            if (navOn() && mapAvailable()) { pointTap(x,y); return; }
+            cardTitle=null; cardNav=false; invalidate(); return;
+        }
+        ++cardSeq;
         cardTitle=tTitle[hit]; cardSub=tSub[hit]; cardX=twx[hit]; cardZ=twz[hit]; cardUntil=SystemClock.uptimeMillis()+8000;
+        AtlasModel.Area a=area();
+        if (tKind[hit]==T_GATE && nav!=null && a!=null) {
+            NavGate[] gates=nav.gates(a.id);
+            if (gates!=null && tGate[hit]>=0 && tGate[hit]<gates.length) { String[] c=AtlasNav.gateCard(gates[tGate[hit]],state,lvalid && current==selected,lx,ly,lz); cardTitle=c[0]; cardSub=c[1]; }
+        }
+        cardNav=tKind[hit]==T_NAV && navOn() && a!=null && a.navData;
+        if (cardNav) { cardNavX=twx[hit]; cardNavY=twy[hit]; cardNavZ=twz[hit]; cardName=tTitle[hit]; cardMarked=false; cardArea=a.id; }
         postInvalidateDelayed(8100); invalidate();
+    }
+
+    /** A tap on an empty spot: the nearest walkable spot of the floor shown within 6 m becomes a possible destination. */
+    private void pointTap(float x,float y) {
+        AtlasModel.Area a=area();
+        if (a==null || !a.navData) { cardTitle=null; cardNav=false; invalidate(); return; }
+        final float wx=cx+(x-ccx)/zoom, wz=cz-(y-ccy)/zoom;
+        int active=activeLayer(a);
+        float[] band=floorBand(a,active);
+        final int seq=++cardSeq;
+        cardTitle="Set destination here"; cardSub="Finding the floor…"; cardX=wx; cardZ=wz; cardNav=false; cardUntil=SystemClock.uptimeMillis()+8000;
+        final String areaId=a.id;
+        nav.snapPoint(areaId,wx,wz,band[0],band[1],(snap,problem) -> {
+            if (seq!=cardSeq || cardTitle==null) return;
+            if (snap!=null) {
+                cardX=snap.x; cardZ=snap.z; cardNav=true; cardNavX=snap.x; cardNavY=snap.y; cardNavZ=snap.z; cardName="Marked point"; cardMarked=true; cardArea=areaId;
+                float d=lvalid && current==selected ? (float)Math.sqrt((snap.x-lx)*(snap.x-lx)+(snap.y-ly)*(snap.y-ly)+(snap.z-lz)*(snap.z-lz)) : -1;
+                cardSub=d>=0 ? String.format(java.util.Locale.ROOT,"%d m away (straight line)",Math.round(d)) : "";
+            } else { cardNav=false; cardSub=problem!=null ? problem : "No walkable floor here"; }
+            cardUntil=SystemClock.uptimeMillis()+8000;
+            postInvalidateDelayed(8100); invalidate();
+        });
+        postInvalidateDelayed(8100); invalidate();
+    }
+    private void navigateCard() {
+        if (nav!=null && cardNav) nav.setDest(cardArea,cardNavX,cardNavY,cardNavZ,cardName,cardMarked);
+        cardTitle=null; cardNav=false; invalidate();
+    }
+
+    /** The heights [lo, hi] of a floor of the area (the player's when there is none): what counts as being on it. */
+    private float[] floorBand(AtlasModel.Area a,int active) {
+        if (active>=0 && active<a.layers.length) {
+            AtlasModel.Layer l=a.layers[active];
+            if (l.hasVertexHeights) return new float[]{l.minY-1f,l.maxY+1f};
+            return new float[]{l.anchor-l.span*.5f-1f,l.anchor+l.span*.5f+1f};
+        }
+        return new float[]{ly-3f,ly+3f};
     }
 
     /** Previews an area (the list): its floors, centred and fitted; the map stops following. */
@@ -411,12 +572,12 @@ final class AtlasView extends View {
     // ---- touch ----
 
     @Override public boolean onTouchEvent(MotionEvent e) {
-        if (mini) return false; // never consumes a touch: the controller and the camera underneath get it
+        if (mini) return false;
         int action=e.getActionMasked();
         if (pickerOpen) return pickerTouch(e);
         if (action==MotionEvent.ACTION_DOWN) {
             pressed=null;
-            for (RectF r:new RectF[]{btnUp,btnDown,btnAuto,btnRecenter,titleHit}) {
+            for (RectF r:new RectF[]{btnClose,chipClear,btnUp,btnDown,btnAuto,btnRecenter,titleHit}) {
                 if (r.contains(e.getX(),e.getY()) && buttonShown(r)) { pressed=r; pressX=e.getX(); pressY=e.getY(); break; }
             }
             if (pressed!=null) { scroller.forceFinished(true); return true; }
@@ -435,14 +596,19 @@ final class AtlasView extends View {
         return true;
     }
 
+
     private boolean buttonShown(RectF r) {
         AtlasModel.Area a=area();
+        if (r==btnClose) return closeHandler!=null && !btnClose.isEmpty();
         if (r==titleHit) return model!=null && !model.areas.isEmpty();
+        if (r==chipClear) return nav!=null && nav.hasDestination() && !chipClear.isEmpty();
         if (r==btnRecenter) return !follow || preview;
         return a!=null && a.state==AtlasModel.READY && a.layers.length>1; // the floor buttons
     }
     private void press(RectF r) {
-        if (r==btnRecenter) recenter();
+        if (r==btnClose) { if (closeHandler!=null) closeHandler.run(); }
+        else if (r==chipClear) { nav.clear(); chipClear.setEmpty(); }
+        else if (r==btnRecenter) recenter();
         else if (r==btnUp) floor(1);
         else if (r==btnDown) floor(-1);
         else if (r==btnAuto) { manualFloor=-1; changed(); invalidate(); }
@@ -522,8 +688,12 @@ final class AtlasView extends View {
     @Override protected void onDraw(Canvas c) {
         int w=getWidth(), h=getHeight();
         if (w==0 || h==0) return;
-        targets=0;
-        if (mini) { drawMini(c,w,h); return; }
+        targets=0; animDelay=Long.MAX_VALUE;
+        if (mini) drawMini(c,w,h); else drawFull(c,w,h);
+        if (animDelay!=Long.MAX_VALUE) { removeCallbacks(animRun); postDelayed(animRun,animDelay); }
+    }
+
+    private void drawFull(Canvas c,int w,int h) {
         if (background!=null) { dst.set(0,0,w,h); c.drawBitmap(background,null,dst,bgPaint); } else c.drawColor(Color.rgb(24,22,19));
         // frame and header rule
         strokePaint.setColor(Color.argb(95,156,148,126)); strokePaint.setStrokeWidth(Math.max(1,.8f*scale));
@@ -536,8 +706,22 @@ final class AtlasView extends View {
         drawHeader(c,a,available);
         if (!available) drawMessage(c,a);
         drawControls(c,a);
+        if (available) drawChip(c); else { chipRect.setEmpty(); chipClear.setEmpty(); }
         if (a!=null && available && cardTitle!=null) drawCard(c);
         if (pickerOpen) drawPicker(c);
+        if (banner!=null) drawBanner(c,w,h);
+    }
+
+    /** The status line (map data update) over the bottom of the map, centered; it takes no touches. */
+    private void drawBanner(Canvas c,int w,int h) {
+        float size=14*dens, padX=12*dens, hh=size*2f;
+        textPaint.setTypeface(bodyFace); textPaint.setTextSize(size);
+        float tw=Math.min(textPaint.measureText(banner),w*.9f-2*padX), bw=tw+2*padX;
+        float left=canvasRect.centerX()-bw*.5f, bottom=canvasRect.bottom-8*dens;
+        tmpRect.set(left,bottom-hh,left+bw,bottom);
+        fillPaint.setColor(Color.argb(228,27,29,27)); c.drawRoundRect(tmpRect,hh/2,hh/2,fillPaint);
+        strokePaint.setColor(GOLD); strokePaint.setStrokeWidth(Math.max(1,dens*.9f)); c.drawRoundRect(tmpRect,hh/2,hh/2,strokePaint);
+        text(c,banner,canvasRect.centerX(),tmpRect.centerY()+size*.35f,fit(banner,bodyFace,size,9*dens,tw),PAPER,bodyFace,Paint.Align.CENTER);
     }
 
     /** The mini map: background, the map around the player, a title line, a thin border (the rounded clip is the outline). */
@@ -560,9 +744,26 @@ final class AtlasView extends View {
             fillPaint.setColor(Color.argb(150,12,12,12)); c.drawRect(0,0,w,strip,fillPaint);
             text(c,t,w*.5f,strip*.5f+size*.34f,size,PAPER,titleFace,Paint.Align.CENTER);
         }
+        drawMiniDest(c,w,h);
+        if (ringOn) drawHoldRing(c,w,h);
         float bw=Math.max(1,1.2f*dens), r=miniRadius(getContext());
         strokePaint.setColor(Color.argb(210,198,173,118)); strokePaint.setStrokeWidth(bw);
         tmpRect.set(bw/2,bw/2,w-bw/2,h-bw/2); c.drawRoundRect(tmpRect,r,r,strokePaint);
+    }
+
+    /** The hold's progress: a ring that fills clockwise over the middle of the mini map, after 300 ms. */
+    private void drawHoldRing(Canvas c,int w,int h) {
+        animDelay=Math.min(animDelay,45);
+        long el=SystemClock.uptimeMillis()-ringStart;
+        if (el<RING_AFTER_MS) return;
+        float frac=Math.min(1f,(el-RING_AFTER_MS)/(float)(HOLD_MS-RING_AFTER_MS));
+        float r=Math.min(w,h)*.2f, sw=Math.max(3f,3.2f*dens);
+        tmpRect.set(w*.5f-r,h*.5f-r,w*.5f+r,h*.5f+r);
+        fillPaint.setColor(Color.argb(95,12,12,12)); c.drawCircle(w*.5f,h*.5f,r+sw,fillPaint);
+        strokePaint.setStrokeCap(Paint.Cap.ROUND);
+        strokePaint.setColor(Color.argb(110,223,214,187)); strokePaint.setStrokeWidth(sw); c.drawCircle(w*.5f,h*.5f,r,strokePaint);
+        strokePaint.setColor(Color.rgb(255,226,140)); strokePaint.setStrokeWidth(sw*1.15f); c.drawArc(tmpRect,-90,360*frac,false,strokePaint);
+        strokePaint.setStrokeCap(Paint.Cap.BUTT);
     }
 
     private void drawMap(Canvas c,AtlasModel.Area a) {
@@ -592,6 +793,8 @@ final class AtlasView extends View {
         }
         if (active>=0) drawLayer(c,a,a.layers[active],0,255,hmin,hmax,fog,vx0,vz0,vx1,vz1,true,Color.argb(220,204,193,163));
         c.restore();
+        drawGates(c,a,active);
+        drawFootprints(c,a,active);
 
         // markers, in screen space
         float marker=active>=0 ? a.layers[active].span : 6;
@@ -605,7 +808,7 @@ final class AtlasView extends View {
             float px=sx(d.x), py=sy(d.z);
             if (!canvasRect.contains(px,py)) continue;
             icon(c,0,px,py,32*ms,0,d.available ? null : dimLamp);
-            target(px,py,d.x,d.z,d.name,d.available ? "Lamp · lit" : "Lamp · locked or unavailable");
+            target(px,py,d.x,d.y,d.z,d.name,d.available ? "Lamp · lit" : "Lamp · locked or unavailable",T_NAV,-1);
         }
         for (AtlasModel.Marker m:a.markers) {
             float px=sx(m.x), py=sy(m.z);
@@ -615,7 +818,8 @@ final class AtlasView extends View {
             if (m.kind.equals("npc") && !f.npcVisible(a.id,m.entity,optNpc,state)) continue;
             int idx=m.kind.equals("ladder") ? 1 : m.kind.equals("gate") ? 3 : 2;
             icon(c,idx,px,py,32*ms,0,null);
-            target(px,py,m.x,m.z,m.name.isEmpty() ? m.kind : m.name,m.kind.equals("npc") ? "Conversation" : m.kind.equals("gate") ? "Gate · may need unlocking" : "Ladder");
+            target(px,py,m.x,m.y,m.z,m.name.isEmpty() ? m.kind : m.name,m.kind.equals("npc") ? "Conversation" : m.kind.equals("gate") ? "Gate · may need unlocking" : "Ladder",
+                m.kind.equals("npc") ? T_NAV : T_LABEL,-1);
         }
         if (optPickups) for (AtlasFeatures.PickupView p:pickups) {
             if (haveAnchor && Math.abs(p.y-anchor)>Math.max(3,a.layers[active].span)) continue;
@@ -625,8 +829,9 @@ final class AtlasView extends View {
                 : p.category.equals("equipment") ? Color.rgb(93,172,242) : Color.rgb(235,193,79);
             fillPaint.setColor(Color.rgb(20,22,24)); c.drawCircle(px,py,4.1f*ms,fillPaint);
             fillPaint.setColor(color); c.drawCircle(px,py,3f*ms,fillPaint);
-            target(px,py,p.x,p.z,categoryName(p.category),p.label);
+            target(px,py,p.x,p.y,p.z,categoryName(p.category),p.label,T_NAV,-1);
         }
+        drawRouteMarks(c,a,active);
         if (lvalid && current==selected) {
             float px=sx(lx), py=sy(lz);
             float dx=-(float)Math.sin(lyaw), dy=(float)Math.cos(lyaw);   // FacingOnMap (bbport_map_direction.h)
@@ -636,6 +841,7 @@ final class AtlasView extends View {
             strokePaint.setColor(Color.argb(120,125,160,155)); strokePaint.setStrokeWidth(Math.max(1,.8f*ms)); c.drawCircle(px,py,17f*ms,strokePaint);
             icon(c,4,px,py,35*ms,(float)Math.toDegrees(angle),playerTint);
         }
+        if (mini) drawEdgeArrow(c,a);
         c.restore();
     }
 
@@ -677,6 +883,401 @@ final class AtlasView extends View {
         }
     }
 
+    // ---- route finding: drawing ----
+
+    private static final int ROUTE_COLOR=Color.rgb(255,214,84), GATE_OPEN=Color.rgb(96,204,116), GATE_BLOCKED=Color.rgb(226,84,72),
+        GATE_ONEWAY=Color.rgb(240,176,56), GATE_FREE=Color.rgb(196,194,176);
+
+    /** Places the prints by arc length along the route polyline: every strideW metres (world), each at the exact interpolated
+     *  point with the direction of the polyline segment it is on (never an averaged direction). The stepping restarts (first
+     *  print half a stride on) after each ladder, lift or drop and where the route changes floor shown, so no print lies across
+     *  a transition. Made again only when the route, the floor shown or strideW (the zoom bucket) changes. */
+    private void ensurePrints(NavData.Route r,AtlasModel.Area a,int active,float strideW) {
+        float[] band=floorBand(a,active);
+        if (r==pathRoute && active==pathLayer && band[0]==pathLo && band[1]==pathHi && strideW==stepStride) return;
+        pathRoute=r; pathLayer=active; pathLo=band[0]; pathHi=band[1]; stepStride=strideW;
+        stepCount=0;
+        float rem=strideW*.5f; int prevOn=-1;
+        for (int i=1;i<r.n;++i) {
+            byte k=r.kind[i];
+            if (k==NavData.K_LADDER || k==NavData.K_LIFT || k==NavData.K_DROP) { rem=strideW*.5f; prevOn=-1; continue; }
+            float x0=r.x[i-1], z0=r.z[i-1], dx=r.x[i]-x0, dz=r.z[i]-z0, len=(float)Math.hypot(dx,dz);
+            if (len<0.01f) continue;
+            float ym=(r.y[i-1]+r.y[i])*.5f;
+            int on=ym>=pathLo && ym<=pathHi ? 1 : 0;
+            if (prevOn>=0 && on!=prevOn) rem=strideW*.5f; // the floor shown changes here
+            prevOn=on;
+            float ang=(float)Math.toDegrees(Math.atan2(-dz,dx)), rad=(float)Math.toRadians(ang), sn=(float)Math.sin(rad), cs=(float)Math.cos(rad);
+            float c0=r.cum!=null ? r.cum[i-1] : 0, cl=r.cum!=null ? r.cum[i]-r.cum[i-1] : 0;
+            float at=rem;
+            while (at<=len) {
+                if (stepCount==stepX.length) growSteps();
+                int n=stepCount++;
+                stepX[n]=x0+dx*at/len; stepZ[n]=z0+dz*at/len; stepAng[n]=ang; stepSin[n]=sn; stepCos[n]=cs; stepOn[n]=(byte)on; stepCum[n]=c0+cl*at/len;
+                at+=strideW;
+            }
+            rem=at-len;
+        }
+    }
+    private void growSteps() {
+        int n=stepX.length*2;
+        stepX=java.util.Arrays.copyOf(stepX,n); stepZ=java.util.Arrays.copyOf(stepZ,n); stepAng=java.util.Arrays.copyOf(stepAng,n);
+        stepSin=java.util.Arrays.copyOf(stepSin,n); stepCos=java.util.Arrays.copyOf(stepCos,n); stepCum=java.util.Arrays.copyOf(stepCum,n);
+        stepOn=java.util.Arrays.copyOf(stepOn,n);
+    }
+
+    /** One shoe print (a sole and a heel) pointing right, drawn with its light halo (haloPx wide outside the shoe) at length
+     *  lenPx; the right foot is the left one mirrored. Made again only when the sizes change (density, size, mini or not). */
+    private static Bitmap makeFoot(int side,int lenPx,float haloPx) {
+        float S=lenPx/FOOT_SHAPE;
+        int m=(int)Math.ceil(haloPx)+2, w=lenPx+2*m, h=(int)(S*.56f)+2*m;
+        Bitmap b=Bitmap.createBitmap(w,h,Bitmap.Config.ARGB_8888);
+        Canvas c=new Canvas(b);
+        c.translate(w/2f,h/2f); c.scale(S,S*side);
+        Path p=new Path();
+        Path sole=new Path(); sole.addOval(new RectF(-.01f,-.19f,.51f,.19f),Path.Direction.CW);
+        Matrix rot=new Matrix(); rot.setRotate(-8f,.25f,0f); sole.transform(rot);
+        p.addPath(sole);
+        p.addOval(new RectF(-.45f,-.11f,-.19f,.11f),Path.Direction.CW);
+        Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
+        paint.setStyle(Paint.Style.FILL_AND_STROKE); paint.setStrokeJoin(Paint.Join.ROUND);
+        paint.setStrokeWidth(2*haloPx/S); paint.setColor(FOOT_HALO); c.drawPath(p,paint);
+        paint.setStyle(Paint.Style.FILL); paint.setColor(FOOT_INK); c.drawPath(p,paint);
+        return b;
+    }
+
+    /** The first step whose length along the route is at least len. */
+    private int firstStep(float len) {
+        int lo=0, hi=stepCount;
+        while (lo<hi) { int mid=(lo+hi)>>>1; if (stepCum[mid]<len) lo=mid+1; else hi=mid; }
+        return lo;
+    }
+
+    /** The print's length on screen (px) at zoom z: the size choice (FOOT_LEN_*, in dp) however far out the map is, growing with
+     *  the world (to FOOT_UP times) once the world stride is wider than FOOT_GAP print lengths. */
+    private float footLen(float base,float z) { return base*Math.max(1f,Math.min(FOOT_UP,STRIDE*z/(FOOT_GAP*base))); }
+
+    /** Adds the dashes of the segment (x0,y0)-(x1,y1) (screen) to the dash list; phase is the length along the route so far. */
+    private void addDashes(boolean on,float x0,float y0,float x1,float y1,float phase,float dash,float period) {
+        float dx=x1-x0, dy=y1-y0, len=(float)Math.hypot(dx,dy);
+        if (len<1e-3f) return;
+        // the part of the segment inside the (widened) canvas, by parameter
+        float t0=0, t1=1, m=period;
+        for (int ax=0;ax<2;++ax) {
+            float p0=ax==0 ? x0 : y0, d=ax==0 ? dx : dy;
+            float lo=(ax==0 ? canvasRect.left : canvasRect.top)-m, hi=(ax==0 ? canvasRect.right : canvasRect.bottom)+m;
+            if (Math.abs(d)<1e-6f) { if (p0<lo || p0>hi) return; continue; }
+            float ta=(lo-p0)/d, tb=(hi-p0)/d;
+            if (ta>tb) { float t=ta; ta=tb; tb=t; }
+            t0=Math.max(t0,ta); t1=Math.min(t1,tb);
+            if (t0>=t1) return;
+        }
+        float ux=dx/len, uy=dy/len;
+        float s=t0*len, e=t1*len;
+        float q=(float)Math.floor((phase+s)/period)*period-phase; // start of the dash period that holds s
+        for (;q<e;q+=period) {
+            float a0=Math.max(s,q), a1=Math.min(e,q+dash);
+            if (a1<=a0) continue;
+            float[] buf; int n;
+            if (on) { if (dashOnN+4>dashOn.length) dashOn=java.util.Arrays.copyOf(dashOn,dashOn.length*2); buf=dashOn; n=dashOnN; dashOnN+=4; }
+            else { if (dashOffN+4>dashOff.length) dashOff=java.util.Arrays.copyOf(dashOff,dashOff.length*2); buf=dashOff; n=dashOffN; dashOffN+=4; }
+            buf[n]=x0+ux*a0; buf[n+1]=y0+uy*a0; buf[n+2]=x0+ux*a1; buf[n+3]=y0+uy*a1;
+        }
+    }
+
+    /** The exact route as a thin dotted ink line along the polyline (ahead of the player; ladder and lift hops are the marks),
+     *  with a light halo, parts on other floors fainter. Screen space; no allocation. */
+    private void drawRouteLine(Canvas c,NavData.Route r,AtlasModel.Area a,int active,float boost) {
+        float dash=4*dens, gap=3*dens, period=dash+gap;
+        float from=nav.progressLength();
+        dashOnN=0; dashOffN=0;
+        float phase=0, px=sx(r.x[0]), py=sy(r.z[0]);
+        for (int i=1;i<r.n;++i) {
+            float qx=sx(r.x[i]), qy=sy(r.z[i]);
+            byte k=r.kind[i];
+            float seg=(float)Math.hypot(qx-px,qy-py);
+            if (k!=NavData.K_LADDER && k!=NavData.K_LIFT && r.cum[i]>from) {
+                float ax=px, ay=py;
+                float cl=r.cum[i]-r.cum[i-1];
+                float ph=phase;
+                if (from>r.cum[i-1] && cl>1e-6f) { float t=(from-r.cum[i-1])/cl; ax=px+(qx-px)*t; ay=py+(qy-py)*t; ph+=seg*t; }
+                float ym=(r.y[i-1]+r.y[i])*.5f;
+                boolean on=ym>=pathLo && ym<=pathHi && k!=NavData.K_DROP;
+                addDashes(on,ax,ay,qx,qy,ph,dash,period);
+            }
+            phase+=seg; px=qx; py=qy;
+        }
+        float w=Math.max(1.5f,1.5f*dens), halo=Math.max(1f,1f*dens);
+        dotPaint.setStyle(Paint.Style.STROKE); dotPaint.setStrokeCap(Paint.Cap.BUTT);
+        for (int pass=0;pass<2;++pass) {
+            float[] buf=pass==0 ? dashOn : dashOff; int n=pass==0 ? dashOnN : dashOffN;
+            if (n==0) continue;
+            float f=pass==0 ? 1f : FOOT_OFF;
+            dotPaint.setStrokeWidth(w+2*halo); dotPaint.setColor(Color.argb((int)(Math.min(1f,.6f*f*boost)*217),243,230,200));
+            c.drawLines(buf,0,n,dotPaint);
+            dotPaint.setStrokeWidth(w); dotPaint.setColor(Color.argb((int)(Math.min(1f,.6f*f*boost)*255),43,29,16));
+            c.drawLines(buf,0,n,dotPaint);
+        }
+    }
+
+    /** The route as the Marauder's Map draws a walk: the exact path as a thin dotted line, with footprints on it alternating left
+     *  and right (a little), placed by arc length (see ensurePrints) at least FOOT_GAP print lengths apart on screen, in dark ink
+     *  with a light halo, sized in screen space (see FOOT_LEN_*). The route behind the player is not drawn; the prints ahead are
+     *  faint, and a walker prints them one after another (FOOT_RATE a second) from the player toward the destination, each print
+     *  then fading over FOOT_TRAIL steps, looped. Parts of other floors are fainter. Screen space. */
+    private void drawFootprints(Canvas c,AtlasModel.Area a,int active) {
+        NavData.Route r=nav!=null ? nav.route() : null;
+        if (r==null || !r.area.equals(a.id) || r.n<2) return;
+        // the mini map is shown at the user's opacity (a view alpha): the route is drawn stronger to stay legible
+        float boost=mini ? Math.max(1f,Math.min(1.6f,.65f/Math.max(.2f,getAlpha()))) : 1f;
+        // the placement is made for the zoom bucket below the zoom; the stride is wide enough for the largest print of the bucket
+        float base=(mini ? FOOT_LEN_MINI : FOOT_LEN_FULL)*dens*footMul;
+        float zb=(float)Math.pow(ZOOM_BUCKET,Math.floor(Math.log(Math.max(1e-6f,zoom))/Math.log(ZOOM_BUCKET)));
+        float strideW=Math.max(STRIDE,FOOT_GAP*footLen(base,zb*ZOOM_BUCKET)/zb);
+        ensurePrints(r,a,active,strideW);
+        drawRouteLine(c,r,a,active,boost);
+        int n=stepCount;
+        if (n==0) return;
+        int lenPx=Math.max(8,Math.round(base*FOOT_UP));
+        float haloPx=(mini ? 1.6f : 1.2f)*dens*FOOT_UP;
+        int haloKey=Math.round(haloPx*4);
+        if (footL==null || lenPx!=footKeyLen || haloKey!=footKeyHalo) {
+            footKeyLen=lenPx; footKeyHalo=haloKey; footL=makeFoot(1,lenPx,haloPx); footR=makeFoot(-1,lenPx,haloPx);
+        }
+        float len=footLen(base,zoom);
+        float lat=FOOT_LAT*len, sc=len/lenPx;
+        int m0=firstStep(nav.progressLength()-STRIDE*.6f), mEnd=n-1;
+        if (m0>mEnd) return; // the player is past the last print
+        boolean anim=footAnimate;
+        float pw=0;
+        if (anim) {
+            float cycle=(mEnd-m0+1)+FOOT_TRAIL+5;
+            double t=SystemClock.uptimeMillis()*(FOOT_RATE/1000.0);
+            pw=m0+(float)(t-Math.floor(t/cycle)*cycle);
+            animDelay=Math.min(animDelay,mini ? MINI_ANIM_MS : ANIM_MS);
+        }
+        float left=canvasRect.left-len*2, right=canvasRect.right+len*2, top=canvasRect.top-len*2, bottom=canvasRect.bottom+len*2;
+        float hw=footL.getWidth()*.5f, hh=footL.getHeight()*.5f;
+        for (int m=m0;m<=mEnd;++m) {
+            float px=sx(stepX[m]), py=sy(stepZ[m]);
+            if (px<left || px>right || py<top || py>bottom) continue;
+            float alpha;
+            if (!anim) alpha=FOOT_STATIC;
+            else {
+                float d=pw-m;
+                if (d<0 || d>=FOOT_TRAIL) alpha=FOOT_BASE;
+                else alpha=FOOT_BASE+(1-FOOT_BASE)*(1-d/FOOT_TRAIL)*Math.min(1f,d/.35f);
+            }
+            if (stepOn[m]==0) alpha*=FOOT_OFF;
+            alpha=Math.min(1f,alpha*boost);
+            int side=(m&1)==0 ? -1 : 1;
+            px-=stepSin[m]*lat*side; py+=stepCos[m]*lat*side;
+            footMatrix.setTranslate(-hw,-hh); footMatrix.postScale(sc,sc); footMatrix.postRotate(stepAng[m]); footMatrix.postTranslate(px,py);
+            footPaint.setAlpha((int)(alpha*255));
+            c.drawBitmap(side<0 ? footL : footR,footMatrix,footPaint);
+        }
+    }
+
+    /** The marks where the route climbs, rides, drops or needs a lever, and the destination pin (screen space). */
+    private void drawRouteMarks(Canvas c,AtlasModel.Area a,int active) {
+        if (nav==null) return;
+        NavData.Route r=nav.route();
+        if (r!=null && r.area.equals(a.id) && r.n>=2) {
+            float[] band=floorBand(a,active);
+            for (int k=0;k<r.marks;++k) {
+                float px=sx(r.mx[k]), py=sy(r.mz[k]);
+                if (!canvasRect.contains(px,py)) continue;
+                boolean on=r.my[k]>=band[0] && r.my[k]<=band[1];
+                int kind=r.mkind[k];
+                if (kind==NavData.K_LADDER) icon(c,1,px,py,26*ms,0,on ? null : dimLamp);
+                else if (kind==NavData.K_DROP) glyph(c,px,py,ms,0,on);
+                else if (kind==NavData.K_LIFT) glyph(c,px,py,ms,1,on);
+                else if (kind==NavData.M_LEVER) glyph(c,px,py,ms,2,on);
+            }
+        }
+        AtlasNav.Dest d=nav.dest();
+        if (d!=null && d.area.equals(a.id)) {
+            float px=sx(d.x), py=sy(d.z);
+            float[] band=floorBand(a,active);
+            boolean on=d.y>=band[0]-0.5f && d.y<=band[1]+0.5f;
+            if (canvasRect.contains(px,py-10*ms)) pin(c,px,py,ms,on);
+        }
+    }
+
+    /** Small vector marks: 0 drop (down arrow), 1 lift (box with up / down arrows), 2 lever (handle). */
+    private void glyph(Canvas c,float px,float py,float u,int type,boolean on) {
+        int alpha=on ? 255 : 130;
+        float r=7.5f*u;
+        fillPaint.setColor(Color.argb(alpha*7/10,12,14,14)); c.drawCircle(px,py,r,fillPaint);
+        strokePaint.setColor(Color.argb(alpha,255,244,200)); strokePaint.setStrokeWidth(Math.max(1.2f,1.3f*u));
+        Path p=scratch; p.reset();
+        if (type==0) { p.moveTo(px,py-r*.55f); p.lineTo(px,py+r*.55f); p.moveTo(px-r*.4f,py+r*.15f); p.lineTo(px,py+r*.55f); p.lineTo(px+r*.4f,py+r*.15f); }
+        else if (type==1) {
+            p.moveTo(px-r*.55f,py-r*.1f); p.lineTo(px,py-r*.6f); p.lineTo(px+r*.55f,py-r*.1f);
+            p.moveTo(px-r*.55f,py+r*.1f); p.lineTo(px,py+r*.6f); p.lineTo(px+r*.55f,py+r*.1f);
+        } else { p.moveTo(px-r*.45f,py+r*.55f); p.lineTo(px+r*.2f,py-r*.35f); p.addCircle(px+r*.3f,py-r*.5f,r*.2f,Path.Direction.CW); }
+        c.drawPath(p,strokePaint);
+    }
+
+    private void pin(Canvas c,float px,float py,float u,boolean on) {
+        int alpha=on ? 255 : 140;
+        float r=6.5f*u, h=15*u;
+        Path p=scratch; p.reset();
+        p.moveTo(px,py); p.lineTo(px-r*.8f,py-h+r*.35f); p.lineTo(px+r*.8f,py-h+r*.35f); p.close();
+        fillPaint.setColor(Color.argb(alpha,16,16,16)); c.drawCircle(px,py-h,r*1.28f,fillPaint); c.drawPath(p,fillPaint);
+        fillPaint.setColor(Color.argb(alpha,232,76,62)); c.drawCircle(px,py-h,r,fillPaint); c.drawPath(p,fillPaint);
+        fillPaint.setColor(Color.argb(alpha,255,244,230)); c.drawCircle(px,py-h,r*.38f,fillPaint);
+    }
+
+    /** Doors and mechanisms of the area as small bars / marks, coloured by their state from the live flags. */
+    private void drawGates(Canvas c,AtlasModel.Area a,int active) {
+        if (nav==null || state==null || a.gates==null) return;
+        NavGate[] gates=a.gates;
+        byte[] st=nav.drawStates(a.id,state);
+        if (st==null) return;
+        float[] band=floorBand(a,active);
+        float margin=30*ms;
+        for (int i=0;i<gates.length;++i) {
+            NavGate g=gates[i];
+            if (g.type.equals(NavGate.FOG)) continue; // boss fog walls: passable, not drawn
+            int color=st[i]==AtlasNav.S_OPEN ? GATE_OPEN : st[i]==AtlasNav.S_BLOCKED ? GATE_BLOCKED : st[i]==AtlasNav.S_ONEWAY ? GATE_ONEWAY : GATE_FREE;
+            if (g.seg!=null) {
+                if (g.yHi<band[0]-0.5f || g.yLo>band[1]+0.5f) continue;
+                float x0=sx(g.seg[0]), y0=sy(g.seg[1]), x1=sx(g.seg[2]), y1=sy(g.seg[3]);
+                float mx=(x0+x1)*.5f, my=(y0+y1)*.5f;
+                if (mx<canvasRect.left-margin || my<canvasRect.top-margin || mx>canvasRect.right+margin || my>canvasRect.bottom+margin) continue;
+                strokePaint.setStrokeCap(Paint.Cap.BUTT);
+                strokePaint.setColor(Color.argb(210,12,14,14)); strokePaint.setStrokeWidth(Math.max(3f,4.6f*ms)); c.drawLine(x0,y0,x1,y1,strokePaint);
+                strokePaint.setColor(color); strokePaint.setStrokeWidth(Math.max(2f,3.0f*ms)); c.drawLine(x0,y0,x1,y1,strokePaint);
+                // a dot on the side the door opens from
+                if (st[i]!=AtlasNav.S_OPEN && (g.side==NavGate.FRONT || g.side==NavGate.BACK) && g.hasFrame) {
+                    float sgn=g.side==NavGate.FRONT ? 1 : -1;
+                    float dx=sx(g.cx+g.nx*sgn*1.1f), dy=sy(g.cz+g.nz*sgn*1.1f);
+                    fillPaint.setColor(Color.argb(235,12,14,14)); c.drawCircle(dx,dy,3.0f*ms,fillPaint);
+                    fillPaint.setColor(color); c.drawCircle(dx,dy,2.0f*ms,fillPaint);
+                }
+                if (g.type.equals(NavGate.KEY) && st[i]!=AtlasNav.S_OPEN) keyGlyph(c,mx,my-6.5f*ms,ms,color);
+                target(mx,my,g.cx!=0||g.cz!=0 ? g.cx : g.x,g.y,g.cx!=0||g.cz!=0 ? g.cz : g.z,"Gate","",T_GATE,i);
+            } else if (g.stops.length>=3 || g.type.equals(NavGate.LADDER)) {
+                int n=g.type.equals(NavGate.LADDER) ? 1 : g.stops.length/3;
+                for (int k=0;k<n;++k) {
+                    float gx=g.type.equals(NavGate.LADDER) ? g.x : g.stops[k*3], gy=g.type.equals(NavGate.LADDER) ? g.y : g.stops[k*3+1], gz=g.type.equals(NavGate.LADDER) ? g.z : g.stops[k*3+2];
+                    if (gy<band[0]-0.5f || gy>band[1]+0.5f) continue;
+                    float px=sx(gx), py=sy(gz);
+                    if (!canvasRect.contains(px,py)) continue;
+                    fillPaint.setColor(Color.argb(215,12,14,14)); c.drawCircle(px,py,6.2f*ms,fillPaint);
+                    strokePaint.setColor(color); strokePaint.setStrokeWidth(Math.max(1.5f,1.7f*ms)); c.drawCircle(px,py,5f*ms,strokePaint);
+                    glyph(c,px,py,ms*.75f,g.type.equals(NavGate.LIFT) ? 1 : 2,true);
+                    target(px,py,gx,gy,gz,"Gate","",T_GATE,i);
+                }
+            }
+        }
+    }
+
+    private void keyGlyph(Canvas c,float px,float py,float u,int color) {
+        strokePaint.setColor(Color.argb(230,12,14,14)); strokePaint.setStrokeWidth(Math.max(3f,3.3f*u));
+        Path p=scratch; p.reset();
+        p.addCircle(px-3.2f*u,py,2.3f*u,Path.Direction.CW); p.moveTo(px-.9f*u,py); p.lineTo(px+4.2f*u,py); p.moveTo(px+2.6f*u,py); p.lineTo(px+2.6f*u,py+2.2f*u); p.moveTo(px+4.2f*u,py); p.lineTo(px+4.2f*u,py+2.2f*u);
+        c.drawPath(p,strokePaint);
+        strokePaint.setColor(color); strokePaint.setStrokeWidth(Math.max(1.4f,1.5f*u)); c.drawPath(p,strokePaint);
+    }
+
+    /** The mini map's edge arrow: points toward where the route leaves the map (or the destination), with the distance. */
+    private void drawEdgeArrow(Canvas c,AtlasModel.Area a) {
+        if (nav==null || !nav.hasDestination()) return;
+        AtlasNav.Dest d=nav.dest();
+        if (!d.area.equals(a.id)) return;
+        float inset=13*ms;
+        tmpRect.set(canvasRect.left+inset,canvasRect.top+inset+18*dens,canvasRect.right-inset,canvasRect.bottom-inset-(nav.hasDestination() ? 18*dens : 0));
+        if (tmpRect.contains(sx(d.x),sy(d.z))) return;
+        float tx=sx(d.x), ty=sy(d.z);
+        NavData.Route r=nav.route();
+        if (r!=null && r.area.equals(a.id)) {
+            float from=nav.progressLength();
+            for (int i=0;i<r.n;++i) {
+                if (r.cum[i]<from) continue;
+                float qx=sx(r.x[i]), qy=sy(r.z[i]);
+                if (!tmpRect.contains(qx,qy)) { tx=qx; ty=qy; break; }
+            }
+        }
+        float dx=tx-ccx, dy=ty-ccy, len=(float)Math.hypot(dx,dy);
+        if (len<1) return;
+        dx/=len; dy/=len;
+        float hw=tmpRect.width()*.5f, hh=tmpRect.height()*.5f;
+        float t=Math.min(dx!=0 ? hw/Math.abs(dx) : 1e9f,dy!=0 ? hh/Math.abs(dy) : 1e9f);
+        float ax=tmpRect.centerX()+dx*t, ay=tmpRect.centerY()+dy*t;
+        float s=8*ms;
+        Path p=scratch; p.reset(); p.moveTo(s,0); p.lineTo(-s*.7f,-s*.75f); p.lineTo(-s*.3f,0); p.lineTo(-s*.7f,s*.75f); p.close();
+        c.save(); c.translate(ax,ay); c.rotate((float)Math.toDegrees(Math.atan2(dy,dx)));
+        fillPaint.setColor(Color.argb(235,12,14,14)); c.scale(1.25f,1.25f); c.drawPath(p,fillPaint); c.scale(.8f,.8f);
+        fillPaint.setColor(ROUTE_COLOR); c.drawPath(p,fillPaint);
+        c.restore();
+        String dist=distanceText(nav.remaining()>=0 ? nav.remaining() : nav.straightLine());
+        if (!dist.isEmpty()) {
+            float size=fit(dist,bodyFace,10.5f*dens,7*dens,canvasRect.width()*.4f);
+            textPaint.setTypeface(bodyFace); textPaint.setTextSize(size);
+            float tw=textPaint.measureText(dist);
+            float lx2=Math.max(canvasRect.left+3*dens,Math.min(canvasRect.right-tw-3*dens,ax-tw*.5f-dx*(s*1.9f+tw*.5f)));
+            float ly2=Math.max(canvasRect.top+18*dens+size,Math.min(canvasRect.bottom-20*dens,ay-dy*s*2.2f+size*.35f));
+            fillPaint.setColor(Color.argb(170,12,14,14)); c.drawRoundRect(lx2-3*dens,ly2-size,lx2+tw+3*dens,ly2+size*.3f,3*dens,3*dens,fillPaint);
+            text(c,dist,lx2,ly2,size,PAPER,bodyFace,Paint.Align.LEFT);
+        }
+    }
+
+    private static String distanceText(float meters) {
+        if (meters<0) return "";
+        return meters>=1000 ? String.format(java.util.Locale.ROOT,"%.1f km",meters/1000) : String.format(java.util.Locale.ROOT,"%d m",Math.round(meters));
+    }
+
+    /** The destination chip at the top of the map: the target, the remaining distance and a cross that clears it. */
+    private void drawChip(Canvas c) {
+        chipRect.setEmpty(); chipClear.setEmpty();
+        if (nav==null) return;
+        boolean arrived=nav.arrived();
+        AtlasNav.Dest d=nav.dest();
+        if (d==null && !arrived) return;
+        String name=arrived ? "Arrived" : d.marked ? "Marked point" : d.name.isEmpty() ? "Destination" : d.name;
+        String detail=arrived ? "" : nav.chipDetail();
+        float size=15*dens, pad=10*dens, clearW=arrived ? 0 : 38*dens, h=38*dens;
+        float maxW=canvasRect.width()*.92f-clearW-2*pad-12*dens;
+        textPaint.setTypeface(bodyFace); textPaint.setTextSize(size);
+        float dw=detail.isEmpty() ? 0 : textPaint.measureText(detail)+14*dens;
+        float nameMax=Math.max(60*dens,maxW-dw);
+        String shownName=name; 
+        while (shownName.length()>3 && textPaint.measureText(shownName)>nameMax) shownName=shownName.substring(0,shownName.length()-2);
+        if (!shownName.equals(name)) shownName=shownName.trim()+"…";
+        float nw=textPaint.measureText(shownName);
+        float w=pad*2+nw+dw+clearW;
+        float left=canvasRect.centerX()-w/2, top=canvasRect.top+8*dens;
+        chipRect.set(left,top,left+w,top+h);
+        fillPaint.setColor(Color.argb(228,27,29,27)); c.drawRoundRect(chipRect,h/2,h/2,fillPaint);
+        strokePaint.setColor(arrived ? GATE_OPEN : GOLD); strokePaint.setStrokeWidth(Math.max(1,dens*.9f)); c.drawRoundRect(chipRect,h/2,h/2,strokePaint);
+        float base=chipRect.centerY()+size*.35f;
+        text(c,shownName,left+pad,base,size,arrived ? GATE_OPEN : PAPER,bodyFace,Paint.Align.LEFT);
+        if (!detail.isEmpty()) text(c,detail,left+pad+nw+14*dens,base,size,detail.startsWith("No route") || detail.startsWith("Go to") ? MUTED : GOLD,bodyFace,Paint.Align.LEFT);
+        if (!arrived) {
+            chipClear.set(chipRect.right-clearW,chipRect.top,chipRect.right,chipRect.bottom);
+            float cxp=chipClear.centerX()-2*dens, cyp=chipClear.centerY(), r=5*dens;
+            strokePaint.setColor(pressed==chipClear ? GOLD : PAPER); strokePaint.setStrokeWidth(Math.max(1.5f,1.6f*dens));
+            c.drawLine(cxp-r,cyp-r,cxp+r,cyp+r,strokePaint); c.drawLine(cxp-r,cyp+r,cxp+r,cyp-r,strokePaint);
+        }
+        if (arrived) postInvalidateDelayed(3200);
+    }
+
+    /** The mini map's destination line (bottom strip): "→ name · distance", or Arrived. */
+    private void drawMiniDest(Canvas c,int w,int h) {
+        if (nav==null) return;
+        boolean arrived=nav.arrived();
+        if (!nav.hasDestination() && !arrived) return;
+        String name=arrived ? "Arrived" : nav.dest().marked ? "Marked point" : nav.dest().name;
+        String detail=arrived ? "" : nav.chipDetail();
+        String t=detail.isEmpty() ? name : name+" · "+detail;
+        float strip=18*dens, size=fit(t,bodyFace,11*dens,7.5f*dens,w-10*dens);
+        fillPaint.setColor(Color.argb(165,12,12,12)); c.drawRect(0,h-strip,w,h,fillPaint);
+        text(c,t,w*.5f,h-strip*.5f+size*.34f,size,arrived ? GATE_OPEN : ROUTE_COLOR,bodyFace,Paint.Align.CENTER);
+        if (arrived) postInvalidateDelayed(3200);
+    }
+
     private void icon(Canvas c,int index,float px,float py,float size,float degrees,PorterDuffColorFilter filter) {
         if (icons==null) return;
         int col=index%4, row=index/4;
@@ -686,9 +1287,10 @@ final class AtlasView extends View {
         if (degrees!=0) { c.save(); c.rotate(degrees,px,py); c.drawBitmap(icons,src,dst,iconPaint); c.restore(); }
         else c.drawBitmap(icons,src,dst,iconPaint);
     }
-    private void target(float px,float py,float wx,float wz,String title,String sub) {
+    private void target(float px,float py,float wx,float wz,String title,String sub) { target(px,py,wx,0,wz,title,sub,T_LABEL,-1); }
+    private void target(float px,float py,float wx,float wy,float wz,String title,String sub,int kind,int gate) {
         if (mini || targets>=MAX_TARGETS) return;
-        tx[targets]=px; ty[targets]=py; twx[targets]=wx; twz[targets]=wz; tTitle[targets]=title; tSub[targets]=sub; ++targets;
+        tx[targets]=px; ty[targets]=py; twx[targets]=wx; twy[targets]=wy; twz[targets]=wz; tTitle[targets]=title; tSub[targets]=sub; tKind[targets]=kind; tGate[targets]=gate; ++targets;
     }
     private static String categoryName(String c) {
         return c.equals("healing") ? "Blood vials" : c.equals("insight") ? "Insight" : c.equals("equipment") ? "Equipment" : "Coldblood";
@@ -784,6 +1386,15 @@ final class AtlasView extends View {
             text(c,(pos+1)+"/"+total,btnAuto.centerX(),btnAuto.centerY()-size*.15f,size*1.05f,PAPER,bodyFace,Paint.Align.CENTER);
             text(c,auto ? "AUTO" : "auto",btnAuto.centerX(),btnAuto.centerY()+size*1.0f,size*.62f,auto ? GOLD : MUTED,bodyFace,Paint.Align.CENTER);
         }
+        if (buttonShown(btnClose)) {
+            button(c,btnClose,true,pressed==btnClose);
+            float cr=Math.min(btnClose.height()*.16f,7*dens), cxp=btnClose.left+btnClose.height()*.5f, cyp=btnClose.centerY();
+            strokePaint.setStrokeCap(Paint.Cap.ROUND); strokePaint.setColor(PAPER); strokePaint.setStrokeWidth(Math.max(2f,2f*dens));
+            c.drawLine(cxp-cr,cyp-cr,cxp+cr,cyp+cr,strokePaint); c.drawLine(cxp-cr,cyp+cr,cxp+cr,cyp-cr,strokePaint);
+            strokePaint.setStrokeCap(Paint.Cap.BUTT);
+            float cs=Math.min(17*dens,btnClose.height()*.36f);
+            text(c,"Close",(cxp+cr+btnClose.right-4*dens)*.5f,btnClose.centerY()+cs*.35f,cs,PAPER,bodyFace,Paint.Align.CENTER);
+        }
         if (buttonShown(btnRecenter)) {
             button(c,btnRecenter,true,pressed==btnRecenter);
             text(c,"Recenter",btnRecenter.centerX(),btnRecenter.centerY()+size*.36f,size,PAPER,bodyFace,Paint.Align.CENTER);
@@ -799,24 +1410,33 @@ final class AtlasView extends View {
     }
 
     private void drawCard(Canvas c) {
-        if (SystemClock.uptimeMillis()>cardUntil) { cardTitle=null; return; }
+        if (SystemClock.uptimeMillis()>cardUntil) { cardTitle=null; cardNav=false; return; }
         float px=sx(cardX), py=sy(cardZ);
-        if (!canvasRect.contains(px,py)) return;
+        if (!canvasRect.contains(px,py)) { cardRect.setEmpty(); cardBtn.setEmpty(); return; }
         float ts=15*dens, ss=12*dens, pad=9*dens;
         String[] lines=cardSub==null ? new String[0] : cardSub.split("\n");
-        int shown=Math.min(lines.length,5);
+        int shown=Math.min(lines.length,6);
         textPaint.setTypeface(bodyFace);
         textPaint.setTextSize(ts); float wid=textPaint.measureText(cardTitle);
         textPaint.setTextSize(ss);
         for (int i=0;i<shown;++i) wid=Math.max(wid,textPaint.measureText(lines[i]));
-        float w=Math.min(canvasRect.width()*.8f,wid+2*pad), h=pad*2+ts*1.2f+shown*ss*1.3f;
+        float buttonH=cardNav ? 34*dens : 0, buttonGap=cardNav ? 6*dens : 0;
+        if (cardNav) { textPaint.setTextSize(ts); wid=Math.max(wid,textPaint.measureText("Navigate")+36*dens); }
+        float w=Math.min(canvasRect.width()*.8f,wid+2*pad), h=pad*2+ts*1.2f+shown*ss*1.3f+buttonGap+buttonH;
         float left=Math.max(canvasRect.left+4*dens,Math.min(canvasRect.right-w-4*dens,px-w/2));
         float top=py-24*ms-h; if (top<canvasRect.top+4*dens) top=py+24*ms;
-        tmpRect.set(left,top,left+w,top+h);
+        tmpRect.set(left,top,left+w,top+h); cardRect.set(tmpRect);
         fillPaint.setColor(Color.argb(235,27,29,27)); c.drawRoundRect(tmpRect,6*dens,6*dens,fillPaint);
         strokePaint.setColor(GOLD); strokePaint.setStrokeWidth(Math.max(1,dens*.8f)); c.drawRoundRect(tmpRect,6*dens,6*dens,strokePaint);
         text(c,cardTitle,left+pad,top+pad+ts,ts,PAPER,bodyFace,Paint.Align.LEFT);
         for (int i=0;i<shown;++i) text(c,lines[i],left+pad,top+pad+ts*1.2f+(i+1)*ss*1.3f-ss*.2f,ss,MUTED,bodyFace,Paint.Align.LEFT);
+        if (cardNav) {
+            float by=top+h-pad-buttonH;
+            cardBtn.set(left+pad,by,left+w-pad,by+buttonH);
+            fillPaint.setColor(Color.argb(235,103,91,63)); c.drawRoundRect(cardBtn,6*dens,6*dens,fillPaint);
+            strokePaint.setColor(GOLD); c.drawRoundRect(cardBtn,6*dens,6*dens,strokePaint);
+            text(c,"Navigate",cardBtn.centerX(),cardBtn.centerY()+ts*.35f,ts,PAPER,bodyFace,Paint.Align.CENTER);
+        } else cardBtn.setEmpty();
     }
 
     private void drawPicker(Canvas c) {

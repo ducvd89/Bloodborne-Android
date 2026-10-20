@@ -61,6 +61,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -133,6 +134,9 @@ static struct {
      * outstanding. inflight is the id (txn_seq) of the newest transaction not yet completed, 0 none;
      * on_complete of an older one (after a surface loss, say) does not clear it. */
     int fifo;
+    /* The app asks for no display work (an online game while the app is in the background or the screen is off: the
+     * game must keep running, never block on a frame that nobody shows). Frames are released at once, paced. */
+    int hold;
     Queued queue[BB_PRESENT_MAX_BUFFERS];
     uint32_t queue_head, queue_len;
     uint64_t txn_seq, inflight;
@@ -370,8 +374,8 @@ static void present_frame(const bb_present_msg* m, int acquire_fd) {
         return; /* a frame of a set we do not have: nothing to show, nothing to release */
     }
     atomic_fetch_add(&S.frames, 1);
-    if (!S.sc || !api.ok) {
-        /* No display now (surface lost, app paused): the frame is dropped; its own acquire fence
+    if (!S.sc || !api.ok || S.hold) {
+        /* No display now (surface lost, app paused, held): the frame is dropped; its own acquire fence
          * is the release (the game's writes are what the buffer still waits for). */
         send_release(m->generation, m->index, m->frame, acquire_fd);
         return;
@@ -398,6 +402,21 @@ static void present_frame(const bb_present_msg* m, int acquire_fd) {
     S.queue[tail].fence = acquire_fd;
     S.queue_len++;
     pump_queue();
+}
+
+/* Held frames come back at once, so the game would render without any pacing: the receive thread spaces them (about
+ * 60 per second at most). Receive thread only, lock not held. */
+static void hold_pace(void) {
+    static struct timespec last;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t since = (int64_t)(now.tv_sec - last.tv_sec) * 1000000000 + (now.tv_nsec - last.tv_nsec);
+    if (since >= 0 && since < 16000000) {
+        struct timespec nap = {0, (long)(16000000 - since)};
+        nanosleep(&nap, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    }
+    last = now;
 }
 
 static void close_connection(void) {
@@ -445,7 +464,7 @@ static void serve(int fd) {
             break;
         }
         pthread_mutex_lock(&S.lock);
-        int stop = 0;
+        int stop = 0, paced = 0;
         switch (m.type) {
         case BB_PRESENT_HELLO: {
             if (m.version != BB_PRESENT_VERSION || m.count == 0 || m.count > BB_PRESENT_MAX_BUFFERS) {
@@ -492,6 +511,7 @@ static void serve(int fd) {
         case BB_PRESENT_FRAME:
             present_frame(&m, fence);
             fence = -1;
+            paced = S.hold;
             break;
         case BB_PRESENT_BYE:
             stop = 1;
@@ -502,6 +522,7 @@ static void serve(int fd) {
         pthread_mutex_unlock(&S.lock);
         if (fence >= 0) close(fence);
         if (stop) break;
+        if (paced) hold_pace();
     }
     pthread_mutex_lock(&S.lock);
     close_connection();
@@ -577,6 +598,19 @@ JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeSetSurface(JNIEn
     if (surface) {
         S.window = ANativeWindow_fromSurface(env, surface);
         make_surface_control();
+    }
+    pthread_mutex_unlock(&S.lock);
+}
+
+/* Hold on: queued frames go back unseen and every frame that follows is released at once (paced), as if no surface
+ * were there; hold off: frames show again. The socket stays served either way. */
+JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeSetHold(JNIEnv* env, jclass cls, jboolean hold) {
+    (void)env; (void)cls;
+    pthread_mutex_lock(&S.lock);
+    S.hold = hold ? 1 : 0;
+    if (S.hold) {
+        clear_queue(1);
+        S.inflight = 0;
     }
     pthread_mutex_unlock(&S.lock);
 }

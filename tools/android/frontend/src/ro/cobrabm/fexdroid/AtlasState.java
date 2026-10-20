@@ -48,6 +48,16 @@ final class AtlasState implements AtlasFeatures.Flags {
         reset();
     }
 
+    /** A new request for the running game's file (the pack was updated while it runs): like expect() but the mapping and the
+     *  place stay (only the flag values are unknown until the game applies the new generation). */
+    void expectLive(int gen,List<Integer> flagIds) {
+        this.gen=gen;
+        int n=Math.min(flagIds.size(),MAX_FLAGS);
+        ids=new int[n]; index.clear();
+        for (int i=0;i<n;++i) { ids[i]=flagIds.get(i); index.put(ids[i],i); }
+        java.util.Arrays.fill(flags,(byte)-1); flagCount=0; ++flagsVersion;
+    }
+
     /** Drops the mapping and what was read (a new game process makes a new file). */
     void reset() {
         close(); mapped=false; valid=false; menuOpen=false; tick=0; flagsGen=0; flagCount=0; ++flagsVersion;

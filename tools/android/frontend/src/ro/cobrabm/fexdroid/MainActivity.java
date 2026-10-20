@@ -67,6 +67,11 @@ public final class MainActivity extends Activity {
     private final Object pauseLock=new Object();
     private int gamePid;
     private boolean userPaused, backgrounded, notTop, stopped;
+    /** The running game started online (OnlineSettings.launchedOnline() when it started; it stays so until the game
+     *  ends, whatever the Online switch says later). It is never stopped: a stopped process drops the online session
+     *  (signaling, relays, keep-alives). In the background or with the screen off it is muted and its frames are
+     *  released unseen instead; a player pause is refused. Guarded by pauseLock. */
+    private boolean onlineGame;
     /** The display (BbPresent's listener) is running and the game may start. */
     private volatile boolean displayReady;
     private volatile boolean destroyed;
@@ -85,7 +90,26 @@ public final class MainActivity extends Activity {
     private AtlasScreen atlas;
     private AtlasDialog atlasDialog;
     private LinearLayout atlasItem;
-    private AtlasView atlasMini;
+    private AtlasView atlasMini, atlasFull;
+    /** The full-screen map over the game is open (opened by holding the mini map): the controller is hidden, the mini map too. */
+    private boolean fullMapOpen;
+    /** Online play: the choices (OnlineSettings), the menu (OnlineDialog), its drawer row, and the game's own short notices
+     *  (BB_NET_BANNER_FILE: BBSC's loading lines, notifications) shown as a chip while an online game runs. */
+    private OnlineSettings online;
+    private OnlineDialog onlineDialog;
+    private LinearLayout onlineItem;
+    private TextView noticeChip, mapChip;
+    /** The online badge (a coloured dot and a word, at the top edge) and the state it shows: OnlineStatus, read from
+     *  BB_NET_STATUS_FILE once a second while an online game runs; null until the game's online module reports. */
+    private TextView onlineBadge;
+    private volatile OnlineStatus netStatus;
+    private long netStamp, netStartMs;
+    private int badgeGen;
+    private int noticeGen;
+    private long noticeStamp;
+    private String noticeLast="";
+    private final java.util.ArrayDeque<String> noticeQueue=new java.util.ArrayDeque<>();
+    private boolean noticeShowing;
     private int miniL=-1, miniT, miniS;
     private GameInstaller installer;
     private AppUpdater updater;
@@ -104,6 +128,7 @@ public final class MainActivity extends Activity {
         BASE=FILES+"/bbport";
         drivers=new DriverManager(new File(FILES));
         atlas=new AtlasScreen(this,new File(BASE));
+        online=new OnlineSettings(this);
         GameInstaller.Host host=modsHost();
         mods=new ModsDialog(this,host); installer=new GameInstaller(this,host);
         updater=new AppUpdater(this,new AppUpdater.Host() {
@@ -186,12 +211,16 @@ public final class MainActivity extends Activity {
         atlasMini=atlas.createMini(this);
         screen.addView(atlasMini,frame(dp(120),dp(120),Gravity.TOP|Gravity.LEFT));
         screen.addView(controllerOverlay,frame(-1,-1,Gravity.CENTER));
+        // The full-screen map: above the controller and the mini map, below the handle, the notices, the scrim and the drawer.
+        atlasFull=atlas.createFull(this);
+        atlasFull.setCloseHandler(this::closeFullMap);
+        screen.addView(atlasFull,frame(-1,-1,Gravity.FILL));
         controllerOverlay.setMiniListener(new TouchControllerOverlay.MiniListener() {
             @Override public void rect(int left,int top,int side) { placeMini(left,top,side); }
-            @Override public void editing(boolean on) { atlas.setSuppressed(on); }
+            @Override public void editing(boolean on) { atlas.setSuppressed(on); if (on) closeFullMap(); }
         });
         atlas.setTopHooks(() -> sysTop,() -> { if (!destroyed) evalTop(); });
-        atlas.setConfigListener(() -> controllerOverlay.setMiniMap(atlas.floatOn()));
+        atlas.setConfigListener(() -> { controllerOverlay.setMiniMap(atlas.floatOn()); if (!atlas.floatOn()) closeFullMap(); });
         controllerOverlay.setMiniMap(atlas.floatOn());
 
         handle=new View(this);
@@ -208,6 +237,36 @@ public final class MainActivity extends Activity {
         pausedChip.setOnClickListener(v -> togglePause());
         FrameLayout.LayoutParams chipParams=frame(-2,-2,Gravity.TOP|Gravity.CENTER_HORIZONTAL); chipParams.topMargin=dp(16);
         screen.addView(pausedChip,chipParams);
+        // The game's own notices (online play): the same chip look, a little lower than the paused chip; it takes no touches.
+        noticeChip=text("",13,0xffe8dfc9); noticeChip.setPadding(dp(14),dp(7),dp(14),dp(7));
+        GradientDrawable noticeBack=new GradientDrawable(); noticeBack.setColor(0xcc121318); noticeBack.setCornerRadius(dp(16));
+        noticeBack.setStroke(dp(1),0x99c6ad76);
+        noticeChip.setBackground(noticeBack); noticeChip.setVisibility(View.GONE); noticeChip.setClickable(false);
+        noticeChip.setMaxWidth(dp(560)); noticeChip.setMaxLines(2); noticeChip.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        FrameLayout.LayoutParams noticeParams=frame(-2,-2,Gravity.TOP|Gravity.CENTER_HORIZONTAL); noticeParams.topMargin=dp(56);
+        screen.addView(noticeChip,noticeParams);
+        // Online badge: a tiny pill at the top edge, in the middle (clear of the game's health and soul counters); a dot
+        // and a word for 5 s after every change of state, then the dot alone. It takes no touches.
+        onlineBadge=text("",11,0xffe8dfc9); onlineBadge.setPadding(dp(7),dp(1),dp(7),dp(2));
+        GradientDrawable badgeBack=new GradientDrawable(); badgeBack.setColor(0x99121318); badgeBack.setCornerRadius(dp(10));
+        onlineBadge.setBackground(badgeBack); onlineBadge.setVisibility(View.GONE);
+        onlineBadge.setClickable(false); onlineBadge.setFocusable(false); onlineBadge.setSingleLine(true);
+        FrameLayout.LayoutParams badgeParams=frame(-2,-2,Gravity.TOP|Gravity.CENTER_HORIZONTAL); badgeParams.topMargin=dp(3);
+        screen.addView(onlineBadge,badgeParams);
+        // The map pack's update (Hunter's Atlas, in the background): the same chip look, at the notices' place (below them while
+        // one shows); it takes no touches.
+        mapChip=text("",13,0xffe8dfc9); mapChip.setPadding(dp(14),dp(7),dp(14),dp(7));
+        GradientDrawable mapBack=new GradientDrawable(); mapBack.setColor(0xcc121318); mapBack.setCornerRadius(dp(16));
+        mapBack.setStroke(dp(1),0x99c6ad76);
+        mapChip.setBackground(mapBack); mapChip.setVisibility(View.GONE); mapChip.setClickable(false); mapChip.setFocusable(false);
+        mapChip.setMaxWidth(dp(560)); mapChip.setMaxLines(2); mapChip.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        FrameLayout.LayoutParams mapParams=frame(-2,-2,Gravity.TOP|Gravity.CENTER_HORIZONTAL); mapParams.topMargin=dp(56);
+        screen.addView(mapChip,mapParams);
+        atlas.setStatusListener(line -> {
+            if (line==null) mapChip.setVisibility(View.GONE); else { mapChip.setText(line); mapChip.setVisibility(View.VISIBLE); }
+            positionMapChip();
+        });
+        atlas.setGameRunning(() -> displayReady && game!=null);
 
         scrim=new View(this); scrim.setBackgroundColor(0x99000000);
         scrim.setVisibility(View.GONE); scrim.setOnClickListener(v -> closeDrawer());
@@ -249,14 +308,15 @@ public final class MainActivity extends Activity {
         pauseItem=menuItem("ic_pause","Pause game","",() -> togglePause());
         gameSettingsItem=menuItem("ic_settings","Game settings","",() -> {
             closeDrawer();
-            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showGame();
+            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showGame(online.playingOnline());
         });
         cheatsItem=menuItem("ic_cheats","Cheats","",() -> {
             closeDrawer();
-            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showCheats();
+            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showCheats(online.playingOnline());
         });
         modsItem=menuItem("ic_extension","Mods","",() -> { closeDrawer(); mods.show(); });
         atlasItem=menuItem("ic_map","Hunter's Atlas","",() -> { closeDrawer(); showAtlas(); });
+        onlineItem=menuItem("ic_online","Online","",() -> { closeDrawer(); showOnline(); });
         menuItem("ic_refresh","Restart game","Unsaved progress is lost",() -> new AlertDialog.Builder(this)
             .setTitle("Restart Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> restartGame()).show());
@@ -405,7 +465,7 @@ public final class MainActivity extends Activity {
     /** The rows' second lines: the current settings, read when the drawer opens. */
     private void refreshDrawer() {
         java.util.List<String> game=new java.util.ArrayList<>();
-        if (!"0".equals(setting("skip_network_choice"))) game.add("Offline start");
+        if ("1".equals(setting("skip_network_choice"))) game.add(online.playingOnline() ? "online screen shown" : "Offline start");
         if ("1".equals(setting("skip_intro"))) game.add("no intros");
         if ("1".equals(setting("debug_camera"))) game.add("free camera");
         if ("1".equals(setting("debug_menu"))) game.add("debug menu");
@@ -413,7 +473,8 @@ public final class MainActivity extends Activity {
         java.util.List<String> cheats=new java.util.ArrayList<>();
         if ("1".equals(setting("cheat_health"))) cheats.add("infinite health");
         if ("1".equals(setting("cheat_items"))) cheats.add("infinite items");
-        setDetail(cheatsItem,cheats.isEmpty() ? "Off" : String.join(" · ",cheats));
+        setDetail(cheatsItem,online.playingOnline() ? "Off while playing online" : cheats.isEmpty() ? "Off" : String.join(" · ",cheats));
+        setDetail(onlineItem,onlineDetail());
         mods.summary(text -> setDetail(modsItem,text));
         setDetail(atlasItem,AtlasDialog.summary(atlas));
         String upscaler="off".equals(setting("upscaler")) ? "No upscaling"
@@ -476,9 +537,85 @@ public final class MainActivity extends Activity {
         super.onWindowFocusChanged(focus);
         if (focus) immersive(); else if (pad!=null) pad.reset();
     }
-    @Override public void onBackPressed() { if (drawerOpen) closeDrawer(); else openDrawer(); }
+    @Override public void onBackPressed() { if (drawerOpen) closeDrawer(); else if (fullMapOpen) closeFullMap(); else openDrawer(); }
+
+    // ---- the 2 s hold on the mini map that opens the full map (seen here, before any view, whatever the z-order) ----
+    private static final long MINI_HOLD_MS=2000;
+    private static final String HT="Bloodborne";
+    private boolean miniHolding, miniHoldSwallow;
+    private int miniHoldPointer=-1;
+    private float miniHoldX, miniHoldY;
+    private final Runnable miniHoldRun=new Runnable() { @Override public void run() { fireMiniHold(); } };
+    private void cancelMiniHold(String why) {
+        if (!miniHolding) return;
+        miniHolding=false; miniHoldPointer=-1; main.removeCallbacks(miniHoldRun);
+        if (atlasMini!=null) atlasMini.holdEnd();
+        android.util.Log.i(HT,"atlas hold: cancelled ("+why+")");
+    }
+    private void fireMiniHold() {
+        if (!miniHolding) return;
+        miniHolding=false; miniHoldPointer=-1;
+        android.util.Log.i(HT,"atlas hold: fired");
+        atlasMini.holdEnd();
+        atlasMini.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS);
+        // Release whatever the views hold (camera, sticks) and swallow the rest of this gesture.
+        long now=android.os.SystemClock.uptimeMillis();
+        MotionEvent cancel=MotionEvent.obtain(now,now,MotionEvent.ACTION_CANCEL,miniHoldX,miniHoldY,0);
+        super.dispatchTouchEvent(cancel); cancel.recycle();
+        controllerOverlay.release();
+        miniHoldSwallow=true;
+        openFullMap();
+    }
+    /** Hold tracking for one event. Returns true when the event must not reach the views (the gesture after the hold fired). */
+    private boolean miniHoldTouch(MotionEvent e) {
+        int action=e.getActionMasked();
+        if (miniHoldSwallow) {
+            if (action==MotionEvent.ACTION_UP || action==MotionEvent.ACTION_CANCEL) miniHoldSwallow=false;
+            return true;
+        }
+        if (action==MotionEvent.ACTION_DOWN) {
+            if (miniHolding) cancelMiniHold("new down");
+            if (atlasMini==null) return false;
+            int[] at=new int[2]; atlasMini.getLocationInWindow(at);
+            float w=atlasMini.getWidth(), h=atlasMini.getHeight(), x=e.getX(), y=e.getY();
+            boolean inside=x>=at[0] && x<at[0]+w && y>=at[1] && y<at[1]+h;
+            String block=null;
+            if (atlasMini.getVisibility()!=View.VISIBLE || !atlasMini.isShown() || w<=0) block="mini map not shown";
+            else if (fullMapOpen) block="full map open";
+            else if (drawerOpen) block="drawer open";
+            else if (controllerOverlay.isEditing()) block="layout editor open";
+            else if (x<dp(28)) block="edge swipe zone";
+            if (!inside) {
+                android.util.Log.i(HT,"atlas hold: down outside at "+Math.round(x)+","+Math.round(y)+" rect "+at[0]+","+at[1]+" "+Math.round(w)+"x"+Math.round(h)
+                    +(block!=null ? " ("+block+")" : ""));
+                return false;
+            }
+            if (block!=null) { android.util.Log.i(HT,"atlas hold: down in rect, blocked ("+block+")"); return false; }
+            miniHolding=true; miniHoldPointer=e.getPointerId(0); miniHoldX=x; miniHoldY=y;
+            atlasMini.holdBegin();
+            main.removeCallbacks(miniHoldRun); main.postDelayed(miniHoldRun,MINI_HOLD_MS);
+            android.util.Log.i(HT,"atlas hold: started at "+Math.round(x)+","+Math.round(y)+" rect "+at[0]+","+at[1]+" "+Math.round(w)+"x"+Math.round(h));
+            return false;
+        }
+        if (!miniHolding) return false;
+        switch (action) {
+            case MotionEvent.ACTION_MOVE: {
+                int i=e.findPointerIndex(miniHoldPointer);
+                float slop=Math.max(android.view.ViewConfiguration.get(this).getScaledTouchSlop()*2f,dp(16));
+                if (i<0) cancelMiniHold("pointer lost");
+                else if (Math.hypot(e.getX(i)-miniHoldX,e.getY(i)-miniHoldY)>slop) cancelMiniHold("moved");
+                break;
+            }
+            case MotionEvent.ACTION_POINTER_DOWN: cancelMiniHold("second pointer"); break;
+            case MotionEvent.ACTION_UP: cancelMiniHold("lifted"); break;
+            case MotionEvent.ACTION_CANCEL: cancelMiniHold("cancel"); break;
+            default: break;
+        }
+        return false;
+    }
 
     @Override public boolean dispatchTouchEvent(MotionEvent e) {
+        if (miniHoldTouch(e)) return true;
         if (e.getActionMasked()==MotionEvent.ACTION_DOWN) {
             swipeConsumed=false;
             touchX=e.getX(); touchY=e.getY();
@@ -561,6 +698,7 @@ public final class MainActivity extends Activity {
             @Override public boolean destroyed() { return destroyed; }
             @Override public void closed() { if (!destroyed) immersive(); }
             @Override public boolean needsRestart() { return displayReady && game!=null && !atlas.launchedWithAtlas(); }
+            @Override public boolean gameRunning() { return displayReady && game!=null; }
             @Override public void restart() { restartGame(); }
             @Override public int miniPercent() { return controllerOverlay.miniPercent(); }
             @Override public void setMiniPercent(int percent) { controllerOverlay.setMiniPercent(percent); }
@@ -573,6 +711,133 @@ public final class MainActivity extends Activity {
         });
         atlasDialog.show();
     }
+    /** The Online menu (pool, account, test); closing it offers a restart when the running game started with other settings. */
+    private void showOnline() {
+        if (onlineDialog!=null) onlineDialog.close();
+        onlineDialog=new OnlineDialog(this,online,new File(BASE),new OnlineDialog.Host() {
+            @Override public boolean destroyed() { return destroyed; }
+            @Override public void closed() { if (!destroyed) immersive(); }
+            @Override public boolean needsRestart() { return displayReady && game!=null && online.differsFromLaunch(new File(BASE)); }
+            @Override public void restart() { restartGame(); }
+            @Override public void cheatsChanged() { worker.execute(() -> online.syncCheatState(new File(BASE))); }
+            @Override public OnlineStatus liveStatus() { return game!=null && online.launchedOnline() ? netStatus : null; }
+            @Override public boolean runningOnline() { return game!=null && online.launchedOnline(); }
+        });
+        onlineDialog.show();
+    }
+
+    // ---- the game's notices (online play) ----
+
+    /** About once a second while an online game runs: reads BB_NET_BANNER_FILE when it changed (a stat, nothing else when
+     *  it did not) and queues the lines that are new. The file may be appended to or rewritten. */
+    private void startNoticePoll() {
+        final int gen=++noticeGen;
+        noticeStamp=0; noticeLast=""; noticeQueue.clear(); noticeShowing=false;
+        noticeChip.setVisibility(View.GONE); positionMapChip();
+        clearNetStatus();
+        if (!online.launchedOnline()) return;
+        final File file=new File(BASE,"net-banner.txt"), statusFile=OnlineStatus.file(new File(BASE));
+        netStartMs=android.os.SystemClock.elapsedRealtime();
+        main.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (destroyed || gen!=noticeGen || game==null) return;
+                pollNotice(file);
+                pollNetStatus(statusFile);
+                main.postDelayed(this,1000);
+            }
+        },1000);
+    }
+    /** The online status file, when it changed (a stat; the file is read only then). The game's online module rewrites it
+     *  on every change; with no word from it for 45 s the badge says so. */
+    private void pollNetStatus(File file) {
+        long stamp=file.isFile() ? file.lastModified()*31+file.length() : 0;
+        if (stamp==0) {
+            if (netStatus==null && android.os.SystemClock.elapsedRealtime()-netStartMs>45000) {
+                netStamp=-1;
+                onNetStatus(new OnlineStatus(OnlineStatus.OFFLINE,"The online module has not reported: see Report a problem"));
+            }
+            return;
+        }
+        if (stamp==netStamp) return;
+        netStamp=stamp;
+        OnlineStatus fresh=OnlineStatus.read(file);
+        if (fresh!=null) onNetStatus(fresh);
+    }
+    /** A new state or text: the badge shows its word for 5 s, the text goes to the chip, the menu rows follow. */
+    private void onNetStatus(OnlineStatus fresh) {
+        OnlineStatus before=netStatus;
+        if (fresh.same(before)) return;
+        netStatus=fresh;
+        if (!fresh.detail.isEmpty()) queueNotice(fresh.detail);
+        renderBadge(before==null || before.state!=fresh.state || badgeExpanded);
+        if (drawerOpen) setDetail(onlineItem,onlineDetail());
+        if (onlineDialog!=null) onlineDialog.refreshLive();
+    }
+    private boolean badgeExpanded;
+    private void renderBadge(boolean expanded) {
+        OnlineStatus s=netStatus;
+        if (s==null) { onlineBadge.setVisibility(View.GONE); badgeExpanded=false; return; }
+        badgeExpanded=expanded;
+        android.text.SpannableString text=new android.text.SpannableString(expanded ? "\u25CF "+s.shortText() : "\u25CF");
+        text.setSpan(new android.text.style.ForegroundColorSpan(s.color()),0,1,android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        onlineBadge.setText(text);
+        onlineBadge.setContentDescription("Online: "+s.shortText()+(s.detail.isEmpty() ? "" : ", "+s.detail));
+        onlineBadge.setVisibility(View.VISIBLE);
+        final int gen=++badgeGen;
+        if (expanded) main.postDelayed(() -> { if (!destroyed && gen==badgeGen) renderBadge(false); },5000);
+    }
+    /** No game, or a game that is not online: no state, no badge. */
+    private void clearNetStatus() {
+        ++badgeGen; netStatus=null; netStamp=0; badgeExpanded=false;
+        if (onlineBadge!=null) onlineBadge.setVisibility(View.GONE);
+        if (drawerOpen) setDetail(onlineItem,onlineDetail());
+        if (onlineDialog!=null) onlineDialog.refreshLive();
+    }
+    /** The drawer row's second line: the live state while an online game runs, else the settings. */
+    private String onlineDetail() {
+        OnlineStatus s=netStatus;
+        return s!=null && game!=null && online.launchedOnline() ? s.menuLine() : online.summary();
+    }
+    private void pollNotice(File file) {
+        long stamp=file.isFile() ? file.lastModified()*31+file.length() : 0;
+        if (stamp==noticeStamp) return;
+        noticeStamp=stamp;
+        String text="";
+        if (stamp!=0) {
+            try (java.io.FileInputStream in=new java.io.FileInputStream(file)) {
+                byte[] data=new byte[(int)Math.min(file.length(),8192)];
+                int n=0; for (int r; n<data.length && (r=in.read(data,n,data.length-n))>0;) n+=r;
+                text=new String(data,0,n,"UTF-8");
+            } catch (Exception ex) { return; }
+        }
+        String fresh=text.startsWith(noticeLast) ? text.substring(noticeLast.length()) : text;
+        noticeLast=text;
+        for (String line:fresh.split("\r?\n")) queueNotice(line);
+    }
+    /** A line for the chip (the game's own notice or a change of the online state). */
+    private void queueNotice(String line) {
+        line=line.replaceAll("[\\p{Cntrl}]"," ").trim();
+        if (line.isEmpty()) return;
+        if (line.length()>140) line=line.substring(0,140)+"\u2026";
+        if (noticeQueue.size()<6) noticeQueue.add(line);
+        showNextNotice();
+    }
+    /** The map update's chip sits under the game's notice while one is shown. */
+    private void positionMapChip() { if (mapChip!=null) mapChip.setTranslationY(noticeChip!=null && noticeChip.getVisibility()==View.VISIBLE ? dp(40) : 0); }
+    private void showNextNotice() {
+        if (noticeShowing) return;
+        String line=noticeQueue.poll();
+        if (line==null) { noticeChip.setVisibility(View.GONE); positionMapChip(); return; }
+        noticeShowing=true;
+        noticeChip.setText(line); noticeChip.setVisibility(View.VISIBLE); positionMapChip();
+        final int gen=noticeGen;
+        main.postDelayed(() -> {
+            if (destroyed || gen!=noticeGen) return;
+            noticeShowing=false; noticeChip.setVisibility(View.GONE); positionMapChip();
+            showNextNotice();
+        },4000);
+    }
+
     /** Multi-window (Android 10+; never called before): the game runs only in the window on top. Not the window
      *  focus: the app's own dialogs (settings, cheats, Bloodframe) take that and the game keeps running behind them. */
     @Override public void onTopResumedActivityChanged(boolean top) {
@@ -594,17 +859,26 @@ public final class MainActivity extends Activity {
      *  (a player pause, the app in the background, another window on top). Main thread. */
     private void applyPause() {
         synchronized (pauseLock) {
-            boolean hold=userPaused || backgrounded || notTop, stop=hold && gamePid>0;
+            boolean hold=userPaused || backgrounded || notTop, stop=hold && gamePid>0 && !onlineGame;
             if (stop && !stopped) { pad.reset(); android.os.Process.sendSignal(gamePid,SIGSTOP); }
             else if (!stop && stopped) android.os.Process.sendSignal(gamePid,SIGCONT);
             stopped=stop;
-            if (audio!=null) { if (hold) audio.pause(); else audio.resume(); }
+            boolean quiet=hold && onlineGame;
+            if (quiet) pad.reset();
+            // Online: the game runs on, so its sound is muted (the track keeps flowing, see AudioBridge.mute) and its
+            // frames are dropped while nothing shows them (see bbpresent.c); resuming undoes both.
+            BbPresent.setHold(quiet);
+            if (audio!=null) {
+                audio.mute(quiet);
+                if (hold && !onlineGame) audio.pause(); else audio.resume();
+            }
         }
         updatePauseUi();
     }
     private void togglePause() {
         synchronized (pauseLock) {
             if (gamePid<=0) return; // no game
+            if (onlineGame) { main.post(() -> android.widget.Toast.makeText(this,"Pause is off while playing online",android.widget.Toast.LENGTH_SHORT).show()); return; }
             userPaused=!userPaused;
         }
         applyPause();
@@ -614,20 +888,23 @@ public final class MainActivity extends Activity {
     private void releasePause(boolean signal) {
         synchronized (pauseLock) {
             if (signal && stopped && gamePid>0) android.os.Process.sendSignal(gamePid,SIGCONT);
-            gamePid=0; userPaused=false; stopped=false;
-            if (audio!=null && !backgrounded && !notTop) audio.resume();
+            gamePid=0; userPaused=false; stopped=false; onlineGame=false;
+            BbPresent.setHold(false);
+            if (audio!=null) { audio.mute(false); if (!backgrounded && !notTop) audio.resume(); }
         }
-        main.post(() -> { if (!destroyed) updatePauseUi(); });
+        main.post(() -> { if (!destroyed) { updatePauseUi(); clearNetStatus(); } });
     }
     /** The pause row (Pause game / Play game), the "Paused" chip and the on-screen controller, which a pause hides. */
     private void updatePauseUi() {
-        boolean paused, running;
-        synchronized (pauseLock) { paused=userPaused; running=gamePid>0; }
+        boolean paused, running, noPause;
+        synchronized (pauseLock) { paused=userPaused; running=gamePid>0; noPause=onlineGame; }
         if (pauseItem!=null) {
             ((android.widget.ImageView)pauseItem.findViewWithTag("icon")).setImageResource(
                 getResources().getIdentifier(paused ? "ic_play" : "ic_pause","drawable",getPackageName()));
             ((TextView)pauseItem.findViewWithTag("title")).setText(paused ? "Play game" : "Pause game");
-            setDetail(pauseItem,paused ? "Paused" : running ? "Freezes the game and its sound" : "The game is not running");
+            setDetail(pauseItem,paused ? "Paused" : noPause ? "Not available while playing online"
+                : running ? "Freezes the game and its sound" : "The game is not running");
+            pauseItem.setAlpha(noPause ? 0.45f : 1f);
         }
         if (pausedChip!=null) pausedChip.setVisibility(paused && !drawerOpen ? View.VISIBLE : View.GONE);
         if (controllerOverlay!=null) {
@@ -642,8 +919,25 @@ public final class MainActivity extends Activity {
         if (controllerOverlay==null) return;
         boolean paused;
         synchronized (pauseLock) { paused=userPaused; }
-        boolean show=!drawerOpen && (controllerOverlay.isEditing() || (controllerEnabled() && !paused));
+        boolean show=!drawerOpen && (controllerOverlay.isEditing() || (controllerEnabled() && !paused && !fullMapOpen));
         controllerOverlay.setVisibility(show ? View.VISIBLE : View.INVISIBLE);
+    }
+    /** Opens the full-screen map (Hunter's Atlas) over the game: the on-screen controller is released and hidden, the mini map hides,
+     *  the game keeps running (a physical gamepad still plays). */
+    private void openFullMap() {
+        if (fullMapOpen || destroyed || drawerOpen || atlas==null || atlasFull==null || controllerOverlay.isEditing() || !atlas.floatOn()) return;
+        controllerOverlay.release();
+        atlas.setFullOpen(true);
+        if (!atlas.fullOpen()) return; // the map could not open (not ready)
+        fullMapOpen=true;
+        applyOverlayVisibility();
+    }
+    /** Closes the full-screen map: back to the mini map (with the route) and the on-screen controller. */
+    private void closeFullMap() {
+        if (!fullMapOpen) return;
+        fullMapOpen=false;
+        if (atlas!=null) atlas.setFullOpen(false);
+        applyOverlayVisibility();
     }
     /** The floating mini map's square, from the layout editor's place (view pixels of the game's layout). */
     private void placeMini(int left,int top,int side) {
@@ -1365,6 +1659,9 @@ public final class MainActivity extends Activity {
             if (app0!=null) extra.add("BB_APP0_DIR="+app0);
             // The map: where the game writes its state for the second screen (BB_ATLAS_FILE) and the flags it is asked for.
             atlas.prepareLaunch(extra);
+            // Online play (the pool's variables, the host overrides; secrets only in the process environment).
+            String onlineNotice=online.prepareLaunch(extra,new File(BASE),modsLog);
+            if (onlineNotice!=null) main.post(() -> { if (!destroyed) toast(onlineNotice); });
             // Automatic GPU driver: the bundled one for this GPU (installed from the APK on first use) or the phone's own.
             if (gpuSetting().equals("auto")) {
                 AutoDriver.Result auto=AutoDriver.resolve(this,drivers,gpu(),Build.VERSION.SDK_INT,
@@ -1393,8 +1690,11 @@ public final class MainActivity extends Activity {
             if (gameLog.length()>0) { previous.delete(); gameLog.renameTo(previous); }
             final Process launched=launchScript(extra.toArray(new String[0]));
             game=launched;
-            synchronized (pauseLock) { gamePid=pidOf(launched); }
+            synchronized (pauseLock) { gamePid=pidOf(launched); onlineGame=online.launchedOnline(); }
             main.post(this::applyPause); // the app may be in the background already
+            main.post(() -> { if (!destroyed) startNoticePoll(); });
+            // The map pack is brought up to date in the background when it is older than this app expects (never awaited here).
+            main.post(() -> { if (!destroyed) atlas.autoUpdate(); });
             Thread log=new Thread(() -> {
                 try (BufferedReader r=new BufferedReader(new InputStreamReader(launched.getInputStream()));
                      PrintWriter out=new PrintWriter(gameLog)) {
@@ -1402,7 +1702,7 @@ public final class MainActivity extends Activity {
                     out.flush();
                     boolean driverTrouble=false;
                     String line; while ((line=r.readLine())!=null) {
-                        out.println(line); out.flush();
+                        out.println(OnlineSettings.scrub(line)); out.flush();
                         if (!driverTrouble && driverTrouble(line)) driverTrouble=true;
                     }
                     int code=launched.waitFor();
@@ -1444,7 +1744,7 @@ public final class MainActivity extends Activity {
         if (p!=null) { p.destroyForcibly(); try { p.waitFor(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
     @Override protected void onDestroy() {
-        destroyed=true; if (atlasDialog!=null) atlasDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); audio.stop(); main.removeCallbacksAndMessages(null);
+        destroyed=true; if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); audio.stop(); main.removeCallbacksAndMessages(null);
         stopGame();
         worker.shutdownNow(); super.onDestroy();
     }

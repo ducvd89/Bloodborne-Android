@@ -14,6 +14,7 @@ public final class BbPresent {
     private static native String nativeStart(String socketPath);
     private static native void nativeSetSurface(Surface surface);
     private static native long nativeFrames();
+    private static native void nativeSetHold(boolean hold);
     private static native void nativeShutdown();
 
     private static SurfaceHolder.Callback callback;
@@ -38,6 +39,10 @@ public final class BbPresent {
     }
 
     private static synchronized void setSurface(Surface surface) { nativeSetSurface(surface); }
+
+    /** An online game keeps running while the app is in the background or the screen is off: with hold on, its frames
+     *  are released unseen (a few per refresh at most) so it never waits for a display that is not there. */
+    public static synchronized void setHold(boolean hold) { if (used) nativeSetHold(hold); }
 
     /** Frames the game has presented to the app so far. */
     public static long frames() { return nativeFrames(); }

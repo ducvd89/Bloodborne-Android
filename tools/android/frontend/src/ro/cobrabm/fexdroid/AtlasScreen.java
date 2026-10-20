@@ -32,8 +32,9 @@ import java.util.function.BooleanSupplier;
 
 /** Hunter's Atlas (https://github.com/MikeTat1988/HuntersAtlas by MikeTat1988, GPL-2.0-or-later; this map is a port
  *  of its renderer): owns the map pack's data, the live state read from the game (AtlasState) and the views that show
- *  the map (AtlasView), 0 to 2 of them: the full map in a Presentation on the second display and/or the floating mini
- *  map, a view in the game's own layout (made by createMini, placed and layered by MainActivity). The map is on with
+ *  the map (AtlasView), 0 to 3 of them: the full map in a Presentation on the second display and/or the floating mini
+ *  map, a view in the game's own layout (made by createMini, placed and layered by MainActivity), and the full-screen
+ *  map over the game (createFull, opened by holding the mini map: setFullOpen; it hides the mini map while it is open). The map is on with
  *  the atlas_enabled setting; atlas_mode says where: "screen2", "float" or "both" (unset: the second screen when
  *  there is one, else floating; with no second display the effective mode is always floating, and the saved choice
  *  applies again when a display appears). The main screen is the display the game's activity is on
@@ -50,7 +51,7 @@ import java.util.function.BooleanSupplier;
  *  views (the file is read once per tick). */
 final class AtlasScreen implements DisplayManager.DisplayListener {
     static final String PREF_ENABLED="atlas_enabled", PREF_PICKUPS="atlas_pickups", PREF_NPC="atlas_npc", PREF_FOG="atlas_fog",
-        PREF_MODE="atlas_mode", PREF_ALPHA="atlas_float_alpha", PREF_DISPLAY="atlas_display";
+        PREF_MODE="atlas_mode", PREF_METERED_NOTICE="atlas_update_notice", PREF_ALPHA="atlas_float_alpha", PREF_PRINT_SIZE="atlas_print_size", PREF_DISPLAY="atlas_display", PREF_DOOR_LOG=AtlasDoorLog.PREF;
     static final String MODE_SCREEN="screen2", MODE_FLOAT="float", MODE_BOTH="both";
     static final int ALPHA_MIN=20, ALPHA_MAX=100, ALPHA_STEP=5, ALPHA_DEFAULT=50;
     /** The floating map is redrawn at most about 15 times a second, and only when the player or the flags changed. */
@@ -62,9 +63,13 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
     private final Handler main=new Handler(Looper.getMainLooper());
     private final ExecutorService jobs=Executors.newSingleThreadExecutor(r -> { Thread t=new Thread(r,"Atlas-jobs"); t.setDaemon(true); return t; });
     private final AtlasState state;
+    private final AtlasNav nav;
+    private final AtlasDoorLog doorLog;
+    private java.util.Set<Integer> requestedFlags=new java.util.HashSet<>();
+    private int sNav;
     private final DisplayManager displays;
 
-    private AtlasModel model; private boolean modelLoading;
+    private volatile AtlasModel model; private boolean modelLoading;
     private Bitmap background, parchment, icons; private Typeface bodyFace, titleFace; private boolean artLoaded, artLoading;
     private AtlasPresentation presentation; private AtlasView view;   // the second display's map
     private AtlasActivity atlasActivity;                              // ... or this activity (displays without FLAG_PRESENTATION)
@@ -78,6 +83,7 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
     private int lastMainId=-2; private long lastMainCheck;
     private static final long LAUNCH_TIMEOUT_MS=3500, LAUNCH_GUARD_MS=1000, TOP_WINDOW_MS=4000;
     private AtlasView mini;                                           // the floating mini map
+    private AtlasView full; private boolean fullOpen;                 // the full-screen map over the game
     private boolean resumed, destroyed, listening, launchedWithAtlas, ticking;
     private boolean gamePaused, suppressed, everValid, miniFed, miniDirty;
     private long lastPrefs, lastMini;
@@ -91,6 +97,9 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
         this.activity=activity; this.base=base;
         prefs=activity.getSharedPreferences("bloodborne",Context.MODE_PRIVATE);
         state=new AtlasState(new File(base,"atlas.shm"));
+        nav=new AtlasNav(base,prefs,main);
+        doorLog=new AtlasDoorLog(base,jobs);
+        nav.setListener(() -> { miniDirty=true; if (view!=null) view.invalidate(); if (mini!=null) mini.invalidate(); if (full!=null && fullOpen) full.invalidate(); });
         displays=(DisplayManager)activity.getSystemService(Context.DISPLAY_SERVICE);
         try { titleFace=activity.getResources().getFont(activity.getResources().getIdentifier("im_fell_english","font",activity.getPackageName())); }
         catch (Exception e) { titleFace=Typeface.SERIF; }
@@ -148,7 +157,9 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
     void setConfigListener(Runnable r) { configListener=r; }
     private void notifyConfig() { if (configListener!=null) configListener.run(); }
     /** The game is paused by the player: the floating map is hidden. */
-    void setGamePaused(boolean paused) { if (gamePaused!=paused) { gamePaused=paused; updateMini(); } }
+    void setGamePaused(boolean paused) {
+        if (gamePaused!=paused) { gamePaused=paused; if (mini!=null) mini.setFootAnimation(!paused); if (full!=null) full.setFootAnimation(!paused); updateMini(); }
+    }
     /** The layout editor is open: the editor draws the mini map's place, the view itself is hidden. */
     void setSuppressed(boolean on) { if (suppressed!=on) { suppressed=on; updateMini(); } }
     boolean pickups() { return prefs.getBoolean(PREF_PICKUPS,true); }
@@ -156,11 +167,30 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
     boolean fog() { return prefs.getBoolean(PREF_FOG,false); }
     void setOption(String key,boolean value) { prefs.edit().putBoolean(key,value).apply(); applyOptions(); }
     void setNpcMode(String mode) { prefs.edit().putString(PREF_NPC,mode).apply(); applyOptions(); }
+    /** Footprint size of the route: 0 small, 1 medium (default), 2 large. */
+    int printSize() { return Math.max(0,Math.min(2,prefs.getInt(PREF_PRINT_SIZE,1))); }
+    void setPrintSize(int size) { prefs.edit().putInt(PREF_PRINT_SIZE,Math.max(0,Math.min(2,size))).apply(); applyPrintSize(); }
+    private void applyPrintSize() {
+        if (view!=null) view.setPrintSize(printSize());
+        if (mini!=null) mini.setPrintSize(printSize());
+        if (full!=null) full.setPrintSize(printSize());
+    }
     private void applyOptions() {
         if (view!=null) view.setOptions(pickups(),npcMode(),fog());
         if (mini!=null) mini.setOptions(pickups(),npcMode(),fog());
+        if (full!=null) full.setOptions(pickups(),npcMode(),fog());
     }
     File base() { return base; }
+    AtlasNav nav() { return nav; }
+    boolean doorLog() { return prefs.getBoolean(PREF_DOOR_LOG,false); }
+    void setDoorLog(boolean on) { prefs.edit().putBoolean(PREF_DOOR_LOG,on).apply(); doorLog.reset(); }
+    /** The running game was asked for fewer flags than the pack's gates need (the pack was updated after it started). */
+    boolean flagsStale() {
+        AtlasModel m=model;
+        if (m==null || !launchedWithAtlas || m.navFlagIds.isEmpty()) return false;
+        for (int id:m.navFlagIds) if (!requestedFlags.contains(id)) return true;
+        return false;
+    }
 
     // ---- displays ----
 
@@ -239,16 +269,17 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
         sync();
     }
     void destroy() {
-        destroyed=true; sync(); state.close(); jobs.shutdownNow(); main.removeCallbacks(tick); ticking=false;
+        destroyed=true; cancelUpdate(); nav.destroy(); sync(); state.close(); jobs.shutdownNow(); main.removeCallbacks(tick); ticking=false;
     }
     /** The setting or the pack changed. */
     void refresh() { sync(); notifyConfig(); }
     /** The pack was installed or deleted: the data is read again. */
     void packChanged() {
-        model=null; modelLoading=false; artLoaded=false;
+        model=null; modelLoading=false; artLoaded=false; nav.setModel(null);
         if (presentation!=null) { presentation.dismiss(); }
         if (atlasActivity!=null) hide();
         if (mini!=null) mini.setModel(null,null);
+        if (full!=null) full.setModel(null,null);
         sync();
     }
 
@@ -261,6 +292,7 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
             }
             if (screenMode()) show(); else hide();
             if (mini!=null && floatMode()) ensureData(mini);
+            if (full!=null && fullOpen) ensureData(full);
             ensureTick();
         } else hide();
         applyFloat(); updateMini();
@@ -413,8 +445,9 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
     AtlasView makeView(Context context) {
         final AtlasView v=new AtlasView(context,jobs,titleFace,bodyFace!=null ? bodyFace : Typeface.SANS_SERIF);
         view=v;
-        v.setState(state);
+        v.setState(state); v.setNav(nav); v.setPrintSize(printSize());
         v.setOptions(pickups(),npcMode(),fog());
+        v.setBanner(statusText);
         ensureData(v);
         return v;
     }
@@ -426,12 +459,44 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
     AtlasView createMini(Context context) {
         final AtlasView v=new AtlasView(context,jobs,titleFace,bodyFace!=null ? bodyFace : Typeface.SANS_SERIF,true);
         mini=v;
-        v.setState(state);
+        v.setState(state); v.setNav(nav); v.setPrintSize(printSize());
         v.setOptions(pickups(),npcMode(),fog());
         v.setLayerType(View.LAYER_TYPE_HARDWARE,null);
         v.setAlpha(floatAlpha()/100f);
         v.setVisibility(View.GONE);
         return v;
+    }
+
+    /** The full-screen map over the game: a normal (interactive) map view with a Close button (MainActivity sets the handler),
+     *  fully opaque (no alpha, no layer), hidden until setFullOpen(true). It shares the model, the art, the state, the
+     *  destination and the routes with the other views. */
+    AtlasView createFull(Context context) {
+        final AtlasView v=new AtlasView(context,jobs,titleFace,bodyFace!=null ? bodyFace : Typeface.SANS_SERIF,false);
+        full=v;
+        v.setState(state); v.setNav(nav); v.setPrintSize(printSize());
+        v.setOptions(pickups(),npcMode(),fog());
+        v.setBanner(statusText);
+        v.setFootAnimation(!gamePaused);
+        v.setVisibility(View.GONE);
+        return v;
+    }
+    boolean fullOpen() { return fullOpen; }
+    /** Opens or closes the full-screen map (main thread): while it is open the mini map is hidden, one poll loop drives it
+     *  as the others; it starts following the player at the default zoom. */
+    void setFullOpen(boolean open) {
+        if (full==null || fullOpen==open) return;
+        if (open && (destroyed || !resumed || !wanted())) return;
+        fullOpen=open;
+        if (open) {
+            ensureData(full);
+            full.setVisibility(View.VISIBLE);
+            full.resetView(); full.requestApplyInsets();
+            ensureTick();
+        } else {
+            full.setVisibility(View.GONE);
+            miniDirty=true;
+        }
+        updateMini();
     }
 
     /** Gives a view the pack's data and art (read when first needed, for every view that asks). */
@@ -448,8 +513,10 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
             final AtlasModel m=model(); // blocks
             main.post(() -> {
                 modelLoading=false; if (destroyed) return;
+                nav.setModel(m);
                 if (view!=null) view.setModel(m,m.error);
                 if (mini!=null) mini.setModel(m,m.error);
+                if (full!=null) full.setModel(m,m.error);
             });
         });
     }
@@ -474,6 +541,7 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
                 background=bg; parchment=pc; icons=ic; if (f!=null) bodyFace=f; artLoaded=true;
                 if (view!=null) giveArt(view);
                 if (mini!=null) giveArt(mini);
+                if (full!=null) giveArt(full);
             });
         });
     }
@@ -483,7 +551,7 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
     }
 
     private boolean needTick() {
-        return !destroyed && (secondUp() || (mini!=null && resumed && wanted() && floatMode()));
+        return !destroyed && (secondUp() || (mini!=null && resumed && wanted() && floatMode()) || (fullOpen && resumed && wanted()));
     }
     private boolean secondUp() { return (presentation!=null || atlasActivity!=null) && view!=null; }
     private void ensureTick() { if (!ticking && needTick()) { ticking=true; main.post(tick); } }
@@ -495,12 +563,18 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
             if (!needTick()) { ticking=false; return; }
             long now=android.os.SystemClock.uptimeMillis();
             boolean polled=state.poll();
+            if (wanted()) {
+                if (model!=null) nav.useModel(model);
+                nav.onState(state);
+                if (doorLog()) doorLog.poll(model,state,nav.playerArea());
+            }
             if (polled && secondUp()) view.onState();
+            if (polled && fullOpen && full!=null) full.onState();
             if (now-lastMainCheck>500) { // the game's activity moved to another display without a configuration change
                 lastMainCheck=now; int id=mainDisplayId();
                 if (lastMainId!=-2 && id!=lastMainId) { lastMainId=id; displaysChanged(); } else lastMainId=id;
             }
-            if (mini!=null && resumed && wanted() && floatMode()) driveMini(now);
+            if (mini!=null && resumed && wanted() && floatMode() && !fullOpen) driveMini(now);
             if (now-lastPrefs>1000) { lastPrefs=now; applyOptions(); applyFloat(); }
             main.postDelayed(this,33);
         }
@@ -512,7 +586,7 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
         if (miniChanged()) miniDirty=true;
         if (miniDirty && now-lastMini>=MINI_INTERVAL_MS) {
             lastMini=now; miniDirty=false;
-            sMapped=state.mapped; sValid=state.valid; sx=state.x; sy=state.y; sz=state.z; sYaw=state.yaw; sBlock=state.block; sFlags=state.flagsVersion;
+            sMapped=state.mapped; sValid=state.valid; sx=state.x; sy=state.y; sz=state.z; sYaw=state.yaw; sBlock=state.block; sFlags=state.flagsVersion; sNav=nav.version;
             mini.onState();
             if (validNow) miniFed=true;
         }
@@ -520,7 +594,7 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
     }
     /** Something the mini map shows moved: validity, the block, the flags, the place (a tenth of a unit) or the facing. */
     private boolean miniChanged() {
-        return state.mapped!=sMapped || state.valid!=sValid || state.block!=sBlock || state.flagsVersion!=sFlags
+        return nav.version!=sNav || state.mapped!=sMapped || state.valid!=sValid || state.block!=sBlock || state.flagsVersion!=sFlags
             || Math.abs(state.x-sx)>.1f || Math.abs(state.y-sy)>.1f || Math.abs(state.z-sz)>.1f || Math.abs(state.yaw-sYaw)>.01f;
     }
 
@@ -528,12 +602,37 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
      *  editor is closed and the game has reported a valid place since it started (a later loading keeps the last frame). */
     private void updateMini() {
         if (mini==null) return;
-        boolean show=!destroyed && resumed && wanted() && floatMode() && !gamePaused && !suppressed && everValid && miniFed;
+        boolean show=!destroyed && resumed && wanted() && floatMode() && !gamePaused && !suppressed && everValid && miniFed && !fullOpen;
         int visibility=show ? View.VISIBLE : View.GONE;
         if (mini.getVisibility()!=visibility) mini.setVisibility(visibility);
     }
 
     // ---- the game's process ----
+
+    /** One request for the game: the generation written to atlas.flags, the flag ids in file order and the set of them. */
+    private static final class FlagRequest {
+        final int gen; final List<Integer> ids; final java.util.Set<Integer> requested;
+        FlagRequest(int gen,List<Integer> ids) { this.gen=gen; this.ids=ids; requested=new java.util.HashSet<>(ids); }
+    }
+    private int lastGen;
+    /** Writes atlas.flags for a model (every flag the pack's features need, then the gates' candidate flags; the state file
+     *  holds MAX_FLAGS, the tail is dropped) with a generation newer than any written before (the game applies a file
+     *  whose generation it has not seen). Any thread; writes are serialized so the file and the order of the main-thread
+     *  applyRequest posts agree. */
+    private synchronized FlagRequest writeRequest(AtlasModel m,File flags) throws java.io.IOException {
+        int gen=(int)(System.currentTimeMillis()/1000L);
+        if (gen<=lastGen) gen=lastGen+1;
+        lastGen=gen;
+        java.util.LinkedHashSet<Integer> want=new java.util.LinkedHashSet<>(m.features.flagIds); want.addAll(m.navFlagIds);
+        FlagRequest r=new FlagRequest(gen,AtlasState.limited(want));
+        AtlasState.writeFlags(flags,gen,r.ids);
+        return r;
+    }
+    /** Main thread: what the state reader expects from the game now. live: the game is running already (keep the mapping). */
+    private void applyRequest(FlagRequest r,boolean live) {
+        requestedFlags=r.requested; doorLog.reset();
+        if (live) state.expectLive(r.gen,new ArrayList<>(r.ids)); else state.expect(r.gen,new ArrayList<>(r.ids));
+    }
 
     /** Before the game starts (any thread): when the map is on, writes atlas.flags (every flag the pack's features
      *  need) and adds BB_ATLAS_FILE and BB_ATLAS_FLAGS_FILE to the game's environment. */
@@ -543,16 +642,165 @@ final class AtlasScreen implements DisplayManager.DisplayListener {
         if (!wanted()) return;
         try {
             AtlasModel m=model();
-            final int gen=(int)(System.currentTimeMillis()/1000L);
-            final List<Integer> ids=AtlasState.limited(m.features.flagIds);
             File shm=new File(base,"atlas.shm"), flags=new File(base,"atlas.flags");
             shm.delete();
-            AtlasState.writeFlags(flags,gen,ids);
+            final FlagRequest r=writeRequest(m,flags);
             extra.add("BB_ATLAS_FILE="+shm.getPath());
             extra.add("BB_ATLAS_FLAGS_FILE="+flags.getPath());
             launchedWithAtlas=true;
-            main.post(() -> state.expect(gen,new ArrayList<>(ids)));
+            main.post(() -> applyRequest(r,false));
         } catch (Exception e) { android.util.Log.w("Bloodborne","atlas launch: "+e); }
+    }
+
+    // ---- the map pack's update (at the game's start, or from the menu) ----
+
+    /** The menu follows a running download. All calls on the main thread. */
+    interface UpdateListener {
+        void progress(long done,long total,boolean unpacking);
+        /** problem: the reason it failed (null: installed, or cancelled). The model is reloaded and the game's flags renewed first. */
+        void finished(String problem,boolean cancelled);
+    }
+    private final List<UpdateListener> updateListeners=new ArrayList<>();
+    private AtlasPack.Install install;
+    private long updateDone, updateTotal; private boolean updateUnpacking;
+    private String statusText; private int statusToken;
+    private java.util.function.Consumer<String> statusListener;
+    private int reloadToken;
+
+    boolean updating() { return install!=null; }
+    long updateDone() { return updateDone; }
+    long updateTotal() { return updateTotal; }
+    boolean updateUnpacking() { return updateUnpacking; }
+    void addUpdateListener(UpdateListener l) { if (!updateListeners.contains(l)) updateListeners.add(l); }
+    void removeUpdateListener(UpdateListener l) { updateListeners.remove(l); }
+    void cancelUpdate() { AtlasPack.Install i=install; if (i!=null) i.cancel(); }
+    /** The chip on the game's screen (MainActivity): text (null: hidden). */
+    void setStatusListener(java.util.function.Consumer<String> l) { statusListener=l; if (l!=null) l.accept(statusText); }
+    /** The text of the chip / the second screen's banner while the map pack is being updated (null: none). */
+    String statusLine() { return statusText; }
+    private void setStatus(String text,long ttlMs) {
+        statusText=text; final int token=++statusToken;
+        if (statusListener!=null) statusListener.accept(text);
+        if (view!=null) view.setBanner(text);
+        if (full!=null) full.setBanner(text);
+        if (text!=null && ttlMs>0) main.postDelayed(() -> { if (token==statusToken && !destroyed) setStatus(null,0); },ttlMs);
+    }
+
+    /** At the game's start and when the map is turned on: the map is on and the pack is not there or older than this app
+     *  expects: the update runs in the background (the game never waits for it) on a network that is not metered; on a
+     *  metered one the player is told once (per pack version) where the Update button is. */
+    void autoUpdate() {
+        if (destroyed || !enabled() || install!=null || !AtlasPack.needsUpdate(base)) return;
+        int mode=networkMode();
+        if (mode==NET_NONE) return; // offline: tried again at the next start
+        if (mode==NET_METERED) {
+            if (prefs.getInt(PREF_METERED_NOTICE,0)>=AtlasPack.PACK_VERSION) return;
+            prefs.edit().putInt(PREF_METERED_NOTICE,AtlasPack.PACK_VERSION).apply();
+            setStatus(AtlasPack.installed(base)
+                ? "Map update available ("+AtlasPack.APPROX_MB+" MB) \u2014 Hunter's Atlas menu \u2192 Update"
+                : "Map data needs a download ("+AtlasPack.APPROX_MB+" MB) \u2014 Hunter's Atlas menu \u2192 turn the Map off and on",9000);
+            return;
+        }
+        startUpdate();
+    }
+    private static final int NET_NONE=0, NET_METERED=1, NET_FREE=2;
+    private int networkMode() {
+        try {
+            android.net.ConnectivityManager cm=(android.net.ConnectivityManager)activity.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm==null) return NET_METERED;
+            android.net.NetworkInfo info=cm.getActiveNetworkInfo();
+            if (info==null || !info.isConnected()) return NET_NONE;
+            return cm.isActiveNetworkMetered() ? NET_METERED : NET_FREE;
+        } catch (RuntimeException e) { return NET_METERED; } // no permission or no service: ask first
+    }
+
+    /** Starts the one download of the map pack (also the menu's, which then shares it). false: one runs already. The old pack
+     *  stays (and keeps drawing) until the new one is verified, unpacked and swapped in; then the model, the art and the
+     *  game's flags are renewed live. */
+    boolean startUpdate() {
+        if (destroyed || install!=null) return false;
+        final AtlasPack.Install job=new AtlasPack.Install(); install=job;
+        updateDone=0; updateTotal=0; updateUnpacking=false;
+        setStatus("Updating map data\u2026",0);
+        Thread t=new Thread(() -> {
+            String failure=null; boolean cancelled=false;
+            try {
+                job.run(base,(done,total) -> main.post(() -> {
+                    if (install!=job) return;
+                    updateDone=done; updateTotal=total; updateUnpacking=false;
+                    setStatus(total>0 ? "Updating map data\u2026 "+(done*100/total)+"%" : "Updating map data\u2026",0);
+                    for (UpdateListener l:new ArrayList<>(updateListeners)) l.progress(done,total,false);
+                }),() -> main.post(() -> {
+                    if (install!=job) return;
+                    updateUnpacking=true;
+                    setStatus("Updating map data\u2026 unpacking",0);
+                    for (UpdateListener l:new ArrayList<>(updateListeners)) l.progress(updateDone,updateTotal,true);
+                }));
+            } catch (java.util.concurrent.CancellationException e) { cancelled=true; }
+            catch (Exception e) { failure=AtlasPack.message(e); android.util.Log.e("Bloodborne","map pack: "+e); }
+            final String problem=failure; final boolean stopped=cancelled;
+            main.post(() -> finishUpdate(job,problem,stopped));
+        },"Atlas-download");
+        t.setDaemon(true); t.start();
+        return true;
+    }
+    private void finishUpdate(AtlasPack.Install job,String problem,boolean cancelled) {
+        if (install!=job) return;
+        install=null;
+        if (destroyed) return;
+        if (problem!=null || cancelled) {
+            setStatus(problem!=null && updateListeners.isEmpty() ? "Map update failed \u2014 will retry next launch" : null,5000);
+            for (UpdateListener l:new ArrayList<>(updateListeners)) l.finished(problem,cancelled);
+            return;
+        }
+        final boolean silent=updateListeners.isEmpty();
+        reloadPack(() -> {
+            setStatus(silent ? (launchedWithAtlas || !gameRunningHint() ? "Map data updated" : "Map data updated \u2014 restart the game to use the map") : null,3500);
+            for (UpdateListener l:new ArrayList<>(updateListeners)) l.finished(null,false);
+        });
+    }
+    private BooleanSupplier gameRunning; // set by MainActivity: a game process runs
+    void setGameRunning(BooleanSupplier running) { gameRunning=running; }
+    private boolean gameRunningHint() { BooleanSupplier g=gameRunning; return g!=null && g.getAsBoolean(); }
+
+    /** The pack on disk changed under a running map: reads the new model and art in the background and swaps them into the
+     *  views when ready (the old ones keep drawing until then). If the game was started with the map's files its flag list is
+     *  rewritten with a new generation for the new model's flags (the game's reader notices the file's change within about
+     *  a second). after runs on the main thread when it is done. When the map is off the data is just dropped (read when the map
+     *  is turned on). */
+    private void reloadPack(final Runnable after) {
+        final int token=++reloadToken;
+        if (!wanted()) { packChanged(); if (after!=null) after.run(); return; }
+        jobs.execute(() -> {
+            final AtlasModel m=AtlasModel.load(AtlasPack.dir(base));
+            File art=new File(AtlasPack.dir(base),"art");
+            final Bitmap bg=decode(new File(art,"background.png")), pc=decode(new File(art,"parchment.png")), ic=decode(new File(art,"icons.png"));
+            Typeface face=null; File ttf=new File(art,"fallback.ttf");
+            if (ttf.isFile()) { try { face=Typeface.createFromFile(ttf); } catch (RuntimeException e) { android.util.Log.w("Bloodborne","atlas font: "+e); } }
+            final Typeface f=face;
+            FlagRequest request=null;
+            if (launchedWithAtlas) {
+                try { request=writeRequest(m,new File(base,"atlas.flags")); }
+                catch (Exception e) { android.util.Log.w("Bloodborne","atlas flags after the update: "+e); }
+            }
+            final FlagRequest r=request;
+            main.post(() -> {
+                if (destroyed) return;
+                if (token==reloadToken) {
+                    model=m; modelLoading=false;
+                    nav.setModel(m);
+                    if (f!=null) bodyFace=f;
+                    background=bg; parchment=pc; icons=ic; artLoaded=true;
+                    if (view!=null) { view.setModel(m,m.error); giveArt(view); }
+                    if (mini!=null) { mini.setModel(m,m.error); giveArt(mini); }
+                    if (full!=null) { full.setModel(m,m.error); giveArt(full); }
+                    if (r!=null) applyRequest(r,true);
+                    miniDirty=true;
+                    sync();
+                }
+                if (after!=null) after.run();
+            });
+        });
     }
 
     // ---- the window ----

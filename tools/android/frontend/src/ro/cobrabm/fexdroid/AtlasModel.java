@@ -63,12 +63,18 @@ final class AtlasModel {
         final List<AtlasFeatures.Lamp> mapLamps=new ArrayList<>();
         final List<Landmark> landmarks=new ArrayList<>();
         final List<Region> regions=new ArrayList<>();
+        /** Route data (pack version 2): the area's gates, from maps/nav/&lt;id&gt;.gates.json; null when the pack has none. */
+        NavGate[] gates;
+        boolean navData; // maps/nav/<id>.bnv exists
     }
 
     final File root;
     final List<Area> areas=new ArrayList<>();
     AtlasFeatures features=new AtlasFeatures();
     String error;
+    /** pack.json's pack_version (1 when absent) and the flags every gate of every area reads (pack version 2). */
+    int packVersion=1;
+    final java.util.LinkedHashSet<Integer> navFlagIds=new java.util.LinkedHashSet<>();
 
     private AtlasModel(File root) { this.root=root; }
 
@@ -139,8 +145,29 @@ final class AtlasModel {
             }
         } catch (Throwable e) { android.util.Log.w("Bloodborne","atlas catalog: "+e); }
         m.features=AtlasFeatures.load(find(maps,root,"features.json"));
+        m.loadNav(maps);
         return m;
     }
+
+    /** pack.json's version and the gate tables of maps/nav (pack version 2). Tolerant: what cannot be read is left out. */
+    private void loadNav(File maps) {
+        try {
+            JSONObject pack=new JSONObject(read(new File(root,"pack.json")));
+            packVersion=pack.optInt("pack_version",1);
+        } catch (Exception e) { packVersion=1; }
+        if (packVersion<2) return;
+        for (Area a:areas) {
+            File g=new File(new File(maps,"nav"),a.id+".gates.json");
+            a.navData=new File(new File(maps,"nav"),a.id+".bnv").isFile();
+            if (!g.isFile() || !a.navData) { a.navData=false; continue; }
+            try {
+                a.gates=NavGate.parse(read(g));
+                for (NavGate gate:a.gates) for (NavGate.Flag f:gate.flags) navFlagIds.add(f.id);
+            } catch (Exception e) { a.gates=null; a.navData=false; android.util.Log.w("Bloodborne","atlas gates "+a.id+": "+e); }
+        }
+    }
+    /** The pack has route data for at least one area. */
+    boolean navAvailable() { for (Area a:areas) if (a.navData) return true; return false; }
 
     /** maps/name, else the pack's root (the C++ looks for the catalog beside the maps folder). */
     private static File find(File maps,File root,String name) {
