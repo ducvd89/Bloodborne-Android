@@ -81,6 +81,12 @@ public final class MainActivity extends Activity {
     private volatile boolean autoNoticeShown;
     private final AtomicBoolean gpuProbing=new AtomicBoolean();
     private ModsDialog mods;
+    /** Hunter's Atlas: the live map on the second screen (AtlasScreen), its menu (AtlasDialog) and the drawer row. */
+    private AtlasScreen atlas;
+    private AtlasDialog atlasDialog;
+    private LinearLayout atlasItem;
+    private AtlasView atlasMini;
+    private int miniL=-1, miniT, miniS;
     private GameInstaller installer;
     private AppUpdater updater;
     private ReportDialog report;
@@ -97,6 +103,7 @@ public final class MainActivity extends Activity {
         FILES="/data/data/"+getPackageName()+"/files";
         BASE=FILES+"/bbport";
         drivers=new DriverManager(new File(FILES));
+        atlas=new AtlasScreen(this,new File(BASE));
         GameInstaller.Host host=modsHost();
         mods=new ModsDialog(this,host); installer=new GameInstaller(this,host);
         updater=new AppUpdater(this,new AppUpdater.Host() {
@@ -171,8 +178,21 @@ public final class MainActivity extends Activity {
         status.setClickable(false);
 
         controllerOverlay=new TouchControllerOverlay(this,pad);
-        controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
+        // The overlay is INVISIBLE, not GONE, when hidden: it keeps its size, which places the floating mini map, and an
+        // invisible view takes no touch.
+        controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.INVISIBLE);
+        // Hunter's Atlas' floating mini map: above the game (and the status text), below the touch controller, the
+        // handle, the scrim and the drawer. It is not clickable (AtlasView mini), so touches go to what is under it.
+        atlasMini=atlas.createMini(this);
+        screen.addView(atlasMini,frame(dp(120),dp(120),Gravity.TOP|Gravity.LEFT));
         screen.addView(controllerOverlay,frame(-1,-1,Gravity.CENTER));
+        controllerOverlay.setMiniListener(new TouchControllerOverlay.MiniListener() {
+            @Override public void rect(int left,int top,int side) { placeMini(left,top,side); }
+            @Override public void editing(boolean on) { atlas.setSuppressed(on); }
+        });
+        atlas.setTopHooks(() -> sysTop,() -> { if (!destroyed) evalTop(); });
+        atlas.setConfigListener(() -> controllerOverlay.setMiniMap(atlas.floatOn()));
+        controllerOverlay.setMiniMap(atlas.floatOn());
 
         handle=new View(this);
         GradientDrawable grip=new GradientDrawable(); grip.setColor(0x80c6ad76); grip.setCornerRadius(dp(4));
@@ -236,6 +256,7 @@ public final class MainActivity extends Activity {
             new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).showCheats();
         });
         modsItem=menuItem("ic_extension","Mods","",() -> { closeDrawer(); mods.show(); });
+        atlasItem=menuItem("ic_map","Hunter's Atlas","",() -> { closeDrawer(); showAtlas(); });
         menuItem("ic_refresh","Restart game","Unsaved progress is lost",() -> new AlertDialog.Builder(this)
             .setTitle("Restart Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> restartGame()).show());
@@ -394,6 +415,7 @@ public final class MainActivity extends Activity {
         if ("1".equals(setting("cheat_items"))) cheats.add("infinite items");
         setDetail(cheatsItem,cheats.isEmpty() ? "Off" : String.join(" · ",cheats));
         mods.summary(text -> setDetail(modsItem,text));
+        setDetail(atlasItem,AtlasDialog.summary(atlas));
         String upscaler="off".equals(setting("upscaler")) ? "No upscaling"
             : setting("upscaler")==null || "gsr2".equals(setting("upscaler")) ? "Snapdragon GSR 2" : "FSR 3.1";
         String limit=setting("fps_limit");
@@ -418,7 +440,7 @@ public final class MainActivity extends Activity {
         if (drawerOpen) return;
         drawerOpen=true; controllerOverlay.release(); pad.reset();
         refreshDrawer();
-        controllerOverlay.setVisibility(View.GONE);
+        applyOverlayVisibility();
         handle.setVisibility(View.GONE);
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.setAlpha(0); scrim.setVisibility(View.VISIBLE); scrim.animate().alpha(1).setDuration(200).start();
@@ -428,8 +450,7 @@ public final class MainActivity extends Activity {
     private void closeDrawer() {
         if (!drawerOpen) return;
         drawerOpen=false; pad.reset();
-        controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
-        updatePauseUi();
+        updatePauseUi(); // also shows the controller again
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.animate().alpha(0).setDuration(180).withEndAction(() -> scrim.setVisibility(View.GONE)).start();
         drawer.animate().translationX(-dp(320)).setDuration(200)
@@ -521,12 +542,51 @@ public final class MainActivity extends Activity {
         synchronized (pauseLock) { backgrounded=false; }
         applyPause();
         if (updater!=null) updater.resumed(); // back from the "install unknown apps" setting
+        if (atlas!=null) atlas.resume();
+    }
+    /** The game's activity moved to another display or its display changed (also reported by the display listener):
+     *  the map's second screen is chosen again (never the display the game is on). */
+    @Override public void onConfigurationChanged(android.content.res.Configuration config) {
+        super.onConfigurationChanged(config);
+        if (atlas!=null) main.post(() -> { if (!destroyed) atlas.displaysChanged(); });
+    }
+    @Override protected void onStop() {
+        if (atlas!=null) atlas.stop();
+        super.onStop();
+    }
+    /** The Hunter's Atlas menu (the map on the second screen). */
+    private void showAtlas() {
+        if (atlasDialog!=null) atlasDialog.close();
+        atlasDialog=new AtlasDialog(this,atlas,new AtlasDialog.Host() {
+            @Override public boolean destroyed() { return destroyed; }
+            @Override public void closed() { if (!destroyed) immersive(); }
+            @Override public boolean needsRestart() { return displayReady && game!=null && !atlas.launchedWithAtlas(); }
+            @Override public void restart() { restartGame(); }
+            @Override public int miniPercent() { return controllerOverlay.miniPercent(); }
+            @Override public void setMiniPercent(int percent) { controllerOverlay.setMiniPercent(percent); }
+            @Override public void editMiniMap() {
+                if (atlasDialog!=null) atlasDialog.close();
+                // The editor on the mini map, with the controls as usual; the controller's visibility returns when it is done.
+                controllerOverlay.edit(() -> applyOverlayVisibility());
+                applyOverlayVisibility();
+            }
+        });
+        atlasDialog.show();
     }
     /** Multi-window (Android 10+; never called before): the game runs only in the window on top. Not the window
      *  focus: the app's own dialogs (settings, cheats, Bloodframe) take that and the game keeps running behind them. */
     @Override public void onTopResumedActivityChanged(boolean top) {
         super.onTopResumedActivityChanged(top);
-        synchronized (pauseLock) { notTop=!top; }
+        sysTop=top;
+        evalTop();
+    }
+    /** The system says whether this activity has the top. The Hunter's Atlas activity on the other display takes the
+     *  top for a moment when it opens (and returns it to this task at once): losing it to that one does not pause the
+     *  game; losing it to anything else does. */
+    private volatile boolean sysTop=true;
+    private void evalTop() {
+        boolean own=!sysTop && atlas!=null && atlas.ownWindowHasTop();
+        synchronized (pauseLock) { notTop=!sysTop && !own; }
         applyPause();
     }
 
@@ -571,9 +631,31 @@ public final class MainActivity extends Activity {
         }
         if (pausedChip!=null) pausedChip.setVisibility(paused && !drawerOpen ? View.VISIBLE : View.GONE);
         if (controllerOverlay!=null) {
-            if (paused) { controllerOverlay.release(); controllerOverlay.setVisibility(View.GONE); }
-            else if (!drawerOpen) controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.GONE);
+            if (paused) controllerOverlay.release();
+            applyOverlayVisibility();
         }
+        if (atlas!=null) atlas.setGamePaused(paused);
+    }
+    /** The touch controller shows while the menu is closed and the game is not paused, when it is on, or when the layout
+     *  editor is open on it (the Controller menu's, or the mini map's from the Hunter's Atlas menu). */
+    private void applyOverlayVisibility() {
+        if (controllerOverlay==null) return;
+        boolean paused;
+        synchronized (pauseLock) { paused=userPaused; }
+        boolean show=!drawerOpen && (controllerOverlay.isEditing() || (controllerEnabled() && !paused));
+        controllerOverlay.setVisibility(show ? View.VISIBLE : View.INVISIBLE);
+    }
+    /** The floating mini map's square, from the layout editor's place (view pixels of the game's layout). */
+    private void placeMini(int left,int top,int side) {
+        if (atlasMini==null || side<=0) return;
+        if (left==miniL && top==miniT && side==miniS) return;
+        miniL=left; miniT=top; miniS=side;
+        // Not during the layout pass that reported it.
+        atlasMini.post(() -> {
+            FrameLayout.LayoutParams p=frame(miniS,miniS,Gravity.TOP|Gravity.LEFT);
+            p.leftMargin=miniL; p.topMargin=miniT;
+            atlasMini.setLayoutParams(p);
+        });
     }
     /** The pid of a child process: Android's Process prints it ("Process[pid=1234, ...]"), else the "pid" field of its
      *  class (any of its superclasses). 0 when neither works (the game then cannot be paused). */
@@ -1281,6 +1363,8 @@ public final class MainActivity extends Activity {
             for (String line:modsLog) android.util.Log.i("Bloodborne",line);
             java.util.List<String> extra=new java.util.ArrayList<>();
             if (app0!=null) extra.add("BB_APP0_DIR="+app0);
+            // The map: where the game writes its state for the second screen (BB_ATLAS_FILE) and the flags it is asked for.
+            atlas.prepareLaunch(extra);
             // Automatic GPU driver: the bundled one for this GPU (installed from the APK on first use) or the phone's own.
             if (gpuSetting().equals("auto")) {
                 AutoDriver.Result auto=AutoDriver.resolve(this,drivers,gpu(),Build.VERSION.SDK_INT,
@@ -1360,7 +1444,7 @@ public final class MainActivity extends Activity {
         if (p!=null) { p.destroyForcibly(); try { p.waitFor(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
     @Override protected void onDestroy() {
-        destroyed=true; if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); audio.stop(); main.removeCallbacksAndMessages(null);
+        destroyed=true; if (atlasDialog!=null) atlasDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); audio.stop(); main.removeCallbacksAndMessages(null);
         stopGame();
         worker.shutdownNow(); super.onDestroy();
     }

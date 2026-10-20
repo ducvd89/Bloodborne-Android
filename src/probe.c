@@ -950,6 +950,7 @@ int main(int argc, char **argv) {
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
 #ifndef _WIN32
     start_cheats(segments, ns);
+    runtime_atlas_start(image, size);
     /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
     enum { MAIN_STACK=8*1024*1024 };
     unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);

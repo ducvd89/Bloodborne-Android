@@ -9,4 +9,12 @@
         <item name="android:navigationBarColor">#000000</item>
         <item name="android:windowLightStatusBar">false</item>
     </style>
+    <style name="AtlasTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowBackground">#181613</item>
+        <item name="android:statusBarColor">#181613</item>
+        <item name="android:navigationBarColor">#181613</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
 </resources>

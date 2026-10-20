@@ -114,6 +114,8 @@ if [[ ${1:-} == --test ]]; then
     out/sema-test
     "$CC" -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_content.c src/runtime_content.c -o out/content-test
     out/content-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_atlas.c -o out/atlas-test
+    out/atlas-test
     if [[ ${#cpu[@]} -gt 0 ]]; then
         "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_guest_cpu.c "${cpu[@]}" -o out/guest-cpu-test
         out/guest-cpu-test

@@ -3,6 +3,8 @@
     package="com.ducvd89.bloodborne" android:versionCode="32" android:versionName="1.0.0">
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="28" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Hunter's Atlas on a display without presentation windows (AtlasActivity): the game's task is brought back to the top. -->
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
     <!-- The menu's "Check for updates" installs the new APK through a PackageInstaller session. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- The game folder in shared storage (targetSdk 28: file paths, as the game process reads them). -->
@@ -26,6 +28,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Hunter's Atlas' map on a second display that refuses a Presentation: its own task on that display, never in
+             recents, not focusable (AtlasActivity). No orientation lock: it follows the display. -->
+        <activity android:name="ro.cobrabm.fexdroid.AtlasActivity" android:exported="false"
+            android:theme="@style/AtlasTheme" android:taskAffinity="com.ducvd89.bloodborne.atlas"
+            android:launchMode="singleInstance" android:excludeFromRecents="true" android:resizeableActivity="true"
+            android:noHistory="false" android:label="Hunter's Atlas"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation|uiMode" />
         <!-- Serves the problem report's zip (files/reports) to the share sheet; see ReportProvider. -->
         <provider android:name="ro.cobrabm.fexdroid.ReportProvider" android:authorities="com.ducvd89.bloodborne.reports"
             android:exported="false" android:grantUriPermissions="true" />

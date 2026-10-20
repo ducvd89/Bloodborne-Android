@@ -23,6 +23,9 @@ void runtime_restart(void);
 #endif
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
+/* Position and event-flag publisher for the Android app's map (src/runtime_atlas.c): with BB_ATLAS_FILE set,
+ * starts a thread that reads the game's memory (the image, `size` bytes) and writes the shared file. */
+void runtime_atlas_start(void *image, uint64_t size);
 uintptr_t runtime_resolve(const char *name, int is_data);
 void runtime_report(void);
 void runtime_finalize(void *dso);

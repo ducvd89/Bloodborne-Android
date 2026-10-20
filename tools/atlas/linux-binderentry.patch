@@ -1,0 +1,13 @@
+--- a/generate_atlas.py
++++ b/generate_atlas.py
+@@ -109,6 +109,10 @@
+     # scans other games for proprietary tools. Readers here use in-memory paths.
+     import soulstruct_local_config
+     sys.modules['soulstruct.config']=soulstruct_local_config
++    # LINUX PATCH: binder entry paths are Windows paths ('N:\\SPRJ\\...\\X.param'); pathlib.Path on Linux does not split on backslash.
++    from pathlib import PureWindowsPath as _PWP
++    from soulstruct.containers.entry import BinderEntry as _BE
++    _BE.name=property(lambda self:_PWP(self.path).name);_BE.stem=property(lambda self:_PWP(self.path).stem);_BE.minimal_stem=property(lambda self:_PWP(self.path).name.split('.')[0])
+     # Explicit imports make the frozen build's dependency discovery reliable.
+     import generate_navigation_maps as base
+     import probe_markers,update_verified_markers as markers
