@@ -59,14 +59,6 @@ def cheat_writes(text):
         '8b88fc000000' '8988f8000000' # mov ecx,[rax+0xfc]; mov [rax+0xf8],ecx
         '8b88f8000000')               # mov ecx,[rax+0xf8] (the game's own)
     writes.append((site, original, back, cave, code, b''))
-    # Items: the count change (count += amount, at 0x14d94a0); flag on: a negative amount (a blood
-    # vial or bullet used, items given away) leaves the count as it was.
-    site, original, back, cave = 0x14d9540, bytes.fromhex('448b63084501f44139c4'), 0x14d954a, CAVE + 0x40
-    code = bytes.fromhex('448b6308') + flag_test(cave + 4, CHEAT_FLAGS + 1) + bytes.fromhex(
-        '7405'                        # je +5 (off: add)
-        '4585f6' '7803'               # test r14d,r14d; js +3 (skip the add)
-        '4501f4' '4139c4')            # add r12d,r14d; cmp r12d,eax (the game's own)
-    writes.append((site, original, back, cave, code, b''))
     out = []
     for site, original, back, cave, code, _ in writes:
         if text[site:site + len(original)] != original:
@@ -75,6 +67,58 @@ def cheat_writes(text):
         hook = jump(site, cave) + b'\x90' * (len(original) - 5)
         assert cave + len(code) <= 0x50da000
         out += [(cave, code), (site, hook)]
+    out += item_use_writes(text)
+    return out
+
+
+# Items. The game's whole inventory goes through ChangeCount(container, slot, delta, &over) at
+# 0x14d94a0 (count += delta, clamped to the max), and every removal of goods through
+# Remove(container, slot, -n, force, ..) at 0x14d0be0 (it checks the goods' consumable flag, calls
+# ChangeCount at 0x14d0e48, and frees the slot when the count reaches 0). An earlier version skipped
+# every negative ChangeCount: that also skipped what is NOT a use - items moved to the storage box
+# (0x14da750 / the menu's send-to-storage 0x14fcd40: add to the box, then Remove from the
+# inventory), the over-the-cap moves, the max-count clamp when the cap changes (0x1a573f0), the
+# restock that takes vials back out of the storage (0x1b63bc0), discard (0x1743590), shop costs and
+# sales (0x1736140, 0x1b5cde0 via 0x1c14a00) - and left the inventory structures out of sync (no
+# Blood Vials in the inventory, the HUD slot still showing 20).
+# The player's USES are four Remove calls, found from the callers of 0x14d94a0 / 0x14d0be0
+# (all with force = 0, the consumable-flag path), and only these are made free now:
+#   0x18f983c  PlayerIns::ConsumeGoods(goods id), the virtual at vtable +0x400 (relocated slots
+#              0x538f718 / 0x538fe88). It is reached from the use-item animation event (id 0xfa1:
+#              the player event switch 0x18cef90 calls vtable +0x3e8 = 0x18c6db0, which calls +0x400
+#              for a player target). It looks the goods up in the quick-item list 0x14deff0 / the
+#              inventory 0x14d9f60 and calls Remove(inv + 0x1d0, slot, -1, 0, 0, 0), then
+#              `test eax,eax; setle cl` (the "last one used" flag). A flag word of the player's
+#              behaviour data ([[chr+0x3b0]+0x20]+0x200 & 0x200) already skips it for the game's
+#              own free uses. Blood Vials (goods 1000), the throwables, the other consumables.
+#   0x18fa58b  consume the firearm's bullet (0x18fa3f0 (player, slot, 1), from the shot event
+#              0x1a267a0: weapon type [param+0xe2] = 0xa / 0xb, the ammo slot read from the
+#              player's equip table [gamedata+0x1f4 + 4 * n]).
+#   0x18fa0b3, 0x18fa0ce   0x18f9f00 (player, n): pay n bullets of a weapon's cost (an event
+#              0x1a249d0 / a SpEffect 0x18b61c0): goods 901 first, then goods 900 (Quicksilver
+#              Bullets), both removed once the whole n is there (it returns 0, not paying, when
+#              they are not: nothing is removed then, with or without the cheat).
+# Each call's rel32 is moved to a 20-byte stub: flag off, it jumps to 0x14d0be0 (the same call);
+# flag on, it returns 1 (more than 0 left: nothing used up, the slot kept, no count change, no
+# quick-slot reset) without calling. The stub is also what the callers' return value checks see:
+# the 0x18f9841 `test eax, eax; setle cl` (a use is "not the last"), the others ignore it.
+# Nothing else is touched: with the flag off the game's code runs as it is.
+ITEM_USE_SITES = (0x18f983c, 0x18fa58b, 0x18fa0b3, 0x18fa0ce)
+ITEM_REMOVE = 0x14d0be0
+
+
+def item_use_writes(text):
+    stub = CAVE + 0x40
+    code = flag_test(stub, CHEAT_FLAGS + 1) + bytes.fromhex(
+        '7406'                        # je +6 (off: the game's own call)
+        'b801000000' 'c3')            # mov eax,1; ret (on: one left, nothing removed)
+    code += jump(stub + len(code), ITEM_REMOVE)    # off: the remove, with the caller's return address
+    assert stub + len(code) <= 0x50da000 and stub >= CAVE + 0x20
+    out = [(stub, code)]
+    for site in ITEM_USE_SITES:
+        if text[site:site + 5] != b'\xe8' + struct.pack('<i', ITEM_REMOVE - (site + 5)):
+            raise SystemExit(f'cheats: unexpected code at {site:#x}: not the 1.09 eboot')
+        out.append((site + 1, struct.pack('<i', stub - (site + 5))))    # call rel32 -> the stub
     return out
 
 
@@ -104,7 +148,7 @@ def main():
     write(args.out / 'fps=uncap.bin',
           patches.compile_patches(args.xml, patches.FPS_PRESETS['uncap'], args.app_version, segments))
     count += 1
-    # The title screen straight to the main menu, offline (on unless skip_network_choice=0).
+    # The title screen straight to the main menu, offline (only with skip_network_choice=1; off by default since 1.2.0).
     write(args.out / 'skip_network_choice=1.bin',
           patches.compile_patches(args.xml, [patches.SKIP_NETWORK_CHOICE], args.app_version, segments))
     count += 1
