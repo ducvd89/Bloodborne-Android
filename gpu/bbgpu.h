@@ -34,6 +34,14 @@ int bbgpu_overlay_captures_input(void);
  * Mouse input is zero while released, unfocused, in a text dialog or in the overlay. */
 typedef struct { float x, y; uint32_t buttons; int focused; } BbMouseState;
 void bbgpu_mouse_state(BbMouseState *state);
+/* A module's look at the window's events first (an SDL_Event and the SDL_Window, on the window thread): nonzero
+ * takes the event. Android has no SDL window: the filter is accepted and never called. */
+typedef int (*BbGpuEventFilter)(const void *sdl_event, void *sdl_window);
+void bbgpu_add_event_filter(BbGpuEventFilter filter);
+/* A line of text for the player over the game until called with NULL (any thread; online modules: BBSC's "joining
+ * the host"). The overlay has no such line on Android: the text goes to the file BB_NET_BANNER_FILE names (one
+ * line; the file is removed on NULL), else to the log. */
+void bbgpu_overlay_banner(const char *utf8);
 /* Patches the loaded image before the game runs (image still writable): libGnm entry hooks. */
 void bbgpu_patch_image(unsigned char *image, uint64_t size);
 /* 1 when bbgpu_patch_image installed the frame rate hooks (bbport_frame_rate.cpp); 0 when it did not

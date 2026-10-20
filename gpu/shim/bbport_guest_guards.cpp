@@ -32,6 +32,7 @@
 #include "common/types.h"
 #include "bbport_guest_guards.h"
 #include "bbport_guest_code.h"
+#include "bbport_patch_notes.h"
 #include "../../src/guest_cpu.h"
 
 #include <sys/mman.h>
@@ -79,6 +80,7 @@ u8* MapNear() {
 }
 
 void Writable(u64 address, std::size_t size) {
+    BbPatchNote(address, size, "guest guards (bbport_guest_guards)");
     const u64 page = u64(sysconf(_SC_PAGESIZE));
     const u64 start = address & ~(page - 1);
     mprotect(reinterpret_cast<void*>(start), address + size - start, PROT_READ | PROT_WRITE | PROT_EXEC);

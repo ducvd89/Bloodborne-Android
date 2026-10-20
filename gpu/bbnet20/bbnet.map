@@ -1,0 +1,5 @@
+/* The module's C interface (gpu/bbnet/bbnet.h) is all it exports. */
+{
+    global: bbnet_*;
+    local: *;
+};

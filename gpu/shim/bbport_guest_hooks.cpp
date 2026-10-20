@@ -2,6 +2,7 @@
 #include "bbport_guest_hooks.h"
 #include "bbport_heap_sites.h"
 #include "bbport_toggles.h"
+#include "bbport_patch_notes.h"
 #include "../../src/guest_cpu.h"
 
 #include <array>
@@ -206,6 +207,7 @@ bool Patch(u64 address, const unsigned char* expected, std::size_t size) {
         std::memcmp(bytes, expected, size) != 0) {
         return false;
     }
+    BbPatchNote(address, size, "guest hooks (bbport_guest_hooks)");
 #ifndef GUEST_CPU_NATIVE
     return guest_cpu_hook(address, size, OnHook) != 0;
 #endif

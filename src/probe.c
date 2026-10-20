@@ -592,7 +592,9 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
 /* bbport: live cheats (the Android app's Cheats menu). The cheat hooks (patch part cheats.bin,
  * build_thor_patch_parts.py) test flag bytes in the unused end of the data segment's last page;
  * BB_CHEATS_FILE holds them as digits ("10": infinite health on, items off). The file is read a
- * few times a second and the bytes follow it: the cheats switch while the game runs. */
+ * few times a second and the bytes follow it: the cheats switch while the game runs. A game started
+ * online (BB_ONLINE=1) has them forced off for the whole session: the flags are zeroed once and the
+ * file is never read, so nothing turns them on until the game restarts offline. */
 enum { CheatFlags = 0x56d3f00, CheatCount = 2 };
 static void *cheat_poller(void *arg) {
     const char *path = arg;
@@ -620,9 +622,17 @@ static void *cheat_poller(void *arg) {
 }
 static void start_cheats(Segment *segments, uint64_t ns) {
     const char *path = getenv("BB_CHEATS_FILE");
-    if (!path || !*path) return;
+    const char *online = getenv("BB_ONLINE");
+    int offline = !(online && online[0] == '1');
+    if (offline && (!path || !*path)) return;
     if (!mapped(segments, ns, CheatFlags, CheatCount)) {
         puts("Cheats: no flag bytes in this image");
+        return;
+    }
+    if (!offline) {
+        for (int i = 0; i < CheatCount; ++i) __atomic_store_n(image + CheatFlags + i, (unsigned char)0, __ATOMIC_RELAXED);
+        puts("Cheats: off while playing online");
+        fflush(stdout);
         return;
     }
     pthread_t thread;
@@ -638,6 +648,8 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     if (!f || fread(magic,1,8,f)!=8 || memcmp(magic,"BBPATCH2",8)) fail("invalid patch file");
     uint64_t base=read64(f), count=read64(f), bytes=0, rebased=0;
     unsigned char data[4096];
+    const char *owner=strrchr(path,'/'); /* the patch file's name, for runtime_code_patch_owner (argv: static) */
+    owner=owner ? owner+1 : path;
     for (uint64_t i=0;i<count;++i) {
         uint64_t offset=read64(f), length=read64(f);
         if (!length || length>sizeof(data) || !mapped(segments,ns,offset,length) || fread(data,1,length,f)!=length)
@@ -652,6 +664,7 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
             slots[nslots++]=target;
         }
         memcpy(image+offset,data,length);
+        runtime_code_patch_note((uintptr_t)(image+offset),length,owner);
         for (size_t s=0;s<nslots;++s) {
             uint64_t value;
             memcpy(&value,image+slots[s],8);
@@ -759,6 +772,11 @@ int main(int argc, char **argv) {
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
             runtime_savedata_configure(id);
+        char serial[16]="", title[128]="", version[16]="";
+        sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
+        sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
+        sfo_value(sfo,"APP_VER",version,sizeof(version),NULL);
+        runtime_net_configure(app0,serial,title,version);
     }
     bbgpu_register_kernel();
 #ifdef _WIN32
@@ -930,6 +948,7 @@ int main(int argc, char **argv) {
         }
         memcpy(image + relocs[i].target, &value, 8);
     }
+    runtime_net_image_mapped(image, size); /* online modules that read the original code */
     for (int i=0;i<patch_count;++i) apply_patches(patch_files[i], segments, ns, relocs, nr);
     if (!cpu_only) {
         bbgpu_patch_image(image, size);
@@ -948,6 +967,7 @@ int main(int argc, char **argv) {
     }
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
+    runtime_net_image_ready((uintptr_t)image, size); /* online game modules (BBSC) hook it now */
 #ifndef _WIN32
     start_cheats(segments, ns);
     runtime_atlas_start(image, size);
@@ -979,6 +999,7 @@ int main(int argc, char **argv) {
         }
     }
     if (gpu_enabled) bbgpu_adpf_register_main(); /* the game runs on this thread: the performance hint session */
+    runtime_net_start(); /* online sessions start with the game */
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     /* Static: the host stack may lie above 47-bit guest addresses (arm64 hosts). */

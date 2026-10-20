@@ -29,6 +29,8 @@ R GuestCall(R (*fn)(P...), A... args) {
         return;
     } else if constexpr (std::is_pointer_v<R>) {
         return reinterpret_cast<R>(static_cast<std::uintptr_t>(result));
+    } else if constexpr (std::is_same_v<R, bool>) {
+        return (result & 0xff) != 0; // a bool comes back in AL: the rest of RAX is whatever was there
     } else {
         static_assert(std::is_integral_v<R> || std::is_enum_v<R>);
         return static_cast<R>(result);

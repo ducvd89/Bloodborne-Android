@@ -66,6 +66,11 @@ int guest_cpu_handle_fault(int sig, siginfo_t *info, void *ucontext);
  * (bbport_guest_hooks.cpp uses int3 there): returns 0. */
 typedef void (*GuestHook)(GuestRegs *regs);
 int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook);
+/* The host wrote guest code in [address, address + size) (a byte patch made while the game runs, a hook
+ * installed): what the guest CPU translated of it is dropped, on every thread, and translated again from
+ * the new bytes when next run. A no-op on x86-64 hosts. The JIT has no page tracking here, so every write
+ * of code that may already have run needs this call after it. */
+void guest_cpu_invalidate(uintptr_t address, size_t size);
 /* The guest's time stamp counter (RDTSC) and its frequency in Hz. */
 uint64_t guest_cpu_tsc(void);
 uint64_t guest_cpu_tsc_frequency(void);

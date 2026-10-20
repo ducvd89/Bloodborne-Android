@@ -26,6 +26,7 @@
 #include "common/types.h"
 #include "bbport_frame_rate.h"
 #include "bbport_guest_code.h"
+#include "bbport_patch_notes.h"
 #include "../../src/guest_cpu.h"
 
 #include <sys/mman.h>
@@ -189,6 +190,7 @@ constexpr Redirect Redirects[] = {
 /// [address, address + size) writable (the loader sets the image's protection after
 /// bbgpu_patch_image; hooks installed earlier, BbGuestHooks, may have set a page's already).
 void Writable(u64 address, std::size_t size) {
+    BbPatchNote(address, size, "frame-rate hooks (bbport_frame_rate)");
     const u64 page = u64(sysconf(_SC_PAGESIZE));
     const u64 start = address & ~(page - 1);
     mprotect(reinterpret_cast<void*>(start), address + size - start, PROT_READ | PROT_WRITE | PROT_EXEC);

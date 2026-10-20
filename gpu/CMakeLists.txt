@@ -240,6 +240,19 @@ add_executable(settings-test EXCLUDE_FROM_ALL ../tests/test_settings.cpp shim/bb
 target_compile_options(settings-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(settings-test PRIVATE .. shim)
 
+# The game-code hooks' trampoline, run on an x86-64 host against fake game functions (tests/test_guest_code_hooks.cpp):
+# once with the hook called directly (the x86-64 runtime), once through a host-function thunk (the FEXCore build's
+# call path; the guest CPU is the host's here). ninja -C out/gpu guest-code-hooks-test guest-code-hooks-thunk-test.
+foreach(variant "" "-thunk")
+    add_executable(guest-code-hooks${variant}-test EXCLUDE_FROM_ALL ../tests/test_guest_code_hooks.cpp
+        shim/bbport_guest_code_hooks.cpp)
+    target_compile_options(guest-code-hooks${variant}-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(guest-code-hooks${variant}-test PRIVATE ../src shim)
+    target_link_libraries(guest-code-hooks${variant}-test PRIVATE Zydis::Zydis)
+endforeach()
+target_compile_definitions(guest-code-hooks-thunk-test PRIVATE BB_GUEST_HOOK_THUNK=1)
+target_compile_definitions(guest-code-hooks-test PRIVATE BB_GUEST_HOOK_THUNK=0)
+
 add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_include_directories(scene-resolution-test PRIVATE shim shadps4 third_party/gcn/include)
 # The test's Vulkan-Hpp inline methods have a different set of platform extensions
@@ -281,3 +294,48 @@ add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
 target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
 target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)
 
+
+# bbport online module (gpu/bbnet20, libbbnet20.so): shadPS4's network and NP libraries with the shadNet
+# client, and The Hunter's Dream backend. Built when its libraries are there; BB_NET=OFF leaves it out.
+# Without it the port plays offline. On Android (tools/android/build_bionic_deps.sh) its dependencies
+# (OpenSSL, protobuf, miniupnpc, zlib) are static libraries in the Bionic prefix; a protoc of the same
+# protobuf version runs on the build host (BB_HOST_PROTOC). Off by default elsewhere: only the Android build
+# loads it.
+option(BB_NET "Build the online module (shadNet)" ${ANDROID})
+if (BB_NET)
+    if (ANDROID)
+        set(OPENSSL_USE_STATIC_LIBS ON)
+        set(ZLIB_USE_STATIC_LIBS ON)
+        set(BB_HOST_PROTOC "" CACHE FILEPATH "protoc of the protobuf version in the Android prefix")
+    endif()
+    find_package(Protobuf CONFIG QUIET)
+    find_package(nlohmann_json CONFIG QUIET)
+    find_package(OpenSSL QUIET)
+    find_package(ZLIB QUIET)
+    find_path(MINIUPNPC_INCLUDE miniupnpc.h PATH_SUFFIXES miniupnpc)
+    find_library(MINIUPNPC_LIBRARY NAMES miniupnpc)
+    if (ANDROID AND BB_HOST_PROTOC AND NOT TARGET protobuf::protoc)
+        add_executable(protobuf::protoc IMPORTED)
+        set_target_properties(protobuf::protoc PROPERTIES IMPORTED_LOCATION "${BB_HOST_PROTOC}")
+    endif()
+    if (Protobuf_FOUND AND TARGET protobuf::protoc AND nlohmann_json_FOUND AND OpenSSL_FOUND AND ZLIB_FOUND AND
+        MINIUPNPC_INCLUDE AND MINIUPNPC_LIBRARY)
+        add_subdirectory(bbnet20)
+        message(STATUS "Online module: on (libbbnet20.so)")
+    else()
+        set(missing "")
+        foreach(dep Protobuf nlohmann_json OpenSSL ZLIB)
+            if (NOT ${dep}_FOUND)
+                list(APPEND missing ${dep})
+            endif()
+        endforeach()
+        if (NOT TARGET protobuf::protoc)
+            list(APPEND missing protoc)
+        endif()
+        if (NOT MINIUPNPC_INCLUDE OR NOT MINIUPNPC_LIBRARY)
+            list(APPEND missing miniupnpc)
+        endif()
+        list(JOIN missing ", " missing)
+        message(STATUS "Online module: off (missing: ${missing})")
+    endif()
+endif()

@@ -22,6 +22,7 @@
 #define STACK_MARGIN (256*1024)
 #define MIN_STACK (64*1024)
 #define DEFAULT_STACK (1024*1024)
+#define HOST_ENTRY_STACK (4*1024*1024)
 #define DEFAULT_PRIO 700
 
 typedef void *(ABI *GuestEntry)(void *);
@@ -43,6 +44,7 @@ typedef struct GuestThread {
     unsigned char *guest_stack; /* separate from the host stack when the guest CPU is not the host's */
     size_t guest_stack_size;
     int detached, finished, joined, host_owned;
+    int host_entry; /* entry is host code (the online module's threads), not a guest function */
     jmp_buf exit_jump;
     struct GuestThread *next;
 } GuestThread;
@@ -125,6 +127,7 @@ GuestThread *runtime_thread_current(void) {
 /* Host threads that call guest code (HLE decoders invoking guest callbacks) need
  * a TCB/TLS like guest threads; the record lives until process exit. */
 void runtime_thread_attach_host(const char *name) {
+    if (current) return; /* already a guest thread or attached: keep its name */
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "host");
 }
@@ -249,27 +252,36 @@ static void *host_start(void *p) {
     set_host_name(t->name);
     if (t->guest_stack) guest_cpu_thread_stack(t->guest_stack+t->guest_stack_size,t->guest_stack_size);
     const uint64_t argument=(uint64_t)(uintptr_t)t->argument;
-    if (!setjmp(t->exit_jump)) t->result=(void *)(uintptr_t)guest_cpu_call((uintptr_t)t->entry,1,&argument);
-    else guest_cpu_abandon();
+    if (!setjmp(t->exit_jump)) {
+        /* bbport online: a host entry (gpu/bbnet20's NP and signaling threads) is called as host code on this thread,
+         * which has a guest TCB and guest stack for the game's callbacks it makes (GuestCall); handing it to the
+         * guest CPU would run the host function's arm64 code as x86-64. */
+        if (t->host_entry) t->result=t->entry(t->argument);
+        else t->result=(void *)(uintptr_t)guest_cpu_call((uintptr_t)t->entry,1,&argument);
+    } else guest_cpu_abandon();
     runtime_thread_keys_cleanup();
     guest_cpu_thread_end();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
     return t->result;
 }
-static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,void *argument,const char *name) {
+static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,void *argument,const char *name,int host_entry) {
     if (!out || !entry) return ERR(22);
     ThreadAttr *a=NULL;
     if (attr_slot && !(a=find_attr(attr_slot))) return ERR(22);
     GuestThread *t=new_thread();
     if (!t) return ERR(12);
     if (a) { t->attr=*a; t->attr.next=NULL; }
-    t->entry=entry; t->argument=argument; t->detached=t->attr.detached;
+    t->entry=entry; t->argument=argument; t->detached=t->attr.detached; t->host_entry=host_entry;
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "guest");
     pthread_attr_t host;
     pthread_attr_init(&host);
     uint64_t stack=t->attr.stack<MIN_STACK ? MIN_STACK : t->attr.stack;
+    /* Host code (TLS, protobuf, asio) needs far more stack than the 128 KiB the game asks of its NP threads;
+     * the guest stack, for the game's callbacks they make, keeps at least 1 MiB. */
+    uint64_t host_stack=stack;
+    if (host_entry) { if (host_stack<HOST_ENTRY_STACK) host_stack=HOST_ENTRY_STACK; if (stack<DEFAULT_STACK) stack=DEFAULT_STACK; }
     /* Stacks below 1 TiB as on PS4; guest code may pack stack addresses. */
-    size_t stack_bytes=(size_t)stack+STACK_MARGIN;
+    size_t stack_bytes=(size_t)host_stack+STACK_MARGIN;
     void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
     if (stack_memory) pthread_attr_setstack(&host,stack_memory,stack_bytes);
     else pthread_attr_setstacksize(&host,stack_bytes);
@@ -290,7 +302,7 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     return 0;
 }
 static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry entry,void *argument,const char *name) {
-    return create(out,attr,entry,argument,name);
+    return create(out,attr,entry,argument,name,0);
 }
 static ABI int32_t thread_join(GuestThread *t,void **result) {
     if (!find_thread(t) || t->host_owned) return ERR(3);
@@ -318,6 +330,8 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     /* No host unwinder: guest frames have no registered FDEs. */
     longjmp(t->exit_jump,1);
 }
+/* pthread_exit for the online module's threads (gpu/bbnet20): ends the calling thread, host or guest. */
+__attribute__((noreturn)) void runtime_thread_exit(void *value) { thread_exit(value); }
 static ABI int32_t thread_yield(void) { sched_yield(); return 0; }
 static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
     if (!find_thread(t)) return ERR(3);
@@ -353,9 +367,30 @@ static ABI int32_t posix_attr_destroy(ThreadAttr **a) { return posix(attr_destro
 static ABI int32_t posix_attr_set_detach(ThreadAttr **a,int s) { return posix(attr_set_detach(a,s)); }
 static ABI int32_t posix_attr_set_stack(ThreadAttr **a,uint64_t s) { return posix(attr_set_stack(a,s)); }
 static ABI int32_t posix_attr_set_param(ThreadAttr **a,const int *p) { return posix(attr_set_param(a,p)); }
-static ABI int32_t posix_create(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg) { return posix(create(t,a,e,arg,"posix")); }
-static ABI int32_t posix_create_name(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg,const char *name) { return posix(create(t,a,e,arg,name)); }
+static ABI int32_t posix_create(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg) { return posix(create(t,a,e,arg,"posix",0)); }
+static ABI int32_t posix_create_name(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg,const char *name) { return posix(create(t,a,e,arg,name,0)); }
 static ABI int32_t posix_join(GuestThread *t,void **r) { return posix(thread_join(t,r)); }
+
+int32_t runtime_thread_spawn(void **out,void *(ABI *entry)(void *),void *argument,uint64_t stack,const char *name) {
+    ThreadAttr *attr=NULL;
+    int32_t r=attr_init(&attr);
+    if (!r && stack) r=attr_set_stack(&attr,stack<16384 ? 16384 : stack);
+    if (!r) r=create((GuestThread **)out,&attr,(GuestEntry)entry,argument,name,1);
+    if (attr) attr_destroy(&attr);
+    return posix(r);
+}
+/* The same for a guest function (a start routine the game gave to sceNpCreateThread). */
+int32_t runtime_thread_spawn_guest(void **out,void *(ABI *entry)(void *),void *argument,uint64_t stack,const char *name) {
+    ThreadAttr *attr=NULL;
+    int32_t r=attr_init(&attr);
+    if (!r && stack) r=attr_set_stack(&attr,stack<16384 ? 16384 : stack);
+    if (!r) r=create((GuestThread **)out,&attr,(GuestEntry)entry,argument,name,0);
+    if (attr) attr_destroy(&attr);
+    return posix(r);
+}
+int32_t runtime_thread_join_spawned(void *thread,void **result) {
+    return posix(thread_join((GuestThread *)thread,result));
+}
 
 uintptr_t runtime_thread_resolve(const char *name) {
     static const struct { const char *nid; void *fn; } table[]={

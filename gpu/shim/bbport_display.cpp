@@ -15,6 +15,7 @@
 #include "common/types.h"
 #include "bbport_display.h"
 #include "bbport_guest_code.h"
+#include "bbport_patch_notes.h"
 #include "../../src/guest_cpu.h"
 
 #include <sys/mman.h>
@@ -82,6 +83,7 @@ bool hud_anchor_on = true;
 
 // ---- Check / commit installation (as bbport_frame_rate.cpp) ----
 void Writable(u64 address, std::size_t size) {
+    BbPatchNote(address, size, "display hooks (bbport_display)");
     const u64 page = u64(sysconf(_SC_PAGESIZE));
     const u64 start = address & ~(page - 1);
     mprotect(reinterpret_cast<void*>(start), address + size - start, PROT_READ | PROT_WRITE | PROT_EXEC);

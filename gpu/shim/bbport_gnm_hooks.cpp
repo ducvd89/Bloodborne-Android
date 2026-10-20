@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_gnm_hooks.h"
+#include "bbport_patch_notes.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -590,6 +591,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
             ++mismatched;
             continue;
         }
+        BbPatchNote(reinterpret_cast<std::uintptr_t>(fn), e.prologue_size, "Gnm census hooks (bbport_gnm_hooks)");
         fn[0] = 0xe9;
         std::memcpy(fn + 1, &to_stub, 4);
         std::memset(fn + 5, 0xcc, e.prologue_size - 5);

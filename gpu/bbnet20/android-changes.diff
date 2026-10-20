@@ -1,0 +1,2337 @@
+diff
+--- a/gpu/bbnet20/bbnet_glue.cpp
++++ b/gpu/bbnet20/bbnet_glue.cpp
+@@ -4,7 +4,9 @@
+ 
+ #include <chrono>
+ #include <condition_variable>
++#include <csignal>
+ #include <cstdio>
++#include <exception>
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
+@@ -59,27 +61,108 @@
+ #include "core/libraries/np/np_web_api/np_web_api.h"
+ #include "core/libraries/np/np_web_api2/np_web_api2.h"
+ #include <algorithm>
++#include <dlfcn.h>
+ #include <sys/mman.h>
+-#include <SDL3/SDL_events.h>
+ 
+ #include "bbgpu.h"
+ #include "common/memory_patcher.h"
+ #include "common/singleton.h"
++#include "core/file_format/psf.h"
++#include "thd/thd.h"
++#ifdef BBNET_BBSC
++// bbport-android: BBSC (seamless co-op) is built only with BB_NET_BBSC (gpu/bbnet20/CMakeLists.txt).
++#include <SDL3/SDL_events.h>
+ #include "core/bbsc_cinematic.h"
+ #include "core/bbsc_persistence.h"
+ #include "core/bloodborne_re.h"
+ #include "core/cpu_patches.h"
+-#include "core/file_format/psf.h"
+ #include "games/game_profile.h"
+-#include "thd/thd.h"
++#endif
+ 
+ #include "bbnet/bbnet.h"
++#include "bbnet_guest.h"
++#include "bbnet_status.h" // bbport-android: the online status file
++#include "bbnet_tls.h"
++
++#ifdef BBNET_BBSC
++// The runtime's notes of who wrote the game's code (src/runtime_patches.c, in bb-probe); weak: absent in a test.
++extern "C" const char* runtime_code_patch_owner(uintptr_t address, size_t size) __attribute__((weak));
++#endif
+ 
+ namespace {
+ /// The runtime's side (bbnet_init).
+ BbNetHost g_host{};
++
++/// bbport-android: whether `entry` is this library's own code (a host function) or the game's (x86-64 code the
++/// guest CPU runs): sceNpCreateThread is called with both.
++bool IsHostEntry(const void* entry) {
++    static const void* module_base = [] {
++        Dl_info self{};
++        return dladdr(reinterpret_cast<const void*>(&IsHostEntry), &self) ? self.dli_fbase : nullptr;
++    }();
++    Dl_info other{};
++    return module_base && dladdr(entry, &other) && other.dli_fbase == module_base;
++}
++
++/// bbport-android: a host thread entry runs under a C++ exception guard (an exception that left it would end the
++/// process); the start routine and its argument travel in a small record.
++struct HostThread {
++    void* (*start)(void*);
++    void* arg;
++    std::string what;
++};
++void* HostThreadMain(void* p) {
++    const HostThread thread = *static_cast<HostThread*>(p);
++    delete static_cast<HostThread*>(p);
++    try {
++        return thread.start(thread.arg);
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "Online: C++ exception ended thread %s: %s\n", thread.what.c_str(), e.what());
++    } catch (...) {
++        std::fprintf(stderr, "Online: C++ exception ended thread %s\n", thread.what.c_str());
++    }
++    return nullptr;
++}
++int32_t SpawnHost(void** thread, void* (*start)(void*), void* arg, uint64_t stack, const char* name) {
++    auto* record = new HostThread{start, arg, std::string(name ? name : "np")};
++    const int32_t rc = g_host.thread_spawn(thread, HostThreadMain, record, stack, name ? name : "np");
++    if (rc != 0) {
++        delete record;
++    }
++    return rc;
++}
+ } // namespace
+ 
++namespace BbNet {
++const std::string& CaBundlePath() {
++    static const std::string path = [] {
++        if (const char* forced = std::getenv("BB_CA_BUNDLE"); forced && *forced) {
++            return std::string(forced);
++        }
++        // The runtime layout: lib/libbbnet20.so beside share/cacert.pem.
++        Dl_info self{};
++        if (dladdr(reinterpret_cast<const void*>(&CaBundlePath), &self) && self.dli_fname) {
++            std::filesystem::path candidate = std::filesystem::path(self.dli_fname).parent_path() /
++                                              ".." / "share" / "cacert.pem";
++            std::error_code error;
++            if (std::filesystem::is_regular_file(candidate, error)) {
++                return candidate.lexically_normal().string();
++            }
++        }
++        return std::string();
++    }();
++    return path;
++}
++
++void EnsureGuestThread() {
++    thread_local bool ready = false;
++    if (!ready) {
++        ready = true;
++        g_host.thread_attach("bbnet");
++    }
++}
++} // namespace BbNet
++
+ // The Hunter's Dream backend reads game structures (the player's position for the live map):
+ // only from mapped guest memory (bbport).
+ namespace BbEngine {
+@@ -305,13 +388,18 @@
+                                  PthreadEntryFunc start, void* arg, const char* name) {
+     if (!thread || !start) return 22;
+     const u64 stack = attr && *attr ? (*attr)->stack : 0;
+-    return g_host.thread_spawn(thread, start, arg, stack, name ? name : "np");
++    // bbport-android: a start routine of the game runs as guest code, one of this library as host code.
++    if (IsHostEntry(reinterpret_cast<const void*>(start))) {
++        return SpawnHost(thread, start, arg, stack, name);
++    }
++    return g_host.thread_spawn_guest(thread, start, arg, stack, name ? name : "np");
+ }
+ int posix_pthread_join(PthreadT thread, void** ret) {
+     return g_host.thread_join(thread, ret);
+ }
+ void posix_pthread_exit(void* status) {
+     g_host.thread_exit(status);
++    __builtin_unreachable();
+ }
+ 
+ } // namespace Libraries::Kernel
+@@ -371,6 +459,8 @@
+ }
+ void Push(Kind kind, std::string text) {
+     std::printf("Co-op: %s: %s\n", DisplayOf(kind).tag, text.c_str());
++    // bbport-android: no toast layer here; the text goes to the app's chip (BB_NET_BANNER_FILE).
++    BbNetStatus::Notice(text);
+     std::scoped_lock lock{history_mutex};
+     history.push_back({kind, std::move(text), {}});
+     ++unread;
+@@ -400,6 +490,8 @@
+ void Push(s32, std::string invitation_id, std::string, std::string from_npid) {
+     std::printf("Co-op: invitation %s from %s (invitations are not supported yet)\n",
+                 invitation_id.c_str(), from_npid.c_str());
++    // bbport-android: shown on the app's chip (BB_NET_BANNER_FILE).
++    BbNetStatus::Notice("Invited to a session by " + from_npid + " (invitations are not supported yet)");
+ }
+ void Dismiss(const std::string&) {}
+ void Register() {}
+@@ -482,14 +574,78 @@
+     return 0;
+ }
+ 
++#ifdef BBNET_BBSC
++namespace {
++/// bbport-android: what BBSC's hooks ask when the game's code is not what they expect. The port patches the code
++/// before BBSC gets to it (the launcher's patch files, the frame-rate and GPU hooks), and BBSC checks every site
++/// byte for byte and leaves one that differs alone: a hash of every 64-byte block of the image as it was mapped
++/// tells "changed by a port patch" from "not the build BBSC knows", and the runtime's notes (runtime_patches.c)
++/// say which patch. Taken only with BB_BBSC=1.
++constexpr std::size_t PristineBlock = 64;
++std::vector<uint32_t> g_pristine;
++const uint8_t* g_pristine_image = nullptr;
++uint64_t g_pristine_size = 0;
++
++uint32_t BlockHash(const uint8_t* block) {
++    uint64_t words[PristineBlock / 8];
++    std::memcpy(words, block, PristineBlock);
++    uint64_t h = 0x9e3779b97f4a7c15ull;
++    for (const uint64_t w : words) {
++        h = (h ^ w) * 0xff51afd7ed558ccdull;
++        h ^= h >> 32;
++    }
++    return uint32_t(h ^ (h >> 29));
++}
++
++void SnapshotPristine(const uint8_t* image, uint64_t size) {
++    g_pristine.assign(size_t(size / PristineBlock), 0);
++    for (size_t i = 0; i < g_pristine.size(); ++i) {
++        g_pristine[i] = BlockHash(image + i * PristineBlock);
++    }
++    g_pristine_image = image;
++    g_pristine_size = size;
++}
++
++std::string ExplainCodeMismatch(std::uintptr_t address, std::size_t size) {
++    if (!g_pristine_image || address < reinterpret_cast<std::uintptr_t>(g_pristine_image) ||
++        address + size > reinterpret_cast<std::uintptr_t>(g_pristine_image) + g_pristine_size) {
++        return "outside the image";
++    }
++    const std::size_t offset = address - reinterpret_cast<std::uintptr_t>(g_pristine_image);
++    char text[160];
++    bool changed = false;
++    for (std::size_t block = offset / PristineBlock; block <= (offset + size - 1) / PristineBlock; ++block) {
++        if (block < g_pristine.size() && BlockHash(g_pristine_image + block * PristineBlock) != g_pristine[block]) {
++            changed = true;
++        }
++    }
++    if (!changed) {
++        std::snprintf(text, sizeof(text), "image offset %#zx is as it was mapped: not the game build BBSC knows",
++                      offset);
++        return text;
++    }
++    const char* owner = runtime_code_patch_owner ? runtime_code_patch_owner(address, size) : nullptr;
++    std::snprintf(text, sizeof(text), "image offset %#zx was changed by the port after it was mapped (%s)", offset,
++                  owner ? owner : "a patcher that left no note");
++    return text;
++}
++} // namespace
++#endif
++
+ BBNET_EXPORT void bbnet_image_mapped(uint8_t* image, uint64_t size) {
+     // The Hunter's Dream backend reads the game's code before the patches change it.
+     BbThd::SetImage(image, size);
++#ifdef BBNET_BBSC
++    if (const char* bbsc = std::getenv("BB_BBSC"); bbsc && bbsc[0] == '1') {
++        SnapshotPristine(image, size);
++    }
++#endif
+ }
+ 
+ BBNET_EXPORT void bbnet_image_ready(uint64_t base, uint64_t size) {
+     MemoryPatcher::g_eboot_address = base;
+     MemoryPatcher::g_eboot_image_size = size;
++#ifdef BBNET_BBSC
+     // BBSC (Bloodborne seamless co-op): BB_BBSC=1 (the launcher's
+     // co-op switch). Its game code checks for CUSA03173 01.09; every retail Bloodborne runs the
+     // same 1.09 executable (gpu/games/bloodborne.cpp), and each of its sites is byte-checked.
+@@ -542,6 +698,10 @@
+     }
+     std::printf("BBSC: seamless co-op hooks for the image at %#llx (%u code mappings writable)\n",
+                 static_cast<unsigned long long>(base), writable);
++    // The pages stay read, write and execute (FEXCore here has no page tracking of the game's code: every write
++    // of it is followed by guest_cpu_invalidate, Core::GuestCodeWritten); a refused hook says who changed its site.
++    Core::KeepGuestCodeWritable();
++    Core::SetGuestCodeMismatchExplainer(&ExplainCodeMismatch);
+     if (const char* probe = std::getenv("BB_BBSC_PROBE")) {
+         const unsigned long long at = std::strtoull(probe, nullptr, 0);
+         if (FILE* maps = std::fopen("/proc/self/maps", "r")) {
+@@ -567,6 +727,17 @@
+     Core::Bloodborne::InstallSeamlessCoopPatches();
+     Core::Bbsc::InstallPersistentSessionPatches();
+     Core::Bloodborne::InstallReverseEngineeringTrace();
++    std::printf("BBSC: %u code hooks installed, %u refused (a refused one is logged above with its site: the game's "
++                "code there is not what BBSC checks for; the rest of BBSC runs without it)\n",
++                Core::GuestCodeHooksInstalled(), Core::GuestCodeHooksRefused());
++    std::fflush(stdout);
++#else
++    // bbport-android: no BBSC in this build: nothing of it is installed (no code patch, no mprotect of the
++    // game's code), whatever BB_BBSC says.
++    if (const char* bbsc = std::getenv("BB_BBSC"); bbsc && bbsc[0] == '1') {
++        std::printf("BBSC: not in this build: seamless co-op off\n");
++    }
++#endif
+ }
+ 
+ namespace Libraries::Np::NpManager {
+@@ -584,12 +755,21 @@
+ }
+ 
+ BBNET_EXPORT int bbnet_init(const BbNetHost* host) {
+-    if (!host || host->abi != BBNET_ABI_VERSION || !host->thread_spawn || !host->thread_join ||
+-        !host->thread_exit || !host->memory_is_mapped) {
++    if (!host || host->abi != BBNET_ABI_VERSION || !host->thread_spawn || !host->thread_spawn_guest ||
++        !host->thread_join || !host->thread_exit || !host->memory_is_mapped || !host->thread_attach) {
+         std::printf("Online: the runtime and the online module are from different versions\n");
+         return -1;
+     }
+     g_host = *host;
++    // bbport-android: a write to a socket the peer closed must fail with EPIPE, not end the game's process.
++    std::signal(SIGPIPE, SIG_IGN);
++    // The CA bundle for every OpenSSL client of the library (httplib is told as well: bbnet_tls.h).
++    if (const std::string& bundle = BbNet::CaBundlePath(); !bundle.empty()) {
++        setenv("SSL_CERT_FILE", bundle.c_str(), 0);
++        std::printf("Online: CA bundle %s\n", bundle.c_str());
++    } else {
++        std::printf("Online: no CA bundle (BB_CA_BUNDLE): HTTPS certificates are not verifiable\n");
++    }
+     Core::Emulator::SetGame(host->app0, host->serial, host->title, host->app_ver);
+     // What BBSC reads of the game (param.sfo, the serial: shadPS4's PSF and memory patcher).
+     {
+@@ -601,9 +781,11 @@
+     }
+     // BBSC patches the game's code, some of it while the game runs: from now on the port's own
+     // code patches leave it writable (bbnet_image_ready).
++#ifdef BBNET_BBSC
+     if (const char* bbsc = std::getenv("BB_BBSC"); bbsc && bbsc[0] == '1') {
+         Core::KeepGuestCodeWritable();
+     }
++#endif
+     const auto& ids = Common::ElfInfo::Instance().GetNpCommIds();
+     std::printf("Co-op: %s, NP communication id %s%s\n", host->serial ? host->serial : "?",
+                 ids.empty() ? "missing" : ids.front().c_str(),
+@@ -644,5 +826,5 @@
+ // The Hunter's Dream backend starts its dispatcher as a guest thread (thd_session.cpp).
+ extern "C" int32_t runtime_thread_spawn(void** out, void* PS4_SYSV_ABI (*entry)(void*),
+                                         void* argument, uint64_t stack, const char* name) {
+-    return g_host.thread_spawn(out, entry, argument, stack, name);
++    return SpawnHost(out, entry, argument, stack, name);
+ }
+diff
+--- a/gpu/bbnet20/bbnet.map	1970-01-01 08:00:00.000000000 +0800
++++ b/gpu/bbnet20/bbnet.map
+@@ -0,0 +1,5 @@
++/* The module's C interface (gpu/bbnet/bbnet.h) is all it exports. */
++{
++    global: bbnet_*;
++    local: *;
++};
+diff
+--- a/gpu/bbnet20/bbnet_status.cpp	1970-01-01 08:00:00.000000000 +0800
++++ b/gpu/bbnet20/bbnet_status.cpp
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport-android: the online status file (include/bbnet_status.h).
++#include "bbnet_status.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <set>
++#include <string>
++
++#include <unistd.h>
++
++#include "bbgpu.h"
++
++namespace {
++std::mutex g_mutex;
++BbNetStatus::State g_state = BbNetStatus::State::Connecting;
++std::string g_detail;
++int g_peers = 0;
++std::set<int> g_transports;
++std::string g_written;
++
++const char* Name(BbNetStatus::State state) {
++    switch (state) {
++    case BbNetStatus::State::Connecting:
++        return "connecting";
++    case BbNetStatus::State::Online:
++        return "online";
++    case BbNetStatus::State::Offline:
++        return "offline";
++    case BbNetStatus::State::Rejected:
++        return "rejected";
++    default:
++        return "error";
++    }
++}
++
++std::string OneLine(std::string text) {
++    for (char& c : text) {
++        if (c == '\n' || c == '\r' || c == '\t') {
++            c = ' ';
++        }
++    }
++    return text;
++}
++
++// Written whole under another name and renamed, so the app never reads half a line. The caller holds g_mutex.
++void WriteLocked() {
++    std::string detail = g_detail;
++    if (g_state == BbNetStatus::State::Online && g_peers > 0) {
++        detail += g_peers == 1 ? " \xC2\xB7 1 player connected"
++                               : " \xC2\xB7 " + std::to_string(g_peers) + " players connected";
++    }
++    const std::string line = std::string(Name(g_state)) + "|" + OneLine(detail);
++    if (line == g_written) {
++        return;
++    }
++    g_written = line;
++    std::printf("Online status: %s\n", line.c_str());
++    std::fflush(stdout);
++    const char* path = std::getenv("BB_NET_STATUS_FILE");
++    if (!path || !*path) {
++        return;
++    }
++    const std::string temporary = std::string(path) + ".tmp";
++    if (FILE* file = std::fopen(temporary.c_str(), "w")) {
++        std::fprintf(file, "%s\n", line.c_str());
++        if (std::fclose(file) != 0 || std::rename(temporary.c_str(), path) != 0) {
++            unlink(temporary.c_str());
++        }
++    }
++}
++} // namespace
++
++namespace BbNetStatus {
++
++const char* PoolName() {
++    static const bool thd = [] {
++        const char* backend = std::getenv("BB_NET_BACKEND");
++        return backend && std::string(backend) == "thd";
++    }();
++    return thd ? "The Hunter's Dream" : "Seamless Hunt";
++}
++
++std::string ServerLabel(const std::string& host, unsigned port) {
++    return port == 31313 || port == 0 ? host : host + ":" + std::to_string(port);
++}
++
++void Set(State state, std::string detail) {
++    std::scoped_lock lock{g_mutex};
++    if (g_state == State::Rejected && state != State::Rejected) {
++        return;
++    }
++    g_state = state;
++    g_detail = std::move(detail);
++    WriteLocked();
++}
++
++State Current() {
++    std::scoped_lock lock{g_mutex};
++    return g_state;
++}
++
++void SetPeers(int count) {
++    std::scoped_lock lock{g_mutex};
++    if (count < 0) {
++        count = 0;
++    }
++    if (count == g_peers) {
++        return;
++    }
++    g_peers = count;
++    if (!g_detail.empty()) {
++        WriteLocked();
++    }
++}
++
++void TransportUp(int id, bool up) {
++    int count;
++    {
++        std::scoped_lock lock{g_mutex};
++        if (up) {
++            g_transports.insert(id);
++        } else {
++            g_transports.erase(id);
++        }
++        count = int(g_transports.size());
++    }
++    SetPeers(count);
++}
++
++void Notice(const std::string& text) {
++    const std::string line = OneLine(text);
++    if (line.empty()) {
++        return;
++    }
++    // The banner is one text at a time (a newer one replaces an older one the app has not read yet).
++    bbgpu_overlay_banner(line.c_str());
++}
++
++} // namespace BbNetStatus
+diff
+--- a/gpu/bbnet20/bbsc/core/bbsc_cinematic.cpp
++++ b/gpu/bbnet20/bbsc/core/bbsc_cinematic.cpp
+@@ -67,9 +67,11 @@
+     const bool enabled = cine_state.enabled;
+     cine_state = CinematicInput{};
+     cine_state.enabled = enabled;
++#ifndef __ANDROID__ // bbport-android: no SDL window (the event filter is never called: bbgpu_add_event_filter)
+     if (looking && window != nullptr) {
+         SDL_SetWindowRelativeMouseMode(window, false);
+     }
++#endif
+     looking = false;
+ }
+ 
+@@ -108,9 +110,11 @@
+     case SDL_EVENT_MOUSE_BUTTON_UP:
+         if (event.button.button == SDL_BUTTON_RIGHT) {
+             looking = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
++#ifndef __ANDROID__ // bbport-android: see ReleaseAll
+             if (window != nullptr) {
+                 SDL_SetWindowRelativeMouseMode(window, looking);
+             }
++#endif
+         }
+         return true;
+     case SDL_EVENT_MOUSE_MOTION:
+diff
+--- a/gpu/bbnet20/bbsc/core/bbsc_persistence.cpp
++++ b/gpu/bbnet20/bbsc/core/bbsc_persistence.cpp
+@@ -14,6 +14,7 @@
+ #include "common/singleton.h"
+ #include "common/types.h"
+ #include "core/file_format/psf.h"
++#include "core/cpu_patches.h"
+ 
+ namespace Core::Bbsc {
+ namespace {
+@@ -48,8 +49,10 @@
+         if (enable) {
+             const auto patched = EncodeRel32(0xE9, entry.site, entry.target);
+             std::memcpy(site, patched.data(), patched.size());
++            Core::GuestCodeWritten(site, patched.size());
+         } else {
+             std::memcpy(site, entry.prologue.data(), entry.prologue.size());
++            Core::GuestCodeWritten(site, entry.prologue.size());
+         }
+         ++count;
+     }
+@@ -60,6 +63,7 @@
+         const auto bytes = EncodeRel32(entry.opcode, entry.site,
+                                        enable ? entry.target : entry.original);
+         std::memcpy(reinterpret_cast<u8*>(base + entry.site), bytes.data(), bytes.size());
++        Core::GuestCodeWritten(reinterpret_cast<u8*>(base + entry.site), bytes.size());
+         ++count;
+     }
+     for (const auto& entry : EntryReturns) {
+@@ -68,6 +72,7 @@
+         }
+         // Only the first byte changes: 0xC3 (ret) or the function's real first instruction byte.
+         *reinterpret_cast<u8*>(base + entry.site) = enable ? 0xC3 : entry.prologue[0];
++        Core::GuestCodeWritten(reinterpret_cast<u8*>(base + entry.site), 1);
+         ++count;
+     }
+     for (const auto& entry : ByteEdits) {
+@@ -76,6 +81,7 @@
+         }
+         const auto& bytes = enable ? entry.replacement : entry.original;
+         std::memcpy(reinterpret_cast<u8*>(base + entry.site), bytes.data(), bytes.size());
++        Core::GuestCodeWritten(reinterpret_cast<u8*>(base + entry.site), bytes.size());
+         ++count;
+     }
+     for (const auto& entry : WideEdits) {
+@@ -84,6 +90,7 @@
+         }
+         const auto& bytes = enable ? entry.replacement : entry.original;
+         std::memcpy(reinterpret_cast<u8*>(base + entry.site), bytes.data(), bytes.size());
++        Core::GuestCodeWritten(reinterpret_cast<u8*>(base + entry.site), bytes.size());
+         ++count;
+     }
+     if (scope == Scope::Install) {
+diff
+--- a/gpu/bbnet20/bbsc/core/bloodborne_re.cpp
++++ b/gpu/bbnet20/bbsc/core/bloodborne_re.cpp
+@@ -36,6 +36,7 @@
+ #include "core/bbsc_cinematic.h"
+ #include "imgui/bbsc_loading_layer.h"
+ #include "core/cpu_patches.h"
++#include "bbnet_guest.h"
+ #include "core/debugger.h"
+ #include "core/file_format/psf.h"
+ #include "core/libraries/np/np_matching2/np_matching2_mm.h"
+@@ -1381,11 +1382,11 @@
+         reinterpret_cast<PlacementSelector>(image_base + SelectSummonedPlacementOffset);
+     const auto transition = reinterpret_cast<StageTransition>(image_base + StageTransitionOffset);
+ 
+-    set_position(reinterpret_cast<const void*>(state + 0x14D0));
+-    set_orientation(reinterpret_cast<const void*>(state + 0x14E0));
+-    set_map(reinterpret_cast<const void*>(state + 0x14C4));
+-    set_warp();
+-    record.select_result = select(0, -1);
++    BbGuestCall(set_position, reinterpret_cast<const void*>(state + 0x14D0));
++    BbGuestCall(set_orientation, reinterpret_cast<const void*>(state + 0x14E0));
++    BbGuestCall(set_map, reinterpret_cast<const void*>(state + 0x14C4));
++    BbGuestCall(set_warp);
++    record.select_result = BbGuestCall(select, 0, -1);
+     record.selected_map = ReadValue<u32>(state, 0x0C);
+     if (!record.select_result || record.selected_map != record.received_map) {
+         record.result = "native_select_failed";
+@@ -1395,7 +1396,7 @@
+     pending_summon_reload_map.store(record.received_map, std::memory_order_release);
+     pending_summon_reload_state_map.store(record.received_map, std::memory_order_release);
+     record.summon_reload_armed = true;
+-    record.transition_result = transition();
++    record.transition_result = BbGuestCall(transition);
+     if (record.transition_result == 0) {
+         pending_summon_reload_map.store(0, std::memory_order_release);
+         pending_summon_reload_state_map.store(0, std::memory_order_release);
+@@ -1523,14 +1524,14 @@
+     using SummonedMapReload = void PS4_SYSV_ABI (*)();
+     const auto reload_summoned_map =
+         reinterpret_cast<SummonedMapReload>(image_base + SummonedMapReloadOffset);
+-    reload_summoned_map();
++    BbGuestCall(reload_summoned_map);
+     record.summon_reload_started = true;
+     record.state_after = ReadValue<s32>(record.reload_state, 0x84);
+     if (record.state_after != 3) {
+         using SummonReloadStateSetter = void PS4_SYSV_ABI (*)(u64 state);
+         const auto set_reload_state =
+             reinterpret_cast<SummonReloadStateSetter>(image_base + SetSummonReloadStateOffset);
+-        set_reload_state(record.reload_state);
++        BbGuestCall(set_reload_state, record.reload_state);
+         record.state_setter_used = true;
+         record.state_after = ReadValue<s32>(record.reload_state, 0x84);
+     }
+@@ -1563,9 +1564,9 @@
+             reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonPositionOffset);
+         const auto set_orientation =
+             reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonOrientationOffset);
+-        set_position(reinterpret_cast<const void*>(placement_state + 0x14D0));
+-        set_orientation(reinterpret_cast<const void*>(placement_state + 0x14E0));
+-        set_map(reinterpret_cast<const void*>(placement_state + 0x14C4));
++        BbGuestCall(set_position, reinterpret_cast<const void*>(placement_state + 0x14D0));
++        BbGuestCall(set_orientation, reinterpret_cast<const void*>(placement_state + 0x14E0));
++        BbGuestCall(set_map, reinterpret_cast<const void*>(placement_state + 0x14C4));
+         record.placement_refreshed = true;
+     }
+     record.result = "applied";
+@@ -1656,7 +1657,7 @@
+     using SummonedMapReload = void PS4_SYSV_ABI (*)();
+     const auto reload_summoned_map =
+         reinterpret_cast<SummonedMapReload>(image_base + SummonedMapReloadOffset);
+-    reload_summoned_map();
++    BbGuestCall(reload_summoned_map);
+     record.summon_reload_started = true;
+     record.result = "applied";
+     if (bbsc_request) {
+@@ -1760,18 +1761,18 @@
+         reinterpret_cast<PlacementSelector>(image_base + SelectSummonedPlacementOffset);
+     const auto transition = reinterpret_cast<StageTransition>(image_base + StageTransitionOffset);
+ 
+-    set_position(reinterpret_cast<const void*>(state + 0x14D0));
+-    set_orientation(reinterpret_cast<const void*>(state + 0x14E0));
+-    set_map(reinterpret_cast<const void*>(state + 0x14C4));
+-    set_warp();
+-    record.select_result = select(0, -1);
++    BbGuestCall(set_position, reinterpret_cast<const void*>(state + 0x14D0));
++    BbGuestCall(set_orientation, reinterpret_cast<const void*>(state + 0x14E0));
++    BbGuestCall(set_map, reinterpret_cast<const void*>(state + 0x14C4));
++    BbGuestCall(set_warp);
++    record.select_result = BbGuestCall(select, 0, -1);
+     record.selected_map = ReadValue<u32>(state, 0x0C);
+     if (!record.select_result || record.selected_map != record.target_map) {
+         record.result = "native_select_failed";
+         return;
+     }
+ 
+-    record.transition_result = transition();
++    record.transition_result = BbGuestCall(transition);
+     if (record.transition_result == 0) {
+         record.result = "stage_transition_failed";
+         return;
+@@ -1901,7 +1902,7 @@
+     using UseItemNativeApply = bool PS4_SYSV_ABI (*)(u64 player, s32 goods_id, s32 argument);
+     const auto use_item =
+         reinterpret_cast<UseItemNativeApply>(image_base + UseItemNativeApplyOffset);
+-    record.native_result = use_item(record.player, SmallResonantBellGoodsId, BellUseArgument);
++    record.native_result = BbGuestCall(use_item, record.player, SmallResonantBellGoodsId, BellUseArgument);
+     ++pending.attempts;
+     pending.dispatched = true;
+     pending.dispatched_at = std::chrono::steady_clock::now();
+@@ -3497,7 +3498,7 @@
+     for (s32 i = 0; i < count; ++i) {
+         const u64 player = ReadValue<u64>(entries, static_cast<size_t>(i) * 0x38);
+         if (ReadablePointer(player, 0x400) && IsValidMemberId(player + 0x3D8) &&
+-            IsValidMemberId(task + 0xC8) && equals(player + 0x3D8, task + 0xC8)) {
++            IsValidMemberId(task + 0xC8) && BbGuestCall(equals, player + 0x3D8, task + 0xC8)) {
+             return true;
+         }
+     }
+@@ -3527,7 +3528,7 @@
+     }
+     u64 entry = ReadValue<u64>(head, 0);
+     for (int guard = 0; guard < 16 && ReadablePointer(entry, 0x38) && entry != head; ++guard) {
+-        if (IsValidMemberId(entry + 0x10) && equals(entry + 0x10, task + 0xC8)) {
++        if (IsValidMemberId(entry + 0x10) && BbGuestCall(equals, entry + 0x10, task + 0xC8)) {
+             info.index = ReadValue<s32>(entry, 0x30);
+             break;
+         }
+@@ -3680,7 +3681,7 @@
+             continue;
+         }
+         WriteValue<u8>(task, 0xED, static_cast<u8>(ReadValue<u8>(task, 0xED) | 0x01));
+-        set_state(task, 4);
++        BbGuestCall(set_state, task, 4);
+         ++restarted;
+     }
+     if (bbsc_v8_original_swapped) {
+@@ -3758,7 +3759,7 @@
+             continue;
+         }
+         WriteValue<u8>(task, 0xED, static_cast<u8>(ReadValue<u8>(task, 0xED) | 0x01));
+-        set_state(task, 4);
++        BbGuestCall(set_state, task, 4);
+         *it = {};
+         LOG_INFO(Debug,
+                  "BBSC self-heal: member character missing for {} ms (mode {}, session state {}); "
+@@ -3804,7 +3805,7 @@
+     // 0x01332BC0 already picked the destination (global+0xC map, global+0x10 respawn point) while
+     // the death step ran, so the request alone reproduces the vanilla death reload.
+     using ReloadRequest = u64 PS4_SYSV_ABI (*)();
+-    const u64 result = reinterpret_cast<ReloadRequest>(image_base + DeathReloadRequestOffset)();
++    const u64 result = BbGuestCall(reinterpret_cast<ReloadRequest>(image_base + DeathReloadRequestOffset));
+     LOG_INFO(Debug, "BBSC death: reload requested ({}), result {}", why, result);
+ }
+ s64 bbsc_spectate_since_ms = 0;
+@@ -4310,15 +4311,15 @@
+     using FlagSetter = void PS4_SYSV_ABI (*)();
+     using PlacementSelector = bool PS4_SYSV_ABI (*)(u64 context, s32 warp_info_id);
+     using StageTransition = u64 PS4_SYSV_ABI (*)();
+-    reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonPositionOffset)(
++    BbGuestCall(reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonPositionOffset), 
+         reinterpret_cast<const void*>(global + 0x14D0));
+-    reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonOrientationOffset)(
++    BbGuestCall(reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonOrientationOffset), 
+         reinterpret_cast<const void*>(global + 0x14E0));
+-    reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonMapOffset)(
++    BbGuestCall(reinterpret_cast<PlacementSetter>(image_base + SetForcedSummonMapOffset), 
+         reinterpret_cast<const void*>(global + 0x14C4));
+-    reinterpret_cast<FlagSetter>(image_base + SetForcedSummonWarpOffset)();
++    BbGuestCall(reinterpret_cast<FlagSetter>(image_base + SetForcedSummonWarpOffset));
+     const bool selected =
+-        reinterpret_cast<PlacementSelector>(image_base + SelectSummonedPlacementOffset)(0, -1);
++        BbGuestCall(reinterpret_cast<PlacementSelector>(image_base + SelectSummonedPlacementOffset), 0, -1);
+     const u32 selected_map = ReadValue<u32>(global, 0x0C);
+     if (!selected || selected_map != to.packed_region) {
+         LOG_WARNING(Debug, "BBSC {} warp: selector picked {:#x}, wanted {:#x}; not loading", why,
+@@ -4330,7 +4331,7 @@
+         WriteValue<s32>(rules, 0x84, 3);
+     }
+     StartBbscLoadCover(why); // already on for the summon when this is the cross-map second reload
+-    const u64 result = reinterpret_cast<StageTransition>(image_base + StageTransitionOffset)();
++    const u64 result = BbGuestCall(reinterpret_cast<StageTransition>(image_base + StageTransitionOffset));
+     LOG_INFO(Debug,
+              "BBSC {} warp: full reload requested into map {:#x} at ({:.2f}, {:.2f}, {:.2f}), "
+              "result {}",
+@@ -4451,7 +4452,7 @@
+     position[3] = 1.0f;
+     rotation[3] = 0.0f;
+     using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
+-    reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
++    BbGuestCall(reinterpret_cast<Warp>(warp), player, position.data(), rotation.data(), 1);
+     WriteValue<u8>(player, 0x1E1, static_cast<u8>(ReadValue<u8>(player, 0x1E1) | 0x02));
+     LOG_INFO(Debug,
+              "BBSC join teleport: guest moved from ({:.2f}, {:.2f}, {:.2f}) to the host at "
+@@ -4749,7 +4750,7 @@
+         alignas(16) std::array<float, 4> position{spot.x + 1.0f, spot.y, spot.z, 1.0f};
+         alignas(16) std::array<float, 4> rotation{0.0f, spot.heading, 0.0f, 0.0f};
+         using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
+-        reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
++        BbGuestCall(reinterpret_cast<Warp>(warp), player, position.data(), rotation.data(), 1);
+         WriteValue<u8>(player, 0x1E1, static_cast<u8>(ReadValue<u8>(player, 0x1E1) | 0x02));
+         LOG_INFO(Debug,
+                  "BBSC warp together: guest arrived in map {:#x} at the host's {} ({:.2f}, "
+@@ -6303,7 +6304,7 @@
+     alignas(16) std::array<float, 4> rotation{};
+     using ResolvePoint = u8 PS4_SYSV_ABI (*)(u64 map_list, float* position, float* rotation,
+                                              s32 point_id);
+-    if (reinterpret_cast<ResolvePoint>(image_base + 0x0154AFC0)(map_list, position.data(),
++    if (BbGuestCall(reinterpret_cast<ResolvePoint>(image_base + 0x0154AFC0), map_list, position.data(),
+                                                                 rotation.data(), point_id) == 0) {
+         return std::nullopt;
+     }
+@@ -6420,7 +6421,7 @@
+     if (ReadValue<u64>(image_base + 0x0553B0D8, 0) != 0 &&
+         ReadValue<u64>(image_base + 0x0553B100, 0) != 0 && BbscEventFlag(4000)) {
+         using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+-        reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, 4000, 0);
++        BbGuestCall(reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0), 0, 4000, 0);
+         LOG_INFO(Debug, "BBSC death script re-armed ({}): event flag 4000 cleared", why);
+     }
+ }
+@@ -6503,10 +6504,10 @@
+         WriteValue<s32>(ReadValue<u64>(image_base + MenuManPointerOffset, 0), 0x808, 2);
+         alignas(16) static std::array<u32, 4> args{}; // args+8: MenuMan+0x17C0, the stage flow's 0
+         using Open = bool PS4_SYSV_ABI (*)(const void* args);
+-        return reinterpret_cast<Open>(image_base + NowLoadingOpenOffset)(args.data());
++        return BbGuestCall(reinterpret_cast<Open>(image_base + NowLoadingOpenOffset), args.data());
+     }
+     using Close = bool PS4_SYSV_ABI (*)();
+-    return reinterpret_cast<Close>(image_base + NowLoadingCloseOffset)();
++    return BbGuestCall(reinterpret_cast<Close>(image_base + NowLoadingCloseOffset));
+ }
+ 
+ void BbscCurtainStepTo(BbscCurtainStep step, s64 now) {
+@@ -6568,7 +6569,7 @@
+     if (bbsc_load_cover.own_screen) {
+         bbsc_load_cover.own_screen = false;
+         if (!BbscLoadingScreen(false)) {
+-            reinterpret_cast<void PS4_SYSV_ABI (*)(u32)>(image_base + NowLoadingSetStateOffset)(0);
++            BbGuestCall(reinterpret_cast<void PS4_SYSV_ABI (*)(u32)>(image_base + NowLoadingSetStateOffset), 0);
+         }
+     }
+     if (!BbscCurtainActive()) { // a death curtain brings the screen back itself
+@@ -6706,7 +6707,7 @@
+         // 0x0176D320 writes [MenuMan]+0x804 with no null check (review 2026-10-08): a quit to the
+         // title can leave MenuMan gone when this limit fires.
+         if (ReadValue<u64>(image_base + MenuManPointerOffset, 0) != 0) {
+-            reinterpret_cast<void PS4_SYSV_ABI (*)(u32)>(image_base + NowLoadingSetStateOffset)(0);
++            BbGuestCall(reinterpret_cast<void PS4_SYSV_ABI (*)(u32)>(image_base + NowLoadingSetStateOffset), 0);
+         }
+         EndBbscDeathCurtain(now, "time limit");
+         return;
+@@ -6746,7 +6747,7 @@
+         if (BbscLoadingScreen(false)) {
+             EndBbscDeathCurtain(now, "loading screen closed");
+         } else if (in_step > BbscCurtainCloseWaitMs) {
+-            reinterpret_cast<void PS4_SYSV_ABI (*)(u32)>(image_base + NowLoadingSetStateOffset)(0);
++            BbGuestCall(reinterpret_cast<void PS4_SYSV_ABI (*)(u32)>(image_base + NowLoadingSetStateOffset), 0);
+             EndBbscDeathCurtain(now, "loading screen forced closed");
+         }
+         return;
+@@ -6897,24 +6898,24 @@
+         }
+     }
+     using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
+-    reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
++    BbGuestCall(reinterpret_cast<Warp>(warp), player, position.data(), rotation.data(), 1);
+     WriteValue<u8>(player, 0x1E4, static_cast<u8>(ReadValue<u8>(player, 0x1E4) | 0x02));
+ 
+     // 3. leave the death animation
+     const u64 behaviour = ReadValue<u64>(modules, 0x30);
+     if (ReadablePointer(behaviour, 0x388) && ReadValue<u8>(behaviour, 0x384) != 0) {
+         using PlayAnimation = void PS4_SYSV_ABI (*)(u64 behaviour, u64 name_utf16);
+-        reinterpret_cast<PlayAnimation>(image_base + 0x01A19F60)(behaviour,
++        BbGuestCall(reinterpret_cast<PlayAnimation>(image_base + 0x01A19F60), behaviour,
+                                                                  image_base + 0x04992C40);
+     }
+ 
+     // 4. state reset, HP, death flags, drawing
+     using Reset = void PS4_SYSV_ABI (*)(u64 chr);
+-    reinterpret_cast<Reset>(reset)(player);
++    BbGuestCall(reinterpret_cast<Reset>(reset), player);
+     const u64 stats = ReadValue<u64>(modules, 0x20);
+     if (ReadablePointer(stats, 0x100)) {
+         using SetHp = void PS4_SYSV_ABI (*)(u64 chr, s32 hp);
+-        reinterpret_cast<SetHp>(image_base + 0x018BCD40)(player, ReadValue<s32>(stats, 0xFC));
++        BbGuestCall(reinterpret_cast<SetHp>(image_base + 0x018BCD40), player, ReadValue<s32>(stats, 0xFC));
+     }
+     const u64 control_flags = ReadValue<u64>(control, 0x38);
+     if (ReadablePointer(control_flags, 0x50)) {
+@@ -7182,7 +7183,7 @@
+         }
+         if (!flag_cleared_this_window) {
+             using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+-            reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, 0xFCF, 0);
++            BbGuestCall(reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0), 0, 0xFCF, 0);
+             flag_cleared_this_window = true;
+             flag = true;
+         }
+@@ -7378,11 +7379,11 @@
+         *it = {};
+ 
+         using PhysicsReset = void PS4_SYSV_ABI (*)(u64 chr, u8 flag);
+-        reinterpret_cast<PhysicsReset>(image_base + 0x018BCF30)(chr, 1);
++        BbGuestCall(reinterpret_cast<PhysicsReset>(image_base + 0x018BCF30), chr, 1);
+         const u64 behaviour = ReadValue<u64>(modules, 0x30);
+         if (ReadablePointer(behaviour, 0x388) && ReadValue<u8>(behaviour, 0x384) != 0) {
+             using PlayAnimation = void PS4_SYSV_ABI (*)(u64 behaviour, u64 name_utf16);
+-            reinterpret_cast<PlayAnimation>(image_base + 0x01A19F60)(behaviour,
++            BbGuestCall(reinterpret_cast<PlayAnimation>(image_base + 0x01A19F60), behaviour,
+                                                                      image_base + 0x04992C40);
+         }
+         WriteValue<u64>(chr, 0x208, 0x3F8000003F800000ull);
+@@ -7557,9 +7558,9 @@
+     }
+     using Query = u32 PS4_SYSV_ABI (*)(u64 chr);
+     using TextEvent = bool PS4_SYSV_ABI (*)(u64 event, u32 id, u32 first, u32 second);
+-    const u32 first = reinterpret_cast<Query>(cause)(player);
+-    const u32 second = reinterpret_cast<Query>(detail)(player);
+-    const bool accepted = reinterpret_cast<TextEvent>(image_base + DeathTextEventOffset)(
++    const u32 first = BbGuestCall(reinterpret_cast<Query>(cause), player);
++    const u32 second = BbGuestCall(reinterpret_cast<Query>(detail), player);
++    const bool accepted = BbGuestCall(reinterpret_cast<TextEvent>(image_base + DeathTextEventOffset), 
+         event_object, DeathTextEventId, first, second);
+     LOG_INFO(Debug, "BBSC death text: \"YOU DIED\" raised for the {} (args {}, {}, accepted {})",
+              who, first, second, accepted);
+@@ -7619,7 +7620,7 @@
+         WriteValue<u8>(global, 0x1592, 1);
+     }
+     using DropBloodstain = void PS4_SYSV_ABI (*)(u64 stain_root, u64 chr, u8 drop);
+-    reinterpret_cast<DropBloodstain>(image_base + DropBloodstainOffset)(stain_root, player, 1);
++    BbGuestCall(reinterpret_cast<DropBloodstain>(image_base + DropBloodstainOffset), stain_root, player, 1);
+     if (guest) {
+         WriteValue<u8>(global, 0x1592, 0);
+     }
+@@ -7974,9 +7975,9 @@
+     }
+     using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+     const auto set = reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0);
+-    set(0, 0xFCF, 0); // 4047
+-    set(0, 0xFA0, 0); // 4000
+-    set(0, 0xFFC, 0); // 4092
++    BbGuestCall(set, 0, 0xFCF, 0); // 4047
++    BbGuestCall(set, 0, 0xFA0, 0); // 4000
++    BbGuestCall(set, 0, 0xFFC, 0); // 4092
+     static s64 logged_window = 0;
+     if (logged_window != bbsc_boss_unlock_until_ms || menu) {
+         logged_window = bbsc_boss_unlock_until_ms;
+@@ -8075,7 +8076,7 @@
+     if (flag && ReadValue<u64>(image_base + 0x0553B0D8, 0) != 0 &&
+         ReadValue<u64>(image_base + 0x0553B100, 0) != 0) {
+         using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+-        reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, 4047, 0);
++        BbGuestCall(reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0), 0, 4047, 0);
+     }
+     LOG_INFO(Debug, "BBSC leave: {} by the {} (event flag 4047 was {}) - the co-op ends", event,
+              state == 3 ? "host" : "guest", flag ? "set, cleared" : "clear");
+@@ -8248,7 +8249,7 @@
+                 if (ReadablePointer(session_manager, 0x128)) {
+                     using Stop = u8 PS4_SYSV_ABI (*)(u64 session_manager);
+                     const u8 stopped =
+-                        reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset)(
++                        BbGuestCall(reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset), 
+                             session_manager);
+                     LOG_INFO(Debug, "BBSC invasion won: the host is dead - leaving (Stop -> {})",
+                              stopped);
+@@ -8306,8 +8307,8 @@
+         using Stop = u8 PS4_SYSV_ABI (*)(u64 session_manager);
+         using Cleanup = void PS4_SYSV_ABI (*)(u64 remote);
+         const u8 stopped =
+-            reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset)(session_manager);
+-        reinterpret_cast<Cleanup>(image_base + WorldChrManRemoteCleanupOffset)(remote);
++            BbGuestCall(reinterpret_cast<Stop>(image_base + MultiPlayStopRequestOffset), session_manager);
++        BbGuestCall(reinterpret_cast<Cleanup>(image_base + WorldChrManRemoteCleanupOffset), remote);
+         LOG_INFO(Debug,
+                  "BBSC partner gone for {} s: session ended on the host (Stop -> {}, remote "
+                  "cleanup); host stays in their world",
+@@ -8361,7 +8362,7 @@
+     const bool flag = BbscEventFlag(4047);
+     if (flag) {
+         using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+-        reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, 4047, 0);
++        BbGuestCall(reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0), 0, 4047, 0);
+     }
+     const u64 lua_man = ReadValue<u64>(image_base + 0x0553B0C8, 0);
+     const u64 lua = ReadablePointer(lua_man, 0x10) ? ReadValue<u64>(lua_man, 8) : 0;
+@@ -8510,8 +8511,8 @@
+     WriteValue<u8>(global, 0x1520, 1);
+     using HomePoint = void PS4_SYSV_ABI (*)(u64 lua, s32 point);
+     using Transition = u64 PS4_SYSV_ABI (*)();
+-    reinterpret_cast<HomePoint>(image_base + 0x01332BC0)(lua, -1);
+-    reinterpret_cast<Transition>(image_base + 0x013CDE30)();
++    BbGuestCall(reinterpret_cast<HomePoint>(image_base + 0x01332BC0), lua, -1);
++    BbGuestCall(reinterpret_cast<Transition>(image_base + 0x013CDE30));
+ }
+ 
+ // Shop trace (2026-10-07). Report: in the host's Dream the Bath Messenger sold the guest everything
+@@ -8548,12 +8549,12 @@
+     std::string shown;
+     for (s32 id = first; id <= last; ++id) {
+         RowRef ref{-1, 0, 0};
+-        get(&ref, id);
++        BbGuestCall(get, &ref, id);
+         if (ref.row == 0 || !ReadablePointer(ref.row, 0x20)) {
+             continue;
+         }
+         ++rows;
+-        if (!unlocked(&ref)) {
++        if (!BbGuestCall(unlocked, &ref)) {
+             continue;
+         }
+         ++open;
+@@ -9057,7 +9058,7 @@
+         return false;
+     }
+     using GetEventFlag = bool PS4_SYSV_ABI (*)(u64 unused, u32 flag);
+-    return reinterpret_cast<GetEventFlag>(image_base + GetEventFlagOffset)(0, flag);
++    return BbGuestCall(reinterpret_cast<GetEventFlag>(image_base + GetEventFlagOffset), 0, flag);
+ }
+ 
+ bool BbscNightIsOver() {
+@@ -9097,7 +9098,7 @@
+         had[i] = BbscEventFlag(BbscDreamToolFlags[i]);
+         if (host_has[i] && !had[i]) {
+             using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+-            reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, BbscDreamToolFlags[i], 1);
++            BbGuestCall(reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0), 0, BbscDreamToolFlags[i], 1);
+         }
+     }
+     if (!bbsc_dream_tools_logged) {
+@@ -9297,15 +9298,15 @@
+     alignas(16) static u32 key = 0;
+     code = 0x40000000u | lot.goods;
+     key = 0x80000000u | (3u << 28) | lot.goods;
+-    const s32 fits = reinterpret_cast<Fits>(image_base + 0x014D9A80)(carried, &code, lot.count);
++    const s32 fits = BbGuestCall(reinterpret_cast<Fits>(image_base + 0x014D9A80), carried, &code, lot.count);
+     const s32 slot =
+-        fits > 0 ? reinterpret_cast<Add>(image_base + 0x014DA0A0)(carried, &key, lot.count) : -1;
++        fits > 0 ? BbGuestCall(reinterpret_cast<Add>(image_base + 0x014DA0A0), carried, &key, lot.count) : -1;
+     // Added for real (review 2026-10-11): "carried now" alone is also true when the guest had one
+     // already (Blood Stone Chunks) and the add failed - then the award below gives it instead.
+     const bool there = slot >= 0 && BbscInventoryHas(carried, code);
+     if (there && lot.flag != 0) {
+         using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+-        reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, lot.flag, 1);
++        BbGuestCall(reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0), 0, lot.flag, 1);
+     }
+     LOG_INFO(Debug, "BBSC boss drop: goods {} x{} put into the carried items (fits {}, slot {}, there "
+                     "now: {}, get flag {})",
+@@ -9349,7 +9350,7 @@
+             continue;
+         }
+         using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
+-        reinterpret_cast<AwardItemLot>(image_base + AwardItemLotOffset)(item_man, lot, 0);
++        BbGuestCall(reinterpret_cast<AwardItemLot>(image_base + AwardItemLotOffset), item_man, lot, 0);
+         LOG_INFO(Debug, "BBSC boss drop: event {} - item lot {} given to the guest ({})", event, lot,
+                  taken ? "repeat lot, flag already set" : "first kill");
+     }
+@@ -9492,7 +9493,7 @@
+     if (!IsEbootCodeAddress(info_fn)) {
+         return;
+     }
+-    const u64 info = reinterpret_cast<u64 PS4_SYSV_ABI (*)(u64)>(info_fn)(dead);
++    const u64 info = BbGuestCall(reinterpret_cast<u64 PS4_SYSV_ABI (*)(u64)>(info_fn), dead);
+     const u64 row = ReadablePointer(info, 0x10) ? ReadValue<u64>(info, 8) : 0;
+     if (!ReadablePointer(row, 0x150) || ((ReadValue<u8>(row, 329) >> 4) & 1) != 0) {
+         return; // no NpcParam row (a player), or a boss
+@@ -9524,7 +9525,7 @@
+     }
+     using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
+     for (const auto& [lot, name] : due) {
+-        reinterpret_cast<AwardItemLot>(image_base + AwardItemLotOffset)(item_man, lot, 0);
++        BbGuestCall(reinterpret_cast<AwardItemLot>(image_base + AwardItemLotOffset), item_man, lot, 0);
+         LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) died - the guest's own roll of item "
+                         "lot {}",
+                  name, lot);
+@@ -9599,7 +9600,7 @@
+     s64 bosses = 0;
+     for (const u32 flag : flags) {
+         if (!BbscEventFlag(flag)) {
+-            set(0, flag, 1);
++            BbGuestCall(set, 0, flag, 1);
+             ++bosses;
+         }
+     }
+@@ -10031,7 +10032,7 @@
+     }
+     alignas(16) std::array<u32, 4> found{};
+     using NpcParamRow = void PS4_SYSV_ABI (*)(u32* out, u32 id);
+-    reinterpret_cast<NpcParamRow>(image_base + NpcParamRowOffset)(found.data(), id);
++    BbGuestCall(reinterpret_cast<NpcParamRow>(image_base + NpcParamRowOffset), found.data(), id);
+     u64 row = 0;
+     std::memcpy(&row, &found[2], sizeof(row));
+     return row;
+@@ -10815,13 +10816,13 @@
+     const auto enable = reinterpret_cast<EnableItem>(image_base + ItemEnableOffset);
+     u32 switched = 0;
+     for (u32 id : off) {
+-        switched += enable(manager, &id, 1) != 0 ? 1 : 0;
++        switched += BbGuestCall(enable, manager, &id, 1) != 0 ? 1 : 0;
+     }
+     if (!stale.empty()) {
+         u32 hidden = 0;
+         std::string ids;
+         for (u32 id : stale) {
+-            hidden += enable(manager, &id, 0) != 0 ? 1 : 0;
++            hidden += BbGuestCall(enable, manager, &id, 0) != 0 ? 1 : 0;
+             if (ids.size() < 120) {
+                 ids += fmt::format("{}{:#x}", ids.empty() ? "" : " ", id);
+             }
+@@ -11256,7 +11257,7 @@
+     WriteBbscRoleColumn(RoleGuestLine, nullptr, BbscNoticeCarrierId);
+     alignas(16) static const std::array<u8, 16> args{}; // args+8 == 0: "not skipped"
+     using SummonedLine = void PS4_SYSV_ABI (*)(u64 unused, u64 unused2, const void* args);
+-    reinterpret_cast<SummonedLine>(image_base + SummonedLineOffset)(0, 0, args.data());
++    BbGuestCall(reinterpret_cast<SummonedLine>(image_base + SummonedLineOffset), 0, 0, args.data());
+     WriteBbscRoleColumn(RoleGuestLine, &column, 0);
+     bbsc_banner_own_pending = true; // BBSC's own: never hidden by the join filter
+     LOG_INFO(Debug, "BBSC notice shown: {}", what);
+@@ -12271,7 +12272,7 @@
+         return 0;
+     }
+     using GameData = u64 PS4_SYSV_ABI (*)(u64 chr);
+-    const u64 data = reinterpret_cast<GameData>(getter)(player);
++    const u64 data = BbGuestCall(reinterpret_cast<GameData>(getter), player);
+     const u64 inventory = ReadablePointer(data, 0x5B8) ? ReadValue<u64>(data, 0x5B0) : 0;
+     return ReadablePointer(inventory, 0x90) ? inventory : 0;
+ }
+@@ -12329,10 +12330,10 @@
+     over = 0;
+     using Change = s32 PS4_SYSV_ABI (*)(u64 inventory, u32 slot, s32 delta, s32* over);
+     using Free = void PS4_SYSV_ABI (*)(u64 inventory, u32 slot, s32 one);
+-    const s32 left = reinterpret_cast<Change>(image_base + 0x014D94A0)(
++    const s32 left = BbGuestCall(reinterpret_cast<Change>(image_base + 0x014D94A0), 
+         inventory, static_cast<u32>(slot), -std::max(count, 1), &over);
+     if (over == 0 && left == 0) {
+-        reinterpret_cast<Free>(image_base + 0x014DAB20)(inventory, static_cast<u32>(slot), 1);
++        BbGuestCall(reinterpret_cast<Free>(image_base + 0x014DAB20), inventory, static_cast<u32>(slot), 1);
+     }
+     return BbscInventorySlot(inventory, code) < 0;
+ }
+@@ -12408,22 +12409,22 @@
+         }
+         code = item;
+         key = 0x80000000u | (3u << 28) | goods;
+-        const s32 fits = reinterpret_cast<Fits>(image_base + 0x014D9A80)(carried, &code, stored);
++        const s32 fits = BbGuestCall(reinterpret_cast<Fits>(image_base + 0x014D9A80), carried, &code, stored);
+         const s32 want = std::min(fits, stored);
+         if (want <= 0) {
+             summary += fmt::format(" {} {} (full)", name, before);
+             continue;
+         }
+-        reinterpret_cast<Add>(image_base + 0x014DA0A0)(carried, &key, want);
++        BbGuestCall(reinterpret_cast<Add>(image_base + 0x014DA0A0), carried, &key, want);
+         const s32 moved = std::clamp(BbscInventoryCount(carried, item) - before, 0, want);
+         if (moved > 0) {
+             const s32 slot = BbscInventorySlot(storage, item);
+             if (slot >= 0) {
+                 over = 0;
+-                const s32 left = reinterpret_cast<Change>(image_base + 0x014D94A0)(
++                const s32 left = BbGuestCall(reinterpret_cast<Change>(image_base + 0x014D94A0), 
+                     storage, static_cast<u32>(slot), -moved, &over);
+                 if (over == 0 && left == 0) {
+-                    reinterpret_cast<Free>(image_base + 0x014DAB20)(storage,
++                    BbGuestCall(reinterpret_cast<Free>(image_base + 0x014DAB20), storage,
+                                                                     static_cast<u32>(slot), 1);
+                 }
+             }
+@@ -12560,7 +12561,7 @@
+     if (ReadValue<u8>(global, 0x1592) != 0 && ReadValue<u64>(image_base + 0x0553B0D8, 0) != 0 &&
+         ReadValue<u64>(image_base + EventFlagManPointerOffset, 0) != 0 && !BbscEventFlag(6622)) {
+         using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
+-        reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, 6622, 1);
++        BbGuestCall(reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0), 0, 6622, 1);
+         LOG_INFO(Debug, "BBSC kit: the Dream messenger's vanilla Beckoning Bell marked as given "
+                         "(flag 6622) - the kit's Hunt Bell replaces it");
+     }
+@@ -12602,9 +12603,9 @@
+         alignas(16) static u32 key = 0;
+         code = 0x40000000u | item->id;
+         key = 0x80000000u | (3u << 28) | item->id;
+-        const s32 fits = reinterpret_cast<Fits>(image_base + InventoryFitsOffset)(carried, &code, 1);
++        const s32 fits = BbGuestCall(reinterpret_cast<Fits>(image_base + InventoryFitsOffset), carried, &code, 1);
+         const s32 slot =
+-            fits > 0 ? reinterpret_cast<Add>(image_base + InventoryAddOffset)(carried, &key, 1) : -1;
++            fits > 0 ? BbGuestCall(reinterpret_cast<Add>(image_base + InventoryAddOffset), carried, &key, 1) : -1;
+         const bool now_there = BbscInventoryHas(carried, code);
+         LOG_INFO(Debug, "BBSC kit: goods {} added to the carried items (fits {}, slot {}, there now: "
+                         "{})",
+@@ -12704,7 +12705,7 @@
+     }
+     const u64 manager = ReadValue<u64>(GetLocalPlayerCharacter(), 0x1C8);
+     using EraseFn = void PS4_SYSV_ABI (*)(u64 manager, u64 node, s32 now);
+-    reinterpret_cast<EraseFn>(image_base + 0x017E1D90)(manager, node, 1);
++    BbGuestCall(reinterpret_cast<EraseFn>(image_base + 0x017E1D90), manager, node, 1);
+     return BbscLocalEffectNode(id) == 0;
+ }
+ 
+@@ -12768,10 +12769,17 @@
+     if (!IsEbootCodeAddress(add)) {
+         return;
+     }
+-    using AddSpEffect = void PS4_SYSV_ABI (*)(u64 chr, s32 id, u64 source, s32, s32, s32, float,
+-                                               float, float, float, float, s32);
+-    reinterpret_cast<AddSpEffect>(add)(player, static_cast<s32>(BbscInvadableEffectId), player, 0, 0,
+-                                       0, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0);
++    // AddSpEffect(u64 chr, s32 id, u64 source, s32, s32, s32, float x5, s32): five float arguments,
++    // which GuestCall (integers only) cannot pass under a guest CPU: Core::CallGuestWithFloats
++    // (bbport-android; on an x86-64 host the same call, through a guest stub).
++    BbNet::EnsureGuestThread();
++    {
++        const std::array<std::uint64_t, 7> ints{
++            player, static_cast<std::uint64_t>(static_cast<s64>(static_cast<s32>(BbscInvadableEffectId))),
++            player, 0, 0, 0, 0};
++        const std::array<float, 5> floats{1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
++        CallGuestWithFloats(add, ints, floats);
++    }
+     if (added++ < 20) {
+         LOG_INFO(Debug, "BBSC invasions: world open to invaders (SpEffect {} added, session state {}, "
+                         "now on: {})",
+@@ -12893,8 +12901,8 @@
+     // As 0x018FF74D..0x018FF759: the Lua event by name, then every remote slot marked as leaving.
+     using LuaEvent = void PS4_SYSV_ABI (*)(u64 lua, u64 name);
+     using MarkSlotsLeaving = void PS4_SYSV_ABI (*)();
+-    reinterpret_cast<LuaEvent>(image_base + 0x01339870)(lua, image_base + 0x0492EA75);
+-    reinterpret_cast<MarkSlotsLeaving>(image_base + 0x014EB860)();
++    BbGuestCall(reinterpret_cast<LuaEvent>(image_base + 0x01339870), lua, image_base + 0x0492EA75);
++    BbGuestCall(reinterpret_cast<MarkSlotsLeaving>(image_base + 0x014EB860));
+ }
+ 
+ void SendBbscPvpPacket(u8 kind, bool on) {
+@@ -13581,7 +13589,7 @@
+         u64 row;
+     } result{0xFFFFFFFFu, 0, 0};
+     using Lookup = void PS4_SYSV_ABI (*)(LookupResult* out, u32 id);
+-    reinterpret_cast<Lookup>(image_base + 0x01F1E3D0)(&result, 200);
++    BbGuestCall(reinterpret_cast<Lookup>(image_base + 0x01F1E3D0), &result, 200);
+     if (!ReadablePointer(result.row, 0x40) ||
+         !HasMemoryAccess(result.row + 0x38, 1, MemoryProt::CpuWrite)) {
+         return;
+@@ -15137,30 +15145,43 @@
+ 
+     std::memcpy(area_comparison, BeckoningSignedAreaComparison.data(),
+                 BeckoningSignedAreaComparison.size());
++    GuestCodeWritten(area_comparison, BeckoningSignedAreaComparison.size());
+     std::memcpy(area_flag_result, BeckoningAllowedAreaFlagResult.data(),
+                 BeckoningAllowedAreaFlagResult.size());
++    GuestCodeWritten(area_flag_result, BeckoningAllowedAreaFlagResult.size());
+     std::memcpy(responder_bell_area_result, ResponderBellAllowedAreaResult.data(),
+                 ResponderBellAllowedAreaResult.size());
++    GuestCodeWritten(responder_bell_area_result, ResponderBellAllowedAreaResult.size());
+     std::memcpy(responder_bell_common_result, ResponderBellAllowedCommonResult.data(),
+                 ResponderBellAllowedCommonResult.size());
++    GuestCodeWritten(responder_bell_common_result, ResponderBellAllowedCommonResult.size());
+     std::memcpy(active_bell_area_comparison, ActiveBellSignedAreaComparison.data(),
+                 ActiveBellSignedAreaComparison.size());
++    GuestCodeWritten(active_bell_area_comparison, ActiveBellSignedAreaComparison.size());
+     std::memcpy(active_bell_area_flag_result, ActiveBellAllowedAreaFlagResult.data(),
+                 ActiveBellAllowedAreaFlagResult.size());
++    GuestCodeWritten(active_bell_area_flag_result, ActiveBellAllowedAreaFlagResult.size());
+     std::memcpy(responder_search_area_range_result, ResponderSearchSignedAreaRangeResult.data(),
+                 ResponderSearchSignedAreaRangeResult.size());
++    GuestCodeWritten(responder_search_area_range_result, ResponderSearchSignedAreaRangeResult.size());
+     std::memcpy(sos_status_area_restriction, SosStatusAllowedArea.data(),
+                 SosStatusAllowedArea.size());
++    GuestCodeWritten(sos_status_area_restriction, SosStatusAllowedArea.size());
+     std::memcpy(summon_candidate_area_restriction, SummonCandidateAllowedCrossMap.data(),
+                 SummonCandidateAllowedCrossMap.size());
++    GuestCodeWritten(summon_candidate_area_restriction, SummonCandidateAllowedCrossMap.size());
+     std::memcpy(summon_build_area_restriction, SummonBuildAllowedCrossMap.data(),
+                 SummonBuildAllowedCrossMap.size());
++    GuestCodeWritten(summon_build_area_restriction, SummonBuildAllowedCrossMap.size());
+     std::memcpy(summon_build_world_state_restriction, SummonBuildAllowedWorldState.data(),
+                 SummonBuildAllowedWorldState.size());
++    GuestCodeWritten(summon_build_world_state_restriction, SummonBuildAllowedWorldState.size());
+     std::memcpy(summon_build_negative_event_restriction, SummonBuildAllowedNegativeEvent.data(),
+                 SummonBuildAllowedNegativeEvent.size());
++    GuestCodeWritten(summon_build_negative_event_restriction, SummonBuildAllowedNegativeEvent.size());
+     std::memcpy(stage_transition_stop_matching_call, StageTransitionKeepMatchingCall.data(),
+                 StageTransitionKeepMatchingCall.size());
++    GuestCodeWritten(stage_transition_stop_matching_call, StageTransitionKeepMatchingCall.size());
+     negative_area_patch_installed = true;
+     area_flag_patch_installed = true;
+     responder_bell_area_patch_installed = true;
+diff
+--- a/gpu/bbnet20/bbsc_off.cpp	1970-01-01 08:00:00.000000000 +0800
++++ b/gpu/bbnet20/bbsc_off.cpp
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport-android: BBSC (Bloodborne seamless co-op, bbsc/) is not in this build (BB_NET_BBSC=OFF): the
++// places in the network and NP libraries that report to it (summon placement header, host follow and world
++// flag packets) find these no-ops, and nothing of it patches the game.
++#include "core/bloodborne_re.h"
++
++namespace Core::Bloodborne {
++
++std::optional<std::string> GetSeamlessHostPlacementHeader() {
++    return std::nullopt;
++}
++bool SetSeamlessHostPlacementHeader(std::string_view) {
++    return true;
++}
++void ClearSeamlessHostPlacementHeader() {}
++std::optional<std::uint32_t> GetBbscConnectFirstAreaId() {
++    return std::nullopt;
++}
++void TraceMatching2LeaveRoom(std::uintptr_t, std::uint64_t) {}
++void OnBbscHostFollowPacket(std::uint32_t, float, float, float, float, std::uint32_t, std::int32_t) {}
++void OnBbscWorldFlagsPacket(const void*, std::uint32_t) {}
++
++} // namespace Core::Bloodborne
+diff
+--- a/gpu/bbnet20/CMakeLists.txt
++++ b/gpu/bbnet20/CMakeLists.txt
+@@ -11,7 +11,7 @@
+ file(MAKE_DIRECTORY "${SHADNET_PROTO_OUT20}")
+ add_custom_command(
+     OUTPUT "${SHADNET_PROTO_OUT20}/shadnet.pb.cc" "${SHADNET_PROTO_OUT20}/shadnet.pb.h"
+-    COMMAND protobuf::protoc "--proto_path=${BBNET_VENDOR}/shadnet"
++    COMMAND $<TARGET_FILE:protobuf::protoc> "--proto_path=${BBNET_VENDOR}/shadnet"
+             "--cpp_out=${SHADNET_PROTO_OUT20}" "${BBNET_VENDOR}/shadnet/shadnet.proto"
+     DEPENDS "${BBNET_VENDOR}/shadnet/shadnet.proto")
+ file(GLOB_RECURSE BBNET20_SOURCES CONFIGURE_DEPENDS
+@@ -22,20 +22,54 @@
+ list(FILTER BBNET20_SOURCES EXCLUDE REGEX
+     "np_trophy|trophy_ui|np_sns_facebook_dialog|np_profile_dialog/|np_commerce/")
+ # BBSC, Bloodborne seamless co-op (GPL-2.0+): its game code and the port's stand-ins for
+-# shadPS4's UI (bbsc/bbsc_glue.cpp). Installed only for Bloodborne with BB_BBSC=1.
+-file(GLOB BBNET20_BBSC_SOURCES CONFIGURE_DEPENDS bbsc/core/*.cpp bbsc/bbsc_glue.cpp)
++# shadPS4's UI (bbsc/bbsc_glue.cpp). Installed only for Bloodborne with BB_BBSC=1 (bbnet_image_ready: with it
++# unset nothing of BBSC hooks or writes the game's code). Its hooks and byte patches go through the port's
++# code-hook layer in libbbgpu (shim/bbport_guest_code_hooks.h: trampolines that reach the host through the
++# guest CPU, code invalidation after every write); BB_NET_BBSC=OFF builds the module without BBSC
++# (bbsc_off.cpp: no-op stand-ins for what the network code reports to it).
++option(BB_NET_BBSC "Build BBSC, Bloodborne seamless co-op, into the online module" ON)
++if (BB_NET_BBSC)
++    file(GLOB BBNET20_BBSC_SOURCES CONFIGURE_DEPENDS bbsc/core/*.cpp bbsc/bbsc_glue.cpp)
++else()
++    set(BBNET20_BBSC_SOURCES bbsc_off.cpp)
++endif()
+ file(GLOB BBNET20_THD_SOURCES CONFIGURE_DEPENDS thd/*.cpp compat/common/*.cpp)
+ 
+ add_library(bbnet20 SHARED ${BBNET20_SOURCES} ${BBNET20_THD_SOURCES} ${BBNET20_BBSC_SOURCES}
+-    "${SHADNET_PROTO_OUT20}/shadnet.pb.cc" bbnet_glue.cpp)
+-target_include_directories(bbnet20 PRIVATE include bbsc compat . .. ../shim "${BBNET_VENDOR}"
++    "${SHADNET_PROTO_OUT20}/shadnet.pb.cc" bbnet_glue.cpp bbnet_status.cpp)
++target_include_directories(bbnet20 PRIVATE include bbsc compat . .. ../shim ../shadps4 "${BBNET_VENDOR}"
+     "${BBNET_VENDOR}/shadnet" "${SHADNET_PROTO_OUT20}" ../third_party/imgui ../third_party/httplib)
+ # The version the shadNet client reports to the server (BB_CLIENT_VERSION overrides it).
+ target_compile_definitions(bbnet20 PRIVATE BOOST_ASIO_STANDALONE NDEBUG
+     CPPHTTPLIB_OPENSSL_SUPPORT CPPHTTPLIB_ZLIB_SUPPORT BBNET_PORT_VERSION="${BBPORT_VERSION}")
+ target_compile_options(bbnet20 PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden
+     -Wno-deprecated-declarations -Wno-missing-field-initializers)
++if (BB_NET_BBSC)
++    target_compile_definitions(bbnet20 PRIVATE BBNET_BBSC=1)
++endif()
+ target_link_options(bbnet20 PRIVATE -Wl,-Bsymbolic -Wl,--exclude-libs,ALL)
++if (ANDROID)
++    # Only bbnet.h's C interface leaves the library (check_bionic_symbols.sh verifies it).
++    target_link_options(bbnet20 PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/bbnet.map")
++    set_target_properties(bbnet20 PROPERTIES LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/bbnet.map")
++endif()
++if (ANDROID)
++    # Its guest_cpu_* calls come from libbbcpu.so and its runtime_* calls from bb-probe, both in the
++    # process before it is loaded (the NDK's --no-undefined would refuse them: check_bionic_symbols.sh
++    # verifies every one is provided). libbbgpu.so is a real dependency (logging).
++    target_link_options(bbnet20 PRIVATE -Wl,-z,undefs -Wl,--allow-shlib-undefined)
++    # Android's linker resolves a dlopen'ed library's symbols from the global group (the executable, LD_PRELOADs) and
++    # the library's own DT_NEEDED closure only: bb-probe's NEEDED libbbcpu.so is not visible to it, so guest_cpu_call
++    # would fail the dlopen ("cannot locate symbol"). libbbnet20.so therefore has NEEDED libbbcpu.so itself
++    # (BB_CPU_LIB: the libbbcpu.so build_bionic.sh built; check_bionic_symbols.sh verifies every symbol resolves).
++    set(BB_CPU_LIB "" CACHE FILEPATH "libbbcpu.so (FEXCore) the online module is linked against on Android")
++    if (NOT BB_CPU_LIB OR NOT EXISTS "${BB_CPU_LIB}")
++        message(FATAL_ERROR "bbnet20: BB_CPU_LIB (libbbcpu.so) is required on Android (tools/android/build_bionic.sh passes it)")
++    endif()
++    add_library(bbcpu_runtime SHARED IMPORTED)
++    set_target_properties(bbcpu_runtime PROPERTIES IMPORTED_LOCATION "${BB_CPU_LIB}" IMPORTED_SONAME "libbbcpu.so")
++    target_link_libraries(bbnet20 PRIVATE bbcpu_runtime)
++endif()
+ set_target_properties(bbnet20 PROPERTIES BUILD_RPATH "\$ORIGIN" INSTALL_RPATH "\$ORIGIN"
+     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+ target_link_libraries(bbnet20 PRIVATE bbgpu nlohmann_json::nlohmann_json protobuf::libprotobuf
+diff
+--- a/gpu/bbnet20/include/bbnet_guest.h	1970-01-01 08:00:00.000000000 +0800
++++ b/gpu/bbnet20/include/bbnet_guest.h
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport-android: the game's callbacks (function pointers it handed to sceNp*/sceNet*) run on the guest CPU
++// (FEXCore): a plain call from this library would run x86-64 code as arm64. BbGuestCall goes through
++// guest_cpu_call (gpu/shim/bbport_guest_call.h) and first makes sure the calling thread has a guest TCB and
++// guest stack (the module's own threads are started with them; std::threads of the libraries are attached here
++// on their first call). Integer, enum and pointer arguments and results only.
++#pragma once
++
++#include "bbport_guest_call.h"
++
++namespace BbNet {
++/// The calling host thread can run guest code (runtime_thread_attach_host; once per thread).
++void EnsureGuestThread();
++} // namespace BbNet
++
++template <typename R, typename... P, typename... A>
++inline R BbGuestCall(R (*fn)(P...), A... args) {
++    BbNet::EnsureGuestThread();
++    return GuestCall(fn, args...);
++}
+diff
+--- a/gpu/bbnet20/include/bbnet_status.h	1970-01-01 08:00:00.000000000 +0800
++++ b/gpu/bbnet20/include/bbnet_status.h
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport-android: what the online session is doing, for the app (BB_NET_STATUS_FILE: one line `state|detail`,
++// rewritten whole under another name and renamed on every change; the app shows it as a badge and in its menu)
++// and for the log. The shadNet client and NpHandler, the Hunter's Dream backend and the signaling code report here.
++#pragma once
++
++#include <string>
++
++namespace BbNetStatus {
++
++enum class State { Connecting, Online, Offline, Rejected, Error };
++
++/// The pool's name as the player knows it: "The Hunter's Dream" (BB_NET_BACKEND=thd), else "Seamless Hunt".
++const char* PoolName();
++/// `host` or `host:port` (the port left out when it is the default of shadNet's server, 31313).
++std::string ServerLabel(const std::string& host, unsigned port);
++
++/// The session's state and its text for the player. Rejected is final for the run (the server refused this client,
++/// retrying does not change that): later calls other than another Rejected are ignored.
++void Set(State state, std::string detail);
++State Current();
++/// Players connected over P2P (signaling/transports that are established); appended to the text while Online.
++void SetPeers(int count);
++/// shadNet's signaling: transport `id` is established (up) or is not (any other state, or gone).
++void TransportUp(int id, bool up);
++/// A short notice for the app's chip (BB_NET_BANNER_FILE): a friend request, an invitation, a server message.
++void Notice(const std::string& text);
++
++} // namespace BbNetStatus
+diff
+--- a/gpu/bbnet20/include/bbnet_tls.h	1970-01-01 08:00:00.000000000 +0800
++++ b/gpu/bbnet20/include/bbnet_tls.h
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport-android: the CA certificates the library's HTTPS clients (httplib over OpenSSL) trust. Android has no
++// OpenSSL certificate directory an app can read, so the runtime ships Mozilla's bundle (cacert.pem, build_bionic_deps.sh).
++#pragma once
++
++#include <string>
++
++namespace BbNet {
++/// BB_CA_BUNDLE, else <the directory above this library's>/share/cacert.pem when it exists, else "" (the
++/// library's own defaults). Also exported to OpenSSL as SSL_CERT_FILE by bbnet_init.
++const std::string& CaBundlePath();
++} // namespace BbNet
+diff
+--- a/gpu/bbnet20/include/core/libraries/libs.h
++++ b/gpu/bbnet20/include/core/libraries/libs.h
+@@ -15,7 +15,8 @@
+ };
+ } // namespace Core::Loader
+ 
+-#ifdef _WIN32
++// bbport-android: guest code (FEXCore) has no unwind data either: a C++ exception must not unwind into its frames.
++#if defined(_WIN32) || defined(__ANDROID__)
+ #include <cstdio>
+ #include <exception>
+ #include <type_traits>
+diff
+--- a/gpu/bbnet20/SHADNET-PORT.md
++++ b/gpu/bbnet20/SHADNET-PORT.md
+@@ -28,3 +28,37 @@
+ sceNet imports are these, ahead of the shadPS4 ones; the shadNet pool is unchanged. sceHttp stays
+ shadPS4's, with two `bbport` hooks that act only in that pool: `*.example.com` host-override keys
+ and the account token and ruleset headers.
++
++## BBSC (Seamless Hunt co-op) under FEXCore (`bbsc/`, `BB_NET_BBSC=ON`, run with `BB_BBSC=1`)
++
++BBSC's game code (`bbsc/core/`, upstream's, GPL-2.0-or-later) patches the game's x86-64 code with hooks and byte
++patches. Here the game's code runs in FEXCore, so four things differ from a native x86-64 host (every change is in
++`android-changes.diff`):
++- Hooks (`gpu/shim/bbport_guest_code_hooks.{h,cpp}`, libbbgpu): the site's span (byte-checked, whole
++  position-independent instructions) is replaced by a jump to a trampoline that saves the registers, flags, MXCSR
++  and YMM registers into a `GuestRegisterSnapshot`, calls the hook, restores them, runs the replaced instructions
++  and jumps back (a skip flag, function entries only, returns from the function at once). The hook is arm64 code
++  the guest cannot call: the trampoline calls the guest-callable stub of one host function
++  (`guest_cpu_host_function`), which calls the hook (`tests/run_guest_code_hooks_test.sh` runs the trampoline on a
++  PC, both ways of calling). `BB_GUEST_HOOK_STATS=1` tells every 20 s which sites run how often.
++- FEXCore here has no page tracking of the game's code (its `mtrack` lives in FEX's Linux layer, which is not
++  linked): every write of code is followed by `guest_cpu_invalidate` (`Core::GuestCodeWritten`; BBSC's patch tables
++  and hook installs do it), so BBSC's runtime switches take effect on the next run of the code. The code pages are
++  read-write-execute while BBSC is on (`Core::KeepGuestCodeWritable`; a per-write unprotect would race the threads
++  that switch patches).
++- Calls of the game's functions (`BbGuestCall`; with float arguments, `Core::CallGuestWithFloats`).
++- No SDL: the cinematic camera's event filter is never called.
++A hook whose site differs from what BBSC expects is refused (nothing is written) and logged with who changed the
++bytes: `tools/android/dev/bbsc_sites.sh` runs BBSC's install code against the 1.09 eboot, pristine and with the port's
++patches applied.
++
++## Online status for the app (`bbnet_status.cpp`, `BB_NET_STATUS_FILE`)
++
++The app shows whether the session is up. The module rewrites the file `BB_NET_STATUS_FILE` names (written under another
++name and renamed) with one line `state|detail` on every change; state is `connecting`, `online`, `offline`, `rejected`
++or `error`, and the same line goes to the log ("Online status: ..."). Reported from `np_handler.cpp` (the connect, the
++login and its failures, a dropped connection, `ClientRejected`), `shadnet/client.cpp` (connect retries),
++`signaling_handler.cpp` (established P2P transports: "· N players connected") and `thd/thd_session.cpp` (The Hunter's
++Dream has no connection of its own: the session service's answers, the 401 refusal, and its peer table). `Rejected`
++is final for the run. The stubbed shadNet notification and invitation layers write their texts to `BB_NET_BANNER_FILE`
++(the app's chip).
+diff
+--- a/gpu/bbnet20/thd/thd_internal.h
++++ b/gpu/bbnet20/thd/thd_internal.h
+@@ -12,6 +12,7 @@
+ #include <nlohmann/json.hpp>
+ 
+ #include "common/types.h"
++#include "bbnet_guest.h" // bbport-android: the game's callbacks run on the guest CPU
+ 
+ extern "C" int32_t runtime_thread_spawn(void** out, void* PS4_SYSV_ABI (*entry)(void*),
+                                         void* argument, uint64_t stack, const char* name);
+@@ -67,7 +68,7 @@
+ template <typename... A>
+ inline std::int64_t CallGuest(void* fn, A... a) {
+     using F = std::int64_t(PS4_SYSV_ABI*)(A...);
+-    return fn ? reinterpret_cast<F>(fn)(a...) : 0;
++    return fn ? BbGuestCall(reinterpret_cast<F>(fn), a...) : 0; // bbport-android: through the guest CPU
+ }
+ 
+ // ---- our endpoint
+diff
+--- a/gpu/bbnet20/thd/thd_session.cpp
++++ b/gpu/bbnet20/thd/thd_session.cpp
+@@ -3,6 +3,8 @@
+ // the peer table, the event poller and the keepalive. Adapted from droogie/bbhost
+ // src/net/{http,account,session}.cpp and src/engine/summon_invite.cpp (566184a).
+ #include "httplib.h"
++#include "bbnet_status.h" // bbport-android: the online status file
++#include "bbnet_tls.h" // bbport-android: the CA bundle
+ 
+ #include "thd.h"
+ #include "thd_internal.h"
+@@ -139,6 +141,9 @@
+     Log("the server refused this PC's sign-in as %s (%s): sign in again on the launcher's Online "
+         "page; until then nobody can summon or invite this player",
+         name.c_str(), reason.c_str());
++    // bbport-android: the status file (final for this run: the token stays refused until the next sign-in).
++    BbNetStatus::Set(BbNetStatus::State::Rejected,
++                     "Server rejected this sign-in: " + reason + " (sign in to The Hunter's Dream again)");
+ }
+ std::string OnlineId() {
+     const std::string name = AccountName();
+@@ -150,8 +155,12 @@
+     if (SignedIn()) {
+         Log("The Hunter's Dream as %s: session service %s, P2P port %d", AccountName().c_str(),
+             c.np_base.c_str(), c.p2p_port);
++        // bbport-android: the status file; the first answer of the session service makes it Online (ParseReply).
++        BbNetStatus::Set(BbNetStatus::State::Connecting, "Connecting to The Hunter's Dream\xE2\x80\xA6");
+     } else {
+         Log("not signed in to The Hunter's Dream (the launcher's Online page): the game stays offline");
++        BbNetStatus::Set(BbNetStatus::State::Offline,
++                         "Not signed in to The Hunter's Dream \xE2\x80\x94 sign in from the Online menu");
+     }
+ }
+ 
+@@ -196,6 +205,9 @@
+         cli = std::make_unique<httplib::Client>(base);
+         cli->set_keep_alive(true);
+         cli->set_follow_location(false);
++        if (!BbNet::CaBundlePath().empty()) { // bbport-android: the runtime's CA bundle
++            cli->set_ca_cert_path(BbNet::CaBundlePath());
++        }
+ #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+         cli->enable_server_certificate_verification(Cfg().verify_tls);
+ #endif
+@@ -232,8 +244,31 @@
+     return r;
+ }
+ 
++// bbport-android: the status file follows the session service's answers (it has no connection of its own: the
++// event poll, the heartbeat and the other requests are the session). An answer says it is there; no answer at all
++// (or a gateway error) says it is not; a 401 is the server refusing the sign-in (MarkRefused).
++enum { kLinkUnknown = 0, kLinkUp = 1, kLinkDown = 2 };
++std::atomic<int> g_link{kLinkUnknown};
++void LinkSeen(bool up) {
++    const int before = g_link.exchange(up ? kLinkUp : kLinkDown);
++    if ((up ? kLinkUp : kLinkDown) == before) return;
++    if (up) {
++        BbNetStatus::Set(BbNetStatus::State::Online,
++                         std::string("Signed in to ") + BbNetStatus::PoolName() + " as " + AccountName());
++    } else if (before == kLinkUnknown) {
++        BbNetStatus::Set(BbNetStatus::State::Offline, "Can't reach The Hunter's Dream \xE2\x80\x94 retrying");
++    } else {
++        BbNetStatus::Set(BbNetStatus::State::Offline, "Disconnected \xE2\x80\x94 reconnecting");
++    }
++}
++
+ bool ParseReply(const std::string& what, const HttpResult& r, Json& out, std::string& error) {
+     static std::atomic<int> logs{0};
++    if (!r.error.empty() || r.status >= 502) {
++        LinkSeen(false);
++    } else if (r.status != 401) {
++        LinkSeen(true);
++    }
+     if (!r.error.empty()) {
+         error = r.error;
+     } else if (r.status < 200 || r.status >= 300) {
+@@ -398,6 +433,20 @@
+     return a.s_addr;
+ }
+ 
++// bbport-android: the status file's "N players connected": the other players whose signaling connection is up
++// (the game was told ESTABLISHED/ACTIVE: sig_status 2).
++void PublishPeers() {
++    int count = 0;
++    {
++        std::lock_guard lk(g_pmu);
++        const std::string me = OnlineId();
++        for (const auto& [member, peer] : g_peers) {
++            if (peer.sig_status == 2 && peer.online_id != me) ++count;
++        }
++    }
++    BbNetStatus::SetPeers(count);
++}
++
+ // A peer with a new address: probes toward it so our NAT lets its datagrams in.
+ void PunchIfNew(const Peer& before, const Peer& after) {
+     if (after.online_id == OnlineId() || !after.addr || !after.port) return;
+@@ -410,8 +459,11 @@
+ } // namespace
+ 
+ void PeersClear() {
+-    std::lock_guard lk(g_pmu);
+-    g_peers.clear();
++    {
++        std::lock_guard lk(g_pmu);
++        g_peers.clear();
++    }
++    PublishPeers();
+ }
+ void PeersUpsert(const Peer& p) {
+     Peer before;
+@@ -425,6 +477,7 @@
+         slot.conn_id = conn;
+         slot.sig_status = sig;
+     }
++    PublishPeers();
+     PunchIfNew(before, p);
+ }
+ bool PeersGet(std::uint16_t member_id, Peer* out) {
+@@ -445,15 +498,21 @@
+     return false;
+ }
+ void PeersSetConn(std::uint16_t member_id, unsigned conn_id, int sig_status) {
+-    std::lock_guard lk(g_pmu);
+-    const auto it = g_peers.find(member_id);
+-    if (it == g_peers.end()) return;
+-    it->second.conn_id = conn_id;
+-    it->second.sig_status = sig_status;
++    {
++        std::lock_guard lk(g_pmu);
++        const auto it = g_peers.find(member_id);
++        if (it == g_peers.end()) return;
++        it->second.conn_id = conn_id;
++        it->second.sig_status = sig_status;
++    }
++    PublishPeers();
+ }
+ void PeersErase(std::uint16_t member_id) {
+-    std::lock_guard lk(g_pmu);
+-    g_peers.erase(member_id);
++    {
++        std::lock_guard lk(g_pmu);
++        g_peers.erase(member_id);
++    }
++    PublishPeers();
+ }
+ std::vector<Peer> PeersAll() {
+     std::lock_guard lk(g_pmu);
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/net/net.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/net/net.cpp
+@@ -18,6 +18,7 @@
+ #include <source_location>
+ #include <span>
+ #include <string>
++#include "bbnet_guest.h" // bbport-android: the game's callbacks run on the guest CPU
+ #include <unordered_map>
+ #include <vector>
+ #include <fmt/format.h>
+@@ -2742,7 +2743,7 @@
+ 
+ void* PS4_SYSV_ABI NetThreadEntry(void* p) {
+     const auto* param = static_cast<const OrbisNetThreadParam*>(p);
+-    param->entry(param->arg);
++    BbGuestCall(param->entry, param->arg); // bbport-android
+     if ((param->flags & 1) != 0) {
+         Kernel::posix_pthread_exit(nullptr);
+     }
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/net/net_util.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/net/net_util.cpp
+@@ -31,6 +31,8 @@
+ #include <sstream>
+ #endif
+ 
++#include <array>
++#include <cstdlib>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -45,6 +47,78 @@
+ 
+ namespace NetUtil {
+ 
++#ifdef __ANDROID__
++// bbport-android: what the Linux code below reads is closed to an app's process (getifaddrs and the
++// SIOCGIFHWADDR ioctl see no hardware addresses, /proc/net/route is unreadable since Android 10): a
++// stable MAC derived from the device id, a gateway guessed from the active interface, a netmask with a
++// default.
++namespace {
++std::array<u8, 6> StableFakeMac() {
++    const char* id = std::getenv("BB_NET_DEVICE_ID");
++    if (!id || !*id) {
++        id = std::getenv("BB_SHADNET_NPID");
++    }
++    if (!id || !*id) {
++        id = std::getenv("BB_THD_ONLINE_ID");
++    }
++    if (!id || !*id) {
++        id = "bbport-android";
++    }
++    u64 hash = 0xcbf29ce484222325ull; // FNV-1a
++    for (const char* c = id; *c; ++c) {
++        hash = (hash ^ static_cast<u8>(*c)) * 0x100000001b3ull;
++    }
++    // Locally administered, unicast.
++    return {0x02, static_cast<u8>(hash >> 8), static_cast<u8>(hash >> 16), static_cast<u8>(hash >> 24),
++            static_cast<u8>(hash >> 32), static_cast<u8>(hash >> 40)};
++}
++
++/// The address the default route would use: a UDP socket connected to a public address sends nothing.
++bool ActiveInterfaceAddress(in_addr* out) {
++    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0) {
++        return false;
++    }
++    sockaddr_in peer{};
++    peer.sin_family = AF_INET;
++    peer.sin_port = htons(53);
++    peer.sin_addr.s_addr = inet_addr("1.1.1.1");
++    sockaddr_in self{};
++    socklen_t length = sizeof(self);
++    const bool ok = connect(fd, reinterpret_cast<sockaddr*>(&peer), sizeof(peer)) == 0 &&
++                    getsockname(fd, reinterpret_cast<sockaddr*>(&self), &length) == 0 &&
++                    self.sin_addr.s_addr != 0;
++    close(fd);
++    if (ok) {
++        *out = self.sin_addr;
++    }
++    return ok;
++}
++
++/// The netmask of the interface that has `address`, if getifaddrs shows it.
++bool InterfaceNetmask(in_addr address, in_addr* out) {
++    ifaddrs* ifap = nullptr;
++    if (getifaddrs(&ifap) != 0) {
++        return false;
++    }
++    bool found = false;
++    for (const ifaddrs* p = ifap; p && !found; p = p->ifa_next) {
++        if (p->ifa_addr && p->ifa_netmask && p->ifa_addr->sa_family == AF_INET &&
++            reinterpret_cast<const sockaddr_in*>(p->ifa_addr)->sin_addr.s_addr == address.s_addr) {
++            *out = reinterpret_cast<const sockaddr_in*>(p->ifa_netmask)->sin_addr;
++            found = true;
++        }
++    }
++    freeifaddrs(ifap);
++    return found;
++}
++
++bool IsPrivate(u32 host_order) {
++    return (host_order >> 24) == 10 || (host_order >> 20) == 0xAC1 || (host_order >> 16) == 0xC0A8;
++}
++} // namespace
++#endif
++
+ const std::array<u8, 6>& NetUtilInternal::GetEthernetAddr() const {
+     return ether_address;
+ }
+@@ -81,6 +155,9 @@
+         }
+         freeifaddrs(ifap);
+     }
++#elif defined(__ANDROID__)
++    ether_address = StableFakeMac();
++    return true;
+ #elif defined(__FreeBSD__)
+     // todo
+ #else
+@@ -228,6 +305,40 @@
+     inet_ntop(AF_INET, gateAddr, str, sizeof(str));
+     this->default_gateway = str;
+     return true;
++#elif defined(__ANDROID__)
++    {
++        // The routing table when it can be read, else the first address of the active interface's
++        // private network (usually the router), else 0.0.0.0.
++        std::ifstream route{"/proc/net/route"};
++        std::string line;
++        std::getline(route, line);
++        while (std::getline(route, line)) {
++            std::istringstream iss{line};
++            std::string iface, destination, gateway;
++            iss >> iface >> destination >> gateway;
++            if (destination == "00000000") {
++                in_addr addr{};
++                addr.s_addr = static_cast<u32>(std::strtoul(gateway.c_str(), nullptr, 16));
++                char str[INET_ADDRSTRLEN];
++                if (addr.s_addr && inet_ntop(AF_INET, &addr, str, sizeof(str))) {
++                    this->default_gateway = str;
++                    return true;
++                }
++            }
++        }
++        in_addr own{}, mask{};
++        in_addr guess{};
++        if (ActiveInterfaceAddress(&own) && IsPrivate(ntohl(own.s_addr))) {
++            if (!InterfaceNetmask(own, &mask)) {
++                mask.s_addr = htonl(0xFFFFFF00u);
++            }
++            guess.s_addr = htonl((ntohl(own.s_addr) & ntohl(mask.s_addr)) | 1u);
++        }
++        char str[INET_ADDRSTRLEN];
++        inet_ntop(AF_INET, &guess, str, sizeof(str));
++        this->default_gateway = str;
++        return true;
++    }
+ #elif defined(__FreeBSD__)
+     return true;
+ #else
+@@ -307,6 +418,17 @@
+             }
+         }
+     }
++#elif defined(__ANDROID__)
++    {
++        // The active interface's netmask, else /24 (bbport-android: getifaddrs may show nothing).
++        in_addr own{}, mask{};
++        mask.s_addr = htonl(0xFFFFFF00u);
++        if (ActiveInterfaceAddress(&own)) {
++            InterfaceNetmask(own, &mask);
++        }
++        inet_ntop(AF_INET, &mask, netmaskStr, INET_ADDRSTRLEN);
++        success = true;
++    }
+ #else
+     ifaddrs* ifap;
+ 
+@@ -349,7 +471,13 @@
+ bool NetUtilInternal::RetrieveIp() {
+     std::scoped_lock lock{m_mutex};
+ 
++#ifdef __ANDROID__
++    // bbport-android: a UDP socket tells the local address without connecting out (no wait on a phone
++    // with no route).
++    auto sockfd = socket(AF_INET, SOCK_DGRAM, 0);
++#else
+     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
++#endif
+     if (sockfd == -1) {
+         return false;
+     }
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/network/http.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/network/http.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include "bbnet_tls.h" // bbport-android: the CA bundle
+ #include <atomic>
+ #include <cctype>
+ #include <chrono>
+@@ -862,6 +863,9 @@
+             base_url += ":" + std::to_string(plan.port);
+         }
+         httplib::Client cli(base_url);
++        if (!BbNet::CaBundlePath().empty()) { // bbport-android: the runtime's CA bundle
++            cli.set_ca_cert_path(BbNet::CaBundlePath());
++        }
+         cli.set_connection_timeout(pick_timeout_seconds(plan.settings.connect_timeout_us, 30));
+         cli.set_read_timeout(pick_timeout_seconds(plan.settings.recv_timeout_us, 120));
+         cli.set_write_timeout(pick_timeout_seconds(plan.settings.send_timeout_us, 120));
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/network/net_ctl_obj.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/network/net_ctl_obj.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include "bbnet_guest.h" // bbport-android: the game's callbacks run on the guest CPU
+ #include "common/logging/log.h"
+ #include "core/emulator_settings.h"
+ #include "core/libraries/network/net_ctl_codes.h"
+@@ -51,7 +52,7 @@
+                            : ORBIS_NET_CTL_EVENT_TYPE_DISCONNECTED;
+     for (const auto [func, arg] : callbacks) {
+         if (func != nullptr) {
+-            func(event, arg);
++            BbGuestCall(func, event, arg); // bbport-android
+         }
+     }
+ }
+@@ -63,7 +64,7 @@
+                            : ORBIS_NET_CTL_EVENT_TYPE_DISCONNECTED;
+     for (const auto [func, arg] : nptool_callbacks) {
+         if (func != nullptr) {
+-            func(event, arg);
++            BbGuestCall(func, event, arg); // bbport-android
+         }
+     }
+ }
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_common.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_common.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cctype>
++#include "bbnet_guest.h" // bbport-android: the game's callbacks run on the guest CPU
+ #include <cstddef>
+ #include <cstring>
+ #include <fmt/format.h>
+@@ -68,7 +69,7 @@
+                 ctx->head = entry->next;
+                 sceNpMutexUnlock(mutex);
+                 if (entry->handler != nullptr) {
+-                    entry->handler(entry->arg);
++                    BbGuestCall(entry->handler, entry->arg); // bbport-android
+                 }
+                 sceNpMutexLock(mutex);
+                 continue;
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_handler/np_handler.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_handler/np_handler.cpp
+@@ -20,6 +20,7 @@
+ #include "imgui/shadnet_notifications_layer.h"
+ #include "shadnet.pb.h"
+ #include "shadnet/server_probe.h"
++#include "bbnet_status.h" // bbport-android: the online status file
+ 
+ namespace Libraries::Np {
+ 
+@@ -136,16 +137,24 @@
+ 
+     if (!EmulatorSettings.IsShadNetEnabled()) {
+         LOG_INFO(NpHandler, "shadNet disabled globally we are in offline mode");
++        BbNetStatus::Set(BbNetStatus::State::Offline, "Online play is off"); // bbport-android
+         return;
+     }
+ 
+     {
+         const auto [host, port] = ParseServerAddress();
++        // bbport-android: the status file (BB_NET_STATUS_FILE) follows the session from here.
++        BbNetStatus::Set(BbNetStatus::State::Connecting,
++                         "Connecting to " + BbNetStatus::ServerLabel(host, port) + "\xE2\x80\xA6");
+         const ShadNet::ProbeInfo probe = ShadNet::ProbeServer(host, port);
+         if (probe.result != ShadNet::ProbeResult::Ok) {
+             EmulatorSettings.SetShadNetSessionDisabled(true);
+             switch (probe.result) {
+             case ShadNet::ProbeResult::VersionMismatch:
++                BbNetStatus::Set(BbNetStatus::State::Rejected,
++                                 fmt::format("Server rejected this client: protocol version mismatch "
++                                             "(server v{}, client v{})",
++                                             probe.server_version, ShadNet::SHAD_PROTOCOL_VERSION));
+                 LOG_WARNING(NpHandler,
+                             "shadNet server {}:{} protocol version mismatch (server v{}, emulator "
+                             "v{}); disabling shadNet for this run (saved setting unchanged)",
+@@ -158,6 +167,9 @@
+                                 probe.server_version, ShadNet::SHAD_PROTOCOL_VERSION));
+                 break;
+             case ShadNet::ProbeResult::ProtocolError:
++                BbNetStatus::Set(BbNetStatus::State::Error,
++                                 "Server " + BbNetStatus::ServerLabel(host, port) +
++                                     " sent an invalid handshake");
+                 LOG_WARNING(NpHandler,
+                             "shadNet server {}:{} sent an invalid ServerInfo handshake; disabling "
+                             "shadNet for this run (saved setting unchanged)",
+@@ -169,6 +181,9 @@
+                                 host, port));
+                 break;
+             default: // Unreachable
++                BbNetStatus::Set(BbNetStatus::State::Offline,
++                                 "Can't reach " + BbNetStatus::ServerLabel(host, port) +
++                                     " \xE2\x80\x94 online play is off for this session");
+                 LOG_WARNING(NpHandler,
+                             "shadNet server {}:{} is offline/unreachable; disabling shadNet for "
+                             "this run (saved setting unchanged)",
+@@ -196,6 +211,10 @@
+ 
+     if (connected_count == 0) {
+         LOG_WARNING(NpHandler, "no users connected to shadNet");
++        // bbport-android: ConnectUser has said why when it ran; else there is no account to sign in with.
++        if (BbNetStatus::Current() == BbNetStatus::State::Connecting) {
++            BbNetStatus::Set(BbNetStatus::State::Offline, "Not signed in: no shadNet account set up");
++        }
+         return;
+     }
+ 
+@@ -237,6 +256,18 @@
+                             const std::string& password, const std::string& token) {
+     LOG_INFO(NpHandler, "Connecting user_id={} npid='{}' to {}:{} (timeout {}s)", user_id, npid,
+              host, port, ShadNet::SHAD_CONNECT_TIMEOUT_MS / 1000);
++    // bbport-android: a reconnect after a drop keeps "Disconnected — reconnecting" on the status (no flicker
++    // between the attempts); a first connect says where it connects.
++    bool reconnecting;
++    {
++        std::lock_guard lock(m_mutex_clients);
++        reconnecting = m_reconnect.count(user_id) != 0;
++    }
++    const std::string server_label = BbNetStatus::ServerLabel(host, port);
++    if (!reconnecting) {
++        BbNetStatus::Set(BbNetStatus::State::Connecting,
++                         "Connecting to " + server_label + "\xE2\x80\xA6");
++    }
+ 
+     auto client = std::make_shared<ShadNet::ShadNetClient>();
+ 
+@@ -308,6 +339,27 @@
+     if (conn_state != ShadNet::ShadNetState::Ok) {
+         LOG_ERROR(NpHandler, "user_id={} connection failed (state={})", user_id,
+                   static_cast<int>(conn_state));
++        // bbport-android: the status file.
++        if (conn_state == ShadNet::ShadNetState::FailureProtocol) {
++            BbNetStatus::Set(BbNetStatus::State::Rejected,
++                             "Server rejected this client: incompatible protocol" +
++                                 (client->GetServerProtocolVersion() != 0
++                                      ? fmt::format(" (server v{}, client v{})",
++                                                    client->GetServerProtocolVersion(),
++                                                    ShadNet::SHAD_PROTOCOL_VERSION)
++                                      : std::string{}));
++        } else if (reconnecting) {
++            BbNetStatus::Set(BbNetStatus::State::Offline,
++                             "Disconnected \xE2\x80\x94 reconnecting");
++        } else {
++            const char* why = conn_state == ShadNet::ShadNetState::FailureResolve
++                                  ? "the address was not found"
++                              : conn_state == ShadNet::ShadNetState::FailureServerInfo
++                                  ? "no handshake from the server"
++                                  : "no connection";
++            BbNetStatus::Set(BbNetStatus::State::Offline,
++                             "Can't reach " + server_label + ": " + why);
++        }
+         handle_protocol_mismatch(conn_state);
+         client->Stop();
+         return false;
+@@ -317,6 +369,33 @@
+     if (auth_state != ShadNet::ShadNetState::Ok) {
+         LOG_ERROR(NpHandler, "user_id={} authentication failed (state={})", user_id,
+                   static_cast<int>(auth_state));
++        // bbport-android: the status file (a protocol failure is the server refusing this client).
++        if (auth_state == ShadNet::ShadNetState::FailureProtocol) {
++            BbNetStatus::Set(BbNetStatus::State::Rejected,
++                             "Server rejected this client: incompatible protocol");
++        } else {
++            const char* why = "the server refused the login";
++            switch (auth_state) {
++            case ShadNet::ShadNetState::FailureAlreadyIn:
++                why = "this account is already signed in somewhere else";
++                break;
++            case ShadNet::ShadNetState::FailureUsername:
++                why = "unknown Online ID";
++                break;
++            case ShadNet::ShadNetState::FailurePassword:
++                why = "wrong password";
++                break;
++            case ShadNet::ShadNetState::FailureToken:
++                why = "the sign-in token was refused";
++                break;
++            case ShadNet::ShadNetState::FailureOther:
++                why = "the connection closed during login";
++                break;
++            default:
++                break;
++            }
++            BbNetStatus::Set(BbNetStatus::State::Error, std::string("Login failed: ") + why);
++        }
+         handle_protocol_mismatch(auth_state);
+         client->Stop();
+         return false;
+@@ -324,6 +403,8 @@
+ 
+     LOG_INFO(NpHandler, "user_id={} signed in npid='{}' accountId={}", user_id, npid,
+              client->GetUserId());
++    BbNetStatus::Set(BbNetStatus::State::Online,
++                     std::string("Signed in to ") + BbNetStatus::PoolName() + " as " + npid);
+ 
+     Net::UPnPClient::Instance().SetP2PFeaturesEnabled(client->IsMatching2Enabled());
+     if (client->IsMatching2Enabled() && EmulatorSettings.IsUPnPEnabled()) {
+@@ -457,6 +538,8 @@
+ 
+         for (s32 uid : dropped) {
+             LOG_WARNING(NpHandler, "user_id={} connection dropped (network); will retry", uid);
++            BbNetStatus::Set(BbNetStatus::State::Offline,
++                             "Disconnected \xE2\x80\x94 reconnecting"); // bbport-android
+             DisconnectUser(uid);   // reports SignedOut + stops/removes the dead client
+             MarkForReconnect(uid); // schedule transparent reconnect (network drop, not logout)
+         }
+@@ -769,6 +852,14 @@
+                           : n.message + " Online features are off for this session.";
+     LOG_ERROR(NpHandler, "user_id={} signed out by the server (reason {}, version '{}'): {}",
+               user_id, n.reason, n.version, n.message);
++    // bbport-android: the status file (the server's own words when it gave any).
++    BbNetStatus::Set(
++        BbNetStatus::State::Rejected,
++        "Server rejected this client: " +
++            (!n.message.empty() ? n.message
++             : n.reason == ShadNet::NotifyClientRejected::ReasonVersion
++                 ? "version '" + n.version + "' is not accepted"
++                 : "reason " + std::to_string(n.reason)));
+     ImGui::ShadNetNotify::Push(ImGui::ShadNetNotify::Kind::Warning, text);
+ }
+ 
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_handler/np_handler_invitation.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_handler/np_handler_invitation.cpp
+@@ -6,6 +6,7 @@
+ #include <chrono>
+ #include <cstring>
+ #include <httplib.h>
++#include "bbnet_tls.h" // bbport-android: the CA bundle
+ #include "common/logging/log.h"
+ #include "core/emulator_settings.h"
+ #include "core/libraries/invitation_dialog/invitation_dialog.h"
+@@ -99,6 +100,9 @@
+     const std::string content_type = "multipart/mixed; boundary=" + boundary;
+ 
+     httplib::Client cli(base_url);
++    if (!BbNet::CaBundlePath().empty()) { // bbport-android
++        cli.set_ca_cert_path(BbNet::CaBundlePath());
++    }
+     cli.set_connection_timeout(5);
+     cli.set_read_timeout(10);
+     const httplib::Headers headers = {{"Authorization", "Bearer " + token}};
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_manager.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_manager.cpp
+@@ -5,6 +5,7 @@
+ #include <cctype>
+ #include <deque>
+ #include <map>
++#include "bbnet_guest.h" // bbport-android: the game's callbacks run on the guest CPU
+ #include <mutex>
+ #include <vector>
+ 
+@@ -935,9 +936,8 @@
+ 
+     for (auto& event : pending_events) {
+         if (legacy_callback.func != nullptr) {
+-            legacy_callback.func(event.user_id, event.state,
+-                                 event.has_np_id ? &event.np_id : nullptr,
+-                                 legacy_callback.userdata);
++            BbGuestCall(legacy_callback.func, event.user_id, event.state, // bbport-android
++                        event.has_np_id ? &event.np_id : nullptr, legacy_callback.userdata);
+         }
+ 
+         for (const auto& entry : callbacks) {
+@@ -946,18 +946,20 @@
+             }
+ 
+             if (entry.func != nullptr) {
+-                entry.func(event.user_id, event.state, entry.userdata);
++                BbGuestCall(entry.func, event.user_id, event.state, entry.userdata); // bbport-android
+             }
+         }
+ 
+         if (toolkit_callback.func != nullptr) {
+-            toolkit_callback.func(event.user_id, event.state, toolkit_callback.userdata);
++            BbGuestCall(toolkit_callback.func, event.user_id, event.state, // bbport-android
++                        toolkit_callback.userdata);
+         }
+     }
+ 
+     // Reachability callback fires only on a change, after the state callbacks.
+     for (const auto& [user_id, reach] : reachability_changes) {
+-        reachability_callback.func(user_id, reach, reachability_callback.userdata);
++        BbGuestCall(reachability_callback.func, user_id, reach, // bbport-android
++                    reachability_callback.userdata);
+     }
+ }
+ 
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/np/signaling_handler.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/np/signaling_handler.cpp
+@@ -24,6 +24,7 @@
+ #include "core/libraries/np/np_signaling/np_signaling_state.h"
+ #include "core/bloodborne_re.h"
+ #include "core/net/p2p_relay.h"
++#include "bbnet_status.h" // bbport-android: the online status file
+ #include "core/libraries/np/np_signaling/np_signaling_transport.h"
+ 
+ namespace Libraries::Np::SignalingHandler {
+@@ -351,6 +352,8 @@
+                              NpSignaling::ConnState new_state) {
+     transport.state = new_state;
+     transport.status = StatusFromState(new_state);
++    // bbport-android: the status file counts the peers whose transport is established.
++    BbNetStatus::TransportUp(transport.transport_id, new_state == NpSignaling::ConnState::Established);
+ }
+ 
+ s32 AllocateTransportIdLocked() {
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_matching2/np_matching2_internal.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_matching2/np_matching2_internal.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include "bbnet_guest.h" // bbport-android: the game's callbacks run on the guest CPU
+ #include <cstdio>
+ #include <cstring>
+ #include <string>
+@@ -1616,8 +1617,8 @@
+             LOG_INFO(Lib_NpMatching2, "callback CONTEXT ctx={} event={:#x} cause={} err={:#x}",
+                      ev.ctx_id, static_cast<u16>(ev.ctx_event), static_cast<u8>(ev.ctx_event_cause),
+                      ev.error_code);
+-            ctx->context_callback(ev.ctx_id, ev.ctx_event, ev.ctx_event_cause, ev.error_code,
+-                                  ctx->context_callback_arg);
++            BbGuestCall(ctx->context_callback, ev.ctx_id, ev.ctx_event, // bbport-android
++                        ev.ctx_event_cause, ev.error_code, ctx->context_callback_arg);
+         } else {
+             LOG_WARNING(Lib_NpMatching2, "callback CONTEXT ctx={} event={:#x} SKIPPED: no callback",
+                         ev.ctx_id, static_cast<u16>(ev.ctx_event));
+@@ -1633,8 +1634,8 @@
+                      ev.req_id, static_cast<u16>(ev.req_event), ev.error_code,
+                      fmt::ptr(ev.request_data));
+             LogCreateJoinCallbackPayload(ev);
+-            ev.request_cb(ev.ctx_id, ev.req_id, ev.req_event, ev.error_code, ev.request_data,
+-                          ev.request_cb_arg);
++            BbGuestCall(ev.request_cb, ev.ctx_id, ev.req_id, ev.req_event, // bbport-android
++                        ev.error_code, ev.request_data, ev.request_cb_arg);
+         } else {
+             LOG_WARNING(Lib_NpMatching2,
+                         "callback REQUEST ctx={} reqId={} event={:#x} SKIPPED: no callback",
+@@ -1646,8 +1647,8 @@
+             LOG_INFO(Lib_NpMatching2,
+                      "callback SIGNALING ctx={} room={} member={} event={:#x} err={:#x}", ev.ctx_id,
+                      ev.room_id, ev.member_id, static_cast<u16>(ev.sig_event), ev.error_code);
+-            ctx->signaling_callback(ev.ctx_id, ev.room_id, ev.member_id, ev.sig_event,
+-                                    ev.error_code, ctx->signaling_callback_arg);
++            BbGuestCall(ctx->signaling_callback, ev.ctx_id, ev.room_id, // bbport-android
++                        ev.member_id, ev.sig_event, ev.error_code, ctx->signaling_callback_arg);
+         } else {
+             LOG_WARNING(Lib_NpMatching2,
+                         "callback SIGNALING ctx={} room={} event={:#x} SKIPPED: no callback",
+@@ -1660,8 +1661,8 @@
+                      ev.ctx_id, ev.room_id, static_cast<u16>(ev.room_event),
+                      fmt::ptr(ev.room_event_data));
+             LogMemberJoinedCallbackPayload(ev);
+-            ctx->room_event_callback(ev.ctx_id, ev.room_id, ev.room_event, ev.room_event_data,
+-                                     ctx->room_event_callback_arg);
++            BbGuestCall(ctx->room_event_callback, ev.ctx_id, ev.room_id, // bbport-android
++                        ev.room_event, ev.room_event_data, ctx->room_event_callback_arg);
+         } else {
+             LOG_WARNING(Lib_NpMatching2,
+                         "callback ROOM_EVENT ctx={} room={} event={:#x} SKIPPED: no callback",
+@@ -1673,8 +1674,8 @@
+             LOG_INFO(Lib_NpMatching2, "callback LOBBY_EVENT ctx={} lobby={} event={:#x} data={}",
+                      ev.ctx_id, ev.lobby_id, static_cast<u16>(ev.lobby_event),
+                      fmt::ptr(ev.lobby_event_data));
+-            ctx->lobby_event_callback(ev.ctx_id, ev.lobby_id, ev.lobby_event, ev.lobby_event_data,
+-                                      ctx->lobby_event_callback_arg);
++            BbGuestCall(ctx->lobby_event_callback, ev.ctx_id, ev.lobby_id, // bbport-android
++                        ev.lobby_event, ev.lobby_event_data, ctx->lobby_event_callback_arg);
+         } else {
+             LOG_WARNING(Lib_NpMatching2,
+                         "callback LOBBY_EVENT ctx={} lobby={} event={:#x} SKIPPED: no callback",
+@@ -1685,8 +1686,9 @@
+         if (ctx->lobby_message_callback) {
+             LOG_INFO(Lib_NpMatching2, "callback LOBBY_MESSAGE ctx={} lobby={} src={} event={:#x}",
+                      ev.ctx_id, ev.lobby_id, ev.src_member_id, static_cast<u16>(ev.msg_event));
+-            ctx->lobby_message_callback(ev.ctx_id, ev.lobby_id, ev.src_member_id, ev.msg_event,
+-                                        ev.message_data, ctx->lobby_message_callback_arg);
++            BbGuestCall(ctx->lobby_message_callback, ev.ctx_id, ev.lobby_id, // bbport-android
++                        ev.src_member_id, ev.msg_event, ev.message_data,
++                        ctx->lobby_message_callback_arg);
+         } else {
+             LOG_WARNING(Lib_NpMatching2,
+                         "callback LOBBY_MESSAGE ctx={} lobby={} SKIPPED: no callback", ev.ctx_id,
+@@ -1718,8 +1720,9 @@
+                           info->filtered, info->castType, fmt::ptr(info->dst),
+                           fmt::ptr(info->srcMember), fmt::ptr(info->msg), info->msgLen);
+             }
+-            ctx->room_message_callback(ev.ctx_id, ev.room_id, ev.src_member_id, ev.msg_event,
+-                                       ev.message_data, ctx->room_message_callback_arg);
++            BbGuestCall(ctx->room_message_callback, ev.ctx_id, ev.room_id, // bbport-android
++                        ev.src_member_id, ev.msg_event, ev.message_data,
++                        ctx->room_message_callback_arg);
+         } else {
+             LOG_WARNING(Lib_NpMatching2,
+                         "callback ROOM_MESSAGE ctx={} room={} SKIPPED: no callback", ev.ctx_id,
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_signaling/np_signaling_helpers.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_signaling/np_signaling_helpers.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include "bbnet_guest.h" // bbport-android: the game's callbacks run on the guest CPU
+ #include <array>
+ #include <cctype>
+ #include <chrono>
+@@ -381,8 +382,9 @@
+                       dispatch.conn_id, dispatch.event_type,
+                       SignalingEventName(dispatch.event_type), dispatch.error_code,
+                       fmt::ptr(dispatch.callback_arg));
+-            dispatch.callback(static_cast<u32>(dispatch.ctx_id), static_cast<u32>(dispatch.conn_id),
+-                              dispatch.event_type, dispatch.error_code, dispatch.callback_arg);
++            BbGuestCall(dispatch.callback, static_cast<u32>(dispatch.ctx_id), // bbport-android
++                        static_cast<u32>(dispatch.conn_id), dispatch.event_type,
++                        dispatch.error_code, dispatch.callback_arg);
+         }
+     }
+ }
+diff
+--- a/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_web_api/np_web_api_internal.cpp
++++ b/gpu/bbnet20/vendor/shadps4/core/libraries/np/np_web_api/np_web_api_internal.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include "bbnet_guest.h" // bbport-android: the game's callbacks run on the guest CPU
+ #include <cctype>
+ #include <cstdio>
+ #include <cstring>
+@@ -2219,7 +2220,7 @@
+                         Lib_NpWebApi, "invoking extd cb ctx={:#x} cbId={} dataType='{}'",
+                         title_user_ctx_id, cbId,
+                         ev.dataType); // debug confirm the listener callback fires. to be removed
+-                    reinterpret_cast<ExtdCbA>(raw)(
++                    BbGuestCall(reinterpret_cast<ExtdCbA>(raw), // bbport-android
+                         title_user_ctx_id, cbId, svc, flt->npServiceLabel, to_addr_p, to_p,
+                         from_addr_p, from_p, &dt, ext_data, ev.data.size(), ext_arr, exarr.size(),
+                         cb->pUserArg);
+@@ -2249,7 +2250,7 @@
+                     if (ev.hasFrom) {
+                         from_peer.onlineId = ev.fromOnlineId;
+                     }
+-                    reinterpret_cast<ServiceCb>(reinterpret_cast<void (*)()>(cb->cbFunc))(
++                    BbGuestCall(reinterpret_cast<ServiceCb>(reinterpret_cast<void (*)()>(cb->cbFunc)), // bbport-android
+                         title_user_ctx_id, cbId, svc, flt->npServiceLabel, &to_peer, &from_peer,
+                         &dt, svc_data, ev.data.size(), cb->pUserArg);
+                 }
+@@ -2290,7 +2291,7 @@
+                             from_peer.onlineId = ev.fromOnlineId;
+                         }
+                         const char* p_data = ev.data.empty() ? nullptr : ev.data.data();
+-                        reinterpret_cast<BasicCb>(reinterpret_cast<void (*)()>(cb->cbFunc))(
++                        BbGuestCall(reinterpret_cast<BasicCb>(reinterpret_cast<void (*)()>(cb->cbFunc)), // bbport-android
+                             title_user_ctx_id, cbId, &to_peer, &from_peer, &dt, p_data,
+                             ev.data.size(), cb->pUserArg);
+                     }
+diff
+--- a/gpu/bbnet20/vendor/shadps4/shadnet/client.cpp
++++ b/gpu/bbnet20/vendor/shadps4/shadnet/client.cpp
+@@ -13,6 +13,7 @@
+ #include "common/scm_rev.h"
+ #include "common/thread.h"
+ #include "shadnet.pb.h"
++#include "bbnet_status.h" // bbport-android: the online status file
+ 
+ #ifdef _WIN32
+ #pragma comment(lib, "Ws2_32.lib")
+@@ -180,6 +181,14 @@
+             break;
+         LOG_WARNING(ShadNet, "ShadNet: connect attempt {}/{} to {}:{} failed, retrying in {} ms",
+                     attempt, SHAD_CONNECT_MAX_ATTEMPTS, m_host, m_port, backoff_ms);
++        // bbport-android: the status file says so while the first connect is still going (a reconnect
++        // after a drop keeps its own text).
++        if (BbNetStatus::Current() == BbNetStatus::State::Connecting) {
++            BbNetStatus::Set(BbNetStatus::State::Connecting,
++                             "Can't reach " + BbNetStatus::ServerLabel(m_host, m_port) +
++                                 " \xE2\x80\x94 retrying (" + std::to_string(attempt) + "/" +
++                                 std::to_string(SHAD_CONNECT_MAX_ATTEMPTS) + ")");
++        }
+         // Interruptible backoff: poll m_terminate so Stop() wakes us promptly.
+         for (u32 waited = 0; waited < backoff_ms && !m_terminate; waited += 100)
+             std::this_thread::sleep_for(std::chrono::milliseconds(100));

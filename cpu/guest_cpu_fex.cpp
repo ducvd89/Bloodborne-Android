@@ -533,6 +533,12 @@ int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook) {
     return 1;
 }
 
+void guest_cpu_invalidate(uintptr_t address, size_t size) {
+    if (size) {
+        InvalidateCode(address, size);
+    }
+}
+
 uint64_t guest_cpu_tsc(void) {
     uint64_t value;
     asm volatile("mrs %0, cntvct_el0" : "=r"(value));

@@ -182,6 +182,26 @@ uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *n
 uintptr_t runtime_kernel_resolve(const char *name);
 uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
+/* Online play (runtime_net.c, BB_ONLINE=1): the online module answers the network and PSN imports. */
+void runtime_net_configure(const char *app0, const char *serial, const char *title, const char *version);
+int runtime_net_enabled(void);
+int runtime_net_symbol(const char *symbol);
+uintptr_t runtime_net_resolve(const char *name);
+void runtime_net_image_ready(uintptr_t base, uint64_t size);
+void runtime_net_image_mapped(uint8_t *image, uint64_t size);
+void runtime_net_start(void);
+/* Who wrote the game's code (runtime_patches.c): the patch files (probe.c) and the GPU library's hooks note each
+ * write; a game module whose own hook finds other bytes than it expects asks (gpu/bbnet20: BBSC). `owner` has
+ * static storage. The owner of the first noted write overlapping [address, address + size), or NULL. */
+void runtime_code_patch_note(uintptr_t address, size_t size, const char *owner);
+const char *runtime_code_patch_owner(uintptr_t address, size_t size);
+__attribute__((noreturn)) void runtime_thread_exit(void *value);
+/* Threads for the online module's host code (runtime_thread.c): `entry` is a HOST function, run on a native thread
+ * that has a guest TCB and guest stack (it may call the game's code through guest_cpu_call / GuestCall) and ends
+ * with runtime_thread_exit or by returning. 0 or a positive errno value. */
+int32_t runtime_thread_spawn(void **thread, void *(ABI *entry)(void *), void *argument, uint64_t stack, const char *name);
+int32_t runtime_thread_spawn_guest(void **thread, void *(ABI *entry)(void *), void *argument, uint64_t stack, const char *name);
+int32_t runtime_thread_join_spawned(void *thread, void **result);
 void runtime_file_report(void);
 void runtime_file_configure(const char *app0, const char *user);
 int runtime_file_mount(const char *guest, const char *host);

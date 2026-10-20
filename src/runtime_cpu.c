@@ -29,6 +29,7 @@ void guest_cpu_abandon(void) {}
 void guest_cpu_thread_end(void) {}
 uintptr_t guest_cpu_return_address(uintptr_t native) { return native; }
 uintptr_t guest_cpu_stack_pointer(void) { return (uintptr_t)__builtin_frame_address(0); }
+void guest_cpu_invalidate(uintptr_t address, size_t size) { (void)address; (void)size; }
 int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook) { (void)address; (void)size; (void)hook; return 0; }
 uint64_t guest_cpu_tsc(void) { return __rdtsc(); }
 #ifndef _WIN32

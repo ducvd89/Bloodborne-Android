@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Bionic (Android NDK) build of the native game process, the Android app's only runtime: libbbcpu.so
-# (FEXCore), libbbgpu.so (GPU/HLE), libbloodframe.so (Lossless Scaling frame generation, build_bloodframe.sh),
+# (FEXCore), libbbgpu.so (GPU/HLE), libbbnet20.so (online play: shadNet / The Hunter's Dream, loaded only with
+# BB_ONLINE=1), libbloodframe.so (Lossless Scaling frame generation, build_bloodframe.sh),
 # bb-probe (runtime executable), kgsl-chip-id, bb-prepare (game preparation) and ps4-pkg-tool (PKG
 # installs). Output: out/bionic/{bin,lib,licenses}; build_release_runtime.py packages them.
 # Prerequisite: tools/android/build_bionic_deps.sh (NDK + third-party libraries).
@@ -21,6 +22,8 @@ J=${BB_JOBS:-22}
 run() { taskset -c 2-23 nice -n 19 "$@"; }
 [[ -f $toolchain ]] || { echo "No NDK: $ndk (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
 [[ -f $prefix/.done-ffmpeg ]] || { echo "No Bionic deps in $prefix (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
+[[ -f $prefix/.done-openssl && -x $root/host-tools/bin/protoc && -f $prefix/share/cacert.pem ]] \
+    || { echo "No online-module deps (OpenSSL, protobuf, CA bundle) in $prefix (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
 [[ -d $headers/share/cmake/magic_enum ]] || { echo "No header-only packages in $headers" >&2; exit 1; }
 mkdir -p "$out"
 ndk_cmake=(-DCMAKE_TOOLCHAIN_FILE="$toolchain" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$api -DANDROID_STL=c++_shared)
@@ -57,11 +60,29 @@ if [[ ! -f $out/gpu/build.ninja ]]; then
         -DBoost_DIR="$headers/lib/cmake/Boost-1.92.0" \
         -Dboost_headers_DIR="$headers/lib/cmake/boost_headers-1.92.0" >/dev/null
 fi
-run ninja -C "$out/gpu" -j "$J" bbgpu > "$out/gpu-build.log" 2>&1 || { grep -v '^\[' "$out/gpu-build.log" | tail -40 >&2; exit 1; }
+# The online module's options (an existing build directory picks them up here): its static dependencies are in
+# the prefix, and the protoc that generates the shadNet protocol runs on this PC (the same version as the library).
+# BB_NET_BBSC: BBSC (seamless co-op, BB_BBSC=1 at run time) is part of the module; an old build directory has the
+# option cached as OFF.
+cmake -S gpu -B "$out/gpu" -DBB_NET=ON -DBB_NET_BBSC=ON "-DBB_HOST_PROTOC=$root/host-tools/bin/protoc" "-DBB_CPU_LIB=$PWD/$out/fex/libbbcpu.so" >/dev/null
+run ninja -C "$out/gpu" -j "$J" bbgpu bbnet20 > "$out/gpu-build.log" 2>&1 || { grep -v '^\[' "$out/gpu-build.log" | tail -40 >&2; exit 1; }
 
 # bin/ and lib/ side by side, executables find lib/ through $ORIGIN.
 mkdir -p "$out/bin" "$out/lib"
-cp -f "$out/fex/libbbcpu.so" "$out/gpu/libbbgpu.so" "$out/lib/"
+cp -f "$out/fex/libbbcpu.so" "$out/gpu/libbbgpu.so" "$out/gpu/libbbnet20.so" "$out/lib/"
+# Mozilla's CA bundle (build_bionic_deps.sh): the online module's TLS trust (BB_CA_BUNDLE overrides the default
+# path, <runtime>/share/cacert.pem beside lib/); MPL-2.0, which the bundle's own header names.
+mkdir -p "$out/share" "$out/licenses"
+cp -f "$prefix/share/cacert.pem" "$out/share/cacert.pem"
+# Licences of what libbbnet20.so contains besides this project's own (OpenSSL, protobuf, miniupnpc, nlohmann/json,
+# cpp-httplib), shipped with it.
+src=$root/bionic-src
+cp -f "$src/openssl-3.5.4/LICENSE.txt" "$out/licenses/openssl.LICENSE.txt"
+cp -f "$src/protobuf-3.21.12/LICENSE" "$out/licenses/protobuf.LICENSE"
+cp -f "$src/miniupnpc-2.3.3/LICENSE" "$out/licenses/miniupnpc.LICENSE"
+cp -f "$src/nlohmann-json-3.12.0/LICENSE.MIT" "$out/licenses/nlohmann-json.LICENSE.MIT"
+cp -f gpu/third_party/httplib/LICENSE "$out/licenses/httplib.LICENSE"
+printf 'cacert.pem: Mozilla CA Certificate Store as prepared by curl (https://curl.se/docs/caextract.html),\nsnapshot 2026-09-25, sha256 a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505.\nLicense: MPL-2.0 (https://www.mozilla.org/MPL/2.0/).\n' > "$out/licenses/cacert-source.txt"
 # libSDL3.so only while libbbgpu still links it (the AHardwareBuffer present path removes that);
 # bb-probe does not: src/ is built with BB_NO_SDL on Android (audio to the app's FIFO, pad from BB_PAD_FILE).
 rm -f "$out/lib/libSDL3.so"
@@ -92,5 +113,5 @@ tools/android/build_prepare.sh android
 tools/android/build_bloodframe.sh
 # ps4-pkg-tool: unpacks PKGs for the app's game and mod installers (the app runs it from the runtime).
 tools/android/build_pkg_tool.sh android
-echo "Built $out/bin/bb-probe, $out/lib/libbbgpu.so, $out/lib/libbbcpu.so (Bionic, API $api)"
+echo "Built $out/bin/bb-probe, $out/lib/libbbgpu.so, $out/lib/libbbcpu.so, $out/lib/libbbnet20.so (Bionic, API $api)"
 tools/android/check_bionic_symbols.sh

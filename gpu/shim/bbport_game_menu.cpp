@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_game_menu.h"
+#include "bbport_patch_notes.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -522,6 +523,7 @@ bool Detour(unsigned char* image, u64 va, const u8* prologue, std::size_t length
         return false;
     }
     const std::int32_t to32 = std::int32_t(to);
+    BbPatchNote(reinterpret_cast<std::uintptr_t>(site), length, "game menu hooks (bbport_game_menu)");
     site[0] = 0xe9;
     std::memcpy(site + 1, &to32, 4);
     for (std::size_t i = 5; i < length; ++i) {

@@ -510,7 +510,10 @@ static const RuntimeExport exports[]={
     {"sceDiscMapIsRequestOnHDD",discmap_on_hdd}, {"sceDiscMap_8A828CAEE7EDD5E9",discmap_8a82},
     {"sceVoiceInit",ok_void}, {"sceVoiceEnd",ok_void},
 };
-uintptr_t runtime_services_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
+uintptr_t runtime_services_resolve(const char *name) {
+    const uintptr_t online=runtime_net_resolve(name); /* BB_ONLINE=1: the online module first */
+    return online ? online : RUNTIME_LOOKUP(exports,name);
+}
 #else
 uintptr_t runtime_services_resolve(const char *name) { (void)name; return 0; }
 #endif

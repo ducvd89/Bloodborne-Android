@@ -7,11 +7,14 @@ bb-prepare, kgsl-chip-id), the Bionic PKG tool (build_pkg_tool.sh android), the 
 
 Archive layout (everything under bbport/, extracted into the app's files directory):
   bbport/bionic/bin/   bb-probe bb-prepare kgsl-chip-id ps4-pkg-tool   (stripped, executable)
-  bbport/bionic/lib/   libbbgpu.so libbbcpu.so libbloodframe.so libc++_shared.so   (libbloodframe.so: Lossless Scaling
-                       frame generation, loaded by libbbgpu only when it is on; needs the player's own Lossless.dll)
+  bbport/bionic/lib/   libbbgpu.so libbbcpu.so libbloodframe.so libbbnet20.so libc++_shared.so   (libbloodframe.so: Lossless
+                       Scaling frame generation, loaded by libbbgpu only when it is on; needs the player's own Lossless.dll.
+                       libbbnet20.so: online play, loaded by bb-probe only with BB_ONLINE=1)
+  bbport/bionic/share/ cacert.pem   (Mozilla's CA bundle: the online module's HTTPS trust, BB_CA_BUNDLE overrides)
   bbport/patch-parts/  the settings' BBPATCH2 files (effects, model LOD, resolutions, cheats, ...)
   bbport/run-bionic.sh bbport/fex-compatible.json bbport/bbport.default.ini
-  bbport/licenses/     ps4-pkg-tool.NOTICE, bloodframe-* (the licences of what libbloodframe.so contains)
+  bbport/licenses/     ps4-pkg-tool.NOTICE, bloodframe-* (the licences of what libbloodframe.so contains), cacert-source.txt and the
+                       licences of what libbbnet20.so contains (OpenSSL, protobuf, miniupnpc, nlohmann/json, cpp-httplib)
   bbport/data bbport/logs bbport/user   (empty folders)
 """
 import hashlib
@@ -31,7 +34,11 @@ NDK_STRIP = next(iter(sorted((ROOT / '.local-deps/android/sdk/ndk').glob(
     '*/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip'))), None)
 OUT = ROOT / 'out/release'
 PROGRAMS = ('bb-probe', 'bb-prepare', 'kgsl-chip-id', 'ps4-pkg-tool')
-LIBRARIES = ('libbbgpu.so', 'libbbcpu.so', 'libbloodframe.so', 'libc++_shared.so')
+LIBRARIES = ('libbbgpu.so', 'libbbcpu.so', 'libbloodframe.so', 'libbbnet20.so', 'libc++_shared.so')
+# build_bionic.sh (+ build_bionic_deps.sh): the online module's CA bundle and the licences of its static libraries.
+CA_BUNDLE = 'cacert.pem'
+ONLINE_LICENSES = ('cacert-source.txt', 'openssl.LICENSE.txt', 'protobuf.LICENSE', 'miniupnpc.LICENSE',
+                   'nlohmann-json.LICENSE.MIT', 'httplib.LICENSE')
 # build_bloodframe.sh (run by build_bionic.sh): the licences of libbloodframe.so's contents, shipped with it.
 LSFG_LICENSES = ('bloodframe-lsfg-vk.LICENSE.md', 'bloodframe-dxbc.LICENSE', 'bloodframe-pe-parse.LICENSE', 'bloodframe-volk.LICENSE.md',
                  'bloodframe-source.txt')
@@ -66,6 +73,12 @@ def stage_runtime(stage):
             shutil.copy2(source, target)
             strip(target)
             target.chmod(0o755)
+    source = BIONIC / 'share' / CA_BUNDLE
+    if not source.is_file():
+        raise SystemExit(f'Missing {source}: build_bionic.sh copies it from the deps')
+    (stage / 'bionic' / 'share').mkdir(parents=True)
+    shutil.copy2(source, stage / 'bionic' / 'share' / CA_BUNDLE)
+    (stage / 'bionic' / 'share' / CA_BUNDLE).chmod(0o644)
     # Anything else in out/bionic/lib would be a library the runtime does not know: refuse a surprise.
     extra = sorted(p.name for p in (BIONIC / 'lib').iterdir() if p.name not in LIBRARIES)
     if extra:
@@ -116,7 +129,7 @@ def main():
             owned_by_root(info)
             with open(ROOT / source, 'rb') as handle:
                 tar.addfile(info, handle)
-        for name in LSFG_LICENSES:
+        for name in LSFG_LICENSES + ONLINE_LICENSES:
             source = BIONIC / 'licenses' / name
             if not source.is_file():
                 raise SystemExit(f'Missing {source}: tools/android/build_bloodframe.sh writes it')
