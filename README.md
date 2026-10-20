@@ -16,8 +16,8 @@
 
 <table align="center">
   <tr>
-    <td align="center" width="50%"><img src="docs/images/ayn-thor.jpg" alt="Bloodborne on the AYN Thor with the Hunter's Atlas map on the second screen"><br><sub>AYN Thor · Snapdragon 8 Gen 2 · Hunter's Atlas map on the second screen</sub></td>
-    <td align="center" width="50%"><img src="docs/images/find-n5.jpg" alt="Bloodborne with the on-screen controller and the floating mini map on the Oppo Find N5"><br><sub>Oppo Find N5 · Snapdragon 8 Elite · on-screen controller and floating mini map</sub></td>
+    <td align="center" width="50%"><img src="docs/images/ayn-thor-atlas.jpg" alt="Bloodborne on the AYN Thor with the Hunter's Atlas map on the second screen"><br><sub>AYN Thor · Snapdragon 8 Gen 2 · Hunter's Atlas map on the second screen</sub></td>
+    <td align="center" width="50%"><img src="docs/images/find-n5-minimap.jpg" alt="Bloodborne with the on-screen controller and the floating mini map on the Oppo Find N5"><br><sub>Oppo Find N5 · Snapdragon 8 Elite · on-screen controller and floating mini map</sub></td>
   </tr>
 </table>
 
