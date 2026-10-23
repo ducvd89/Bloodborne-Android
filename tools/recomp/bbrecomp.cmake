@@ -2,6 +2,7 @@
 # FEXCore/Source/CMakeLists.txt) change header layouts, so they are repeated here.
 set(BBR "${BB_RECOMP_DIR}/src")
 set(BBR_COMMON "${BBR}/elf_image.cpp" "${BBR}/fde_scan.cpp" "${BBR}/lifter.cpp")
+set(BBR_JIT "${BBR}/jit_host.cpp")
 set(BBR_LLVM_SRCS "${BBR}/lower_llvm.cpp" "${BBR}/lower_ops.cpp" "${BBR}/lower_vector.cpp" "${BBR}/codegen.cpp" "${BBR}/compile.cpp")
 add_executable(bb-recomp "${BBR}/main.cpp" ${BBR_COMMON} "${BBR}/census.cpp")
 target_include_directories(bb-recomp PRIVATE
@@ -17,17 +18,22 @@ if(BB_RECOMP_LLVM)
   # Step 2: the system LLVM (AArch64 and X86 targets) as a shared library.
   find_package(LLVM REQUIRED CONFIG)
   message(STATUS "bb-recomp: LLVM ${LLVM_PACKAGE_VERSION} (${LLVM_DIR})")
-  foreach(t bb-recomp bb-recomp-asmtest)
-    if(t STREQUAL "bb-recomp-asmtest")
-      add_executable(bb-recomp-asmtest "${BBR}/asmtest.cpp" ${BBR_COMMON})
-      target_include_directories(bb-recomp-asmtest PRIVATE
+  foreach(t bb-recomp bb-recomp-asmtest bb-recomp-difftest)
+    if(NOT t STREQUAL "bb-recomp")
+      # the host-side test tools: the lifter, the lowering and the in-process JIT, no census
+      if(t STREQUAL "bb-recomp-asmtest")
+        add_executable(${t} "${BBR}/asmtest.cpp" ${BBR_COMMON} ${BBR_JIT})
+      else()
+        add_executable(${t} "${BBR}/difftest.cpp" ${BBR_COMMON} ${BBR_JIT})
+      endif()
+      target_include_directories(${t} PRIVATE
         "${CMAKE_SOURCE_DIR}/FEXCore/Source" "${CMAKE_SOURCE_DIR}/FEXCore/include" "${CMAKE_BINARY_DIR}/include" "${BBR}")
-      target_compile_definitions(bb-recomp-asmtest PRIVATE
+      target_compile_definitions(${t} PRIVATE
         JIT_ARM64 ARCHITECTURE_x86_64=1 FEXCORE_PRESERVE_ALL_ATTR= FEXCORE_HAS_PRESERVE_ALL_ATTR=0)
-      target_compile_options(bb-recomp-asmtest PRIVATE -Wall -Wno-trigraphs -fwrapv -march=${BB_RECOMP_MARCH})
-      target_link_libraries(bb-recomp-asmtest PRIVATE FEXCore FEXCore_Base CodeEmitter FEXHeaderUtils JemallocDummy fmt::fmt pthread)
-      add_dependencies(bb-recomp-asmtest IR_INC CONFIG_INC)
-      set_target_properties(bb-recomp-asmtest PROPERTIES CXX_STANDARD 20 CXX_VISIBILITY_PRESET hidden)
+      target_compile_options(${t} PRIVATE -Wall -Wno-trigraphs -fwrapv -march=${BB_RECOMP_MARCH})
+      target_link_libraries(${t} PRIVATE FEXCore FEXCore_Base CodeEmitter FEXHeaderUtils JemallocDummy fmt::fmt pthread)
+      add_dependencies(${t} IR_INC CONFIG_INC)
+      set_target_properties(${t} PROPERTIES CXX_STANDARD 20 CXX_VISIBILITY_PRESET hidden)
     endif()
     target_sources(${t} PRIVATE ${BBR_LLVM_SRCS})
     target_include_directories(${t} PRIVATE ${LLVM_INCLUDE_DIRS})

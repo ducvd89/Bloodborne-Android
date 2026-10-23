@@ -8,6 +8,7 @@
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/CodeGen.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
@@ -28,6 +29,10 @@ void initLlvmTargets() {
     LLVMInitializeAArch64TargetInfo(); LLVMInitializeAArch64Target(); LLVMInitializeAArch64TargetMC();
     LLVMInitializeAArch64AsmPrinter();
     LLVMInitializeX86TargetInfo(); LLVMInitializeX86Target(); LLVMInitializeX86TargetMC(); LLVMInitializeX86AsmPrinter();
+    // LLVM 23 x86-fixup-bw-insts turns `movb 552(%rcx),%cl` into `movzbl` although the upper bits of rcx are live
+    // (the byte-merge `(x & -256) | byte` loses x's upper bits). Only the x86 oracle path is affected.
+    static const char* argv[] = {"bb-recomp", "-fixup-byte-word-insts=0"};
+    cl::ParseCommandLineOptions(2, argv);
   });
 }
 

@@ -430,6 +430,7 @@ void Lower::emitExit(const IR::IROp_ExitFunction* op) {
   }
   if (hint == IR::BranchHint::Call) {
     Value* retAddr = A(op->CallReturnAddress);
+    ++res->callExits;
     spill(m.O.storeFlagsAtCalls);
     if (direct) {
       ++res->directCalls;

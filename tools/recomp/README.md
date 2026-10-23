@@ -39,6 +39,19 @@ built (FEXCore, no thunks, tests, FEXConfig, Zydis, jemalloc, LTO).
     bb-recomp --elf out/eboot.elf --scan --funcs funcs.txt   # function list only (checked against ehscan.py)
     python3 tools/recomp/irclass.py <FEX>/FEXCore/Source/Interface/IR/IR.json out/recomp/ir_ops.csv
 
+### Game functions against native x86 (`bb-recomp-difftest`)
+
+    out/recomp-build/bb-recomp-difftest --elf out/eboot.elf --inputs 8 [--limit N --every K] [--func hexvaddr] [-v]
+
+Every function of the eboot is run twice with the same random arguments: natively (the original bytes, mapped read-only in
+this process at the lift base; in a forked grandchild under a seccomp filter that kills it on any system call, with a
+20 ms timer) and lowered (FEX IR -> LLVM -> x86-64 -> ORC, in the worker). Return value, callee-saved registers, rsp, xmm0/1
+and two 8 KB buffers (reached through pointer arguments and pointers inside the buffers) must agree. Calls and tail jumps
+dispatch to other functions, compiled on demand, so call/return, `rip != retaddr`, jump tables and the gap units are
+exercised too. Inputs where either side faults or times out are skipped (random arguments rarely form a valid object, and
+calls into imports end in a jump to an unresolved stub); functions with `rdtsc` are skipped. Writes to the data segment
+are allowed and undone after each lowered run. Result: `out/recomp/difftest.txt`.
+
 Options: `--host armv8.2|armv8.4|armv9`, `--no-multiblock`, `--no-passes`, `--tso`, `--validate`,
 `--no-gap-units`, `--jobs`, `--every N`. The process renices itself to 19 and uses at most 22 threads.
 
@@ -96,6 +109,16 @@ tests, FEX's own disabled and known-failure lists.
   gathers and masked moves 105, string compares 39, F80 25, FMA 14, AES/SHA/PCLMUL ~30).
 - **Whole game, all 162,959 functions plus the gap units (202,525 units, 58.7 M IR ops)**: no lift failure, no unit with
   `bbr_trap`, every module passes the LLVM verifier. Timings are in "Compile time" in `docs/STATIC_RECOMPILE_PLAN.md`.
+- **Differential test on the game** (`bb-recomp-difftest`, 6 inputs per function, all 162,959 functions, x86-64 host,
+  -O1): 60,796 functions agree on at least one input, 100,426 are skipped (every input faulted or timed out, mostly
+  random arguments that are not valid objects), 1,435 skipped for `rdtsc`, 272 not liftable by the in-process lifter,
+  **30 mismatch**. None is a lowering bug: 17 use `rcpps`/`rsqrtps` (x86 returns a 12-bit table estimate, the lowering
+  computes 1/x; the code refines with a Newton step, so only the last bits differ), 2 differ only in the sign of a
+  default NaN (x86 `ffc00000`, ARM `7fc00000`), 11 return host addresses (a tail jump into an import stub that
+  allocates; the native and lowered runs live in different processes). One real bug was found and fixed on the way: LLVM
+  23's x86 `x86-fixup-bw-insts` rewrites `movb 552(%rcx),%cl` to `movzbl` although the upper bits of rcx are live,
+  which drops the old upper bits of a byte-merge such as `mov al,[rax+0x228]` (about 26 functions). The x86 host path
+  now sets `-fixup-byte-word-insts=0`; the AArch64 backend is not affected.
 - The lowering follows the Arm64 JIT op by op. Lowered: every op the census lists (204 of 424) and the scalar and vector
   ops FEX's tests use. Not lowered: the F80/x87-stack ops (none in the eboot), AES/SHA/PCLMUL, `VPCMP*STRX`, FMA
   (`VFMLA*`), masked loads/stores and gathers, `F64SIN/COS/...`.

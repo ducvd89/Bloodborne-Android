@@ -26,6 +26,7 @@ struct LowerResult {
   std::vector<std::string> unsupported; // distinct IR op names that became bbr_trap calls
   uint32_t trapSites = 0;               // number of bbr_trap(unsupported) calls emitted
   uint32_t directCalls = 0, dispatchCalls = 0, relocConstants = 0;
+  uint32_t callExits = 0;               // ExitFunction with the Call hint (of directCalls + dispatchCalls)
   uint32_t irOps = 0;                   // IR ops lowered (all blocks)
 };
 

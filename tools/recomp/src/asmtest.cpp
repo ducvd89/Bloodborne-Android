@@ -8,9 +8,7 @@
 //     little-endian, tokens in ascending address order) and RegData (expected registers; list = 64-bit lanes)
 //   - the initial state is a default CPUState (all registers 0, flags as FEX resets them); the test ends at hlt
 // Each test runs in a forked child: fixed address mappings, signals and crashes stay isolated.
-#include "codegen.h"
-#include "lifter.h"
-#include "lower_llvm.h"
+#include "jit_host.h"
 
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
@@ -130,143 +128,6 @@ bool parseConfig(const std::string& text, Config& c) {
   return true;
 }
 
-// ----------------------------------------------------------------------------------- the child -----
-sigjmp_buf g_halt;
-volatile int g_haltKind = 0; // 1 hlt, 2 other Break, 3 unsupported op reached, 4 signal, 5 bad dispatch
-volatile uint64_t g_trapArg = 0;
-uint64_t g_codeHi = 0;
-
-extern "C" {
-void bbr_trap(CPUState* s, uint64_t kind) {
-  g_trapArg = kind;
-  if (kind & BBR_TRAP_UNSUPPORTED) g_haltKind = 3;
-  else g_haltKind = *(const uint8_t*)s->rip == 0xF4 ? 1 : 2;
-  siglongjmp(g_halt, 1);
-}
-struct CpuidRes { uint64_t lo, hi; };
-CpuidRes bbr_cpuid(CPUState*, uint64_t fn, uint64_t leaf) {
-  unsigned a, b, c, d;
-  __cpuid_count((unsigned)fn, (unsigned)leaf, a, b, c, d); // the host's values: fine for the tests, the runtime returns Jaguar's
-  return {(uint64_t)a | ((uint64_t)b << 32), (uint64_t)c | ((uint64_t)d << 32)};
-}
-uint64_t bbr_rdtsc() { return __builtin_ia32_rdtsc(); }
-uint64_t bbr_processor_id() { return 0; }
-// x86 control-state helpers on the host MXCSR (the real runtime maps these to FPCR)
-void bbr_set_rounding(uint64_t mode, uint64_t mxcsr, uint64_t setDaz) {
-  unsigned csr = _mm_getcsr();
-  csr = (csr & ~0x6000u) | ((unsigned)(mode & 3) << 13);               // rounding control
-  csr = (csr & ~0x8000u) | ((unsigned)((mode >> 2) & 1) << 15);        // flush to zero
-  if (setDaz) csr = (csr & ~0x40u) | ((unsigned)(mxcsr & 0x40));       // denormals are zero
-  _mm_setcsr(csr);
-}
-uint64_t bbr_xgetbv(uint64_t) { return 7; }
-void bbr_syscall(CPUState* s) { // straight to the host kernel, like FEX's syscall handler does for a 64-bit guest
-  auto& g = s->gregs; // FEX order: RAX 0, RCX 1, RDX 2, RBX 3, RSP 4, RBP 5, RSI 6, RDI 7, R8..R15 8..15
-  g[0] = (uint64_t)syscall(g[0], g[7], g[6], g[2], g[10], g[8], g[9]);
-  s->rip += 2; // the handler skips the 2-byte instruction (FEX Syscalls.cpp)
-}
-uint64_t bbr_get_rounding() { return (_mm_getcsr() >> 13) & 3; }
-uint64_t bbr_push_rounding(uint64_t mode) { const unsigned old = _mm_getcsr(); _mm_setcsr((old & ~0x6000u) | ((unsigned)(mode & 3) << 13)); return old; }
-void bbr_pop_rounding(uint64_t saved) { _mm_setcsr((unsigned)saved); }
-}
-
-class Jit;
-Jit* g_jit = nullptr;
-
-class Jit {
- public:
-  Jit(const ElfImage& img, const LiftOptions& lo, const TargetSpec& ts) : lifter(img, lo), spec(ts) {
-    initLlvmTargets();
-    InitializeNativeTarget();
-    auto jtmb = orc::JITTargetMachineBuilder::detectHost();
-    if (!jtmb) { err = "detectHost"; consumeError(jtmb.takeError()); return; }
-    jtmb->setCodeGenOptLevel(ts.opt <= 1 ? CodeGenOptLevel::Less : CodeGenOptLevel::Default);
-    jtmb->setRelocationModel(Reloc::Static);
-    jtmb->setCodeModel(CodeModel::Large);
-    auto j = orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(*jtmb)).create();
-    if (!j) { err = toString(j.takeError()); return; }
-    jit = std::move(*j);
-    auto& jd = jit->getMainJITDylib();
-    orc::SymbolMap sm;
-    auto sym = [&](const char* n, void* p) {
-      sm[jit->mangleAndIntern(n)] = {orc::ExecutorAddr::fromPtr(p), JITSymbolFlags::Exported | JITSymbolFlags::Callable};
-    };
-    sym("bbr_trap", (void*)&bbr_trap); sym("bbr_dispatch", (void*)&dispatch); sym("bbr_dispatch_tail", (void*)&dispatchTail);
-    sym("bbr_cpuid", (void*)&bbr_cpuid); sym("bbr_rdtsc", (void*)&bbr_rdtsc); sym("bbr_processor_id", (void*)&bbr_processor_id);
-    sym("bbr_set_rounding", (void*)&bbr_set_rounding); sym("bbr_xgetbv", (void*)&bbr_xgetbv); sym("bbr_syscall", (void*)&bbr_syscall);
-    sym("bbr_get_rounding", (void*)&bbr_get_rounding); sym("bbr_push_rounding", (void*)&bbr_push_rounding); sym("bbr_pop_rounding", (void*)&bbr_pop_rounding);
-    cantFail(jd.define(orc::absoluteSymbols(std::move(sm))));
-    auto gen = orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(jit->getDataLayout().getGlobalPrefix());
-    if (gen) jd.addGenerator(std::move(*gen)); else consumeError(gen.takeError());
-    tm = makeTargetMachine(spec, true);
-  }
-  std::string err;
-
-  // Lifts [from, hi) as units and adds them to the JIT. False: nothing lifted or an op is unsupported.
-  bool compile(uint64_t from, uint64_t hi) {
-    struct Sink : UnitSink {
-      Jit& j; std::unique_ptr<LLVMContext> ctx; std::unique_ptr<Module> mod; std::unique_ptr<UnitLowerer> ul;
-      std::vector<std::string> unsup; std::vector<uint64_t> entries;
-      explicit Sink(Jit& jj) : j(jj), ctx(new LLVMContext()), mod(new Module("t", *ctx)) {
-        setModuleTarget(*mod, *j.tm);
-        LowerOptions lo; lo.liftBase = 0; lo.fixedImageBase = true; lo.imageBase = 0; lo.aarch64 = false; lo.hiddenUnits = false; lo.calleeSaved = false; lo.storeFlagsAtCalls = true;
-        lo.isKnownUnit = [](uint64_t) { return false; };
-        ul.reset(new UnitLowerer(*ctx, *mod, lo));
-      }
-      void unit(uint64_t entry, bool, const void* ir) override {
-        LowerResult lr; ul->lower(entry, ir, &lr);
-        for (auto& u : lr.unsupported) unsup.push_back(u);
-        entries.push_back(entry);
-      }
-    } sink(*this);
-    FuncResult fr;
-    std::string irText;
-    lifter.lift(Func{from, hi}, fr, nullptr, nullptr, getenv("BBR_DUMP_IR") ? &irText : nullptr, &sink);
-    if (getenv("BBR_DUMP_IR")) fputs(irText.c_str(), stderr);
-    if (fr.status == LiftStatus::Failed || fr.status == LiftStatus::Crashed || sink.entries.empty()) { liftFailure = fr.reason.empty() ? "no unit" : fr.reason; return false; }
-    if (!sink.unsup.empty()) { for (auto& u : sink.unsup) unsupported.insert(u); return false; }
-    if (getenv("BBR_DUMP_LL")) sink.mod->print(errs(), nullptr); // debugging: the lowered IR of every unit
-    optimizeModule(*sink.mod, *tm, spec.opt);
-    if (auto e = jit->addIRModule(orc::ThreadSafeModule(std::move(sink.mod), std::move(sink.ctx)))) { err = toString(std::move(e)); return false; }
-    for (uint64_t en : sink.entries) known.insert(en);
-    return true;
-  }
-
-  using Fn = void (*)(CPUState*);
-  Fn find(uint64_t addr) {
-    auto it = fns.find(addr);
-    if (it != fns.end()) return it->second;
-    if (!known.count(addr)) return nullptr;
-    auto r = jit->lookup(unitName(addr));
-    if (!r) { err = toString(r.takeError()); return nullptr; }
-    Fn f = r->toPtr<Fn>();
-    fns[addr] = f;
-    return f;
-  }
-
-  static void dispatch(CPUState* s, uint64_t target) {
-    Jit& j = *g_jit;
-    Fn f = j.find(target);
-    if (!f && target >= CodeBase && target < g_codeHi) {
-      if (j.compile(target, g_codeHi)) f = j.find(target);
-      else if (!j.unsupported.empty()) { g_haltKind = 3; siglongjmp(g_halt, 1); }
-    }
-    if (!f) { g_haltKind = 5; g_trapArg = target; siglongjmp(g_halt, 1); }
-    f(s);
-  }
-  static void dispatchTail(CPUState* s) { dispatch(s, s->rip); }
-
-  Lifter lifter;
-  TargetSpec spec;
-  std::unique_ptr<orc::LLJIT> jit;
-  std::unique_ptr<TargetMachine> tm;
-  std::set<uint64_t> known;
-  std::map<uint64_t, Fn> fns;
-  std::set<std::string> unsupported;
-  std::string liftFailure;
-};
-
-void onSignal(int sig) { g_haltKind = 4; g_trapArg = sig; siglongjmp(g_halt, 1); }
 
 void mapFixed(uint64_t addr, size_t size) {
   void* p = mmap((void*)addr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED | MAP_NORESERVE, -1, 0);
@@ -286,7 +147,7 @@ std::string runTest(const Test& t, int opt) {
   memcpy((void*)CodeBase, t.bin.data(), t.bin.size());
   for (auto& [a, s] : c.regions) mapFixed(a, s);
   for (auto& m : c.mem) memcpy((void*)m.addr, m.bytes.data(), m.bytes.size());
-  g_codeHi = CodeBase + t.bin.size();
+  const uint64_t codeHi = CodeBase + t.bin.size();
 
   static ElfImage img; // base 0: IR addresses are the guest addresses
   img.base = 0;
@@ -294,6 +155,7 @@ std::string runTest(const Test& t, int opt) {
   TargetSpec ts; ts.aarch64 = false; ts.opt = opt;
   Jit jit(img, lo, ts);
   g_jit = &jit;
+  jit.rangeEnd = [codeHi](uint64_t t) -> uint64_t { return t >= CodeBase && t < codeHi ? codeHi : 0; };
   if (!jit.err.empty()) return "FAIL jit init: " + jit.err;
 
   alignas(64) static CPUState st;
@@ -308,7 +170,7 @@ std::string runTest(const Test& t, int opt) {
   CPUState::SetGDTLimit(cs, 0xFFFFFu);
   cs->L = 1; cs->D = 0;
   st.rip = CodeBase;
-  if (!jit.compile(CodeBase, g_codeHi)) {
+  if (!jit.compile(CodeBase, codeHi)) {
     if (!jit.unsupported.empty()) { std::string s = "UNSUP"; for (auto& u : jit.unsupported) s += " " + u; return s; }
     if (!jit.liftFailure.empty()) return "LIFT " + jit.liftFailure;
     return "FAIL " + jit.err;
@@ -316,7 +178,7 @@ std::string runTest(const Test& t, int opt) {
   Jit::Fn entry = jit.find(CodeBase);
   if (!entry) return "FAIL no entry: " + jit.err;
 
-  struct sigaction sa {}; sa.sa_handler = onSignal; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_NODEFER | SA_ONSTACK;
+  struct sigaction sa {}; sa.sa_handler = jitOnSignal; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_NODEFER | SA_ONSTACK;
   static char altstack[1 << 16];
   stack_t ss {}; ss.ss_sp = altstack; ss.ss_size = sizeof altstack; sigaltstack(&ss, nullptr);
   for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(s, &sa, nullptr);
