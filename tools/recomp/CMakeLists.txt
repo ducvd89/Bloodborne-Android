@@ -1,0 +1,69 @@
+# bb-recomp: PC tool that lifts the game's x86-64 code with FEXCore's front end (decoder,
+# OpcodeDispatcher, IR passes) and, from step 2 on, lowers FEX IR to LLVM IR for AArch64.
+#
+# FEX's CMake files expect to be the top-level project (CMAKE_SOURCE_DIR, CMAKE_BINARY_DIR), so this
+# is a thin driver: it configures FEX as an external project with only what the front end needs and
+# adds the bb-recomp target into FEX's build through CMAKE_PROJECT_FEX_INCLUDE (the same trick as
+# cpu/fex_project.cmake). Result: <build>/bb-recomp.
+#
+#   cmake -S tools/recomp -B out/recomp-build -G Ninja
+#   nice -n 19 cmake --build out/recomp-build -j 22
+cmake_minimum_required(VERSION 3.20)
+project(bb-recomp-driver NONE)
+include(ExternalProject)
+
+# FEX source. FEX_GIT_DIR is a git checkout of FEX 2609.1 (default third_party/FEX; in a git worktree that
+# submodule is empty, so pass the main checkout's). FEX's own submodules (fmt, unordered_dense, ...) are
+# often not initialised either: then fetch-fex.sh builds a prepared tree under out/recomp-fex without
+# touching the checkout. Set FEX_SOURCE_DIR to use a ready tree directly.
+set(FEX_GIT_DIR "${CMAKE_CURRENT_LIST_DIR}/../../third_party/FEX" CACHE PATH "git checkout of FEX 2609.1")
+set(FEX_SOURCE_DIR "" CACHE PATH "FEX source tree with its submodules (default: FEX_GIT_DIR, or a tree prepared from it)")
+# Step 2: link LLVM (system install, AArch64 target) into bb-recomp.
+option(BB_RECOMP_LLVM "Link LLVM for the IR lowering (step 2; unused in step 1)" OFF)
+set(BB_RECOMP_JOBS 22 CACHE STRING "Parallel jobs for the inner FEX build (2 of 24 cores stay free)")
+set(BB_RECOMP_MARCH x86-64-v3 CACHE STRING "-march for FEX and bb-recomp on x86 hosts (FEX needs AVX)")
+set(BB_RECOMP_CC clang CACHE STRING "C compiler for FEX (needs Clang)")
+set(BB_RECOMP_CXX clang++ CACHE STRING "C++ compiler for FEX (needs Clang)")
+
+if(NOT FEX_SOURCE_DIR)
+  get_filename_component(FEX_GIT_DIR "${FEX_GIT_DIR}" ABSOLUTE)
+  if(EXISTS "${FEX_GIT_DIR}/External/fmt/CMakeLists.txt")
+    set(FEX_SOURCE_DIR "${FEX_GIT_DIR}")
+  else()
+    get_filename_component(prepared "${CMAKE_CURRENT_LIST_DIR}/../../out/recomp-fex" ABSOLUTE)
+    message(STATUS "FEX submodules not initialised: preparing ${prepared} from ${FEX_GIT_DIR} (needs network once)")
+    execute_process(COMMAND bash "${CMAKE_CURRENT_LIST_DIR}/fetch-fex.sh" "${FEX_GIT_DIR}" "${prepared}" RESULT_VARIABLE rc)
+    if(NOT rc EQUAL 0)
+      message(FATAL_ERROR "fetch-fex.sh failed: pass -DFEX_GIT_DIR=<FEX git checkout> or -DFEX_SOURCE_DIR=<ready tree>")
+    endif()
+    set(FEX_SOURCE_DIR "${prepared}")
+  endif()
+endif()
+get_filename_component(FEX_SOURCE_DIR "${FEX_SOURCE_DIR}" ABSOLUTE)
+if(NOT EXISTS "${FEX_SOURCE_DIR}/FEXCore/CMakeLists.txt")
+  message(FATAL_ERROR "FEX_SOURCE_DIR=${FEX_SOURCE_DIR} has no FEXCore")
+endif()
+
+# FEX refuses x86-64 hosts unless ENABLE_X86_HOST_DEBUG (its CI configuration). We never run the JIT,
+# only the front end, so that is fine. Everything else FEX builds besides FEXCore is switched off;
+# bb-recomp is the only target built.
+ExternalProject_Add(fex
+  SOURCE_DIR "${FEX_SOURCE_DIR}"
+  BINARY_DIR "${CMAKE_BINARY_DIR}/fex"
+  CMAKE_GENERATOR "${CMAKE_GENERATOR}"
+  CMAKE_ARGS
+    -DCMAKE_C_COMPILER=${BB_RECOMP_CC}
+    -DCMAKE_CXX_COMPILER=${BB_RECOMP_CXX}
+    -DCMAKE_BUILD_TYPE=Release
+    -DENABLE_X86_HOST_DEBUG=ON
+    -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_STEAM_SUPPORT=OFF
+    -DBUILD_FEX_LINUX_TESTS=OFF -DENABLE_ZYDIS=OFF
+    -DCMAKE_DISABLE_FIND_PACKAGE_fmt=ON -DCMAKE_DISABLE_FIND_PACKAGE_xxhash=ON -DCMAKE_DISABLE_FIND_PACKAGE_range-v3=ON -DENABLE_LTO=OFF -DENABLE_GDB_SYMBOLS=OFF -DENABLE_CCACHE=OFF -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF -DENABLE_FEX_ALLOCATOR=OFF -DENABLE_OFFLINE_TELEMETRY=OFF
+    -DTUNE_CPU=none -DTUNE_ARCH=${BB_RECOMP_MARCH} -DOVERRIDE_VERSION=FEX-2609.1 -DOVERRIDE_HASH=9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf
+    -DCMAKE_PROJECT_FEX_INCLUDE=${CMAKE_CURRENT_LIST_DIR}/fex_project.cmake
+    -DBB_RECOMP_DIR=${CMAKE_CURRENT_LIST_DIR}
+    -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH}
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target bb-recomp --parallel ${BB_RECOMP_JOBS}
+  INSTALL_COMMAND ${CMAKE_COMMAND} -E copy_if_different <BINARY_DIR>/Bin/bb-recomp ${CMAKE_BINARY_DIR}/bb-recomp
+  BUILD_ALWAYS ON
+  USES_TERMINAL_BUILD ON)

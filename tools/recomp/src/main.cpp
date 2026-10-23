@@ -1,0 +1,90 @@
+// bb-recomp: lifts the game's x86-64 code with FEX's front end. Step 1: IR census (no LLVM yet).
+//   bb-recomp --elf out/eboot.elf                    census over every FDE function -> out/recomp/
+//   bb-recomp --elf out/eboot.elf --dump 0x1234560   FEX IR of the function containing that vaddr
+//   bb-recomp --elf out/eboot.elf --scan             just the function list
+#include "census.h"
+#include "fde_scan.h"
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+
+static void usage() {
+  fputs("usage: bb-recomp --elf <eboot.elf> [options]\n"
+        "  --dump <hex vaddr>   print the FEX IR of the function containing the address\n"
+        "  --scan               list function count and range statistics only\n"
+        "  --funcs <file>       compare the FDE list with a 'start end' hex list (ehscan.py output)\n"
+        "  --out <dir>          census output directory (default out/recomp)\n"
+        "  --jobs <n>           worker threads (default: cores - 2, at most 22)\n"
+        "  --limit <n>, --every <n>   census only the first n functions / every nth function\n"
+        "  --base <hex>         host address of image vaddr 0 (default 0x200000000)\n"
+        "  --host <profile>     target features: armv8.2 | armv8.4 (default) | armv9\n"
+        "  --no-multiblock      one basic block per unit (FEX default is multiblock; the game ships Multiblock=1)\n"
+        "  --tso                lift with x86 TSO memory ordering (the game runs with it off)\n"
+        "  --no-gap-units       do not lift code the entry unit does not reach as extra units\n"
+        "  --validate           run FEX's IR validation pass on every unit\n"
+        "  --no-passes          skip the x87 and dead-flag passes\n"
+        "  --no-size-hist       skip ir_ops_by_size.csv\n"
+        "  --inject-crash <hex>, --inject-assert <hex>   test hooks: fault / FEX assert while lifting that function\n"
+        "  --no-nice            do not lower the process priority to 19\n", stderr);
+}
+
+int main(int argc, char** argv) {
+  std::string elf = "out/eboot.elf", funcsFile, dumpArg;
+  uint64_t base = 0x200000000ull;
+  bool scanOnly = false, nice = true, dump = false;
+  CensusOptions co;
+  unsigned hw = std::thread::hardware_concurrency();
+  co.jobs = std::min(22u, hw > 2 ? hw - 2 : 1u);
+  for (int i = 1; i < argc; ++i) {
+    auto is = [&](const char* s) { return !strcmp(argv[i], s); };
+    auto arg = [&]() -> const char* { if (i + 1 >= argc) { usage(); exit(2); } return argv[++i]; };
+    if (is("--elf")) elf = arg();
+    else if (is("--dump")) { dump = true; dumpArg = arg(); }
+    else if (is("--scan")) scanOnly = true;
+    else if (is("--funcs")) funcsFile = arg();
+    else if (is("--out")) co.outDir = arg();
+    else if (is("--jobs")) co.jobs = std::max(1, atoi(arg()));
+    else if (is("--limit")) co.limit = strtoull(arg(), nullptr, 0);
+    else if (is("--every")) co.every = std::max<uint64_t>(1, strtoull(arg(), nullptr, 0));
+    else if (is("--base")) base = strtoull(arg(), nullptr, 16);
+    else if (is("--host")) co.lift.host = arg();
+    else if (is("--no-multiblock")) co.lift.multiblock = false;
+    else if (is("--tso")) co.lift.tso = true;
+    else if (is("--no-gap-units")) co.lift.gapUnits = false;
+    else if (is("--validate")) co.lift.validate = true;
+    else if (is("--no-passes")) co.lift.passes = false;
+    else if (is("--no-size-hist")) co.sizeHist = false;
+    else if (is("--inject-crash")) co.lift.injectCrash = strtoll(arg(), nullptr, 16);
+    else if (is("--inject-assert")) co.lift.injectAssert = strtoll(arg(), nullptr, 16);
+    else if (is("--no-nice")) nice = false;
+    else { usage(); return 2; }
+  }
+  co.jobs = std::min(co.jobs, 22u); // 2 of 24 cores stay free on the dev PC
+#ifndef _WIN32
+  if (nice) setpriority(PRIO_PROCESS, 0, 19);
+#endif
+  ElfImage img; std::string err;
+  if (!img.load(elf, base, err)) { fprintf(stderr, "bb-recomp: %s\n", err.c_str()); return 1; }
+  std::vector<Func> funcs;
+  if (!scanFdes(img, funcs, err)) { fprintf(stderr, "bb-recomp: %s\n", err.c_str()); return 1; }
+  uint64_t bytes = 0, mn = ~0ull, mx = 0; for (auto& f : funcs) { bytes += f.end - f.start; mn = std::min(mn, f.start); mx = std::max(mx, f.end); }
+  printf("image %s: text vaddr %#" PRIx64 "-%#" PRIx64 " mapped at base %#" PRIx64 "; %zu FDE functions, %.1f MB, range %#" PRIx64 "-%#" PRIx64 "\n",
+         elf.c_str(), img.textLo, img.textHi, img.base, funcs.size(), bytes / 1e6, mn, mx);
+  if (!funcsFile.empty()) {
+    FILE* f = fopen(funcsFile.c_str(), "r"); if (!f) { perror(funcsFile.c_str()); return 1; }
+    unsigned long long s, e; size_t n = 0, bad = 0;
+    while (fscanf(f, "%llx %llx", &s, &e) == 2) { if (n >= funcs.size() || funcs[n].start != s || funcs[n].end != e) ++bad; ++n; }
+    fclose(f);
+    printf("compared with %s: %zu entries, %zu differ%s\n", funcsFile.c_str(), n, bad, n != funcs.size() ? " (count differs)" : "");
+    if (bad || n != funcs.size()) return 1;
+  }
+  if (scanOnly) return 0;
+  if (dump) return dumpFunction(img, funcs, strtoull(dumpArg.c_str(), nullptr, 16), co.lift);
+  return runCensus(img, funcs, co);
+}
