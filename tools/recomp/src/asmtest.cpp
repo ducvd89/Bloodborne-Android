@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cpuid.h>
+#include <xmmintrin.h>
 #include <csetjmp>
 #include <csignal>
 #include <cstdio>
@@ -150,16 +151,23 @@ CpuidRes bbr_cpuid(CPUState*, uint64_t fn, uint64_t leaf) {
 }
 uint64_t bbr_rdtsc() { return __builtin_ia32_rdtsc(); }
 uint64_t bbr_processor_id() { return 0; }
-void bbr_set_rounding(uint64_t, uint64_t, uint64_t) {}
+// x86 control-state helpers on the host MXCSR (the real runtime maps these to FPCR)
+void bbr_set_rounding(uint64_t mode, uint64_t mxcsr, uint64_t setDaz) {
+  unsigned csr = _mm_getcsr();
+  csr = (csr & ~0x6000u) | ((unsigned)(mode & 3) << 13);               // rounding control
+  csr = (csr & ~0x8000u) | ((unsigned)((mode >> 2) & 1) << 15);        // flush to zero
+  if (setDaz) csr = (csr & ~0x40u) | ((unsigned)(mxcsr & 0x40));       // denormals are zero
+  _mm_setcsr(csr);
+}
 uint64_t bbr_xgetbv(uint64_t) { return 7; }
 void bbr_syscall(CPUState* s) { // straight to the host kernel, like FEX's syscall handler does for a 64-bit guest
   auto& g = s->gregs; // FEX order: RAX 0, RCX 1, RDX 2, RBX 3, RSP 4, RBP 5, RSI 6, RDI 7, R8..R15 8..15
   g[0] = (uint64_t)syscall(g[0], g[7], g[6], g[2], g[10], g[8], g[9]);
   s->rip += 2; // the handler skips the 2-byte instruction (FEX Syscalls.cpp)
 }
-uint64_t bbr_get_rounding() { return 0; }
-uint64_t bbr_push_rounding(uint64_t) { return 0; }
-void bbr_pop_rounding(uint64_t) {}
+uint64_t bbr_get_rounding() { return (_mm_getcsr() >> 13) & 3; }
+uint64_t bbr_push_rounding(uint64_t mode) { const unsigned old = _mm_getcsr(); _mm_setcsr((old & ~0x6000u) | ((unsigned)(mode & 3) << 13)); return old; }
+void bbr_pop_rounding(uint64_t saved) { _mm_setcsr((unsigned)saved); }
 }
 
 class Jit;
@@ -201,7 +209,7 @@ class Jit {
       std::vector<std::string> unsup; std::vector<uint64_t> entries;
       explicit Sink(Jit& jj) : j(jj), ctx(new LLVMContext()), mod(new Module("t", *ctx)) {
         setModuleTarget(*mod, *j.tm);
-        LowerOptions lo; lo.liftBase = 0; lo.fixedImageBase = true; lo.imageBase = 0; lo.aarch64 = false; lo.hiddenUnits = false;
+        LowerOptions lo; lo.liftBase = 0; lo.fixedImageBase = true; lo.imageBase = 0; lo.aarch64 = false; lo.hiddenUnits = false; lo.calleeSaved = false; lo.storeFlagsAtCalls = true;
         lo.isKnownUnit = [](uint64_t) { return false; };
         ul.reset(new UnitLowerer(*ctx, *mod, lo));
       }
@@ -212,7 +220,9 @@ class Jit {
       }
     } sink(*this);
     FuncResult fr;
-    lifter.lift(Func{from, hi}, fr, nullptr, nullptr, nullptr, &sink);
+    std::string irText;
+    lifter.lift(Func{from, hi}, fr, nullptr, nullptr, getenv("BBR_DUMP_IR") ? &irText : nullptr, &sink);
+    if (getenv("BBR_DUMP_IR")) fputs(irText.c_str(), stderr);
     if (fr.status == LiftStatus::Failed || fr.status == LiftStatus::Crashed || sink.entries.empty()) { liftFailure = fr.reason.empty() ? "no unit" : fr.reason; return false; }
     if (!sink.unsup.empty()) { for (auto& u : sink.unsup) unsupported.insert(u); return false; }
     if (getenv("BBR_DUMP_LL")) sink.mod->print(errs(), nullptr); // debugging: the lowered IR of every unit

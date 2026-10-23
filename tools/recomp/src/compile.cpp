@@ -155,6 +155,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   for (auto& s : img.loads) lo.imageSize = std::max(lo.imageSize, s.vaddr + s.memsz);
   lo.aarch64 = opt.target.aarch64;
   lo.storeFlagsAtCalls = opt.storeFlagsAtCalls;
+  lo.calleeSaved = opt.calleeSaved;
   lo.isKnownUnit = [&starts](uint64_t v) { return std::binary_search(starts.begin(), starts.end(), v); };
 
   std::vector<ShardStats> stats(nshards);

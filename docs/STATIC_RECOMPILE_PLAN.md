@@ -178,47 +178,38 @@ Estimates:
 | A+B+C+D+E | **about 5–6 wk** (hot code on LLVM) | +4–5 wk: compile all code, plus our own small interpreter for misses and hooks | +6–8 wk (our own front end, with FEX's tests as the specification) |
 | FEX disk cache only | 1–2 wk | never | never |
 
-## Compile time estimate (2026-10-24, proxy measurement)
+## Compile time (2026-10-24, measured on the real game)
 
-These numbers come from synthetic "lifted" C, not from the real game code:
+Measured with `bb-recomp` (FEX front end -> LLVM 23 -> AArch64 object, `aarch64-linux-android30`, generic ARMv8.2 + LSE),
+on the dev PC (Ryzen AI 9 HX 370: 12 cores, 24 threads), 22 worker threads at `nice 19`, 64 shards of equal code size, a
+per-function pass pipeline without interprocedural passes. Input: CUSA03173 `eboot.elf`, all 162,959 FDE functions plus the
+gap units = 202,525 units, 11.81 M x86 instructions, 58.7 M FEX IR ops. All ops lowered: no unit contains a `bbr_trap`.
 
-- **The proxy.** A generator writes C in the style of a lifted x86 function: guest state in a
-  struct, flags computed explicitly, guest memory through raw pointers. It matches the game's
-  function sizes, branch density, call and AVX mix.
-- **How it was compiled.** NDK 29 clang for `aarch64-linux-android30`, one core of the Ryzen AI 9
-  HX 370, under `nice 19`.
-- **Results:**
-  - A 500-function shard (28.7 k x86 instructions) took 5.4 s at -O1: front end 0.27 s, optimizer
-    2.0 s, codegen 2.9 s. That is about **5.3 k x86 instructions/s per core**, and about 2.1 ARM64
-    instructions per x86 instruction.
-  - 2,000-function shards (120 k instructions) took 54–101 s each. That is superlinear: the
-    interprocedural passes (IPSCCP, function attrs, inliner) grow with module size. So use small
-    shards and a custom pass pipeline without IPO.
-  - Peak memory was 850 MB per job with 2,000-function shards.
-- **Extrapolated to the whole game.** 11.27 M x86 instructions ≈ **35 core-minutes on a Zen 5 core**
-  with plain -O1. With a tuned pipeline (no IPO, IR emitted directly with no C front end, fast
-  instruction selection for cold code) it would be about 20–25.
-
-Converting to an 8 Gen 2 (Thor: 1× X3 3.19 GHz, 4× A715/A710 2.8 GHz, 3× A510 2.0 GHz):
-
-- **Assumed speed of each core, relative to one Zen 5 core, for compiler work:** X3 ≈ 0.6,
-  A715 ≈ 0.4, A510 ≈ 0.13.
-- **The whole chip:** about 2.7 Zen 5 cores, or about 2 sustained once it heats up.
-- **Memory:** 4–6 jobs on an 8 GB phone; all 8 on a 12–16 GB device.
-
-| What is compiled | Thor (fan, sustained) | 8 Gen 2 phone (throttles) |
+| | -O1 | -O2 |
 |---|---|---|
-| Whole game, plain -O1 | about 18–25 min | about 25–40 min |
-| Whole game, tuned pipeline, cold code with fast codegen | about 8–12 min | about 12–20 min |
-| Hot functions only (corner D, about 0.3–1 M instructions, -O2) | about 1–3 min | about 2–5 min |
-| A patch or hook change (only the changed functions) | seconds | seconds |
+| **Wall time, lift to objects** | **63.9 s** | **70.1 s** |
+| Thread-seconds: lift + lower / optimise / codegen | 51 / 220 / 916 (1187 total) | 51 / 332 / 925 (1308 total) |
+| `.text` | 102.97 MB | 103.41 MB |
+| Object files | 135.4 MB | 135.8 MB |
+| Peak RSS (22 workers, 64 shards) | 15.2 GB | 15.2 GB |
+| `.so` (objects + unit table + link with the NDK `ld.lld`, 0.2 s) | 123.3 MB | |
 
-Huge functions are a risk to these numbers. The real game's code is heavily skewed: the median
-function is 62 bytes, but the largest 10 % hold 63 % of the code, and the biggest is 78 KB (about
-20 k instructions). Per-function passes such as register allocation, GVN and scheduling can be
-superlinear on such functions, so add up to 1.5–2× on the whole-game rows until phase 0 measures
-the real IR. A quick check on the device itself: Termux's clang running the same benchmark on the
-Thor.
+- That is 20 thread-minutes of work at -O1 for the whole game, about 100 us per x86 instruction. The proxy estimated 35
+  core-minutes; the real code is about 40 % cheaper because most of the proxy's cost was a C front end that is gone.
+- **Code generation is 77 % of the time**, the optimiser 18 %, lifting and lowering 4 %. -O2 costs +10 % wall and gives no
+  smaller code at this pipeline, so -O1 is the default; the codegen opt level follows (-O1: `Less`).
+- Code size: 2.2 AArch64 instructions per x86 instruction (25.7 M instructions), as the proxy predicted (2.1). The first
+  lowering had 3.3: storing NZCV and PF/AF before every call and return, and storing every written register at every exit
+  (now: only registers modified since the last store, flags only at tail jumps, rbx/rbp/r12-r15 not reloaded after a call)
+  took `.text` from 156 MB to 103 MB and codegen time by a third. Half of the remaining instructions are loads and stores
+  (spills at calls and exits, guest memory).
+- **The PC tool compiles the whole game in about a minute** on this machine. A 6-core/12-thread desktop needs about 3 min.
+  Memory: about 0.7 GB per worker, so cap the workers at (RAM - 2 GB) / 0.7 GB on smaller PCs.
+- If an on-device compile ever returns: 1187 thread-seconds on the Thor (about 2-2.7 Zen-5-core equivalents sustained) is
+  roughly 8-15 minutes for the whole game, with 4-6 workers of 0.7 GB.
+- Guest memory is plain align-1 loads and stores with no TBAA. Huge functions did not blow up: the largest function
+  (78 KB, 16 k instructions, 3,094 blocks) compiles in 1.1 s, and the one with the most IR (0x26bc320: 64 KB, 358 units,
+  570 k IR ops) in 5.2 s, alone.
 
 ## Risks
 

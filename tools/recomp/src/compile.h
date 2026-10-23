@@ -21,7 +21,8 @@ struct CompileOptions {
   std::string ndk = "/home/cid/BloodbornePC/.local-deps/android/sdk/ndk/29.0.14206865";
   bool table = true;             // emit the unit table object
   bool verify = false;           // run the LLVM verifier on every module
-  bool storeFlagsAtCalls = true; // see LowerOptions
+  bool storeFlagsAtCalls = false; // see LowerOptions
+  bool calleeSaved = true;        // see LowerOptions
 };
 
 int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const CompileOptions& opt);

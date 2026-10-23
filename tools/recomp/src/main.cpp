@@ -42,7 +42,8 @@ static void usage() {
         "  --target aarch64|x86_64   (default aarch64)     -O0 | -O1 (default) | -O2\n"
         "  --shards <n>         modules compiled in parallel (default 64; 1 for --emit-ll)\n"
         "  --verify-llvm        run the LLVM verifier on every module\n"
-        "  --no-flags-at-calls  do not store NZCV before calls (flags are dead across calls in x86 code)\n"
+        "  --flags-at-calls     also store NZCV before calls and returns (x86 flags are dead there; off by default)\n"
+        "  --no-callee-saved    reload rbx, rbp, r12-r15 after calls too (default: the SysV callee-saved set is trusted)\n"
         "  --ndk <dir>          Android NDK for --so\n"
         "  --stats <file>       also write the compile summary here\n", stderr);
 }
@@ -91,7 +92,8 @@ int main(int argc, char** argv) {
     else if (is("-O2")) cc.target.opt = 2;
     else if (is("--shards")) { cc.shards = std::max(1, atoi(arg())); shardsSet = true; }
     else if (is("--verify-llvm")) cc.verify = true;
-    else if (is("--no-flags-at-calls")) cc.storeFlagsAtCalls = false;
+    else if (is("--flags-at-calls")) cc.storeFlagsAtCalls = true;
+    else if (is("--no-callee-saved")) cc.calleeSaved = false;
     else if (is("--ndk")) cc.ndk = arg();
     else if (is("--stats")) cc.statsPath = arg();
     else if (is("--func")) cc.onlyVaddr = strtoll(arg(), nullptr, 16);

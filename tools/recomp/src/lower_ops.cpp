@@ -448,8 +448,8 @@ bool Lower::emitScalarOp(Ref node, IR::IROp_Header* op) {
   }
   case OP_LOADPF: def(node, B.CreateLoad(I64, gpr[16])); return true;
   case OP_LOADAF: def(node, B.CreateLoad(I64, gpr[17])); return true;
-  case OP_STOREPF: B.CreateStore(A(op->C<IROp_StorePF>()->Value), gpr[16]); return true;
-  case OP_STOREAF: B.CreateStore(A(op->C<IROp_StoreAF>()->Value), gpr[17]); return true;
+  case OP_STOREPF: B.CreateStore(A(op->C<IROp_StorePF>()->Value), gpr[16]); dirty |= 1ull << 16; return true;
+  case OP_STOREAF: B.CreateStore(A(op->C<IROp_StoreAF>()->Value), gpr[17]); dirty |= 1ull << 17; return true;
   case OP_LOADREGISTER: {
     auto* o = op->C<IROp_LoadRegister>();
     if (o->Class == RegClass::GPR) def(node, B.CreateLoad(I64, gpr[o->Reg]));
@@ -461,6 +461,7 @@ bool Lower::emitScalarOp(Ref node, IR::IROp_Header* op) {
     PhysicalRegister pr(node);
     Value* v = A(o->Value);
     if (pr.AsRegClass() == RegClass::GPRFixed) B.CreateStore(v, gpr[pr.Reg]); else B.CreateStore(v, xmm[pr.Reg]);
+    dirty |= 1ull << (pr.AsRegClass() == RegClass::GPRFixed ? pr.Reg : NumStaticGPR + pr.Reg);
     return true;
   }
 
@@ -608,10 +609,10 @@ bool Lower::emitExtraOp(Ref node, IR::IROp_Header* op) {
     return true;
   }
   case OP_MASKGENERATEFROMBITWIDTH: {
-    // (~0 << w), or all ones when w == 0
+    // csinv: all ones when w == 0, else ~(~0 << w), the low w bits (lslv takes w mod 64)
     Value* w = A(op->C<IROp_MaskGenerateFromBitWidth>()->BitWidth);
     Value* sh = B.CreateShl(c64(~0ull), B.CreateAnd(w, c64(63)));
-    def(node, B.CreateSelect(B.CreateICmpEQ(w, c64(0)), c64(~0ull), sh));
+    def(node, B.CreateSelect(B.CreateICmpEQ(w, c64(0)), c64(~0ull), B.CreateNot(sh)));
     return true;
   }
   case OP_CMPPAIRZ: {

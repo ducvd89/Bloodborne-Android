@@ -16,7 +16,8 @@ struct LowerOptions {
   bool fixedImageBase = false; // true: addresses become constants (imageBase); false: the global bbr_image_base
   uint64_t imageBase = 0;
   bool aarch64 = true;         // target: picks the few target-specific bits (yield hint)
-  bool storeFlagsAtCalls = true; // also store NZCV to the context before calls (always done at exits)
+  bool storeFlagsAtCalls = false; // also store NZCV before calls and returns (x86 flags are dead there; tail jumps always store)
+  bool calleeSaved = true;       // after a call, rbx rbp r12-r15 are still what they were (the SysV ABI), so they are not reloaded
   bool hiddenUnits = true;       // hidden visibility for the unit functions (off for the in-process JIT)
   std::function<bool(uint64_t)> isKnownUnit; // image vaddr -> a unit with that entry exists (direct call)
 };

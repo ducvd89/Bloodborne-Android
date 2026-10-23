@@ -76,6 +76,8 @@ struct Lower {
   bool flagsRead = false, flagsWritten = false;
   llvm::AllocaInst *fN = nullptr, *fZ = nullptr, *fC = nullptr, *fV = nullptr;
   FlagDesc fd;
+  uint64_t dirty = 0;                       // static registers (bit g: GPR g, bit 18+x: XMM x) that differ from the context
+  std::unordered_map<uint32_t, uint64_t> dirtyIn; // per block, from the dataflow in run()
   uint32_t curGuest = 0;       // offset of the current guest instruction from the entry (GuestOpcode)
   std::set<std::string> unsup; // unsupported op names of this unit
 
@@ -121,7 +123,7 @@ struct Lower {
   // ---- state
   void scan();
   void prologue();
-  void spill(bool flags);
+  void spill(bool flags);                 // store the dirty registers (and the flags when asked)
   void fill();
   Value* loadRegValue(unsigned cls, unsigned reg);
 

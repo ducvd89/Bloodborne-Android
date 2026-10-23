@@ -1,8 +1,10 @@
-# bb-recomp (PC tool, step 1: lifter skeleton and IR census)
+# bb-recomp (PC tool: FEX lifter, IR census, LLVM lowering, ARM64 object/.so, ASM test runner)
 
-Lifts the game's x86-64 code with FEXCore's own front end (decoder, OpcodeDispatcher, IR passes) and
-reports what the FEX IR looks like. Nothing is lowered to LLVM yet (`-DBB_RECOMP_LLVM=ON` is reserved
-for step 2). Design and plan: `docs/STATIC_RECOMPILE_PLAN.md`.
+Lifts the game's x86-64 code with FEXCore's own front end (decoder, OpcodeDispatcher, IR passes), reports what
+the FEX IR looks like (step 1), lowers it to LLVM IR and compiles it to an AArch64 object or Android `.so`
+(step 2: `lower_*.cpp`, `codegen.cpp`, `compile.cpp`), and runs FEX's `unittests/ASM` through the same lowering
+on the x86-64 host (`bb-recomp-asmtest`). Design and plan: `docs/STATIC_RECOMPILE_PLAN.md`; how the compiled
+code runs: `docs/RECOMP_ABI.md`.
 
 ## Build
 
@@ -12,7 +14,17 @@ and nothing else (`lifter.cpp`).
 
     cmake -S tools/recomp -B out/recomp-build -G Ninja -DFEX_GIT_DIR=/path/to/BloodbornePC/third_party/FEX
     nice -n 19 cmake --build out/recomp-build -j 22      # about 20 s on 22 cores after the first FEX build
-    # -> out/recomp-build/bb-recomp
+    # -> out/recomp-build/bb-recomp and out/recomp-build/bb-recomp-asmtest
+
+`-DBB_RECOMP_LLVM=ON` is the default: the system LLVM (23, shared library, with the AArch64 and X86 targets) is
+linked. `-DBB_RECOMP_LLVM=OFF` builds the lifter and census only. The NDK for `--so` is
+`.local-deps/android/sdk/ndk/29.0.14206865` of the main checkout (`--ndk` to change).
+
+nasm for the ASM tests is not packaged here: build it once from source into `.local-deps/nasm` (ignored by git):
+
+    mkdir -p .local-deps/nasm/dl && cd .local-deps/nasm/dl && curl -fsSLO https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.xz
+    tar xf nasm-2.16.03.tar.xz -C .. && mkdir -p ../build && cd ../build
+    nice -n 19 ../nasm-2.16.03/configure --prefix=$PWD/../install && nice -n 19 make -j22 install
 
 `FEX_GIT_DIR` defaults to `third_party/FEX`, which is empty in a git worktree. FEX's own submodules (fmt,
 unordered_dense, ...) are not initialised there either, so `fetch-fex.sh` makes a prepared tree in
@@ -30,6 +42,32 @@ built (FEXCore, no thunks, tests, FEXConfig, Zydis, jemalloc, LTO).
 Options: `--host armv8.2|armv8.4|armv9`, `--no-multiblock`, `--no-passes`, `--tso`, `--validate`,
 `--no-gap-units`, `--jobs`, `--every N`. The process renices itself to 19 and uses at most 22 threads.
 
+### LLVM modes
+
+    bb-recomp --elf out/eboot.elf --emit-ll 0x175340 f.ll        # LLVM IR of one function (all its units), before optimisation
+    bb-recomp --elf out/eboot.elf --emit-ll all out/ll/g.ll --limit 2000
+    bb-recomp --elf out/eboot.elf --func 0x175340 --obj f.o --shards 1 -O1   # one function to an AArch64 object
+    bb-recomp --elf out/eboot.elf --obj out/obj/game.o --shards 64 -O1       # everything: game.000.o ... game.063.o + game.table.o
+    bb-recomp --elf out/eboot.elf --so out/so/libbbaot.so -O1                # compile and link with the NDK's ld.lld
+    bb-recomp ... --target x86_64                                            # same code for the PC (the test runner uses this)
+
+`--shards N` (default 64; 1 for `--emit-ll`) splits the functions into N modules of equal code size, compiled on up to 22
+threads at nice 19. The pass pipeline has no interprocedural passes (SROA/mem2reg, EarlyCSE, InstCombine, SimplifyCFG, DSE;
+GVN and a second round at -O2). `--verify-llvm` runs the LLVM verifier on every module. A summary goes to stdout and
+`out/recomp/compile.txt`: counts, CPU time per phase, `.text`, peak RSS, and the IR ops that still become `bbr_trap`.
+`--flags-at-calls` and `--no-callee-saved` switch off two ABI shortcuts (RECOMP_ABI.md).
+
+### ASM tests (`bb-recomp-asmtest`)
+
+    out/recomp-build/bb-recomp-asmtest                      # every unittests/ASM test -> out/recomp/asmtest.txt
+    out/recomp-build/bb-recomp-asmtest --filter Primary/ -v # a subset, one line per test
+    BBR_DUMP_IR=1 BBR_DUMP_LL=1 out/recomp-build/bb-recomp-asmtest --filter TwoByte/0F_F5   # FEX IR and our LLVM IR of one test
+
+Each test runs in a forked child (the tests map fixed addresses): nasm assembles it the way FEX's CMake does, the code is
+lifted with the front end, lowered, compiled for the host with LLVM ORC, run on a default `CPUState` until `hlt`, and
+`RegData` is compared. Skipped without trying: x87 (376), MMX/3DNow (28), self-modifying code, 32-bit, SHA/CLZERO/RAND
+tests, FEX's own disabled and known-failure lists.
+
 ## How it works
 
 - `elf_image.cpp`: maps the PT_LOAD segments at `base + vaddr` (default base 0x200000000: vaddr 0 cannot be
@@ -46,6 +84,21 @@ Options: `--host armv8.2|armv8.4|armv9`, `--no-multiblock`, `--no-passes`, `--ts
   sweeping the uncovered bytes and lifted as extra units.
 - Failures are caught per function (signals and FEX asserts longjmp back; the unit is rebuilt).
   Release FEX compiles its asserts out, so use `--validate` for IR checks.
+
+## Where things stand (2026-10-24)
+
+- **ASM tests** (x86-64 host, -O1): 1612 pass, 4 fail, 216 not run because an op is still unlowered, 433 skipped:
+  99.8 % of the tests that run pass. Every category except the unlowered-op ones is 100 %: Primary 199/199, PrimaryGroup
+  152/152, Secondary 72/72, TwoByte 221/221, Atomics 12/12, ConstProp, Flags, REP/REPNE 67/67, OpSize 110/110, SSE4a 4/4,
+  VEX 329/332, FEX_bugs 95/95. The 4 failures: `DAZTest` (denormals-are-zero needs FPCR.FIZ, FEAT_AFP) and
+  `vcvtps2ph_rd/ru/trunc` (a half-precision conversion with a rounding mode other than nearest: LLVM's x86 `fptrunc`
+  ignores MXCSR; on ARM64 the rounding helpers set FPCR). The 216 tests not run need ops the game never uses (AVX2
+  gathers and masked moves 105, string compares 39, F80 25, FMA 14, AES/SHA/PCLMUL ~30).
+- **Whole game, all 162,959 functions plus the gap units (202,525 units, 58.7 M IR ops)**: no lift failure, no unit with
+  `bbr_trap`, every module passes the LLVM verifier. Timings are in "Compile time" in `docs/STATIC_RECOMPILE_PLAN.md`.
+- The lowering follows the Arm64 JIT op by op. Lowered: every op the census lists (204 of 424) and the scalar and vector
+  ops FEX's tests use. Not lowered: the F80/x87-stack ops (none in the eboot), AES/SHA/PCLMUL, `VPCMP*STRX`, FMA
+  (`VFMLA*`), masked loads/stores and gathers, `F64SIN/COS/...`.
 
 ## What the census found (CUSA03173 eboot, armv8.4 profile, Multiblock=1, TSO off)
 

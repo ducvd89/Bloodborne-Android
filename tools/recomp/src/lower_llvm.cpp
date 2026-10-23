@@ -375,14 +375,17 @@ void Lower::prologue() {
 
 // Registers and flags back to the context: before every exit and call.
 void Lower::spill(bool flags) {
+  // PF and AF are flags: dead across calls and returns, so they are only stored where the flags are (they stay dirty).
+  const uint64_t keep = flags ? 0 : (3ull << 16) & dirty;
   for (unsigned i = 0; i < NumStaticGPR; ++i) {
-    if (!gprWritten[i]) continue;
+    if (!(dirty >> i & 1) || (i >= 16 && !flags)) continue;
     Value* v = B.CreateLoad(I64, gpr[i]);
     if (i < 16) B.CreateAlignedStore(v, gep(offsetof(Core::CPUState, gregs) + 8 * i), Align(8));
     else B.CreateAlignedStore(B.CreateTrunc(v, I32), gep(i == 16 ? offsetof(Core::CPUState, pf_raw) : offsetof(Core::CPUState, af_raw)), Align(4));
   }
   for (unsigned i = 0; i < NumStaticFPR; ++i)
-    if (xmmWritten[i]) B.CreateAlignedStore(B.CreateLoad(V128, xmm[i]), gep(offsetof(Core::CPUState, xmm.sse.data) + 16 * i), Align(16));
+    if (dirty >> (NumStaticGPR + i) & 1) B.CreateAlignedStore(B.CreateLoad(V128, xmm[i]), gep(offsetof(Core::CPUState, xmm.sse.data) + 16 * i), Align(16));
+  dirty = keep;
   if (flags && flagsWritten) B.CreateAlignedStore(packNZCV(), gep(offsetof(Core::CPUState, flags) + X86State::RFLAG_NZCV_LOC), Align(1));
 }
 
@@ -390,6 +393,9 @@ void Lower::spill(bool flags) {
 void Lower::fill() {
   for (unsigned i = 0; i < NumStaticGPR; ++i) {
     if (!gprUsed[i]) continue;
+    // rbx 3, rbp 5, r12-r15: callee-saved, still what the spill stored
+    if (m.O.calleeSaved && (i == 3 || i == 5 || (i >= 12 && i <= 15))) continue;
+    if (i >= 16 && !m.O.storeFlagsAtCalls) continue; // PF/AF are dead after a call
     if (i < 16) B.CreateStore(B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, gregs) + 8 * i), Align(8)), gpr[i]);
     else B.CreateStore(B.CreateZExt(B.CreateAlignedLoad(I32, gep(i == 16 ? offsetof(Core::CPUState, pf_raw) : offsetof(Core::CPUState, af_raw)), Align(4)), I64), gpr[i]);
   }
@@ -417,7 +423,7 @@ void Lower::emitExit(const IR::IROp_ExitFunction* op) {
   const uint64_t ripOff = offsetof(Core::CPUState, rip);
 
   if (hint == IR::BranchHint::Return) {
-    spill(true);
+    spill(m.O.storeFlagsAtCalls);
     B.CreateAlignedStore(target, gep(ripOff), Align(8));
     B.CreateRetVoid();
     return;
@@ -576,11 +582,37 @@ void Lower::run() {
   }
   std::reverse(post.begin(), post.end());
 
+  // Which static registers may differ from the context at each block start: a register is dirty from its
+  // StoreRegister until the next spill (exit, call, syscall); a call's return block starts clean.
+  for (uint32_t id : order) dirtyIn[id] = 0;
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (uint32_t id : post) {
+      uint64_t d = dirtyIn[id];
+      for (auto [Node, op] : IR.GetCode(blocks[id].node)) {
+        switch (op->Op) {
+        case IR::OP_STOREREGISTER: {
+          IR::PhysicalRegister pr(Node);
+          d |= 1ull << (pr.AsRegClass() == IR::RegClass::GPRFixed ? pr.Reg : NumStaticGPR + pr.Reg);
+          break;
+        }
+        case IR::OP_STOREPF: d |= 1ull << 16; break;
+        case IR::OP_STOREAF: d |= 1ull << 17; break;
+        case IR::OP_EXITFUNCTION: case IR::OP_BREAK: case IR::OP_SYSCALL: d = 0; break;
+        default: break;
+        }
+      }
+      for (uint32_t sc : blocks[id].succ)
+        if (blocks.count(sc) && (dirtyIn[sc] | d) != dirtyIn[sc]) { dirtyIn[sc] |= d; changed = true; }
+    }
+  }
+
   std::set<uint32_t> emitted;
   for (uint32_t id : post) {
     emitted.insert(id);
     B.SetInsertPoint(bbOf[id]);
     fd = FlagDesc{};
+    dirty = dirtyIn[id];
     for (auto [Node, op] : IR.GetCode(blocks[id].node)) {
       if (terminated()) break;
       // Multi-output ops write their handle nodes through allocas.
