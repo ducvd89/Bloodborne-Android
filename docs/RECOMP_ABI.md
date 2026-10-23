@@ -31,9 +31,13 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
   register (GPR 0-15 in x86 order at `gregs[n]`, 16 = PF and 17 = AF at `pf_raw`/`af_raw`, 32-bit; FPR n at
   `xmm.sse.data[n]`, the 128-bit layout of a host without SVE256; the YMM high halves are `avx_high`, reached
   through `LoadContext`/`StoreContext`). Each register the unit touches is loaded from `s` at unit entry.
-  The registers the unit *writes* are stored back before every exit and call. After a call that returns to
-  the expected address, every register the unit touches is reloaded (the callee may have changed any of
-  them; no callee-saved assumption is made). `mem2reg`/`SROA` then keep them in host registers.
+  The registers the unit has *modified since the last store* are stored back before every exit and call (a
+  dataflow over the unit's blocks tracks which those are). After a call that returns to the expected address,
+  the caller-saved registers (rax rcx rdx rsi rdi rsp r8-r11, all XMM) are reloaded; **rbx, rbp and r12-r15 are
+  not**: the SysV ABI guarantees the callee restored them, and the caller's copy then stays in a host register
+  across the call. (`--no-callee-saved` reloads them too; the ASM test runner does.) A callee that returns with
+  different callee-saved registers (setjmp/longjmp, a context switch) goes through the `rip != retaddr` path
+  anyway. `mem2reg`/`SROA` keep the registers in host registers.
 - **`GuestState` initialisation** is the runtime's job and must match FEX's thread setup: a default
   `CPUState` (NZCV word with C set, DF raw = 1, `pf_raw` = 1, MXCSR 0x1F80) plus the segment arrays
   (`segment_arrays[GDT] = segment_arrays[LDT] = gdt[32]`, `cs_idx = 6 << 3`, a 64-bit code segment): the IR
@@ -48,9 +52,10 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
     almost all code and DSE removes them.
   - Flags are materialised lazily: a flag-setting op only records its operands, and a condition built in
     the same block is one `icmp` on them. At block ends the flags go to the four allocas (dead stores die in
-    `mem2reg`/DSE). At unit exits and before calls they are stored to the context as the packed NZCV word
-    (`flags[24]`, N<<31 | Z<<30 | C<<29 | V<<28), but only if the unit writes flags at all. They are not
-    reloaded after a call (x86 flags are dead across calls). `--no-flags-at-calls` drops the store before calls.
+    `mem2reg`/DSE). At tail-jump exits (`ExitFunction ... None`) and at `Break` they are stored to the context
+    as the packed NZCV word (`flags[24]`, N<<31 | Z<<30 | C<<29 | V<<28), but only if the unit writes flags at all.
+    x86 flags are dead across calls and returns, so those two do not store them (`--flags-at-calls` restores the
+    store), and nothing reloads them after a call. PF and AF (`pf_raw`, `af_raw`) follow the flags.
 - **Guest memory.** Guest pointers are host pointers (shared address space). `LoadMem`/`StoreMem`
   become plain loads and stores with `align 1` (x86 allows misalignment), no TBAA, and
   `-fno-strict-aliasing` semantics. TSO is off, matching the shipped FEX config. Atomics
