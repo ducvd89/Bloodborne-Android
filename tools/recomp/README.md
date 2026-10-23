@@ -112,9 +112,9 @@ tests, FEX's own disabled and known-failure lists.
 - **Differential test on the game** (`bb-recomp-difftest`, 6 inputs per function, all 162,959 functions, x86-64 host,
   -O1): 60,796 functions agree on at least one input, 100,426 are skipped (every input faulted or timed out, mostly
   random arguments that are not valid objects), 1,435 skipped for `rdtsc`, 272 not liftable by the in-process lifter,
-  **30 mismatch**. None is a lowering bug: 17 use `rcpps`/`rsqrtps` (x86 returns a 12-bit table estimate, the lowering
+  **30 mismatch**. None is a lowering bug: 18 use `rcpps`/`rsqrtps` (x86 returns a 12-bit table estimate, the lowering
   computes 1/x; the code refines with a Newton step, so only the last bits differ), 2 differ only in the sign of a
-  default NaN (x86 `ffc00000`, ARM `7fc00000`), 11 return host addresses (a tail jump into an import stub that
+  default NaN (x86 `ffc00000`, ARM `7fc00000`), 10 return host addresses (a tail jump into an import stub that
   allocates; the native and lowered runs live in different processes). One real bug was found and fixed on the way: LLVM
   23's x86 `x86-fixup-bw-insts` rewrites `movb 552(%rcx),%cl` to `movzbl` although the upper bits of rcx are live,
   which drops the old upper bits of a byte-merge such as `mov al,[rax+0x228]` (about 26 functions). The x86 host path
