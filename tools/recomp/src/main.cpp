@@ -4,6 +4,9 @@
 //   bb-recomp --elf out/eboot.elf --scan             just the function list
 #include "census.h"
 #include "fde_scan.h"
+#ifdef BB_RECOMP_LLVM
+#include "compile.h"
+#endif
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -31,7 +34,17 @@ static void usage() {
         "  --no-passes          skip the x87 and dead-flag passes\n"
         "  --no-size-hist       skip ir_ops_by_size.csv\n"
         "  --inject-crash <hex>, --inject-assert <hex>   test hooks: fault / FEX assert while lifting that function\n"
-        "  --no-nice            do not lower the process priority to 19\n", stderr);
+        "  --no-nice            do not lower the process priority to 19\n"
+        "LLVM modes (need -DBB_RECOMP_LLVM=ON):\n"
+        "  --emit-ll <hex vaddr|all> <file>   LLVM IR text (one function, or --limit N / all functions)\n"
+        "  --obj <file>         compile to object files (<file> for 1 shard, else <base>.NNN.o + <base>.table.o)\n"
+        "  --so <file>          compile and link an Android ARM64 shared object (needs --target aarch64)\n"
+        "  --target aarch64|x86_64   (default aarch64)     -O0 | -O1 (default) | -O2\n"
+        "  --shards <n>         modules compiled in parallel (default 64; 1 for --emit-ll)\n"
+        "  --verify-llvm        run the LLVM verifier on every module\n"
+        "  --no-flags-at-calls  do not store NZCV before calls (flags are dead across calls in x86 code)\n"
+        "  --ndk <dir>          Android NDK for --so\n"
+        "  --stats <file>       also write the compile summary here\n", stderr);
 }
 
 int main(int argc, char** argv) {
@@ -39,6 +52,11 @@ int main(int argc, char** argv) {
   uint64_t base = 0x200000000ull;
   bool scanOnly = false, nice = true, dump = false;
   CensusOptions co;
+#ifdef BB_RECOMP_LLVM
+  CompileOptions cc;
+  bool shardsSet = false;
+  cc.statsPath = "out/recomp/compile.txt";
+#endif
   unsigned hw = std::thread::hardware_concurrency();
   co.jobs = std::min(22u, hw > 2 ? hw - 2 : 1u);
   for (int i = 1; i < argc; ++i) {
@@ -63,6 +81,21 @@ int main(int argc, char** argv) {
     else if (is("--inject-crash")) co.lift.injectCrash = strtoll(arg(), nullptr, 16);
     else if (is("--inject-assert")) co.lift.injectAssert = strtoll(arg(), nullptr, 16);
     else if (is("--no-nice")) nice = false;
+#ifdef BB_RECOMP_LLVM
+    else if (is("--emit-ll")) { std::string a = arg(); cc.llPath = arg(); if (a == "all") cc.onlyVaddr = -1; else cc.onlyVaddr = strtoll(a.c_str(), nullptr, 16); }
+    else if (is("--obj")) cc.objPath = arg();
+    else if (is("--so")) cc.soPath = arg();
+    else if (is("--target")) { std::string t = arg(); if (t == "aarch64") cc.target.aarch64 = true; else if (t == "x86_64") cc.target.aarch64 = false; else { usage(); return 2; } }
+    else if (is("-O0")) cc.target.opt = 0;
+    else if (is("-O1")) cc.target.opt = 1;
+    else if (is("-O2")) cc.target.opt = 2;
+    else if (is("--shards")) { cc.shards = std::max(1, atoi(arg())); shardsSet = true; }
+    else if (is("--verify-llvm")) cc.verify = true;
+    else if (is("--no-flags-at-calls")) cc.storeFlagsAtCalls = false;
+    else if (is("--ndk")) cc.ndk = arg();
+    else if (is("--stats")) cc.statsPath = arg();
+    else if (is("--func")) cc.onlyVaddr = strtoll(arg(), nullptr, 16);
+#endif
     else { usage(); return 2; }
   }
   co.jobs = std::min(co.jobs, 22u); // 2 of 24 cores stay free on the dev PC
@@ -86,5 +119,12 @@ int main(int argc, char** argv) {
   }
   if (scanOnly) return 0;
   if (dump) return dumpFunction(img, funcs, strtoull(dumpArg.c_str(), nullptr, 16), co.lift);
+#ifdef BB_RECOMP_LLVM
+  if (!cc.llPath.empty() || !cc.objPath.empty() || !cc.soPath.empty()) {
+    cc.lift = co.lift; cc.jobs = co.jobs; cc.limit = co.limit;
+    if (!shardsSet && !cc.llPath.empty() && cc.objPath.empty() && cc.soPath.empty()) cc.shards = 1;
+    return runCompile(img, funcs, cc);
+  }
+#endif
   return runCensus(img, funcs, co);
 }

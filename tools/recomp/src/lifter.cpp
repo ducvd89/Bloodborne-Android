@@ -425,7 +425,7 @@ void Lifter::Impl::gaps(uint64_t lo, uint64_t hi, Gen& g, FuncResult& r) {
 Lifter::Lifter(const ElfImage& img, const LiftOptions& opt) { installCrashHandlers(); impl_ = std::make_unique<Impl>(img, opt); }
 Lifter::~Lifter() = default;
 
-void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts, std::vector<uint64_t>* sizeHist, std::string* irText) {
+void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts, std::vector<uint64_t>* sizeHist, std::string* irText, UnitSink* sink) {
   r = FuncResult {};
   log_.clear();
   std::vector<uint32_t> local;
@@ -450,6 +450,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
         ++r.blocks; count(BlockHeader);
         for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) count(IROp);
       }
+      if (sink) sink->unit(entry - impl_->img.base, extra, &IR);
       if (irText) {
         fextl::ostringstream out; IR::Dump(&out, &IR);
         char h[96]; snprintf(h, sizeof h, "; ---- %s unit at vaddr %#lx ----\n", extra ? "extra" : "entry", (unsigned long)(entry - impl_->img.base));

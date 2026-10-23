@@ -18,8 +18,11 @@ include(ExternalProject)
 # touching the checkout. Set FEX_SOURCE_DIR to use a ready tree directly.
 set(FEX_GIT_DIR "${CMAKE_CURRENT_LIST_DIR}/../../third_party/FEX" CACHE PATH "git checkout of FEX 2609.1")
 set(FEX_SOURCE_DIR "" CACHE PATH "FEX source tree with its submodules (default: FEX_GIT_DIR, or a tree prepared from it)")
-# Step 2: link LLVM (system install, AArch64 target) into bb-recomp.
-option(BB_RECOMP_LLVM "Link LLVM for the IR lowering (step 2; unused in step 1)" OFF)
+# Step 2: the FEX IR -> LLVM lowering needs LLVM (system install with the AArch64 and X86 targets). Also builds the
+# ASM test runner bb-recomp-asmtest.
+option(BB_RECOMP_LLVM "Link LLVM for the IR lowering and build bb-recomp-asmtest" ON)
+get_filename_component(BB_NASM_DEFAULT "${CMAKE_CURRENT_LIST_DIR}/../../.local-deps/nasm/install/bin/nasm" ABSOLUTE)
+set(BB_RECOMP_NASM "${BB_NASM_DEFAULT}" CACHE FILEPATH "nasm for the ASM test runner (built from source into .local-deps/nasm: see README)")
 set(BB_RECOMP_JOBS 22 CACHE STRING "Parallel jobs for the inner FEX build (2 of 24 cores stay free)")
 set(BB_RECOMP_MARCH x86-64-v3 CACHE STRING "-march for FEX and bb-recomp on x86 hosts (FEX needs AVX)")
 set(BB_RECOMP_CC clang CACHE STRING "C compiler for FEX (needs Clang)")
@@ -44,6 +47,11 @@ if(NOT EXISTS "${FEX_SOURCE_DIR}/FEXCore/CMakeLists.txt")
   message(FATAL_ERROR "FEX_SOURCE_DIR=${FEX_SOURCE_DIR} has no FEXCore")
 endif()
 
+set(BB_TARGETS bb-recomp)
+set(BB_BUILT_FILES "<BINARY_DIR>/Bin/bb-recomp")
+if(BB_RECOMP_LLVM)
+endif()
+
 # FEX refuses x86-64 hosts unless ENABLE_X86_HOST_DEBUG (its CI configuration). We never run the JIT,
 # only the front end, so that is fine. Everything else FEX builds besides FEXCore is switched off;
 # bb-recomp is the only target built.
@@ -62,8 +70,8 @@ ExternalProject_Add(fex
     -DTUNE_CPU=none -DTUNE_ARCH=${BB_RECOMP_MARCH} -DOVERRIDE_VERSION=FEX-2609.1 -DOVERRIDE_HASH=9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf
     -DCMAKE_PROJECT_FEX_INCLUDE=${CMAKE_CURRENT_LIST_DIR}/fex_project.cmake
     -DBB_RECOMP_DIR=${CMAKE_CURRENT_LIST_DIR}
-    -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH}
-  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target bb-recomp --parallel ${BB_RECOMP_JOBS}
-  INSTALL_COMMAND ${CMAKE_COMMAND} -E copy_if_different <BINARY_DIR>/Bin/bb-recomp ${CMAKE_BINARY_DIR}/bb-recomp
+    -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH} -DBB_RECOMP_NASM=${BB_RECOMP_NASM}
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target ${BB_TARGETS} --parallel ${BB_RECOMP_JOBS}
+  INSTALL_COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BB_BUILT_FILES} ${CMAKE_BINARY_DIR}
   BUILD_ALWAYS ON
   USES_TERMINAL_BUILD ON)

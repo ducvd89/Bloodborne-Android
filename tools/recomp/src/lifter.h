@@ -49,6 +49,13 @@ struct FuncResult {
   std::vector<std::string> gapReasons; // "category: detail" for undecodable gap bytes
 };
 
+// Receives each lifted unit while its IR is alive (valid only inside the call): entry is the image vaddr,
+// irView a `const FEXCore::IR::IRListView*` (the lowering casts it back).
+struct UnitSink {
+  virtual ~UnitSink() = default;
+  virtual void unit(uint64_t entryVaddr, bool extra, const void* irView) = 0;
+};
+
 class Lifter {
  public:
   Lifter(const ElfImage& img, const LiftOptions& opt);
@@ -58,8 +65,9 @@ class Lifter {
   // Lifts f (image vaddrs). When opCounts is non-null it receives the per-op IR op counts (size numOps()).
   // sizeHist, when non-null, accumulates (op, size, element size) -> count.
   // irText, when non-null, receives FEX's IR dump of the function.
+  // sink, when non-null, gets every unit (the entry unit and the extra units) as it is lifted.
   void lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
-            std::vector<uint64_t>* sizeHist = nullptr, std::string* irText = nullptr);
+            std::vector<uint64_t>* sizeHist = nullptr, std::string* irText = nullptr, UnitSink* sink = nullptr);
 
   static size_t numOps();               // IR op kinds (IR.json), without the sentinel
   static const char* opName(size_t op);
