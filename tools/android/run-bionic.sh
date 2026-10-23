@@ -31,6 +31,7 @@ setting() { sed -n "s/^$1=//p" "$BB_CONFIG" 2>/dev/null | tail -n 1; }
 # The app's pad state file (PadBridge.java) and text requests (the character name: its touch keyboard).
 export BB_ANDROID_INPUT=1
 export BB_PAD_FILE="$base/android-pad.state" BB_PAD_QUIET=1
+export BB_RUMBLE_FILE="$base/android-rumble.state"
 export BB_IME_FILE="$base/ime.request"
 # ---- Aspect ratio, output and scene size ----
 # aspect_ratio (auto, 4:3, 16:10, 16:9, 21:9, 32:9; auto when missing, 16:9 when unknown) is the display's: the app

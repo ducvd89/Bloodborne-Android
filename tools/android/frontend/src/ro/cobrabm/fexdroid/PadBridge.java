@@ -8,7 +8,10 @@ import android.view.MotionEvent;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 
 /** Android gamepad events -> bbport's atomic pad-state file, without /dev/input permissions. */
@@ -21,8 +24,40 @@ final class PadBridge {
     private int virtualLx=128, virtualLy=128, virtualRx=128, virtualRy=128, virtualL2, virtualR2;
     private boolean virtualLeftActive, virtualRightActive;
     private boolean queued;
+    /** The 16 button names, in the order the remap menu lists them. */
+    static final String[] BUTTONS={"cross","circle","square","triangle","l1","r1","l2","r2","l3","r3","options","touchpad","up","down","left","right"};
+    private static final int TRIGGER_PRESS=64;
+    /** Physical name -> target name (a BUTTONS name or "none"); a missing name is itself. Physical pad only. */
+    private Map<String,String> remap=new HashMap<>();
 
     PadBridge(File state) { this.state=state; reset(); }
+
+    /** "cross=circle,circle=none" -> map; unknown names are dropped, identity entries too. */
+    static Map<String,String> parse(String text) {
+        Map<String,String> map=new LinkedHashMap<>();
+        if (text==null) return map;
+        for (String part:text.split(",")) {
+            String[] kv=part.split("=");
+            if (kv.length==2 && valid(kv[0],false) && valid(kv[1],true) && !kv[0].equals(kv[1])) map.put(kv[0],kv[1]);
+        }
+        return map;
+    }
+    static String format(Map<String,String> map) {
+        StringBuilder text=new StringBuilder();
+        for (String b:BUTTONS) {
+            String t=map.get(b);
+            if (t!=null && !t.equals(b)) text.append(text.length()>0 ? "," : "").append(b).append('=').append(t);
+        }
+        return text.toString();
+    }
+    private static boolean valid(String name,boolean none) {
+        if (none && name.equals("none")) return true;
+        for (String b:BUTTONS) if (b.equals(name)) return true;
+        return false;
+    }
+
+    /** Applies at once: the physical state is kept as it is and mapped on every write, so nothing stays pressed. */
+    void remap(Map<String,String> map) { remap=new HashMap<>(map); write(); }
 
     private String name(KeyEvent e) {
         // Thor's Linux scancodes were verified against its printed Nintendo positions.
@@ -98,16 +133,37 @@ final class PadBridge {
         write();
     }
 
+    private String target(String from) { String to=remap.get(from); return to==null ? from : to; }
+    /** A held physical button: its target is pressed; a trigger target (not the button's own) is held at 255. */
+    private void button(Set<String> out,int[] trigger,String from) {
+        String to=target(from);
+        if (to.equals("none")) return;
+        if ((to.equals("l2") || to.equals("r2")) && !to.equals(from)) fire(trigger,to,255);
+        else out.add(to);
+    }
+    /** A physical trigger's analog value: kept on a trigger target, else the target button is pressed from TRIGGER_PRESS. */
+    private void analog(Set<String> out,int[] trigger,String from,int value) {
+        String to=target(from);
+        if (value<=0 || to.equals("none")) return;
+        if (to.equals("l2") || to.equals("r2")) fire(trigger,to,value);
+        else if (value>=TRIGGER_PRESS) out.add(to);
+    }
+    private static void fire(int[] trigger,String to,int value) { int i=to.equals("l2") ? 0 : 1; trigger[i]=Math.max(trigger[i],value); }
+
     private void write() {
         StringBuilder text=new StringBuilder();
-        Set<String> all=new LinkedHashSet<>(keys); all.addAll(virtualKeys);
-        int leftTrigger=Math.max(l2,virtualL2), rightTrigger=Math.max(r2,virtualR2);
+        Set<String> all=new LinkedHashSet<>();
+        int[] trigger={0,0}; // left and right trigger values from the physical pad, after mapping
+        for (String key:keys) button(all,trigger,key);
+        if (hatX<0) button(all,trigger,"left"); if (hatX>0) button(all,trigger,"right");
+        if (hatY<0) button(all,trigger,"up"); if (hatY>0) button(all,trigger,"down");
+        analog(all,trigger,"l2",l2); analog(all,trigger,"r2",r2);
+        all.addAll(virtualKeys);
+        int leftTrigger=Math.max(trigger[0],virtualL2), rightTrigger=Math.max(trigger[1],virtualR2);
         for (String key:all) {
             if ((key.equals("l2") && leftTrigger>0) || (key.equals("r2") && rightTrigger>0)) continue;
             text.append(key).append(' ');
         }
-        if (hatX<0) text.append("left "); if (hatX>0) text.append("right ");
-        if (hatY<0) text.append("up "); if (hatY>0) text.append("down ");
         text.append("lx=").append(virtualLeftActive ? virtualLx : lx)
             .append(" ly=").append(virtualLeftActive ? virtualLy : ly)
             .append(" rx=").append(virtualRightActive ? virtualRx : rx)
