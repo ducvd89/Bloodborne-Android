@@ -61,8 +61,8 @@ Options: `--host armv8.2|armv8.4|armv9`, `--no-multiblock`, `--no-passes`, `--ts
   0.27 MB (rel32 tables sit in .text inside the FDE); 19 bytes undecodable.
 - Without the extra units, only 92.0% of FDE bytes are reached: about 7% of the code is switch case bodies
   that need jump-table resolution or extra entry points.
-- Host profile changes the IR by under 2% (armv8.2 62.2 M ops, armv9 61.2 M). Dead-flag elimination removes
-  22% of the ops (70.3 M without it). Single-block mode makes 1.6 M extra units, so Multiblock is the right
+- Host profile changes the IR by under 2% (armv8.2 62.2 M ops, armv9 61.2 M). The x87 and dead-flag passes remove
+  13% of the ops (70.3 M without them). Single-block mode makes 1.6 M extra units, so Multiblock is the right
   setting. TSO adds 1%.
 
 Top IR ops: LoadRegister 20.1%, StoreRegister 13.9%, GuestOpcode 12.6%, InlineConstant 9.2%, LoadMem 4.2%,
