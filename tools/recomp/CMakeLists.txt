@@ -50,6 +50,8 @@ endif()
 set(BB_TARGETS bb-recomp)
 set(BB_BUILT_FILES "<BINARY_DIR>/Bin/bb-recomp")
 if(BB_RECOMP_LLVM)
+  list(APPEND BB_TARGETS bb-recomp-asmtest)
+  list(APPEND BB_BUILT_FILES "<BINARY_DIR>/Bin/bb-recomp-asmtest")
 endif()
 
 # FEX refuses x86-64 hosts unless ENABLE_X86_HOST_DEBUG (its CI configuration). We never run the JIT,
