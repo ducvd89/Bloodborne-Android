@@ -111,7 +111,13 @@ With the default Android settings, the common non-default ones (below) and BBSC 
 * The whole compile: 76.6 s (62 s without the variants and hook slots, which add forced `GuestOpcode` markers and one slot test per site), 14.5 GB peak, `.so` 124.5 MB.
 * `tests/aot_so_check.cpp` (dev check, needs the game's prepared image): the real x86-64 `.so` with the real image and BBPATCH2 parts applied as the loader does: cheats + res-scene + gx-heap + skip_network_choice = 17 functions,
   all matched to a variant, 0 dirty; with every BBSC group applied on top: 56 variants, 0 dirty (functions touched by several groups included).
-* Known, unrelated: `bb-recomp --func <vaddr>` (one function) fails intermittently with a glibc heap error at exit (about 8 % of runs, also on the `testing` tool before these changes); the whole-image compile does not.
+* The `bb-recomp --func <vaddr>` heap crash (about 8 % of runs, also on the `testing` tool) was a race, now fixed: FEXCore's config store converts a stored string in place when it is read
+  (`Config::MetaLayer::GetConv<bool>` emplaces the variant), so two threads building a FEX context at once free the same string (ASan: bad-free from the `ContextImpl` constructor, found with
+  `-DBB_RECOMP_SANITIZE=address,undefined`). Every worker thread builds its own `Lifter`, so `Lifter::Impl::build` takes a process-wide mutex. The whole-image path had the same exposure.
+  After the fix: 0 crashes in 60 release runs and 25 ASan runs; ASan + UBSan on a 60,000-function compile with the catalogs and on the ASM tests report nothing;
+  UBSan builds of `bb-recomp` (40,000 functions with the catalogs), `bb-recomp-asmtest` (1755/1760, as the release build, all self-tests pass) and `bb-recomp-difftest` (2,000 functions, 0 mismatches)
+  report no undefined behaviour. `bb-recomp-difftest` cannot run under ASan: it forks workers from a threaded process, which deadlocks ASan's allocator (with `die_after_fork=0` it runs but every input
+  faults), so its sanitizer run is UBSan; four ASM tests that map fixed addresses inside ASan's shadow gap (`Displacement_Encoding`) differ under ASan only.
 
 ### Dirty functions per configuration (phase 4b, `tests/aot_so_check.cpp`, the real x86-64 `.so` and image, the patchers and hook catalogs run against the engine)
 
