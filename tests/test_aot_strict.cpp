@@ -151,6 +151,44 @@ int main() {
         assert(InChild([&] { GuestState s; uint64_t st[2] = {0, 0}; s.gregs[RSP] = reinterpret_cast<uint64_t>(st); bbr_dispatch(&s, 0x1000); }, e4) == 22);
         assert(e4.find("outside the image") != std::string::npos);
     }
+    // ---- The game's panic trap: `call print ; movl $0xdeadba, 0x0` is not a missing entry ----
+    {
+        static const uint8_t trap[] = {0xc7, 0x04, 0x25, 0, 0, 0, 0, 0xba, 0xad, 0xde, 0x00};   // movl $0xdeadba, 0x0
+        static const uint8_t call[] = {0xe8, 0x10, 0x20, 0x30, 0x40};                            // call rel32 (its return address is the next byte)
+        std::memcpy(image + 0x2fb, call, 5); std::memcpy(image + 0x300, trap, sizeof trap);      // after a call
+        std::memset(image + 0x31b, 0x90, 5); std::memcpy(image + 0x320, trap, sizeof trap);      // after a nop
+        static const uint8_t reg[] = {0x48, 0x89, 0x04, 0x25, 0, 0, 0, 0};                       // mov [0], rax
+        std::memcpy(image + 0x33b, call, 5); std::memcpy(image + 0x340, reg, sizeof reg);
+        static const uint8_t other[] = {0xc7, 0x04, 0x25, 0x08, 0, 0, 0, 1, 0, 0, 0};            // movl $1, 0x8: not address 0
+        std::memcpy(image + 0x35b, call, 5); std::memcpy(image + 0x360, other, sizeof other);
+        assert(StoresToAddressZero(image + 0x300) && StoresToAddressZero(image + 0x320) && StoresToAddressZero(image + 0x340) && !StoresToAddressZero(image + 0x360));
+        E.panic_text = [](char* out, size_t size) -> size_t { return size_t(std::snprintf(out, size, "[Dantelion2 Panic] DLRegularHeap.cpp(710) | given memory block seems to be improper")); };
+        std::remove(logpath);
+        ML.tried = false;
+        std::string e1, e2, e3, e4, e5;
+        auto stk = [](GuestState& s, uint64_t* st) { st[0] = 0; st[1] = 0; s.gregs[RSP] = reinterpret_cast<uint64_t>(st); };
+        // a call's return address, reached by a dispatch (a host function returned there) / as an unwind (kind=unwind, what the device logged)
+        assert(InChild([&] { GuestState s; uint64_t st[2]; stk(s, st); bbr_dispatch(&s, E.base + 0x300); }, e1) == 22);
+        assert(e1.find("STOP: the game stopped itself after an internal error (panic) at +0x300: [Dantelion2 Panic] DLRegularHeap.cpp(710) | given memory block seems to be improper") != std::string::npos);
+        assert(e1.find("no native code is missing") != std::string::npos && e1.find("missing an entry") == std::string::npos);
+        const std::string log = ReadFile(logpath);
+        assert(log.find("panic +0x300 kind=call") != std::string::npos && log.find("text=\"[Dantelion2 Panic]") != std::string::npos && log.find("miss +0x300") == std::string::npos);
+        assert(InChild([&] { GuestState s; uint64_t st[2]; stk(s, st); NoteMiss(&s, E.base + 0x320, Current(), MissKind::Unwind); }, e2) == 22);   // an unwind needs no call before it
+        assert(e2.find("the game stopped itself after an internal error (panic) at +0x320") != std::string::npos);
+        assert(ReadFile(logpath).find("panic +0x320 kind=unwind") != std::string::npos);
+        assert(InChild([&] { GuestState s; uint64_t st[2]; stk(s, st); bbr_dispatch(&s, E.base + 0x340); }, e3) == 22);   // a register store
+        assert(e3.find("(panic) at +0x340") != std::string::npos);
+        // not the trap: a jump (no call before it), a store to another address
+        assert(InChild([&] { GuestState s; uint64_t st[2]; stk(s, st); bbr_dispatch(&s, E.base + 0x320); }, e4) == 22);
+        assert(e4.find("native code is missing an entry at +0x320") != std::string::npos && e4.find("panic") == std::string::npos);
+        assert(InChild([&] { GuestState s; uint64_t st[2]; stk(s, st); bbr_dispatch(&s, E.base + 0x360); }, e5) == 22);
+        assert(e5.find("native code is missing an entry at +0x360") != std::string::npos);
+        // no text captured: the message sends the reader to the game's own log lines
+        E.panic_text = nullptr;
+        std::string e6;
+        assert(InChild([&] { GuestState s; uint64_t st[2]; stk(s, st); bbr_dispatch(&s, E.base + 0x300); }, e6) == 22);
+        assert(e6.find("(panic) at +0x300; its own message is above in the log") != std::string::npos);
+    }
     std::remove(logpath);
     std::puts("aot strict test: ok");
     return 0;

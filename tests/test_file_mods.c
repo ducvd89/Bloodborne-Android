@@ -6,6 +6,9 @@ int32_t *runtime_errno(void) { return &guest_errno; }
 int32_t runtime_guest_errno(int e) { return e; }
 /* Reads into guest memory tell the GPU side (runtime_memory.c); nothing to tell here. */
 void runtime_memory_note_write(uintptr_t address, uint64_t size) { (void)address; (void)size; }
+unsigned runtime_memory_trap_reasons(uintptr_t address) { (void)address; return 0; }
+void *runtime_memory_io_begin(uintptr_t address, uint64_t size) { (void)address; (void)size; return NULL; }
+void runtime_memory_io_end(void *token) { (void)token; }
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t n,const char *name) {
     for (size_t i=0;i<n;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;
@@ -47,6 +50,31 @@ int main(void) {
     int save=(int)do_open("/data/test-save",0x202,0644); assert(save>=3);
     assert(do_write(save,"save",4)==4 && !do_close(save));
     assert(!path_op("/data/test-save",2,0));
+    /* The game's panic text (Dantelion2 DL_PANIC: printed in pieces to the console, then a store to address 0): kept for the STOP message. */
+    {
+        char text[256]; text[0]='x';
+        assert(runtime_panic_text(text,sizeof(text))==0 && !text[0]);
+        const char *a="---------------------------------\n[Dantelion2 Panic] \nN:\\SPRJ\\Core\\DLRegularHeap.cpp(710)\n";
+        const char *b="given memory block seems to be improper or freed already.\n---------------------------------\n";
+        const char *c="DL_PANIC is firing core dump...\n";
+        assert(do_write(1,"ordinary log line\n",18)==18 && runtime_panic_text(text,sizeof(text))==0);
+        assert(do_write(1,a,strlen(a))==(int64_t)strlen(a) && do_write(2,b,strlen(b))==(int64_t)strlen(b) && do_write(2,c,strlen(c))==(int64_t)strlen(c));
+        assert(do_write(1,"later chatter\n",14)==14);
+        const size_t n=runtime_panic_text(text,sizeof(text));
+        assert(n==strlen(text));
+        assert(!strcmp(text,"[Dantelion2 Panic] | N:\\SPRJ\\Core\\DLRegularHeap.cpp(710) | given memory block seems to be improper or freed already."));
+        assert(runtime_panic_text(text,20)==18 && !strcmp(text,"[Dantelion2 Panic]"));   /* a short buffer truncates */
+        const char *d="[Dantelion2 Panic] second\n";           /* a later panic replaces the first */
+        assert(do_write(1,d,strlen(d))==(int64_t)strlen(d));
+        runtime_panic_text(text,sizeof(text));
+        assert(!strcmp(text,"[Dantelion2 Panic] second"));
+        /* a write to a file is not console output */
+        int fd=(int)do_open("/data/panic-note",0x202,0644); assert(fd>=3);
+        assert(do_write(fd,"[Dantelion2 Panic] in a file\n",29)==29 && !do_close(fd));
+        runtime_panic_text(text,sizeof(text));
+        assert(!strcmp(text,"[Dantelion2 Panic] second"));
+        assert(!path_op("/data/panic-note",2,0));
+    }
     assert(!unlink(link) && !unlink(source) && !rmdir(game));
     const char *dirs[]={"temp0","download0","data"};
     for (int i=0;i<3;++i) { char p[1024]; snprintf(p,sizeof(p),"%s/%s",user,dirs[i]); assert(!rmdir(p)); }

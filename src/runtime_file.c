@@ -504,10 +504,67 @@ static void touch_for_read(const void *buffer,uint64_t size) {
     for (; p<end; p+=4096)
         (void)*(volatile const unsigned char *)(p<(uintptr_t)buffer ? (uintptr_t)buffer : p);
 }
+/* The game's panic text. Dantelion2's DL_PANIC prints "[Dantelion2 Panic] <file>(<line>)" and the message to the console (stdout/stderr, through the
+ * guest's own libc and _write), then stores to address 0 on purpose. The text of the last panic is kept here (what a stop after it can say, see
+ * runtime_panic_text): a write to fd 1 or 2 that holds the marker starts a capture, later writes add to it until the "core dump" line or the buffer is full. */
+#define PANIC_MARK "[Dantelion2 Panic]"
+#define PANIC_MAX 1536
+static char panic_buf[PANIC_MAX];
+static size_t panic_len;
+static int panic_capturing;
+static volatile int panic_lock;
+static const char *find_text(const char *data,size_t size,const char *what) {
+    const size_t n=strlen(what);
+    for (size_t i=0; i+n<=size; ++i) if (data[i]==what[0] && !memcmp(data+i,what,n)) return data+i;
+    return NULL;
+}
+static void panic_note_output(const char *data,size_t size) {
+    if (!size) return;
+    const char *mark=find_text(data,size,PANIC_MARK);
+    if (!mark && !panic_capturing) return;
+    while (__atomic_exchange_n(&panic_lock,1,__ATOMIC_ACQUIRE)) {}
+    if (mark) { panic_len=0; panic_capturing=1; size-=(size_t)(mark-data); data=mark; }
+    if (panic_capturing) {
+        size_t room=PANIC_MAX-1-panic_len, take=size<room ? size : room;
+        memcpy(panic_buf+panic_len,data,take);
+        panic_len+=take;
+        panic_buf[panic_len]=0;
+        if (take<size || find_text(data,size,"core dump")) panic_capturing=0;
+    }
+    __atomic_store_n(&panic_lock,0,__ATOMIC_RELEASE);
+}
+/* The last panic text as one line (rules and the "core dump" line dropped, line breaks as " | "), or 0 when the game printed none. Safe to call from a
+ * signal handler: it never blocks (a capture in progress makes it give up and return what it can). */
+size_t runtime_panic_text(char *out,size_t size) {
+    if (!size) return 0;
+    out[0]=0;
+    if (__atomic_exchange_n(&panic_lock,1,__ATOMIC_ACQUIRE)) return 0;
+    size_t n=0;
+    for (size_t i=0; i<panic_len && n+4<size;) {
+        size_t e=i;
+        while (e<panic_len && panic_buf[e]!='\n') ++e;
+        size_t b=i, f=e;
+        while (b<f && (panic_buf[b]==' ' || panic_buf[b]=='\r')) ++b;
+        while (f>b && (panic_buf[f-1]==' ' || panic_buf[f-1]=='\r')) --f;
+        int rule=f>b;
+        for (size_t k=b; k<f && rule; ++k) if (panic_buf[k]!='-') rule=0;
+        if (f>b && !rule && !find_text(panic_buf+b,f-b,"firing core dump")) {
+            if (n) { memcpy(out+n," | ",3); n+=3; }
+            size_t take=f-b<size-1-n ? f-b : size-1-n;
+            memcpy(out+n,panic_buf+b,take);
+            n+=take;
+        }
+        i=e+1;
+    }
+    out[n]=0;
+    __atomic_store_n(&panic_lock,0,__ATOMIC_RELEASE);
+    return n;
+}
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd_written(fd);
     if (h<0) return -EBADF;
     touch_for_read(buffer,size);
+    if (fd==1 || fd==2) panic_note_output((const char *)buffer,size);
     ssize_t n=write(h,buffer,size);
     if (n<0) return -errno;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
@@ -699,4 +756,5 @@ void runtime_file_report(void) {
 uintptr_t runtime_file_resolve(const char *name) { (void)name; return 0; }
 void runtime_file_report(void) {}
 void runtime_file_configure(const char *a,const char *u) { (void)a; (void)u; }
+size_t runtime_panic_text(char *out,size_t size) { if (size) out[0]=0; return 0; }
 #endif

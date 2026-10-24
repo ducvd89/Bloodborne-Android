@@ -131,6 +131,7 @@ struct Engine {
     bool trace = false;
     const char* miss_log = "logs/aot-misses.log";   // BB_AOT_MISS_LOG overrides
     void* (*low_map)(size_t, int) = nullptr;
+    size_t (*panic_text)(char*, size_t) = nullptr;   // guest_cpu_set_panic_text
     std::atomic<Thread*> threads {nullptr};
     uint64_t sentinel = 0;
 } E;
@@ -424,28 +425,65 @@ std::string GuestBacktrace(const GuestState* s) {
     return out;
 }
 
+// The game's deliberate crash after a panic: Dantelion2's DL_PANIC prints its message and then stores to address 0 (`movl $0xdeadba, 0x0`), right after the
+// call of the print routine. `p` points at a store of a register or an immediate to the absolute address 0: [66] [REX] 88/89/C6/C7 /r with the SIB form of
+// an absolute disp32 address (modrm mod 00 rm 100, SIB 0x25) and disp32 = 0.
+bool StoresToAddressZero(const uint8_t* p) {
+    if (*p == 0x66) ++p;
+    if ((*p & 0xf0) == 0x40) ++p;
+    const uint8_t op = *p++;
+    if (op != 0x88 && op != 0x89 && op != 0xc6 && op != 0xc7) return false;
+    uint32_t disp;
+    std::memcpy(&disp, p + 2, 4);
+    return (p[0] & 0xc7) == 0x04 && p[1] == 0x25 && disp == 0;
+}
+// `target` is the instruction after a call (a return address: an unwind, or a call-return address of a direct call) and a store to address 0: the game
+// stopped itself. A native library built before the tool kept an access through a null pointer as such (LLVM treats it as undefined behaviour and deleted
+// the call-return block before it), so a normal return from the print routine arrived here as an "unwind" to an address nothing could resume.
+bool IsPanicTrap(uint64_t target, MissKind kind) {
+    if (kind == MissKind::Patched || kind == MissKind::Outside || target - E.base >= E.size || target - E.base < 8 || target - E.base + 16 > E.size) return false;
+    const uint8_t* code = reinterpret_cast<const uint8_t*>(target);
+    return StoresToAddressZero(code) && (kind == MissKind::Unwind || code[-5] == 0xe8);
+}
+
 // A guest address no unit and no granular entry covers (or a patched function with no variant): the game stops here. The miss is written to the
 // misses log with the thread and a backtrace of guest return addresses, so that testers' reports find the gaps (docs/RECOMP_ABI.md, "Strict mode";
-// bb-recomp --extra-entries turns the log into entries), and the STOP message says what to do.
+// bb-recomp --extra-entries turns the log into entries), and the STOP message says what to do. When the address is the game's own panic trap (above)
+// it is no gap: the message says that the game stopped itself and quotes the panic text the runtime captured (guest_cpu_set_panic_text), and the log
+// line says `panic` (not `miss`: --extra-entries must not turn it into an entry).
 [[gnu::noinline, noreturn]] void NoteMiss(GuestState* s, uint64_t target, Thread* t, MissKind kind) {
     const bool inside = target - E.base < E.size;
+    const bool panic = IsPanicTrap(target, kind);
     char name[32] = "?";
     pthread_getname_np(pthread_self(), name, sizeof(name));
+    char text[1024];
+    text[0] = 0;
+    if (panic && E.panic_text) E.panic_text(text, sizeof text);
     Trace(t, EvMiss, target, s->gregs[RSP], 0);
     {
         std::lock_guard<std::mutex> g(ML.lock);
-        char line[1024];
+        char line[2048];
         const std::string bt = GuestBacktrace(s);
         int m;
-        if (inside)
+        if (panic)
+            m = std::snprintf(line, sizeof line, "panic +%#llx kind=%s thread=%s tid=%d rsp=%#llx backtrace=%s text=\"%.1000s\"\n", (unsigned long long)(target - E.base), MissKindNames[int(kind)], name,
+                              int(syscall(SYS_gettid)), (unsigned long long)s->gregs[RSP], bt.c_str(), text);
+        else if (inside)
             m = std::snprintf(line, sizeof line, "miss +%#llx kind=%s thread=%s tid=%d rsp=%#llx backtrace=%s\n", (unsigned long long)(target - E.base), MissKindNames[int(kind)], name,
                               int(syscall(SYS_gettid)), (unsigned long long)s->gregs[RSP], bt.c_str());
         else
             m = std::snprintf(line, sizeof line, "outside %#llx kind=%s thread=%s tid=%d rsp=%#llx backtrace=%s\n", (unsigned long long)target, MissKindNames[int(kind)], name,
                               int(syscall(SYS_gettid)), (unsigned long long)s->gregs[RSP], bt.c_str());
-        MissLogWrite(line, size_t(m));
+        MissLogWrite(line, size_t(std::min<int>(m, int(sizeof line) - 1)));
     }
-    if (inside && kind != MissKind::Patched)
+    if (panic) {
+        if (text[0])
+            std::fprintf(stderr, "STOP: the game stopped itself after an internal error (panic) at +%#llx: %s (no native code is missing; details: %s)\n",
+                         (unsigned long long)(target - E.base), text, E.miss_log);
+        else
+            std::fprintf(stderr, "STOP: the game stopped itself after an internal error (panic) at +%#llx; its own message is above in the log (no native code is missing; details: %s)\n",
+                         (unsigned long long)(target - E.base), E.miss_log);
+    } else if (inside && kind != MissKind::Patched)
         std::fprintf(stderr, "STOP: AOT: native code is missing an entry at +%#llx; please report this (details: %s)\n", (unsigned long long)(target - E.base), E.miss_log);
     else if (inside)
         std::fprintf(stderr, "STOP: AOT: native code for a patched or hooked function has no variant at +%#llx; please report this (details: %s)\n",
@@ -891,6 +929,8 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
         std::thread(StatsThread).detach();
     }
 }
+
+void guest_cpu_set_panic_text(size_t (*get)(char* out, size_t size)) { E.panic_text = get; }
 
 void guest_cpu_code(uintptr_t base, size_t size) {
     if (!E.on) return;
