@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Host-JDK test of the app's Native CPU code (NativeCpu.java: libbbaot.json, the import checks, the state).
 #   tests/android-native-cpu/run.sh
 set -euo pipefail
