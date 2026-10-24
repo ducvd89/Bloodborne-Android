@@ -1,31 +1,28 @@
-# Phase 6 (native-only AOT runtime): paused
+# Phase 6 (native-only AOT runtime): done on branch recomp-p6
 
-Branch recomp-p6 (from recomp-rt 142f8e8). Paused on request; nothing is running. Not pushed.
+Branch recomp-p6 (from recomp-rt 142f8e8); nothing pushed, nothing run on the device, the game was never run on the PC. Design and numbers: docs/STATIC_RECOMPILE_PLAN.md
+("Phase 6"), the interfaces: docs/RECOMP_ABI.md ("Granular entries", "Misses, strict mode and the misses log", "BB_AOT_ONLY"), the tool: tools/recomp/README.md.
 
-## Done (tool side, committed as WIP; builds, lifter/discovery checked on the real image, not the whole .so)
-- Discovery: direct branch targets count anywhere in a module's executable segment. The start stub at +0x20 (static initialiser runner,
-  called from the entry +0xa0, before the first FDE) is now a unit.
-- Discovery: secondary units (landing pads, setjmp sites, entryUnits) now report their out-of-unit targets, and setjmp return sites found in them
-  are queued (worklist). Mid-function entries 2145 -> ~3000.
-- Switch tables: `cltq`/`cdq`/mul/div/xchg/... no longer clobber every register (per-instruction write masks), and flag-preserving instructions
-  may sit between `cmp` and `ja`. This resolves the CSChrThread +0x210ebc0 switch (its table has 0x210ebc0 as a case, `cltq` hid the base lea)
-  and the EzWorkPool +0x23a9c9c switch (`cmp rax,11; mov; ja`). Unresolved table-like jumps 45 -> 8, scanned (unbounded) 124 -> 75.
-- Granular entries (tool): `--granular off|jumps|all`, `--granular-funcs`, lowering gives every unit of a granular function a resume-flag switch over every
-  instruction boundary (blocks split like hook resume points), `bbr_func_granular[]`, `bbr_abi_flags` bit 4. Default `jumps`: 62 functions.
-- `--extra-entries <misses log>`, `--dump-units`, `--check-entries a,b,c`, `--units-only`.
+## What is in it
+- The three misses of the device session are fixed in the tool, in general terms (discovery counts direct branch targets anywhere in a module's executable segment; secondary units feed
+  discovery; `cltq`/cdq/mul/... no longer hide the table base lea; flag-preserving instructions may sit between `cmp` and `ja`). `tests/run_aot_entries_check.sh` checks them on the real image.
+- Granular entries for the 62 functions with unresolved/scanned-only table-like jumps: +0.8 % `.text`, +12 % codegen CPU. For every function: not affordable (+77 %, 15x codegen on a sample), so the
+  miss-log loop (`--extra-entries`) covers cross-function mid-targets.
+- Runtime: granular dispatch, `logs/aot-misses.log`, `BB_AOT_STRICT=1`, `BB_AOT_ONLY` libbbcpu (1.1 MB, no FEX symbols) with native CPUID/XGETBV/TSC, unaligned-atomic emulation, host-function stubs,
+  thread state, import-trap peephole.
+- Tests: `tests/run_aot_native_test.sh` (atomic emulator on instruction words, CPUID model, granular dispatch, misses log, strict mode child processes, import traps),
+  `bb-recomp-asmtest --granular-selftest` (with the resume, hook and variant self-tests), `tests/run_aot_entries_check.sh`, the existing PC tests, and `build_bionic.sh` in both forms (below).
 
-## In progress / not built or tested yet
-- `--check-entries` was just changed to also accept "case of a resolved jump table" (compile.cpp, not rebuilt). Last run of the check:
-  +0x20 unit entry; +0x210ebc0 and +0x23a9c9c now covered by resolved switches (the old wording said NOT AN ENTRY).
-- Cost measurement: a full `--so` run with `--granular off` was started (out/aot/base.so) and killed; no size/time numbers yet. Plan: base vs `jumps`
-  on the whole image, and `all` on a `--limit` sample, to decide whether all-function granularity is affordable (else the miss-log loop).
-- Granular selftest in bb-recomp-asmtest (like --resume-selftest): not written.
+## Build status
+- Normal: `BB_NDK=... BB_ARM64_HEADERS=... bash tools/android/build_bionic.sh` links (all outputs, symbol check clean).
+- `BB_AOT_ONLY=1 bash tools/android/build_bionic.sh` (reuses out/bionic, replaces libbbcpu.so and relinks bb-probe into out/bionic-only) links, symbol check clean.
+- The tool: `nice -n 19 cmake --build out/recomp-build -j 22`; the full `.so` with `--granular jumps` builds in ~2 min (128 s), verifier clean.
 
-## Next steps
-1. Rebuild the tool, re-run `--check-entries 20,210ebc0,23a9c9c`, measure granular cost (.text, compile time), write the selftest.
-2. Runtime (cpu/guest_cpu_aot.cpp): granular dispatch on a miss (bbr_funcs + bbr_func_granular, try the function's units with s->resume=1), miss log
-   (files/bbport/logs/aot-misses.log: `miss +0x... thread=... backtrace=...`), `BB_AOT_STRICT=1` abort message, non-strict keeps FEX.
-3. `BB_AOT_ONLY` build of guest_cpu_aot.cpp without FEX: own cpuid/xgetbv/TSC, unaligned-atomic emulation, host-function/trap stubs
-   (probe.c's unresolved-import traps are x86 code and need a native path), fault handling, thread state; list what stays FEX-bound.
-4. Tests (unit tests, PC-side check, build_bionic.sh normal and BB_AOT_ONLY), docs (RECOMP_ABI.md "Granular entries", "Strict mode", README loop).
-Note: recomp-rt has uncommitted edits to cpu/guest_cpu_aot.cpp (crash report) and src/probe.c; expect a small merge there.
+## Not done / needs the device
+- Nothing was run on the Thor: the strict-mode and BB_AOT_ONLY runtimes, the native CPUID values (a port of FEX's model with the host features fixed; compare `cpuid` as the game sees it today),
+  and the unaligned-atomic emulator on real SIGBUS faults are untested there. Granular dispatch and strict mode are tested on the PC with synthetic units; the granular lowering on x86 by the self-test.
+- The unresolved-import path (`unresolved` host function) is recognised, not run.
+- Still FEX-bound: `cpu/guest_cpu_fex.cpp` and what it links, in the normal (non-ONLY) build (non-strict fallback, `guest_cpu_call` without BB_AOT, FEX's hook trampolines `guest_cpu_hook` writes);
+  in strict mode of the FEX build only FEX's initialisation and thread state remain (CPUID, XGETBV, TSC, unaligned atomics, misses are native).
+- Phase 4b hook-slot hang and GPU flip regression belong to the device agent on recomp-rt; recomp-rt has newer commits (7c939e6, 5f259e2) touching cpu/guest_cpu_aot.cpp (crash-report printing),
+  src/probe.c and gpu/shim/bbport_frame_rate.cpp: a small conflict is expected in guest_cpu_aot.cpp's `bbaot_crash_report` when merging. This branch's edits to the hook-slot code and the shim: none.

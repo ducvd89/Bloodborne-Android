@@ -116,3 +116,8 @@ fallback run with the thread's recent transitions, and the first hits of each ho
 The device's `data/boot-linked.bin` must be the image the .so was built from (sha256 b5cb1da3..., identical to
 `out/boot-linked.bin`; eboot.bin sha256 d65f0b4f... on both). The runtime hashes each unit against the loaded image: patched
 units become variants or fall back by themselves.
+
+## Phase 6 (branch recomp-p6, 2026-10-24): the remaining misses are fixed in the tool
+
+Items 4 and the process-main-thread note above: +0x20, +0x210ebc0 and +0x23a9c9c are covered by the next `.so` (docs/PHASE6_STATUS.md; `tests/run_aot_entries_check.sh`). The `.so` has to be rebuilt and
+deployed to see it on the device. `BB_AOT_STRICT=1` logs misses to `logs/aot-misses.log` and stops the game; `bb-recomp --extra-entries aot-misses.log` closes a gap by rebuilding.
