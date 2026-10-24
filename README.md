@@ -31,7 +31,7 @@ The native code is a translation of the game's own program, so it belongs to the
 
 ### What you need
 
-- Your own Bloodborne **base game PKG** and the **1.09 update PKG**, together in one folder with nothing else in it (the same fake PKGs the app's "Install from PKG" uses). Tested with **CUSA03173**; other 1.09 releases should work but are untested.
+- Your own Bloodborne **base game PKG** and the **1.09 update PKG**, together in one folder with nothing else in it (the same fake PKGs the app's "Install from PKG" uses). Or an already extracted 1.09 dump of the game. Tested with **CUSA03173**; other 1.09 releases should work but are untested.
 - A PC with **Windows 10 (1903 or newer) or 11**, or **Linux with glibc 2.35 or newer** (Ubuntu 22.04, Debian 12, Fedora 36, Arch or newer), and a processor with **AVX2** (Intel from 2013, or any AMD Ryzen).
 - **8 GB of free RAM** (16 GB or more is faster) and free disk space of about the size of the base game PKG plus 3 GB.
 - This app (2.0.0 Beta 1 or newer) on an Adreno phone, with room for the game folder.
@@ -40,7 +40,7 @@ The native code is a translation of the game's own program, so it belongs to the
 
 1. **Download the tool** from the [Rebuild Tool releases](https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/latest): `bb-recomp-windows-x86_64.zip` for Windows (unzip it anywhere), or `Bloodborne-Android-Rebuild-Tool-x86_64.AppImage` for Linux (`chmod +x` it). It is free: if you paid for it, you were scammed.
 2. **Start it.** On Windows, double-click `bb-recomp.exe`; if SmartScreen says the app is unknown, click **More info**, then **Run anyway** (the tool is not signed with a paid certificate). On Linux, double-click the AppImage; if nothing happens your system lacks FUSE 2, so run it from a terminal with `./Bloodborne-Android-Rebuild-Tool-x86_64.AppImage --appimage-extract-and-run`.
-3. **Game PKG folder → Browse…**: choose the folder with the base game PKG and the 1.09 update PKG.
+3. **From PKG files → Browse…**: choose the folder with the base game PKG and the 1.09 update PKG. Already have the game extracted (a folder with `eboot.bin`, `sce_module` and `sce_sys`, update 1.09 merged)? Choose **From an extracted game** instead (since Rebuild Tool 1.1.0): only the `aot` folder is built, to copy next to `eboot.bin` on the phone.
 4. **Output folder → Browse…**: choose an empty folder on a disk with enough space (a short path such as `D:\bloodborne` or `~/bloodborne` is best).
 5. Press **Build** and wait. The tool checks every PKG for damage first (a few minutes; a damaged file stops the build before anything is unpacked and tells you which file), unpacks and merges the game and the update, then recompiles the game's code to ARM64 (about 1 to 2 minutes on a 12-core PC, longer on a laptop).
 6. When it says **Done**, the output folder holds a game folder like this:
