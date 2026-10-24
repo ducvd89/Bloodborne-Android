@@ -1,4 +1,5 @@
 #include "jit_host.h"
+#include "bbr_x87.h"
 
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
@@ -82,6 +83,9 @@ Jit::Jit(const ElfImage& img, const LiftOptions& lo, const TargetSpec& ts) : lif
   sym("bbr_cpuid", (void*)&bbr_cpuid); sym("bbr_rdtsc", (void*)&bbr_rdtsc); sym("bbr_processor_id", (void*)&bbr_processor_id);
   sym("bbr_set_rounding", (void*)&bbr_set_rounding); sym("bbr_xgetbv", (void*)&bbr_xgetbv); sym("bbr_syscall", (void*)&bbr_syscall);
   sym("bbr_get_rounding", (void*)&bbr_get_rounding); sym("bbr_push_rounding", (void*)&bbr_push_rounding); sym("bbr_pop_rounding", (void*)&bbr_pop_rounding);
+#define BBR_SYM(n) sym(#n, (void*)&n);
+  BBR_X87_HELPERS(BBR_SYM)
+#undef BBR_SYM
   cantFail(jd.define(orc::absoluteSymbols(std::move(sm))));
   auto gen = orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(jit->getDataLayout().getGlobalPrefix());
   if (gen) jd.addGenerator(std::move(*gen)); else consumeError(gen.takeError());

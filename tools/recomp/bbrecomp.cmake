@@ -3,10 +3,14 @@
 set(BBR "${BB_RECOMP_DIR}/src")
 set(BBR_COMMON "${BBR}/elf_image.cpp" "${BBR}/fde_scan.cpp" "${BBR}/lifter.cpp" "${BBR}/jumptable.cpp" "${BBR}/eh_frame.cpp" "${BBR}/discover.cpp")
 set(BBR_JIT "${BBR}/jit_host.cpp")
+set(BBR_HELPERS "${BB_RECOMP_DIR}/helpers")
+# The x87 helpers (plain C, one translation unit) are linked into every tool: the in-process JIT of the test tools calls them
+# directly. The same file is compiled again for the target and linked into the generated .so (compile.cpp).
+set_source_files_properties("${BBR_HELPERS}/bbr_x87_all.c" PROPERTIES LANGUAGE C COMPILE_OPTIONS "-O2;-fvisibility=hidden;-fno-stack-protector;-ffp-contract=off")
 set(BBR_LLVM_SRCS "${BBR}/lower_llvm.cpp" "${BBR}/lower_ops.cpp" "${BBR}/lower_vector.cpp" "${BBR}/codegen.cpp" "${BBR}/compile.cpp")
 add_executable(bb-recomp "${BBR}/main.cpp" ${BBR_COMMON} "${BBR}/census.cpp")
 target_include_directories(bb-recomp PRIVATE
-  "${CMAKE_SOURCE_DIR}/FEXCore/Source" "${CMAKE_SOURCE_DIR}/FEXCore/include" "${CMAKE_BINARY_DIR}/include" "${BBR}")
+  "${CMAKE_SOURCE_DIR}/FEXCore/Source" "${CMAKE_SOURCE_DIR}/FEXCore/include" "${CMAKE_BINARY_DIR}/include" "${BBR}" "${BBR_HELPERS}")
 target_compile_definitions(bb-recomp PRIVATE
   JIT_ARM64 ARCHITECTURE_x86_64=1 FEXCORE_PRESERVE_ALL_ATTR= FEXCORE_HAS_PRESERVE_ALL_ATTR=0)
 target_compile_options(bb-recomp PRIVATE -Wall -Wno-trigraphs -fwrapv -march=${BB_RECOMP_MARCH})
@@ -27,7 +31,7 @@ if(BB_RECOMP_LLVM)
         add_executable(${t} "${BBR}/difftest.cpp" ${BBR_COMMON} ${BBR_JIT})
       endif()
       target_include_directories(${t} PRIVATE
-        "${CMAKE_SOURCE_DIR}/FEXCore/Source" "${CMAKE_SOURCE_DIR}/FEXCore/include" "${CMAKE_BINARY_DIR}/include" "${BBR}")
+        "${CMAKE_SOURCE_DIR}/FEXCore/Source" "${CMAKE_SOURCE_DIR}/FEXCore/include" "${CMAKE_BINARY_DIR}/include" "${BBR}" "${BBR_HELPERS}")
       target_compile_definitions(${t} PRIVATE
         JIT_ARM64 ARCHITECTURE_x86_64=1 FEXCORE_PRESERVE_ALL_ATTR= FEXCORE_HAS_PRESERVE_ALL_ATTR=0)
       target_compile_options(${t} PRIVATE -Wall -Wno-trigraphs -fwrapv -march=${BB_RECOMP_MARCH})
@@ -35,7 +39,8 @@ if(BB_RECOMP_LLVM)
       add_dependencies(${t} IR_INC CONFIG_INC)
       set_target_properties(${t} PROPERTIES CXX_STANDARD 20 CXX_VISIBILITY_PRESET hidden)
     endif()
-    target_sources(${t} PRIVATE ${BBR_LLVM_SRCS})
+    target_sources(${t} PRIVATE ${BBR_LLVM_SRCS} "${BBR_HELPERS}/bbr_x87_all.c")
+    target_compile_definitions(${t} PRIVATE BBR_HELPERS_DIR="${BBR_HELPERS}")
     target_include_directories(${t} PRIVATE ${LLVM_INCLUDE_DIRS})
     target_compile_definitions(${t} PRIVATE BB_RECOMP_LLVM=1 ${LLVM_DEFINITIONS})
     if(TARGET LLVM)

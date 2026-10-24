@@ -264,9 +264,10 @@ one `.so` and one unit table cover everything. Census (lift only, 0.7 s wall on 
 - **Linked modules** (per module, functions incl. pseudo-functions): eboot 179,692, 98.76 % of the bytes in lifted blocks, 10.67 M
   x86 instructions; libc.prx 2,242 (2,164 FDE, 0.51 MB, 98.22 %, 148,771 instructions, 595 gap units: assembly with
   switch bodies); libSceFios2.prx 729 (650 FDE, 0.23 MB, 98.33 %, 58,575 instructions). All exported function symbols of both
-  (1,597 + 165) are FDE starts. **New op gaps from libc.prx**: 118 units contain a `bbr_trap` for an op the eboot never
-  used: x87 conversions to and from the 80-bit format (`F80CVT` 104 units, `F80CVTTo` 82: `fld/fstp tbyte` in
-  `printf`/`strtold`), `F64FPREM1` 6, `F64SCALE` 3, `NZCVSelectV` 1.
+  (1,597 + 165) are FDE starts. **Op gaps from libc.prx (closed in step 2d)**: 118 units had a `bbr_trap` for an op the eboot never used: x87
+  conversions to and from the 80-bit format (`F80CVT` 104 units, `F80CVTTo` 82: `fld/fstp tbyte` in
+  `printf`/`strtold`), `F64FPREM1` 6, `F64SCALE` 3, `NZCVSelectV` 1. All are lowered now (`bbr_x87_*` helpers linked into the `.so`, `NZCVSelectV` inline); the
+  whole image has **0 units with a `bbr_trap`**.
 - **Entries for jumps from other units.** Every direct call or jump target that lies in another function's middle, or in the same
   function below a gap unit, and is no unit start: **432** (424 new units; the runtime had seen such tail jumps into case bodies
   as dispatcher misses). Direct calls and tail jumps now go straight to any unit.
@@ -281,6 +282,24 @@ one `.so` and one unit table cover everything. Census (lift only, 0.7 s wall on 
   from computed values (not stored as relocations or `lea`) that land in FDE-less code of the eboot would miss: none found;
   every function-pointer-like relocation target outside an FDE is now a unit. (4) Plain `eboot.elf` mode cannot find the
   relocation-reached thunks. (5) Mid-function returns (fibers, stack switching) rely on `--resume-entries` or the fallback.
+
+## Step 2d: x87 and the last op gaps (2026-10-24)
+
+The lifter already configures FEX like the shipped game (`X87ReducedPrecision=1`, `TSOEnabled=0`, `Multiblock=1`, as `tools/android/fex-compatible.json`),
+so x87 is F64 (`X87F64.cpp`) and only its memory conversions and a few transcendental ops need helpers. They are FEX's handlers
+over its SoftFloat, plain C in `tools/recomp/helpers`, compiled by the target's clang and linked into the `.so` (libm becomes a `DT_NEEDED`); the runtime needs
+nothing new (docs/RECOMP_ABI.md, "x87 helpers"). Measured, same machine and settings as above (aarch64, -O1, 22 threads, `nice 19`, `--verify-llvm`):
+
+| | whole image, 0 units with `bbr_trap` |
+|---|---|
+| Wall time | **62.0 s** (lift to `.so`; the helpers add 0.1 s) |
+| Thread-seconds: lift + lower / optimise / codegen | 46.5 / 208.9 / 907.2 |
+| Units / functions / IR ops | 184,695 / 182,663 / 54.4 M |
+| `.text` / objects / `.so` | 102.94 MB / 146.3 MB / 123.8 MB |
+| Peak RSS | 14.2 GB |
+
+ASM tests: the reduced-precision x87 suite (`X87_F64`) passes 149 of 150; the tests written for the 80-bit x87 are not part of the totals.
+Differential test on libc.prx: see `tools/recomp/README.md`.
 
 ## Risks
 

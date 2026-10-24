@@ -425,7 +425,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   std::sort(units.begin(), units.end());
   units.erase(std::unique(units.begin(), units.end()), units.end());
 
-  double tableTime = 0;
+  double tableTime = 0, helperTime = 0;
   std::string tablePath;
   if (wantCode && opt.table) {
     auto t = clk::now();
@@ -450,6 +450,26 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     tableTime = since(t);
   }
 
+  // The x87 helpers (tools/recomp/helpers, docs/RECOMP_ABI.md): plain C, compiled for the target with its own clang and
+  // linked into the .so (or written next to the objects), so that the runtime has nothing to provide for them.
+  std::string helperObj;
+  if (wantCode) {
+    auto t = clk::now();
+    std::string base = opt.objPath.empty() ? opt.soPath : opt.objPath;
+    const size_t dot = base.rfind('.');
+    helperObj = (dot == std::string::npos || dot < base.rfind('/') + 1 ? base : base.substr(0, dot)) + ".helpers.o";
+    std::string dir = opt.helpersDir.empty() ? std::string(BBR_HELPERS_DIR) : opt.helpersDir;
+    std::string cmd;
+    if (opt.target.aarch64) {
+      cmd = "nice -n 19 " + opt.ndk + "/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-linux-android30";
+    } else {
+      cmd = "nice -n 19 clang";
+    }
+    cmd += " -O2 -fPIC -fvisibility=hidden -fno-stack-protector -ffp-contract=off -c " + dir + "/bbr_x87_all.c -o " + helperObj;
+    if (system(cmd.c_str()) != 0) { fprintf(stderr, "bb-recomp: compiling the x87 helpers failed: %s\n", cmd.c_str()); return 1; }
+    helperTime = since(t);
+  }
+
   double linkTime = 0;
   uint64_t soBytes = 0;
   if (!opt.soPath.empty()) {
@@ -461,6 +481,8 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
             "-soname " + opt.soPath.substr(opt.soPath.rfind('/') + 1) + " -o " + opt.soPath;
       for (auto& o : objFiles) cmd += " " + o;
       if (!tablePath.empty()) cmd += " " + tablePath;
+      cmd += " " + helperObj;
+      cmd += " -L" + bin + "/sysroot/usr/lib/aarch64-linux-android/30 -lm"; // the helpers call libm (sin, exp2, fmod ...)
       cmd += " " + bin + "/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a";
       // DT_NEEDED libbbcpu.so: the bbr_* helpers live there, and Android's linker resolves a dlopen()ed library's symbols only
       // against the global group (the executable, LD_PRELOAD) and the library's own DT_NEEDED tree, not against the
@@ -476,6 +498,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       cmd = "nice -n 19 clang -shared -fuse-ld=lld -Wl,-Bsymbolic -Wl,-z,noexecstack -Wl,--build-id=none -o " + opt.soPath;
       for (auto& o : objFiles) cmd += " " + o;
       if (!tablePath.empty()) cmd += " " + tablePath;
+      cmd += " " + helperObj + " -lm";
     }
     const int rc = system(cmd.c_str());
     linkTime = since(t);
@@ -500,7 +523,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   if (opt.resumeEntries) say("resume entries: %" PRIu64 " call-return blocks reachable through the unit-entry resume switch\n", tot.resumeCases);
   say("direct calls %" PRIu64 ", dispatch calls/jumps %" PRIu64 ", relocated constants %" PRIu64 "\n", tot.directCalls, tot.dispatchCalls, tot.relocConsts);
   if (wantCode) {
-    say("CPU time: lift+lower %.1f s, optimise %.1f s, codegen %.1f s (sum over threads); table %.1f s, link %.1f s\n", tot.liftLower, tot.opt, tot.codegen, tableTime, linkTime);
+    say("CPU time: lift+lower %.1f s, optimise %.1f s, codegen %.1f s (sum over threads); table %.1f s, x87 helpers %.1f s, link %.1f s\n", tot.liftLower, tot.opt, tot.codegen, tableTime, helperTime, linkTime);
     say(".text %.2f MB, objects %.2f MB%s\n", tot.textBytes / 1048576.0, tot.objBytes / 1048576.0, soBytes ? "" : "");
     if (soBytes) say("%s: %.2f MB\n", opt.soPath.c_str(), soBytes / 1048576.0);
   } else {

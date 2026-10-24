@@ -37,6 +37,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <regex>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -64,9 +65,11 @@ struct Config {
   std::vector<MemData> mem;
   std::vector<RegExp> regs;
   std::vector<std::string> features;
+  bool x87Reduced = false; // "Env": {"FEX_X87REDUCEDPRECISION": "1"}: the test expects the reduced-precision (F64) x87
 };
 struct Test {
   std::string rel, category, text, bin; // rel: path under unittests/ASM; bin: assembled flat binary
+  bool x87Full = false;                 // uses x87 and does not ask for reduced precision: written for FEX's default 80-bit x87
   Config cfg;
   bool configOk = true;
 };
@@ -121,6 +124,9 @@ bool parseConfig(const std::string& text, Config& c) {
           else e.vals.push_back(parseInt(av.getAsString().value_or("0").str()));
           c.regs.push_back(std::move(e));
         }
+    } else if (key == "ENV") {
+      if (auto* r = val.getAsObject())
+        for (auto& [ak, av] : *r) if (ak.str() == "FEX_X87REDUCEDPRECISION" && av.getAsString().value_or("") == "1") c.x87Reduced = true;
     } else if (key == "HOSTFEATURES") {
       if (auto* arr = val.getAsArray()) for (auto& x : *arr) { std::string f = x.getAsString().value_or("").str(); for (auto& ch : f) ch = toupper(ch); c.features.push_back(f); }
     }
@@ -282,10 +288,20 @@ struct Counts { unsigned pass = 0, fail = 0, unsup = 0, lift = 0, skip = 0, cras
 
 std::string slurp(const fs::path& p) { std::ifstream f(p, std::ios::binary); std::stringstream ss; ss << f.rdbuf(); return ss.str(); }
 
+// FEX runs unittests/ASM/X87 (and every other x87 test without an Env key) in its default x87 mode, 80-bit precision
+// (X87ReducedPrecision=0), and the variants in X87_F64 with "Env": {"FEX_X87REDUCEDPRECISION": "1"}. The game runs reduced
+// (tools/android/fex-compatible.json) and the lifter is configured like that, so the tests that apply are the ones with that Env
+// key (X87_F64 and a few others); the 80-bit ones expect extended significands in MM registers, status-word exceptions and
+// 80-bit rounding that the reduced x87 does not have by design. They still run, in the category "x87 80-bit (info)", which is
+// not part of the totals.
+bool usesX87(const std::string& text) {
+  static const std::regex re(R"((^|\n)[ \t]*(f[a-z0-9]{1,9}|xsave[a-z]*|xrstor[a-z]*)\b)");
+  return std::regex_search(text, re);
+}
+
 std::string skipReason(const Test& t, const std::set<std::string>& disabled) {
   if (disabled.count("Test_" + t.rel)) return "disabled or known failure in FEX";
   if (t.cfg.is32) return "32-bit";
-  if (t.category == "X87" || t.category == "X87_F64" || t.rel.find("x87") != std::string::npos || t.rel == "fld.asm" || t.rel == "fadd.asm") return "x87";
   if (t.category == "MMX" || t.category == "3DNow") return "MMX/3DNow";
   if (t.category == "SelfModifyingCode") return "self-modifying code";
   for (auto& f : t.cfg.features) if (f == "AVX512" || f == "SHA" || f == "CLZERO" || f == "EMMI" || f == "RAND") return "needs host feature " + f;
@@ -338,6 +354,8 @@ int main(int argc, char** argv) {
     t.category = sl == std::string::npos ? "(top level)" : t.rel.substr(0, sl);
     t.text = slurp(e.path());
     t.configOk = parseConfig(t.text, t.cfg);
+    t.x87Full = !t.cfg.x87Reduced && t.category != "X87_F64" && usesX87(t.text); // (four X87_F64 tests have a mistyped Env key)
+    if (t.x87Full) t.category = "x87 80-bit (info)";
     tests.push_back(std::move(t));
   }
   std::sort(tests.begin(), tests.end(), [](const Test& a, const Test& b) { return a.rel < b.rel; });
@@ -431,7 +449,9 @@ int main(int argc, char** argv) {
   snprintf(line, sizeof line, "%-22s %6s %6s %6s %6s %6s %6s   %s\n", "category", "pass", "fail", "unsup", "liftx", "crash", "skip", "pass of runnable");
   out << line;
   Counts tot; unsigned allRun = 0;
+  Counts info;
   for (auto& [name, c] : cats) {
+    if (name == "x87 80-bit (info)") { info = c; continue; }
     const unsigned run = c.pass + c.fail + c.crash;
     snprintf(line, sizeof line, "%-22s %6u %6u %6u %6u %6u %6u   %.1f%% (%u/%u)\n", name.c_str(), c.pass, c.fail, c.unsup, c.lift, c.crash, c.skip,
              run ? 100.0 * c.pass / run : 0.0, c.pass, run);
@@ -442,6 +462,12 @@ int main(int argc, char** argv) {
   snprintf(line, sizeof line, "%-22s %6u %6u %6u %6u %6u %6u   %.1f%% (%u/%u)\n", "TOTAL", tot.pass, tot.fail, tot.unsup, tot.lift, tot.crash, tot.skip,
            allRun ? 100.0 * tot.pass / allRun : 0.0, tot.pass, allRun);
   out << line;
+  {
+    const unsigned run = info.pass + info.fail + info.crash;
+    snprintf(line, sizeof line, "%-22s %6u %6u %6u %6u %6u %6u   %.1f%% (%u/%u)   (not in TOTAL: written for 80-bit x87)\n", "x87 80-bit (info)", info.pass, info.fail, info.unsup, info.lift, info.crash,
+             info.skip, run ? 100.0 * info.pass / run : 0.0, info.pass, run);
+    out << line;
+  }
   out << "\n'pass of runnable' = pass / (pass + fail + crash): the tests whose ops are all lowered. unsup = an IR op still lowers to bbr_trap;\n"
          "liftx = FEX's front end could not lift the test; skip = not attempted (see below).\n";
   out << "\nskipped:\n";

@@ -5,10 +5,15 @@
 // Conventions: a vector value is <2 x i64> (128 bits). An op of IR size S < 16 works on the low S bytes and zeroes the
 // rest (what NEON's D/S/H forms do); S = 16 uses all lanes. `n` = S / ElementSize lanes.
 #include "lower_impl.h"
+#include "bbr_x87.h"
 
 using namespace llvm;
 
 namespace bbr {
+
+// the helpers read the guest's x87 state at these offsets (bbr_x87.h)
+static_assert(offsetof(Core::CPUState, FCW) == BBR_X87_FCW_OFFSET);
+static_assert(offsetof(Core::CPUState, flags) + X86State::X87FLAG_IE_LOC == BBR_X87_IE_OFFSET);
 
 namespace {
 // ---- the named vector constants (FEXCore/Source/Interface/Core/CPUBackend.cpp, copied) ----
@@ -792,6 +797,87 @@ bool Lower::emitVectorOp(Ref node, IR::IROp_Header* op) {
     Value* r = e > se ? B.CreateFPExt(x, FT(e)) : B.CreateFPTrunc(x, FT(e));
     def(node, toV(B.CreateZExt(fromFp(r, e), I128)));
     return true;
+  }
+  case OP_NZCVSELECTV: {
+    // fcsel: the selected scalar (S or D), the rest of the register zeroed
+    auto* o = op->C<IROp_NZCVSelectV>();
+    const unsigned eb = isz == 4 ? 4 : 8;
+    Value* c = cond(o->Cond);
+    Value *t = lane0(A(o->TrueVal), eb), *f = lane0(A(o->FalseVal), eb);
+    def(node, toV(B.CreateZExt(B.CreateSelect(c, t, f), I128)));
+    return true;
+  }
+
+  // ---- x87 (X87ReducedPrecision=1: F64 ops, 80-bit values only in memory conversions). The JIT calls FEX's fallback handlers for
+  // these (F80Fallbacks.h, InterpreterFallbacks.cpp); the calls go to the bbr_x87_* helpers (tools/recomp/helpers/bbr_x87.c: the
+  // same handlers over the same SoftFloat), linked into the generated .so. An 80-bit value is a V128 whose low 10 bytes are the
+  // register: significand in lane 0, sign/exponent in the low 16 bits of lane 1.
+  case OP_F80CVT: case OP_F80CVTTO: case OP_F80CVTINT: case OP_F80CVTTOINT: case OP_F80BCDLOAD: case OP_F80BCDSTORE: {
+    Type *Dbl = Type::getDoubleTy(C), *Flt = Type::getFloatTy(C), *F80 = StructType::get(C, {I64, I64});
+    auto sigOf = [&](Value* v) -> Value* { return B.CreateExtractElement(v, (uint64_t)0); };
+    auto topOf = [&](Value* v) -> Value* { return B.CreateAnd(B.CreateExtractElement(v, (uint64_t)1), c64(0xffff)); };
+    auto f80Out = [&](Value* agg) {
+      Value* v = B.CreateInsertElement(zeroV(), B.CreateExtractValue(agg, 0), (uint64_t)0);
+      def(node, B.CreateInsertElement(v, B.CreateExtractValue(agg, 1), (uint64_t)1));
+      return true;
+    };
+    switch (op->Op) {
+    case OP_F80CVT: {
+      Value* x = A(op->C<IROp_F80CVT>()->X80Src);
+      const bool d = isz == 8;
+      return ret(B.CreateCall(m.helper(d ? "bbr_x87_f80_to_f64" : "bbr_x87_f80_to_f32", d ? Dbl : Flt, {Ptr, I64, I64}), {S, sigOf(x), topOf(x)}));
+    }
+    case OP_F80CVTTO: {
+      auto* o = op->C<IROp_F80CVTTo>();
+      Value* x = A(o->X80Src);
+      const bool d = o->SrcSize == OpSize::i64Bit;
+      Value* in = toFp(lane0(x, d ? 8 : 4), d ? 8 : 4);
+      return f80Out(B.CreateCall(m.helper(d ? "bbr_x87_f64_to_f80" : "bbr_x87_f32_to_f80", F80, {Ptr, d ? Dbl : Flt}), {S, in}));
+    }
+    case OP_F80CVTINT: {
+      auto* o = op->C<IROp_F80CVTInt>();
+      Value* x = A(o->X80Src);
+      Value* r = B.CreateCall(m.helper("bbr_x87_f80_to_int", I64, {Ptr, I64, I64, I64, I64}), {S, sigOf(x), topOf(x), c64(isz), c64(o->Truncate ? 1 : 0)});
+      def(node, zx(tr(r, isz * 8)));
+      return true;
+    }
+    case OP_F80CVTTOINT: {
+      auto* o = op->C<IROp_F80CVTToInt>();
+      return f80Out(B.CreateCall(m.helper("bbr_x87_int_to_f80", F80, {Ptr, I64, I64}), {S, A(o->Src), c64(static_cast<unsigned>(o->SrcSize))}));
+    }
+    case OP_F80BCDLOAD: {
+      Value* x = A(op->C<IROp_F80BCDLoad>()->X80Src);
+      return f80Out(B.CreateCall(m.helper("bbr_x87_bcd_load", F80, {Ptr, I64, I64}), {S, sigOf(x), topOf(x)}));
+    }
+    default: {
+      Value* x = A(op->C<IROp_F80BCDStore>()->X80Src);
+      return f80Out(B.CreateCall(m.helper("bbr_x87_bcd_store", F80, {Ptr, I64, I64}), {S, sigOf(x), topOf(x)}));
+    }
+    }
+  }
+  case OP_F64FPREM: case OP_F64FPREM1: case OP_F64SCALE: case OP_F64ATAN: case OP_F64FYL2X: case OP_F64FYL2XP1: {
+    Type* Dbl = Type::getDoubleTy(C);
+    W w1, w2; const char* fn;
+    switch (op->Op) {
+    case OP_F64FPREM: w1 = op->C<IROp_F64FPREM>()->Src1; w2 = op->C<IROp_F64FPREM>()->Src2; fn = "bbr_x87_f64_fprem"; break;
+    case OP_F64FPREM1: w1 = op->C<IROp_F64FPREM1>()->Src1; w2 = op->C<IROp_F64FPREM1>()->Src2; fn = "bbr_x87_f64_fprem1"; break;
+    case OP_F64SCALE: w1 = op->C<IROp_F64SCALE>()->Src1; w2 = op->C<IROp_F64SCALE>()->Src2; fn = "bbr_x87_f64_scale"; break;
+    case OP_F64ATAN: w1 = op->C<IROp_F64ATAN>()->Src1; w2 = op->C<IROp_F64ATAN>()->Src2; fn = "bbr_x87_f64_atan"; break;
+    case OP_F64FYL2X: w1 = op->C<IROp_F64FYL2X>()->Src; w2 = op->C<IROp_F64FYL2X>()->Src2; fn = "bbr_x87_f64_fyl2x"; break;
+    default: w1 = op->C<IROp_F64FYL2XP1>()->Src; w2 = op->C<IROp_F64FYL2XP1>()->Src2; fn = "bbr_x87_f64_fyl2xp1"; break;
+    }
+    return ret(B.CreateCall(m.helper(fn, Dbl, {Dbl, Dbl}), {toFp(lane0(A(w1), 8), 8), toFp(lane0(A(w2), 8), 8)}));
+  }
+  case OP_F64F2XM1: case OP_F64TAN: case OP_F64SIN: case OP_F64COS: {
+    Type* Dbl = Type::getDoubleTy(C);
+    W w; const char* fn;
+    switch (op->Op) {
+    case OP_F64F2XM1: w = op->C<IROp_F64F2XM1>()->Src; fn = "bbr_x87_f64_f2xm1"; break;
+    case OP_F64TAN: w = op->C<IROp_F64TAN>()->Src; fn = "bbr_x87_f64_tan"; break;
+    case OP_F64SIN: w = op->C<IROp_F64SIN>()->Src; fn = "bbr_x87_f64_sin"; break;
+    default: w = op->C<IROp_F64COS>()->Src; fn = "bbr_x87_f64_cos"; break;
+    }
+    return ret(B.CreateCall(m.helper(fn, Dbl, {Dbl}), {toFp(lane0(A(w), 8), 8)}));
   }
   default: return false;
   }
