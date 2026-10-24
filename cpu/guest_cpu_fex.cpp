@@ -81,6 +81,7 @@ constexpr size_t SyscallOffset = 3;
 unsigned char* stubs;
 uintptr_t callback_ret;
 uintptr_t sentinel_ret;
+uintptr_t free_run_entry;
 void* stub_functions[StubBytes / StubSize];
 std::atomic<size_t> stub_count;
 std::mutex stub_lock;
@@ -333,7 +334,14 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     stubs[StubSize] = 0x0f;
     stubs[StubSize + 1] = 0x3e;
     sentinel_ret = reinterpret_cast<uintptr_t>(stubs) + StubSize;
-    stub_count = 2;
+    // The entry of bb_fb_run's free runs (guest_cpu_aot.cpp): HandleCallback lowers RSP by 16 and writes its trampoline there,
+    // which a frame entered in the middle must not see. bb_fb_run gives it RSP - 128 (the trampoline lands below the red zone)
+    // and the target at RSP - 136; this stub restores RSP and jumps:  lea rsp, [rsp + 0x90]; jmp qword ptr [rsp - 0x88]
+    static constexpr unsigned char free_run[] = {0x48, 0x8d, 0xa4, 0x24, 0x90, 0x00, 0x00, 0x00, 0xff, 0xa4, 0x24, 0x78, 0xff, 0xff, 0xff};
+    static_assert(sizeof(free_run) <= StubSize);
+    std::memcpy(stubs + 2 * StubSize, free_run, sizeof(free_run));
+    free_run_entry = reinterpret_cast<uintptr_t>(stubs) + 2 * StubSize;
+    stub_count = 3;
     guest_cpu_code(reinterpret_cast<uintptr_t>(stubs), StubBytes);
     std::printf("Guest CPU: FEXCore JIT (x86-64 guest on this host), TSC x%u\n", 1u << tsc_shift);
 }
@@ -587,8 +595,12 @@ void bb_fb_run(FEXCore::Core::CPUState* s, uint64_t target, int call) {
         Fatal("bb_fb_run on a state that is not this thread's");
     }
     if (!call) {
-        // In a frame the stack holds already (a longjmp or an exception unwound to it): runs to the sentinel at the bottom.
-        ctx->HandleCallback(t->thread, target);
+        // In a frame the stack holds already (a jump into the middle of a function, a longjmp or an exception unwound to it):
+        // runs to the sentinel at the bottom, with RSP exactly as it is (the free-run stub undoes HandleCallback's push).
+        const uint64_t rsp = st.gregs[REG_RSP];
+        *reinterpret_cast<uint64_t*>(rsp - 136) = target;
+        st.gregs[REG_RSP] = rsp - 128;
+        ctx->HandleCallback(t->thread, free_run_entry);
         st.rip = sentinel_ret;
         return;
     }

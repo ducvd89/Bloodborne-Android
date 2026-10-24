@@ -114,7 +114,11 @@ struct Engine {
     std::vector<Where> by_address;
     uintptr_t so_lo = ~uintptr_t(0), so_hi = 0;
     std::vector<uint8_t> dirty;     // per unit
-    std::atomic<uint64_t> dirty_count {0}, dirty_patched {0}, dirty_unpatchable {0};
+    std::atomic<uint64_t> dirty_count {0}, dirty_unchecked {0};
+    uint8_t* dirty_flags = nullptr;       // the .so's bbr_dirty[] (units check it at entry), or null
+    const uint64_t* ends = nullptr;       // bbr_unit_end[] or null
+    const uint64_t* ehashes = nullptr;    // bbr_unit_ehash[] or null
+    uint64_t trap_units = 0;              // units the tool started dirty (unsupported IR ops)
     std::mutex lock;
     // Host-function stubs (x86-64: ours; ARM64: FEX's).
     uintptr_t stub_base = 0;
@@ -155,6 +159,7 @@ std::atomic<uint64_t> miss_dropped {0};
 std::atomic<uint64_t> mid_unit_jumps {0};
 std::atomic<uint64_t> plt_hops {0};
 std::atomic<uint64_t> unaligned_atomics {0};
+std::atomic<uint64_t> dirty_entries {0};
 
 void CountMiss(uint64_t address, bool dirty_unit) {
     const uint64_t key = address | 1ull << 63;  // address 0 stays distinguishable
@@ -183,12 +188,12 @@ void Report(const char* why) {
     std::fprintf(stderr, "AOT stats (%s): %llu PLT thunks followed; %llu mid-unit jumps run to the end of the stack on the fallback; "
                  "%llu unaligned atomics emulated\n", why,
                  (unsigned long long)plt_hops.load(), (unsigned long long)mid_unit_jumps.load(), (unsigned long long)unaligned_atomics.load());
-    std::fprintf(stderr, "AOT stats (%s): %llu units, %llu dirty (%llu entries patched, %llu not patchable)\n"
+    std::fprintf(stderr, "AOT stats (%s): %llu units, %llu dirty (%llu without an entry check: direct calls still run them), %llu dirty entries\n"
                  "  via the dispatcher (indirect calls, tail jumps; direct unit-to-unit calls are not counted): %llu unit entries, "
                  "%llu host function calls\n"
                  "  fallback runs: %llu misses (%llu of them dirty units), %.3f Gcycles on the fallback\n",
-                 why, (unsigned long long)E.count, (unsigned long long)E.dirty_count.load(), (unsigned long long)E.dirty_patched.load(),
-                 (unsigned long long)E.dirty_unpatchable.load(), (unsigned long long)unit, (unsigned long long)host,
+                 why, (unsigned long long)E.count, (unsigned long long)E.dirty_count.load(), (unsigned long long)E.dirty_unchecked.load(),
+                 (unsigned long long)dirty_entries.load(), (unsigned long long)unit, (unsigned long long)host,
                  (unsigned long long)misses, (unsigned long long)dirty_runs, double(cycles) / 1e9);
     struct Row { uint64_t addr, count, dirty; };
     std::vector<Row> rows;
@@ -259,7 +264,6 @@ bool BuildTable() {
 }
 
 // ------------------------------------------------------------------------------------ fallback CPU run ----
-extern "C" void bbr_dirty_unit(GuestState* s, uint64_t vaddr);
 
 #if defined(__x86_64__) && !defined(BB_AOT_FEX_STATE)
 // Native execution on the host CPU. bbaot_native_enter loads the guest registers from the state, switches to the guest
@@ -643,34 +647,15 @@ bool IsUnitEntry(uint64_t offset) {
 }
 
 // ---------------------------------------------------------------------------------------- dirty units ----
-// Units whose code differs from the image the .so was built from (patches, hooks, code the runtime wrote) leave the
-// table, and their entry is overwritten with a jump to bbr_dirty_unit, so that direct calls from other units reach the
-// fallback too (they bypass the table). The entry patch needs the .so's text writable for a moment (mprotect); where
-// that is refused (Android's W^X policy) only the table is changed and RECOMP_ABI.md asks for a flag the units check.
-#if defined(__x86_64__)
-constexpr size_t PatchBytes = 23;
-void WritePatch(unsigned char* at, uint64_t vaddr) {
-    const uint64_t handler = reinterpret_cast<uint64_t>(&bbr_dirty_unit);
-    at[0] = 0x48; at[1] = 0xbe; std::memcpy(at + 2, &vaddr, 8);       // mov rsi, vaddr
-    at[10] = 0x49; at[11] = 0xbb; std::memcpy(at + 12, &handler, 8);  // mov r11, handler
-    at[20] = 0x41; at[21] = 0xff; at[22] = 0xe3;                      // jmp r11
-}
-#else
-constexpr size_t PatchBytes = 24;
-void WritePatch(unsigned char* at, uint64_t vaddr) {
-    const uint64_t handler = reinterpret_cast<uint64_t>(&bbr_dirty_unit);
-    const uint32_t code[4] = {0x52800001u | uint32_t((vaddr & 0xffff) << 5),          // movz w1, #lo
-                              0x72a00001u | uint32_t(((vaddr >> 16) & 0xffff) << 5),  // movk w1, #hi, lsl #16
-                              0x58000050u,                                            // ldr x16, #8 (the literal at +16)
-                              0xd61f0200u};                                           // br x16
-    std::memcpy(at, code, sizeof(code));
-    std::memcpy(at + 16, &handler, 8);
-}
-#endif
-
+// Units whose code differs from the image the .so was built from (patches, hooks, code the runtime wrote) must not run.
+// Every unit tests its byte of the .so's writable bbr_dirty[] first and, when set, tail-calls bbr_dirty_entry: direct
+// unit-to-unit calls and jumps reach the fallback too, and the .so's text is never written (Android's SELinux refuses
+// execmod on app files). The tool also starts units it could not lower completely (an unsupported IR op) with the byte set.
+// A .so without the check (bbr_abi_flags bit 1 clear, an older tool) only loses the dirty units from the dispatch table:
+// direct calls from other units then still run the stale code.
 void DirtyOne(uint64_t i);
 // A function's units go together: the case bodies are entered by jumps from the function's own code, with no return address
-// on top of the guest stack, so they cannot run on the fallback alone.
+// on top of the guest stack, so the function runs on the fallback from its entry.
 void DirtyUnit(uint64_t i) {  // E.lock held
     uint64_t first = i;
     while (first > 0 && E.extra[first]) --first;
@@ -681,26 +666,23 @@ void DirtyOne(uint64_t i) {
     if (E.dirty[i]) return;
     E.dirty[i] = 1;
     E.dirty_count.fetch_add(1);
+    if (E.dirty_flags) {
+        // The unit stays in the table: its own check sends every entry, through the table or a direct call, to bbr_dirty_entry.
+        __atomic_store_n(&E.dirty_flags[i], uint8_t(1), __ATOMIC_RELEASE);
+        return;
+    }
     const uint32_t key = uint32_t(E.units[i].vaddr) + 1;
     for (uint32_t h = (key * 0x9E3779B1u) >> E.shift;; h = (h + 1) & E.mask) {
         const uint32_t k = E.table[h].key.load(std::memory_order_relaxed);
         if (k == key) { E.table[h].key.store(0xFFFFFFFFu, std::memory_order_release); break; }
         if (k == 0) break;
     }
-    const uintptr_t fn = reinterpret_cast<uintptr_t>(E.units[i].fn);
-    auto at = std::lower_bound(E.by_address.begin(), E.by_address.end(), fn, [](const Engine::Where& w, uintptr_t v) { return w.fn < v; });
-    const uintptr_t next = (at + 1 != E.by_address.end()) ? (at + 1)->fn : fn + 4096;
-    if (next - fn < PatchBytes) { E.dirty_unpatchable.fetch_add(1); return; }
-    const uintptr_t page = uintptr_t(sysconf(_SC_PAGESIZE));
-    const uintptr_t lo = fn & ~(page - 1), hi = (fn + PatchBytes + page - 1) & ~(page - 1);
-    if (mprotect(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-        E.dirty_unpatchable.fetch_add(1);
-        return;
-    }
-    WritePatch(reinterpret_cast<unsigned char*>(fn), E.units[i].vaddr);
-    __builtin___clear_cache(reinterpret_cast<char*>(fn), reinterpret_cast<char*>(fn + PatchBytes));
-    mprotect(reinterpret_cast<void*>(lo), hi - lo, PROT_READ | PROT_EXEC);
-    E.dirty_patched.fetch_add(1);
+    E.dirty_unchecked.fetch_add(1);
+}
+
+uint64_t UnitEnd(uint64_t i) {
+    if (E.ends && E.ends[i] > E.units[i].vaddr) return E.ends[i];
+    return i + 1 < E.count ? E.units[i + 1].vaddr : E.text_end;
 }
 
 void MarkDirty(uintptr_t address, size_t size) {
@@ -710,10 +692,11 @@ void MarkDirty(uintptr_t address, size_t size) {
     std::lock_guard<std::mutex> guard(E.lock);
     uint64_t first = std::upper_bound(E.units, E.units + E.count, lo, [](uint64_t v, const UnitEntry& u) { return v < u.vaddr; }) - E.units;
     if (first) --first;
-    for (uint64_t i = first; i < E.count && E.units[i].vaddr < hi; ++i) {
-        const uint64_t end = i + 1 < E.count ? E.units[i + 1].vaddr : E.text_end;
-        if (end > lo) DirtyUnit(i);
-    }
+    // Units overlap (secondary entries repeat the code after them up to their function's end): units that start before lo
+    // may still cover it.
+    for (uint64_t back = 0; first > 0 && back < 4096; ++back) --first;
+    for (uint64_t i = first; i < E.count && E.units[i].vaddr < hi; ++i)
+        if (UnitEnd(i) > lo) DirtyUnit(i);
 }
 
 uint64_t Fnv(const unsigned char* p, uint64_t n) {
@@ -735,9 +718,11 @@ void PrepareImage() {
     uint64_t bad = 0;
     std::vector<uint64_t> bad_units;
     for (uint64_t i = 0; i < E.count; ++i) {
-        const uint64_t lo = E.units[i].vaddr, hi = i + 1 < E.count ? E.units[i + 1].vaddr : E.text_end;
-        if (hi > E.size || lo >= hi) { ++bad; continue; }
-        if (Fnv(reinterpret_cast<const unsigned char*>(E.base + lo), hi - lo) != E.hashes[i]) { ++bad; bad_units.push_back(i); }
+        // bbr_unit_ehash: the unit's exact bytes [vaddr, bbr_unit_end) (no false positives from a patched neighbour); older
+        // tools: [vaddr, next unit).
+        const uint64_t lo = E.units[i].vaddr, hi = E.ehashes ? UnitEnd(i) : (i + 1 < E.count ? E.units[i + 1].vaddr : E.text_end);
+        if (hi > E.size || lo >= hi) { ++bad; bad_units.push_back(i); continue; }
+        if (Fnv(reinterpret_cast<const unsigned char*>(E.base + lo), hi - lo) != (E.ehashes ? E.ehashes[i] : E.hashes[i])) { ++bad; bad_units.push_back(i); }
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (bad * 4 > E.count) {
@@ -782,6 +767,7 @@ void Load(const char* path) {
     const auto* text_end = static_cast<const uint64_t*>(dlsym(so, "bbr_text_end"));
     auto* image_base = static_cast<uint64_t*>(dlsym(so, "bbr_image_base"));
     const auto* image_hash = static_cast<const uint64_t*>(dlsym(so, "bbr_image_hash"));
+    const auto* abi_flags = static_cast<const uint64_t*>(dlsym(so, "bbr_abi_flags"));
     if (!abi || !count || !units || !image_base || !hashes || !extra || !text_end || !image_hash) {
         std::fprintf(stderr, "AOT: %s is not a bb-recomp unit library (missing bbr_* symbols; unit hashes need a newer tool)\n", path);
         return;
@@ -804,12 +790,22 @@ void Load(const char* path) {
     E.hashes = hashes;
     E.extra = extra;
     E.text_end = *text_end;
+    E.ends = static_cast<const uint64_t*>(dlsym(so, "bbr_unit_end"));
+    E.ehashes = E.ends ? static_cast<const uint64_t*>(dlsym(so, "bbr_unit_ehash")) : nullptr;
+    if (abi_flags && (*abi_flags & 2)) E.dirty_flags = static_cast<uint8_t*>(dlsym(so, "bbr_dirty"));
+    if (abi_flags && (*abi_flags & 1))
+        std::fprintf(stderr, "AOT: %s has resume entries (bbr_abi_flags bit 0); this runtime does not use them\n", path);
     E.stats = std::getenv("BB_AOT_STATS") != nullptr;
     E.trace = std::getenv("BB_AOT_TRACE") != nullptr;
     if (!BuildTable()) { std::fprintf(stderr, "AOT: cannot build the dispatch table\n"); return; }
+    if (E.dirty_flags)  // units the tool could not lower completely start dirty
+        for (uint64_t i = 0; i < E.count; ++i)
+            if (E.dirty_flags[i]) { E.dirty[i] = 1; ++E.trap_units; }
     E.so_lo &= ~uintptr_t(0xfff);
     E.on = true;
-    std::printf("AOT: %s: %llu units\n", path, (unsigned long long)E.count);
+    std::printf("AOT: %s: %llu units; unit entry check %s, exact unit ranges %s; %llu units with unsupported ops run on the fallback\n", path,
+                (unsigned long long)E.count, E.dirty_flags ? "on" : "off (old tool: dirty units leave the table only)", E.ehashes ? "yes" : "no",
+                (unsigned long long)E.trap_units);
 }
 
 void OpenImage(uintptr_t base, size_t size) {
@@ -843,8 +839,24 @@ BBR_EXPORT void bbr_dispatch_tail(GuestState* s) {
     }
     Slow(s, target, true);
 }
-extern "C" void bbr_dirty_unit(GuestState* s, uint64_t vaddr) {
-    Miss(s, E.base + vaddr, Current(), true);
+// A dirty unit's entry check (bbr_dirty[i] set): its code runs on the fallback. A function start is entered by a call (or a tail
+// jump, with the caller's return address still on top): the fallback runs it until it returns there. Any other unit (a case
+// body, a landing pad, a setjmp return site, a jump into a function) is entered by a jump, with no return address of its own on
+// top: the fallback runs from there to the end of the guest stack, as for a jump into the middle of a unit.
+BBR_EXPORT void bbr_dirty_entry(GuestState* s, uint64_t vaddr) {
+    Thread* t = Current();
+    const uint64_t target = E.base + vaddr;
+    s->rip = target;
+    dirty_entries.fetch_add(1, std::memory_order_relaxed);
+    const UnitEntry* end = E.units + E.count;
+    const UnitEntry* at = std::lower_bound(E.units, end, vaddr, [](const UnitEntry& u, uint64_t v) { return u.vaddr < v; });
+    if (at != end && at->vaddr == vaddr && E.extra[at - E.units]) {
+        if (E.stats) { ++t->misses; ++t->dirty_runs; CountMiss(target, true); }
+        Trace(t, EvFree, target, s->gregs[RSP]);
+        FallbackRun(s, target, false, t);
+        return;
+    }
+    Miss(s, target, t, true);
 }
 BBR_EXPORT void bbr_trap(GuestState* s, uint64_t kind) {
     if (kind & TrapUnliftable) {
@@ -852,8 +864,9 @@ BBR_EXPORT void bbr_trap(GuestState* s, uint64_t kind) {
         Miss(s, E.base + (kind & 0xFFFFFFFFull), Current(), true);
         return;
     }
-    if (kind & TrapUnsupported)
-        Fatal("a unit contains an IR op the tool does not lower (FEX IR op index, rip offset)", kind & ~TrapUnsupported, s->rip - E.base);
+    if (kind & TrapUnsupported)  // the tool starts such units dirty (bbr_dirty[i] = 1): only an old tool's .so gets here
+        Fatal("a unit contains an IR op the tool does not lower (FEX IR op index, rip offset); rebuild the .so with a newer bb-recomp",
+              kind & ~TrapUnsupported, s->rip - E.base);
     Fatal("guest trap (signal | trap number << 8 | si_code << 16 | error << 32, rip offset)", kind, s->rip - E.base);
 }
 BBR_EXPORT void bbr_syscall(GuestState* s) {
