@@ -5,6 +5,7 @@
 #include "elf_image.h"
 #include "fde_scan.h"
 #include "jumptable.h"
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -129,6 +130,11 @@ class Lifter {
 
   // Messages FEX logged during the last lift (decode errors, "Invalid or Unknown instruction"...).
   const std::string& log() const { return log_; }
+
+  // FEX's own CPUID model (FEXCore CPUIDEmu, x86-64 build of the tool) for the Thor's host features (the armv9 profile with SSE4a off and CLZERO on, which is
+  // what FEX computes there): answers[i] = {eax, ebx, ecx, edx} of query i = {function, leaf}. For the differential test of cpu/guest_cpu_cpuid.h
+  // (bb-recomp-asmtest --cpuid-diff). The brand string, leaf 0x15 and the host nibble of leaf 0x40000001 are AArch64-only code in FEX: not meaningful here.
+  static std::vector<std::array<uint32_t, 4>> fexCpuidReference(const std::vector<std::pair<uint32_t, uint32_t>>& queries);
 
  private:
   struct Impl;

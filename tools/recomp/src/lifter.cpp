@@ -669,6 +669,22 @@ Lifter::Lifter(const ElfImage& img, const LiftOptions& opt) {
 }
 Lifter::~Lifter() = default;
 
+std::vector<std::array<uint32_t, 4>> Lifter::fexCpuidReference(const std::vector<std::pair<uint32_t, uint32_t>>& queries) {
+  static std::mutex lock;
+  std::lock_guard<std::mutex> guard(lock);
+  setConfig(LiftOptions {});
+  HostFeatures host = makeHost("armv9");
+  host.SupportsSSE4a = 0;  // FEX's HostFeatures never sets it on an ARM host
+  host.SupportsCLZERO = 1; // DC ZVA block of 64 bytes (the Thor's cores)
+  Context::ContextImpl* c = static_cast<Context::ContextImpl*>(Context::Context::CreateNewContext(host).release()); // (like Impl::build: never destroyed)
+  std::vector<std::array<uint32_t, 4>> out;
+  for (auto& q : queries) {
+    const auto r = c->RunCPUIDFunction(q.first, q.second);
+    out.push_back({r.eax, r.ebx, r.ecx, r.edx});
+  }
+  return out;
+}
+
 void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts, std::vector<uint64_t>* sizeHist, std::string* irText, UnitSink* sink) {
   r = FuncResult {};
   log_.clear();

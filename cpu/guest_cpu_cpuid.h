@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// CPUID and XGETBV for ahead-of-time code without FEX (BB_AOT_ONLY): the values FEXCore's CPUID model (FEXCore/Source/Interface/Core/CPUID.cpp,
-// the Intel/Skylake identity, FEX 2609.1) gives the game today on the Thor, with the host features fixed to the profile the units are lifted for
-// (tools/recomp/src/lifter.cpp makeHost: AVX through FEX's AVX128 path, AES, PMULL, CRC32, SHA, SSE4a, 3DNow, no RNG, no SVE256). Leaves FEX answers
-// with zeros stay zero. Pure C++: tests/test_aot_cpuid.cpp checks it on the PC.
-//
-// Not reproduced: the per-CPU product name (FEX reads the MIDR of the core: "Unknown ARM CPU" here) and the hybrid-core leaf 0x1A (FEX hides hybrid).
+// CPUID and XGETBV for ahead-of-time code without FEX (BB_AOT_ONLY and strict mode): exactly the values FEXCore's CPUID model gives the game on the Thor
+// (FEXCore/Source/Interface/Core/CPUID.cpp, the Intel/Skylake identity, FEX 2609.1, default configuration: HideHybrid on, hypervisor bit shown, no atomic
+// memcpy TSO), with the host features of the Thor build: AVX through FEX's AVX128 path, AES, PMULL, CRC32, SHA, 3DNow, no RNG, no SVE256, no WFxT; SSE4a
+// is NOT reported (FEX's HostFeatures never sets it on ARM hosts) and CLZERO is (DC ZVA block of 64 bytes, set from DCZID_EL0). Every leaf FEX answers is
+// here, with FEX's formulas: 0 1 2 4 6 7 0xD 0x15, the FEX hypervisor leaves 0x40000000 and 0x40000001 (sub-leaf 1 holds the FEX version string), and
+// 0x80000000..4, 0x80000006..8 and 0x80000019. Everything else answers zeros, as in FEX: leaf 0x1A (hybrid cores are hidden), and the AMD-only leaves
+// 0x80000005 and 0x8000001D (FEX is built with the Intel identity: CPUID_AMD is not defined).
+// The brand string (0x80000002..4) is the product name FEX derives from the MIDR of core 0 (HideHybrid makes every core report core 0's name); the name
+// table below is FEX's. tests/test_aot_native.cpp pins all of it. Pure C++, no host calls.
 #ifndef BB_GUEST_CPU_CPUID_H
 #define BB_GUEST_CPU_CPUID_H
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -17,10 +21,107 @@ namespace bbaot {
 struct CpuidHost {
     uint32_t cores = 8;          // logical CPUs of the host (FEX: HostFeatures.CPUMIDRs.size())
     uint32_t cpu = 0;            // the CPU the code runs on now (the local APIC id)
-    uint32_t tsc_hz = 0;         // cycle counter frequency in Hz (leaf 0x15 ECX), 0: not reported
-    uint32_t tsc_shift = 0;      // the TSC scale (leaf 0x15 EBX = 1 << tsc_shift)
-    bool avx = true, aes = true, aes256 = true, pmull = true, crc = true, sha = true, rand = false, sse4a = true, now3d = true, wfxt = false;
+    uint32_t tsc_hz = 0;         // the cycle counter's own frequency in Hz (CNTFRQ_EL0, NOT scaled; leaf 0x15 ECX), 0: not reported
+    uint32_t tsc_shift = 0;      // the TSC scale (leaf 0x15 EBX = 1 << tsc_shift): the counter is shifted left by it to reach 1 GHz
+    uint32_t midr = 0;           // MIDR_EL1 of core 0 (sysfs; 0 when unreadable): the brand string
+    bool avx = true, aes = true, aes256 = true, pmull = true, crc = true, sha = true, rand = false, sse4a = false, now3d = true, wfxt = false, clzero = true;
 };
+
+// FEX's CPUMIDRs table (CPUID.cpp SetupHostHybridFlag), in its order; the first entry matching implementer (MIDR[31:24]) and part (MIDR[15:4]) wins. The last
+// entry matches an unreadable MIDR (0). Hybrid grouping is not modelled (FEX hides it by default).
+struct MidrName { uint8_t implementer; uint16_t part; const char* name; };
+inline constexpr MidrName kMidrNames[] = {
+    {0x51, 0x002, "Oryon-3"},
+    {0x51, 0x001, "Oryon-1"},
+    {0x61, 0x039, "Apple Avalanche (M2 Max)"},
+    {0x61, 0x035, "Apple Avalanche (M2 Pro)"},
+    {0x61, 0x033, "Apple Avalanche (M2)"},
+    {0x61, 0x029, "Apple Firestorm (M1 Max)"},
+    {0x61, 0x025, "Apple Firestorm (M1 Pro)"},
+    {0x61, 0x023, "Apple Firestorm (M1)"},
+    {0x61, 0, "Apple Silicon"},
+    {0x41, 0xd8c, "C1-Ultra"},
+    {0x41, 0xd90, "C1-Premium"},
+    {0x41, 0xd8b, "C1-Pro"},
+    {0x41, 0xd85, "Cortex-X925"},
+    {0x41, 0xd87, "Cortex-A725"},
+    {0x41, 0xd84, "Neoverse V3"},
+    {0x41, 0xd83, "Neoverse V3AE"},
+    {0x41, 0xd8e, "Neoverse N3"},
+    {0x41, 0xd82, "Cortex-X4"},
+    {0x41, 0xd81, "Cortex-A720"},
+    {0x41, 0xd4e, "Cortex-X3"},
+    {0x41, 0xd4d, "Cortex-A715"},
+    {0x41, 0xd4f, "Neoverse V2"},
+    {0x41, 0xd4b, "Cortex-A78C"},
+    {0x41, 0xd4a, "Neoverse E1"},
+    {0x41, 0xd49, "Neoverse N2"},
+    {0x41, 0xd48, "Cortex-X2"},
+    {0x41, 0xd47, "Cortex-A710"},
+    {0x41, 0xd4C, "Cortex-X1C"},
+    {0x41, 0xd44, "Cortex-X1"},
+    {0x41, 0xd42, "Cortex-A78AE"},
+    {0x41, 0xd41, "Cortex-A78"},
+    {0x41, 0xd40, "Neoverse V1"},
+    {0x41, 0xd0e, "Cortex-A76AE"},
+    {0x41, 0xd0d, "Cortex-A77"},
+    {0x41, 0xd0c, "Neoverse N1"},
+    {0x41, 0xd0b, "Cortex-A76"},
+    {0x51, 0x804, "Kryo 4xx/5xx"},
+    {0x41, 0xd0a, "Cortex-A75"},
+    {0x51, 0x802, "Kryo 3xx"},
+    {0x41, 0xd09, "Cortex-A73"},
+    {0x51, 0x800, "Kryo 2xx"},
+    {0x41, 0xd08, "Cortex-A72"},
+    {0xc0, 0xac3, "AmpereOne"},
+    {0xc0, 0xac4, "AmpereOneA"},
+    {0xc0, 0xac5, "AmpereOneB"},
+    {0xc0, 0xac7, "AmpereOneC"},
+    {0x4e, 0x010, "Nvidia Olympus"},
+    {0x4e, 0x004, "Nvidia Carmel"},
+    {0x4e, 0x003, "Nvidia Denver"},
+    {0x41, 0xd07, "Cortex-A57"},
+    {0x61, 0x038, "Apple Blizzard (M2 Max)"},
+    {0x61, 0x034, "Apple Blizzard (M2 Pro)"},
+    {0x61, 0x032, "Apple Blizzard (M2)"},
+    {0x61, 0x028, "Apple Icestorm (M1 Max)"},
+    {0x61, 0x024, "Apple Icestorm (M1 Pro)"},
+    {0x61, 0x022, "Apple Icestorm (M1)"},
+    {0x41, 0xd8a, "C1-Nano"},
+    {0x41, 0xd80, "Cortex-A520"},
+    {0x41, 0xd46, "Cortex-A510"},
+    {0x41, 0xd06, "Cortex-A65"},
+    {0x41, 0xd05, "Cortex-A55"},
+    {0x51, 0x805, "Kryo 4xx/5xx S"},
+    {0x51, 0x803, "Kryo 3xx S"},
+    {0x41, 0xd03, "Cortex-A53"},
+    {0x51, 0x801, "Kryo 2xx S"},
+    {0x41, 0xd04, "Cortex-A35"},
+    {0x41, 0, "Unknown ARM CPU"},
+    {0x0, 0, "Unknown ARM CPU"},
+};
+
+// MIDR_EL1 from the 18 bytes of sysfs ("0x" and 16 hex digits, FEX reads exactly that many): the low 32 bits, as FEX truncates them; 0 when it does not parse.
+inline uint32_t ParseMidr(const char* data, size_t size) {
+    if (size < 3) return 0;
+    uint64_t v = 0;
+    size_t digits = 0;
+    for (size_t i = 2; i < size; ++i, ++digits) {
+        const char c = data[i];
+        const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (d < 0) break;
+        v = (v << 4) | uint64_t(d);
+    }
+    return digits ? uint32_t(v) : 0;
+}
+
+inline const char* ProductName(uint32_t midr) {
+    const uint8_t implementer = uint8_t(midr >> 24);
+    const uint16_t part = uint16_t((midr >> 4) & 0xFFF);
+    for (const MidrName& m : kMidrNames)
+        if (m.implementer == implementer && m.part == part) return m.name;
+    return "Unknown ARM CPU";
+}
 
 struct CpuidResult { uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0; };
 
@@ -79,6 +180,11 @@ inline CpuidResult Cpuid(const CpuidHost& h, uint32_t fn, uint32_t leaf) {
         break;
     case 0x40000001:
         if (leaf == 0) r.eax = 0b0010 | (2u << 16);   // AArch64 host, two sub-leaves
+        else if (leaf == 1 || leaf == 2) {            // FEX's version string (GIT_DESCRIBE_STRING, NUL included), 16 bytes per sub-leaf
+            static constexpr char version[] = "FEX-2609.1";
+            const size_t size = sizeof(version), skip = leaf == 1 ? 0 : 16;
+            if (size > skip) std::memcpy(&r, version + skip, std::min<size_t>(size - skip, sizeof(r)));
+        }
         break;
     case 0x80000000:
         r.eax = 0x8000001F;
@@ -92,16 +198,11 @@ inline CpuidResult Cpuid(const CpuidHost& h, uint32_t fn, uint32_t leaf) {
                 bit(h.now3d, 30) | bit(h.now3d, 31);
         break;
     case 0x80000002: case 0x80000003: case 0x80000004: {
-        static const char name[48] = "Unknown ARM CPU";
-        std::memcpy(&r, name + 16 * (fn - 0x80000002), 16);
+        const char* name = ProductName(h.midr);
+        const size_t length = std::strlen(name), skip = 16 * (fn - 0x80000002);
+        if (length > skip) std::memcpy(&r, name + skip, std::min<size_t>(length - skip, sizeof(r)));
         break;
     }
-    case 0x80000005:
-        r.eax = 64u | (255u << 8) | (64u << 16) | (255u << 24);
-        r.ebx = r.eax;
-        r.ecx = 64u | (1u << 8) | (8u << 16) | (32u << 24);
-        r.edx = 64u | (1u << 8) | (4u << 16) | (64u << 24);
-        break;
     case 0x80000006:
         r.eax = 1024u | (6u << 12) | (1536u << 16) | (3u << 28);
         r.ebx = 1024u | (6u << 12) | (1536u << 16) | (5u << 28);
@@ -111,7 +212,11 @@ inline CpuidResult Cpuid(const CpuidHost& h, uint32_t fn, uint32_t leaf) {
     case 0x80000007: r.eax = 1u << 2; r.edx = 1u << 8; break;
     case 0x80000008:
         r.eax = 48u | (48u << 8);
+        r.ebx = bit(h.clzero, 0);
         r.ecx = (std::bit_ceil(h.cores) << 12) | (h.cores - 1);
+        break;
+    case 0x80000019:   // 1 GB page TLBs
+        r.eax = (0xFu << 28) | (64u << 16) | (0xFu << 12) | 64u;
         break;
     default: break;   // reserved leaves answer zeros
     }

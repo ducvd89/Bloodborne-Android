@@ -1637,8 +1637,10 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     // model strict mode and BB_AOT_ONLY use (cpu/guest_cpu_cpuid.h), side by side.
     if (const char* cl = std::getenv("BB_AOT_CPUID_LOG"); cl && cl[0] == '1') {
         if (!E.strict) bbnative::Init();
-        static const uint32_t leaves[][2] = {{0, 0}, {1, 0}, {6, 0}, {7, 0}, {7, 1}, {0xd, 0}, {0xd, 1}, {0x80000000u, 0}, {0x80000001u, 0},
-                                             {0x80000002u, 0}, {0x80000003u, 0}, {0x80000004u, 0}, {0x80000007u, 0}, {0x80000008u, 0}};
+        static const uint32_t leaves[][2] = {{0, 0}, {1, 0}, {2, 0}, {4, 0}, {4, 1}, {4, 2}, {4, 3}, {6, 0}, {7, 0}, {7, 1}, {0xd, 0}, {0xd, 1}, {0xd, 2}, {0x15, 0},
+                                             {0x1a, 0}, {0x40000000u, 0}, {0x40000001u, 0}, {0x40000001u, 1}, {0x40000001u, 2}, {0x80000000u, 0}, {0x80000001u, 0},
+                                             {0x80000002u, 0}, {0x80000003u, 0}, {0x80000004u, 0}, {0x80000005u, 0}, {0x80000006u, 0}, {0x80000007u, 0},
+                                             {0x80000008u, 0}, {0x80000019u, 0}, {0x8000001du, 0}};
         for (const auto& l : leaves) {
             uint32_t nat[4];
             bbnative::Cpuid(l[0], l[1], nat);

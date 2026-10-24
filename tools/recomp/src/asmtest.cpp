@@ -23,6 +23,10 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
 
+#if __has_include("../../../cpu/guest_cpu_cpuid.h")
+#include "../../../cpu/guest_cpu_cpuid.h"
+#define BBR_HAVE_CPUID_MODEL 1
+#endif
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/X86Enums.h>
 
@@ -686,12 +690,46 @@ std::string skipReason(const Test& t, const std::set<std::string>& disabled) {
   return "";
 }
 
+#ifdef BBR_HAVE_CPUID_MODEL
+// --cpuid-diff: FEX's CPUID model (the real FEXCore CPUIDEmu, here as built for the PC with the Thor's host features) against the native model of the
+// FEX-free runtime (cpu/guest_cpu_cpuid.h), over every function and sub-leaf either could answer. Not comparable on a PC: the brand string, leaf 0x15
+// and the host nibble of 0x40000001.0 (AArch64-only code in FEX; tests/test_aot_native.cpp pins the native side), the APIC id byte of leaf 1.
+std::string runCpuidDiff() {
+  std::vector<std::pair<uint32_t, uint32_t>> q;
+  std::vector<uint32_t> fns;
+  for (uint32_t f = 0; f <= 0x30; ++f) fns.push_back(f);
+  for (uint32_t f = 0x40000000; f <= 0x40000004; ++f) fns.push_back(f);
+  for (uint32_t f = 0x80000000; f <= 0x80000024; ++f) fns.push_back(f);
+  for (uint32_t f : {0x31u, 0x7fffffffu, 0x12345678u, 0x50000000u, 0xC0000000u, 0xFFFFFFFFu}) fns.push_back(f);
+  for (uint32_t f : fns) {
+    if (f == 0x15 || (f >= 0x80000002 && f <= 0x80000004)) continue;
+    for (uint32_t l : {0u, 1u, 2u, 3u, 4u, 5u, 0xFFFFu}) q.push_back({f, l});
+  }
+  const auto ref = Lifter::fexCpuidReference(q);
+  bbaot::CpuidHost h; h.cores = 8;
+  size_t diffs = 0, nonzero = 0;
+  for (size_t i = 0; i < q.size(); ++i) {
+    const auto n = bbaot::Cpuid(h, q[i].first, q[i].second);
+    uint32_t a[4] = {ref[i][0], ref[i][1], ref[i][2], ref[i][3]}, b[4] = {n.eax, n.ebx, n.ecx, n.edx};
+    if (q[i].first == 1) { a[1] &= 0x00ffffffu; b[1] &= 0x00ffffffu; }
+    if (q[i].first == 0x40000001 && q[i].second == 0) { a[0] &= ~0xFu; b[0] &= ~0xFu; }
+    if (a[0] | a[1] | a[2] | a[3]) ++nonzero;
+    if (memcmp(a, b, sizeof a)) {
+      ++diffs;
+      printf("  DIFF %08x.%u: fex %08x %08x %08x %08x  native %08x %08x %08x %08x\n", q[i].first, q[i].second, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+    }
+  }
+  printf("  %zu function/sub-leaf pairs compared (%zu non-zero in FEX), %zu differ\n", q.size(), nonzero, diffs);
+  return diffs ? "FAIL" : "PASS";
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
   setpriority(PRIO_PROCESS, 0, 19);
   std::string fexDir = "out/recomp-fex", nasm = BBR_NASM, outFile = "out/recomp/asmtest.txt", filter;
-  int opt = 1; unsigned jobs = 22; bool verbose = false; bool listAll = false, resumeTest = false, hookTest = false, variantTest = false, granularTest = false;
+  int opt = 1; unsigned jobs = 22; bool verbose = false; bool listAll = false, resumeTest = false, hookTest = false, variantTest = false, granularTest = false, cpuidDiff = false;
   for (int i = 1; i < argc; ++i) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s); };
     auto arg = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "missing argument\n"); exit(2); } return argv[++i]; };
@@ -707,6 +745,7 @@ int main(int argc, char** argv) {
     else if (is("--hook-selftest")) hookTest = true;
     else if (is("--granular-selftest")) granularTest = true;
     else if (is("--variant-selftest")) variantTest = true;
+    else if (is("--cpuid-diff")) cpuidDiff = true;
     else { fprintf(stderr, "usage: bb-recomp-asmtest [--fex <FEX tree>] [--nasm <nasm>] [--filter <substr>] [--out <file>] [--jobs n] [-O0|-O1|-O2] [-v]\n"); return 2; }
   }
   jobs = std::min(jobs, 22u);
@@ -717,6 +756,17 @@ int main(int argc, char** argv) {
     printf("resume entries self-test: %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "PASS" : "FAIL");
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
   }
+#ifdef BBR_HAVE_CPUID_MODEL
+  if (cpuidDiff) {
+    const pid_t pid = fork();
+    if (pid == 0) { const std::string v = runCpuidDiff(); puts(v.c_str()); fflush(stdout); _exit(v == "PASS" ? 0 : 1); }
+    int st = 0; waitpid(pid, &st, 0);
+    printf("CPUID model diff (FEX vs native): %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "PASS" : "FAIL");
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
+  }
+#else
+  (void)cpuidDiff;
+#endif
   if (granularTest) {
     const pid_t pid = fork();
     if (pid == 0) { const std::string v = runGranularTest(opt); puts(v.c_str()); fflush(stdout); _exit(v == "PASS" ? 0 : 1); }

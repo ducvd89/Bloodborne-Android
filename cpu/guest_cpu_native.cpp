@@ -6,7 +6,7 @@
 //  - host-function stubs: addresses the guest calls to reach a host function. Nothing ever executes them (the engine's dispatcher recognises the
 //    address), the region is plain memory below 1 TiB like FEX's stub region;
 //  - the sentinel, the guest address a bottom guest call returns to;
-//  - CPUID / XGETBV (guest_cpu_cpuid.h: FEX's CPUID model with fixed host features), the TSC (the cycle counter scaled like FEX's), and the handler
+//  - CPUID / XGETBV (guest_cpu_cpuid.h: FEX's CPUID model; the host values it needs are read in Init), the TSC (the cycle counter scaled like FEX's), and the handler
 //    for unaligned `lock` operations (guest_cpu_atomics.h).
 #if defined(__aarch64__)
 #include "guest_cpu_native.h"
@@ -59,11 +59,35 @@ namespace bbnative {
 void Init() {
     static std::once_flag once;
     std::call_once(once, [] {
-        uint64_t frequency = CounterFrequency();
-        while (frequency && (frequency << tsc_shift) < 1'000'000'000) ++tsc_shift;   // SmallTSCScale (FEX's default): at least 1 GHz
-        cpuid_host.cores = unsigned(sysconf(_SC_NPROCESSORS_CONF) > 0 ? sysconf(_SC_NPROCESSORS_CONF) : 1);
-        cpuid_host.tsc_hz = uint32_t(frequency << tsc_shift);
+        const uint64_t frequency = CounterFrequency();
+        uint64_t scaled = frequency;
+        while (scaled && scaled < 1'000'000'000) { scaled <<= 1; ++tsc_shift; }   // SmallTSCScale (FEX's default): at least 1 GHz
+        // The CPUID model, as FEX derives it (FEXCore CPUID.cpp / HostFeatures.cpp / CPUInfo.cpp):
+        // - cores: the cpuN directories of /sys/devices/system/cpu, counted from cpu0 up to the first one that is missing
+        unsigned cpus = 1;
+        for (;; ++cpus) {
+            char path[64];
+            std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u", cpus);
+            if (access(path, F_OK) != 0) break;
+        }
+        cpuid_host.cores = cpus;
+        // - leaf 0x15: the counter's own frequency (ECX) and the scale (EBX = 1 << shift); TSC frequency = ECX * EBX
+        cpuid_host.tsc_hz = uint32_t(frequency);
         cpuid_host.tsc_shift = tsc_shift;
+        // - brand string: the product name of core 0's MIDR (HideHybrid: every core reports core 0's name); 0 when unreadable
+        char data[18] = {};
+        if (FILE* f = std::fopen("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1", "r")) {
+            const size_t n = std::fread(data, 1, sizeof(data), f);
+            std::fclose(f);
+            if (n != sizeof(data)) std::memset(data, 0, sizeof(data));
+        }
+        cpuid_host.midr = bbaot::ParseMidr(data, sizeof(data));
+        // - CLZERO: DC ZVA usable and its block exactly the emulated 64-byte cache line (DCZID_EL0: DZP bit 4, BS bits 3:0 = log2(words))
+        uint64_t dczid = 0x10;
+#if defined(__aarch64__)
+        __asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
+#endif
+        cpuid_host.clzero = !(dczid & 0x10) && (4u << (dczid & 0xF)) == 64;
     });
 }
 unsigned TscShift() { return tsc_shift; }

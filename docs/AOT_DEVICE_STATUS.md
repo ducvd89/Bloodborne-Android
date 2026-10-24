@@ -22,10 +22,17 @@ idle fallback, bb-probe, run-bionic.sh, this branch's libbbgpu with phase 4b's n
 
 No "Out of order flip IRQ" assertion in these ~26 launches (see open issue 3 below).
 
-**CPUID / XGETBV** (`BB_AOT_CPUID_LOG=1`; FEX's model against the native one strict mode and BB_AOT_ONLY use): equal except
-0x80000001 ECX bit 6 (SSE4a: native 1, FEX 0), 0x80000002 brand string (FEX: the host core's name, "Cortex-A510"; native:
-"Unknown ARM CPU"), 0x80000008 EBX bit 0 (CLZERO: FEX 1, native 0). XGETBV(0) = 7 in both. SSE4a is the one that can change
-the game's code paths: the native model should probably match FEX there (phase 6's cpu/guest_cpu_cpuid.h).
+**CPUID / XGETBV** (`BB_AOT_CPUID_LOG=1`; FEX's model against the native one strict mode and BB_AOT_ONLY use): on the Thor the logged leaves were equal
+except 0x80000001 ECX bit 6 (SSE4a: native 1, FEX 0), 0x80000002 brand string (FEX: the host core's name, "Cortex-A510"; native: "Unknown ARM CPU") and
+0x80000008 EBX bit 0 (CLZERO: FEX 1, native 0). XGETBV(0) = 7 in both. **Fixed in cpu/guest_cpu_cpuid.h (testing branch):** SSE4a is off, CLZERO is on
+(from DCZID_EL0, as FEX), and the brand string is FEX's product-name lookup of core 0's MIDR (`/sys/devices/system/cpu/cpu0/regs/identification/midr_el1`;
+HideHybrid, FEX's default, makes every core report core 0's name). A full read of FEX's CPUID.cpp found three more differences the log did not cover, all
+fixed: leaf 0x15 ECX (FEX: the counter's own frequency and EBX = 1 << scale; the native Init passed the scaled frequency, so ECX * EBX was 64 times too
+large), leaf 0x40000001 sub-leaf 1 (FEX's version string "FEX-2609.1"; native: zeros), and leaf 0x80000005 (AMD-only in FEX, zeros with the Intel identity;
+native answered values). The model is pinned by `tests/test_aot_native.cpp` (exact register values, brand strings of known MIDRs, MIDR parsing) and compared
+with FEXCore's own `CPUIDEmu` (x86-64 build of the tool, Thor host features) over 651 function/sub-leaf pairs by `bb-recomp-asmtest --cpuid-diff` (0 differ);
+the brand string, leaf 0x15 and the host nibble of 0x40000001.0 are AArch64-only code in FEX and are checked by the pinned values instead. Not re-measured
+on the device yet: run once with `BB_AOT_CPUID_LOG=1` (`DIFFERS` must not appear, leaf 7 sub-leaf values depend on FEX's TSO configuration there).
 
 **FPS and CPU, capped (user settings: limit 60, LSFG x2, GSR 2), 60 s each at the save spot, merged runtime:**
 AOT 29.7 FPS, process 325 % of a core (guest threads 113.6 %); FEX 29.4 FPS, 376 % (guest threads 124.0 %). The host GPU

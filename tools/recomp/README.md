@@ -102,7 +102,7 @@ The catalogs are generated from the sources and checked in (they hold addresses,
     tools/recomp/variants/gen_patchers.py                                                 # patchers.txt + hooks-patchers.txt: runs the frame rate, display and guard patchers (needs the image)
     (each has --check: exit 1 when the catalog is out of date)
 
-Tests: `bb-recomp-asmtest --granular-selftest` (a unit entered at every instruction boundary of a granular function, flags from the context, a non-boundary refused),
+Tests: `bb-recomp-asmtest --cpuid-diff` (the native CPUID model of the FEX-free runtime, cpu/guest_cpu_cpuid.h, against FEXCore's own over every function and sub-leaf; only in the Bloodborne-Android tree), `bb-recomp-asmtest --granular-selftest` (a unit entered at every instruction boundary of a granular function, flags from the context, a non-boundary refused),
 `bb-recomp-asmtest --variant-selftest` (a patched function and a cave compiled as variants, run in the in-process JIT, hashes and alternatives checked),
 `bb-recomp-asmtest --hook-selftest` (a hook callback fires, edits registers, flags survive, resume points in the middle of a block and at block entries, return, dispatcher jump, loops),
 `tests/run_aot_patchers_test.sh` (the patchers' hook slot callbacks against the semantics of the stubs they replace), `tests/run_aot_variants_test.sh` (the runtime's classification of functions, redirects, un-dirtying and hook slots on synthetic tables) and `tests/run_guest_code_hooks_test.sh` (the shim's slot path).
