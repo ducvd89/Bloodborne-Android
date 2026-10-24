@@ -87,6 +87,7 @@ struct Thread {
     uint64_t fb_start = 0;
     uint64_t prev_fb = 0, prev_host = 0, prev_units = 0, prev_misses = 0;  // the previous report's values
     unsigned host_depth = 0;
+    unsigned unwound_depth = 0;     // bbr_unwound runs nested on this thread
     pid_t tid = 0;
     Thread* next_registered = nullptr;
 };
@@ -193,7 +194,7 @@ void NoteFreeRun(const char* why, uint64_t target, uint64_t rsp) {
     const UnitEntry* end = E.units + E.count;
     const UnitEntry* at = std::upper_bound(E.units, end, off, [](uint64_t v, const UnitEntry& u) { return v < u.vaddr; });
     const uint64_t unit = at == E.units ? 0 : (at - 1)->vaddr;
-    std::fprintf(stderr, "AOT: free run (%s) at +%#llx (in unit +%#llx), rsp %#llx, [rsp] %#llx, thread %s\n", why, (unsigned long long)off,
+    std::fprintf(stderr, "AOT: fallback run (%s) at +%#llx (in unit +%#llx), rsp %#llx, [rsp] %#llx, thread %s\n", why, (unsigned long long)off,
                  (unsigned long long)unit, (unsigned long long)rsp, (unsigned long long)(ReadGuest(rsp) - E.base), name);
     if (E.trace && self) {
         static const char* names[] = {"?", "miss", "fallback returned", "host call", "dirty unit", "free run", "unwind"};
@@ -219,6 +220,7 @@ std::atomic<uint64_t> plt_hops {0};
 std::atomic<uint64_t> unaligned_atomics {0};
 std::atomic<uint64_t> dirty_entries {0};
 std::atomic<uint64_t> bounded_runs {0};
+std::atomic<uint64_t> unwound_runs {0};
 
 void CountMiss(uint64_t address, bool dirty_unit) {
     const uint64_t key = address | 1ull << 63;  // address 0 stays distinguishable
@@ -245,9 +247,9 @@ void Report(const char* why) {
         unit += t->unit_dispatch; host += t->host_calls; misses += t->misses; dirty_runs += t->dirty_runs; cycles += t->fb_cycles;
     }
     std::fprintf(stderr, "AOT stats (%s): %llu PLT thunks followed; %llu mid-unit jumps run to the end of the stack on the fallback; "
-                 "%llu unaligned atomics emulated; %llu fallback runs bounded to their function (CFI)\n", why,
+                 "%llu unaligned atomics emulated; %llu fallback runs bounded to their function (CFI); %llu unwound returns resumed on units\n", why,
                  (unsigned long long)plt_hops.load(), (unsigned long long)mid_unit_jumps.load(), (unsigned long long)unaligned_atomics.load(),
-                 (unsigned long long)bounded_runs.load());
+                 (unsigned long long)bounded_runs.load(), (unsigned long long)unwound_runs.load());
     std::fprintf(stderr, "AOT stats (%s): %llu units, %llu dirty (%llu without an entry check: direct calls still run them), %llu dirty entries\n"
                  "  via the dispatcher (indirect calls, tail jumps; direct unit-to-unit calls are not counted): %llu unit entries, "
                  "%llu host function calls\n"
@@ -888,6 +890,7 @@ uint64_t ReturnSlot(const GuestState* s, uint64_t target) {
     // unit goes on (its rip check sees its own return address).
     if (const uint64_t slot = ReturnSlot(s, target)) {
         bounded_runs.fetch_add(1, std::memory_order_relaxed);
+        NoteFreeRun("jump into the middle of a unit; bounded to its function", target, s->gregs[RSP]);
         FallbackRunUntil(s, target, slot, t);
         return;
     }
@@ -1131,6 +1134,22 @@ BBR_EXPORT void bbr_dispatch(GuestState* s, uint64_t target) {
     }
     Slow(s, target, false);
 }
+// A unit's callee came back with rip other than its return address (longjmp, an exception's landing pad, a context switch).
+// The unit's state is all stored. When rip starts a unit, it runs from this host frame: the code stays on units, and when it
+// returns, the rip check of a caller further up (whose host frame is still there) matches. Otherwise the unit returns and
+// its callers unwind as before. Nesting is capped so repeated jumps cannot grow the host stack without end.
+BBR_EXPORT void bbr_unwound(GuestState* s) {
+    const uint64_t offset = s->rip - E.base;
+    if (offset >= E.size) return;
+    Thread* t = Current();
+    if (t->unwound_depth >= 16) return;
+    const UnitFn fn = Lookup(offset);
+    if (!fn) return;
+    unwound_runs.fetch_add(1, std::memory_order_relaxed);
+    ++t->unwound_depth;
+    fn(s);
+    --t->unwound_depth;
+}
 BBR_EXPORT void bbr_dispatch_tail(GuestState* s) {
     const uint64_t target = s->rip;
     const uint64_t offset = target - E.base;
@@ -1159,6 +1178,7 @@ BBR_EXPORT void bbr_dirty_entry(GuestState* s, uint64_t vaddr) {
         Trace(t, EvFree, target, s->gregs[RSP]);
         if (const uint64_t slot = ReturnSlot(s, target)) {
             bounded_runs.fetch_add(1, std::memory_order_relaxed);
+            NoteFreeRun("dirty unit entered by a jump; bounded to its function", target, s->gregs[RSP]);
             FallbackRunUntil(s, target, slot, t);
             return;
         }
@@ -1403,6 +1423,7 @@ uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t* args) {
             Trace(t, EvFree, rip, s.gregs[RSP]);
             if (const uint64_t slot = ReturnSlot(&s, rip)) {
                 bounded_runs.fetch_add(1, std::memory_order_relaxed);
+                NoteFreeRun("unwound to an address with no unit; bounded to its function", rip, s.gregs[RSP]);
                 FallbackRunUntil(&s, rip, slot, t);
                 continue;
             }
