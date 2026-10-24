@@ -91,10 +91,11 @@ public final class MainActivity extends Activity {
     private AtlasScreen atlas;
     private AtlasDialog atlasDialog;
     private LinearLayout atlasItem;
-    /** Native CPU (recompiled game code): its menu, its drawer row, and whether the running game started with it. */
+    /** Native CPU (the recompiled game code, required to play): its status/import page, its drawer row, and the full-screen message
+     *  shown instead of the game when the library is missing or does not fit. */
     private NativeCpuDialog nativeCpu;
     private LinearLayout nativeCpuItem;
-    private volatile boolean startedNative;
+    private NativeRequiredView nativeRequired;
     private AtlasView atlasMini, atlasFull;
     /** The full-screen map over the game is open (opened by holding the mini map): the controller is hidden, the mini map too. */
     private boolean fullMapOpen;
@@ -136,7 +137,7 @@ public final class MainActivity extends Activity {
         online=new OnlineSettings(this);
         GameInstaller.Host host=modsHost();
         mods=new ModsDialog(this,host); installer=new GameInstaller(this,host);
-        nativeCpu=new NativeCpuDialog(this,new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame),nativeCpuHost());
+        nativeCpu=new NativeCpuDialog(this,nativeCpuHost());
         updater=new AppUpdater(this,new AppUpdater.Host() {
             @Override public void stopGame() { MainActivity.this.stopGame(); }
             @Override public void restartGame() { if (!destroyed && displayReady) MainActivity.this.restartGame(); }
@@ -224,6 +225,13 @@ public final class MainActivity extends Activity {
         atlasFull=atlas.createFull(this);
         atlasFull.setCloseHandler(this::closeFullMap);
         screen.addView(atlasFull,frame(-1,-1,Gravity.FILL));
+        // Instead of the game when its native code is missing or does not fit: above the controller, below the handle and the drawer.
+        nativeRequired=new NativeRequiredView(this,new NativeRequiredView.Actions() {
+            @Override public void openTool() { openUrl(NativeCpu.TOOL_URL); }
+            @Override public void chooseGameFolder() { askGameFolder(gameDir!=null); }
+            @Override public void importFiles() { nativeCpu.show(); nativeCpu.importNow(); }
+        });
+        screen.addView(nativeRequired,frame(-1,-1,Gravity.FILL));
         controllerOverlay.setMiniListener(new TouchControllerOverlay.MiniListener() {
             @Override public void rect(int left,int top,int side) { placeMini(left,top,side); }
             @Override public void editing(boolean on) { atlas.setSuppressed(on); if (on) closeFullMap(); }
@@ -326,7 +334,7 @@ public final class MainActivity extends Activity {
         modsItem=menuItem("ic_extension","Mods","",() -> { closeDrawer(); mods.show(); });
         atlasItem=menuItem("ic_map","Hunter's Atlas","",() -> { closeDrawer(); showAtlas(); });
         onlineItem=menuItem("ic_online","Online","",() -> { closeDrawer(); showOnline(); });
-        nativeCpuItem=menuItem("ic_cpu","Native CPU (recompiled)","",() -> { closeDrawer(); nativeCpu.show(); });
+        nativeCpuItem=menuItem("ic_cpu","Native CPU (required)","",() -> { closeDrawer(); nativeCpu.show(); });
         menuItem("ic_refresh","Restart game","Unsaved progress is lost",() -> new AlertDialog.Builder(this)
             .setTitle("Restart Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> restartGame()).show());
@@ -1071,7 +1079,9 @@ public final class MainActivity extends Activity {
         status.setVisibility(View.VISIBLE);
         new AlertDialog.Builder(this).setTitle("Bloodborne game folder")
             .setMessage("Select the extracted game folder (e.g. CUSA03173 or CUSA00900, which contains eboot.bin) or the folder "
-                +"that holds it, in your phone's storage."+(gameDir!=null ? "\n\nCurrent: "+gameDir : ""))
+                +"that holds it, in your phone's storage.\n\nThe game runs as native code, which the Bloodborne Android Rebuild Tool builds "
+                +"on a PC: the folder it makes holds the game and that code (aot/), and is the one to choose."
+                +(gameDir!=null ? "\n\nCurrent: "+gameDir : ""))
             .setPositiveButton("Choose folder",(d,w) -> {
                 Intent pick=new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
                 try { startActivityForResult(pick,REQUEST_FOLDER); }
@@ -1127,8 +1137,10 @@ public final class MainActivity extends Activity {
         boolean changed=gameDir!=null && !gameDir.equals(dir.getPath());
         gameDir=dir.getPath();
         getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putString("game_dir",gameDir).apply();
-        status.setText("Starting Bloodborne…");
-        if (changed && game!=null) restartGame(); else startPending();
+        status.setText("Starting Bloodborne…"); status.setVisibility(View.VISIBLE);
+        if (changed && game!=null) restartGame();
+        else if (displayReady && game==null) worker.execute(() -> startGame()); // the message for missing native code was up: check again with this folder
+        else startPending();
     }
     // ---- Lossless.dll for Lossless Scaling frame generation (libbloodframe.so reads its shaders) ----
     /** The Lossless.dll run-bionic.sh uses: the app's own copy (bbport/, from Steam or the picker), else one
@@ -1338,7 +1350,7 @@ public final class MainActivity extends Activity {
         } catch (Exception ex) { return null; }
     }
     /** The game folder made by the rebuild tool holds aot/libbbaot.so + .json: copy them into the app's own files (a library cannot be
-     *  loaded from shared storage) and switch the native CPU on; again only when they changed. Off the UI thread (a copy of ~125 MB). */
+     *  loaded from shared storage); again only when they changed. Off the UI thread (a copy of ~125 MB). */
     private String nativeSyncShown="";
     private void syncNativeCpu() {
         if (gameDir==null) return;
@@ -1355,9 +1367,8 @@ public final class MainActivity extends Activity {
             main.post(() -> { if (!destroyed) { status.setText(text); status.setVisibility(View.VISIBLE); } });
         });
         if (result.kind==NativeCpu.SyncKind.IMPORTED) {
-            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).set(NativeCpu.SETTING,"1");
             nativeSyncShown="";
-            main.post(() -> { if (!destroyed) toast("Native CPU imported from the game folder ("+String.format(java.util.Locale.ROOT,"%,d",result.info.unitCount)+" units) and switched on."); });
+            main.post(() -> { if (!destroyed) toast("Native code imported from the game folder ("+String.format(java.util.Locale.ROOT,"%,d",result.info.unitCount)+" units)."); });
         } else if (result.kind==NativeCpu.SyncKind.FAILED && !result.problem.equals(nativeSyncShown)) {
             nativeSyncShown=result.problem;
             android.util.Log.w("Bloodborne",result.problem);
@@ -1379,10 +1390,21 @@ public final class MainActivity extends Activity {
             }
             @Override public void toast(String message) { MainActivity.this.toast(message); }
             @Override public boolean gameRunning() { Process p=game; return p!=null && p.isAlive(); }
-            @Override public boolean startedNative() { return startedNative; }
-            @Override public void restart() { restartGame(); }
+            @Override public void chooseGameFolder() { askGameFolder(gameDir!=null); }
+            @Override public void openUrl(String url) { MainActivity.this.openUrl(url); }
+            @Override public void changed() { nativeCodeChanged(); }
             @Override public void closed() { if (!destroyed) immersive(); }
         };
+    }
+    private void openUrl(String url) {
+        try { startActivity(new Intent(Intent.ACTION_VIEW,android.net.Uri.parse(url))); }
+        catch (Exception ex) { toast("No browser: "+url); }
+    }
+    /** The library was imported or removed in the Native CPU page: the game starts when it fits and nothing runs, else the message shows. */
+    private void nativeCodeChanged() {
+        if (destroyed || !displayReady || game!=null || !hasGame()) return;
+        status.setText("Starting Bloodborne\u2026"); status.setVisibility(View.VISIBLE);
+        worker.execute(() -> startGame());
     }
     private GameInstaller.Host modsHost() {
         return new GameInstaller.Host() {
@@ -1413,6 +1435,7 @@ public final class MainActivity extends Activity {
             @Override public boolean gameRunning() { Process p=game; return p!=null && p.isAlive(); }
             @Override public void stopGame() { MainActivity.this.stopGame(); }
             @Override public void useGame(File dir) { useInstalledGame(dir); }
+            @Override public boolean nativeReady() { return nativeCpu.quickState().ready(); }
             @Override public void installEnded(boolean stopped) {
                 if (destroyed) return;
                 if (!hasGame()) askGameFolder(false);
@@ -1721,7 +1744,15 @@ public final class MainActivity extends Activity {
         if (destroyed) return;
         hadError=false;
         syncNativeCpu(); // the game folder's aot/ (from the rebuild tool) into bbport/aot/
-        startedNative=nativeCpu.quickState().active(); // run-bionic.sh reads native_cpu and finds libbbaot.so now
+        // The game runs as native code only: without a library that fits, the message below stays instead of the game.
+        final NativeCpu.State native_=nativeCpu.startState();
+        final String blocker=native_.blocker();
+        if (blocker!=null) {
+            android.util.Log.w("Bloodborne","native code: "+blocker);
+            main.post(() -> { if (!destroyed) { status.setVisibility(View.GONE); nativeRequired.show(blocker); if (drawerOpen) refreshDrawer(); } });
+            return;
+        }
+        main.post(() -> { if (!destroyed) nativeRequired.hide(); });
         releasePause(false);
         playing=false; gameState(true);
         pickRefreshRate();
@@ -1777,14 +1808,16 @@ public final class MainActivity extends Activity {
                     for (String line:modsLog) out.println(line);
                     out.flush();
                     boolean driverTrouble=false;
+                    String stopLine=null;
                     String line; while ((line=r.readLine())!=null) {
                         out.println(OnlineSettings.scrub(line)); out.flush();
                         if (!driverTrouble && driverTrouble(line)) driverTrouble=true;
+                        if (line.startsWith("STOP:")) stopLine=line; // the native code's own reason (a miss, a library for another game build)
                     }
                     int code=launched.waitFor();
                     if (game==launched) {
                         game=null; releasePause(false);
-                        error("Game stopped ("+code+")."+(driverTrouble
+                        error("Game stopped ("+code+")."+(stopLine!=null ? "\n"+stopLine : "")+(driverTrouble
                             ? " It looks like a GPU driver problem: Menu \u2192 GPU driver, pick another driver package"
                               +" (Download lists more), then restart."
                             : " Open the menu to restart."));

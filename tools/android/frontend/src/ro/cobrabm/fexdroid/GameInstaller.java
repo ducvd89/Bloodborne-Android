@@ -31,6 +31,8 @@ final class GameInstaller {
         void stopGame();
         /** The folder has the game ready: make it the game folder and start (or restart) the game. */
         void useGame(File dir);
+        /** Whether the native code (libbbaot.so) that fits the game is installed: without it the game cannot start. */
+        boolean nativeReady();
         /** The flow ended without a ready game; `stopped`: the installer had stopped the running game. */
         void installEnded(boolean stopped);
     }
@@ -229,7 +231,15 @@ final class GameInstaller {
     private void finished(PkgInstaller.GameResult o) {
         String where=o.gameDir==null ? "" : o.gameDir;
         if (o.ready && !where.isEmpty()) {
-            closed=true; host.useGame(new File(where)); return;
+            if (host.nativeReady()) { closed=true; host.useGame(new File(where)); return; }
+            // The game is in place, but this app runs it as native code only, built once on a PC: say so before the full-screen message.
+            new AlertDialog.Builder(activity).setTitle("Game installed: native code still needed")
+                .setMessage("The game is installed in "+where+".\n\n"+NativeCpu.REQUIRED_TEXT+"\n\n"
+                    +"Easiest: run the Rebuild Tool on a PC with your game PKGs. Its output folder holds the game and the native code "
+                    +"(its aot/ folder) together: copy it to the phone and choose it as the game folder. "+NativeCpu.TOOL_URL)
+                .setCancelable(false)
+                .setPositiveButton("OK",(d,w) -> { closed=true; host.useGame(new File(where)); }).show();
+            return;
         }
         // Not ready: the install found an older version (the base game, or an update before 1.09).
         String title=o.titleId==null ? "" : o.titleId;

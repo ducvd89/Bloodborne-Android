@@ -12,18 +12,25 @@ import java.security.MessageDigest;
 import java.util.Locale;
 import java.util.Map;
 
-/** Native CPU: the game's code compiled ahead of time to ARM64 (libbbaot.so, made on the player's PC with bb-recomp from
- *  their own game dump: docs/NATIVE_CPU.md), run by the runtime in front of the FEX JIT. The files live in
- *  bbport/aot/ (libbbaot.so and libbbaot.json); run-bionic.sh loads the library when it is there, unless bbport.ini
- *  has native_cpu=0 (or a BB_AOT from bionic-local.sh says otherwise). This class reads and checks the files and
- *  imports a picked pair. No Android classes, so it is tested on a desktop JDK (tests/android-native-cpu). */
+/** Native CPU: the game's code compiled ahead of time to ARM64 (libbbaot.so, made once on the player's PC from their own game
+ *  files with the Bloodborne Android Rebuild Tool, TOOL_URL). It is the only way this app runs the game: there is no translator or
+ *  interpreter to fall back on, so the game cannot start without a library that matches the game. The files live in bbport/aot/
+ *  (libbbaot.so and libbbaot.json); run-bionic.sh loads the library (or a BB_AOT from bionic-local.sh). This class reads and checks
+ *  the files and imports a picked pair. No Android classes, so it is tested on a desktop JDK (tests/android-native-cpu). */
 final class NativeCpu {
     private NativeCpu() {}
 
     /** The libbbaot.json layout and the library's ABI (bbr_abi_version, docs/RECOMP_ABI.md) this app and its runtime take. */
     static final int FORMAT = 1, ABI_VERSION = 1;
-    static final String KIND = "bb-recomp-aot", SO = "libbbaot.so", JSON = "libbbaot.json", SETTING = "native_cpu";
-    static final String DOCS = "https://github.com/ducvd89/Bloodborne-Android/blob/master/docs/NATIVE_CPU.md";
+    static final String KIND = "bb-recomp-aot", SO = "libbbaot.so", JSON = "libbbaot.json";
+    /** The Rebuild Tool (Windows/Linux): its README has the step-by-step guide. */
+    static final String TOOL_URL = "https://github.com/ducvd89/Bloodborne-android-rebuild-tool";
+    static final String REQUIRED_TEXT = "This version of the app runs Bloodborne as native code, which you build once on a PC from your own game files "
+        + "with the Bloodborne Android Rebuild Tool (Windows/Linux).";
+    static final String STEPS_TEXT = "1. On a PC, download the Rebuild Tool from its GitHub page (button below) and run it.\n"
+        + "2. Point it at your Bloodborne game folder (with the 1.09 update) and let it build. It takes a few minutes, once.\n"
+        + "3. Copy the folder it makes to your phone and choose it here as the game folder: the native code in its aot/ folder is imported by itself. "
+        + "Or copy libbbaot.so and libbbaot.json and use Import.";
 
     /** A reason shown to the player as it is. */
     static final class Problem extends Exception { Problem(String message) { super(message); } }
@@ -44,10 +51,17 @@ final class NativeCpu {
         String problem;      // why the installed files cannot be used, or null
         Match match = Match.UNKNOWN;
         String matchNote;    // the reason, for a mismatch or an unchecked match
-        boolean enabled;     // native_cpu is not 0
-        boolean manualOverride; // bionic-local.sh sets BB_AOT: it wins over the switch
-        /** The runtime loads the library at the next start. */
-        boolean active() { return installed && info != null && problem == null && enabled && match != Match.MISMATCH && !manualOverride; }
+        boolean manualOverride; // bionic-local.sh sets BB_AOT: that library is the one that runs
+        /** The runtime can load a library that fits (or the player pointed BB_AOT at one) at the next start. */
+        boolean ready() { return manualOverride || (installed && info != null && problem == null && match != Match.MISMATCH); }
+        /** Why the game cannot start, or null when it can. */
+        String blocker() {
+            if (ready()) return null;
+            if (!installed) return "libbbaot.so is missing.";
+            if (problem != null) return problem;
+            if (match == Match.MISMATCH) return "libbbaot.so does not match this game. " + matchNote;
+            return "libbbaot.so is unusable.";
+        }
     }
 
     static File dir(File base) { return new File(base, "aot"); }
@@ -69,12 +83,12 @@ final class NativeCpu {
         Map<?, ?> m = (Map<?, ?>) root;
         if (!KIND.equals(str(m, "kind"))) throw new Problem("That file is not a bb-recomp libbbaot.json.");
         long format = num(m, "format", -1);
-        if (format != FORMAT) throw new Problem("This libbbaot.json has format " + format + "; this app reads format " + FORMAT + ". Use the bb-recomp that matches this app version.");
+        if (format != FORMAT) throw new Problem("This libbbaot.json has format " + format + "; this app reads format " + FORMAT + ". Use the Rebuild Tool version that matches this app version (" + TOOL_URL + ").");
         Info info = new Info();
         info.abiVersion = num(m, "abi_version", -1);
         if (info.abiVersion != ABI_VERSION)
             throw new Problem("This library uses ABI version " + info.abiVersion + "; this app's runtime takes version " + ABI_VERSION
-                + ". Build it again with the bb-recomp that matches this app version (docs/NATIVE_CPU.md).");
+                + ". Build it again with the Rebuild Tool version that matches this app version (" + TOOL_URL + ").");
         info.gameId = str(m, "game_id"); info.gameVersion = str(m, "game_version"); info.gameTitle = str(m, "game_title");
         info.imageHash = str(m, "image_hash"); info.tool = str(m, "tool"); info.created = str(m, "created"); info.soSha256 = str(m, "so_sha256");
         info.unitCount = num(m, "unit_count", 0); info.functionCount = num(m, "function_count", 0); info.soSize = num(m, "so_size", 0);
@@ -173,13 +187,10 @@ final class NativeCpu {
         return false;
     }
 
-    static boolean enabled(Map<String, String> ini) { return !"0".equals(ini.get(SETTING)); }
-
     /** What is installed and whether it fits the game on this phone. `imageHash` is deviceImageHash(...) (null: unknown),
      *  gameId/gameVersion the game folder's param.sfo (null: unknown). Cheap: no hashing here. */
-    static State state(File base, Map<String, String> ini, String imageHash, String gameId, String gameVersion) {
+    static State state(File base, String imageHash, String gameId, String gameVersion) {
         State s = new State();
-        s.enabled = enabled(ini);
         s.manualOverride = manualOverride(base);
         File so = so(base);
         s.installed = so.isFile();
@@ -199,6 +210,31 @@ final class NativeCpu {
         else if (imageHash != null) s.match = Match.MATCH;
         else { s.match = Match.UNKNOWN; s.matchNote = "The game image is not prepared yet: it is checked against this library when it is."; }
         return s;
+    }
+
+    // ---------------------------------------------------------------- the library's own checksum
+
+    private static File verifiedMarker(File base) { return new File(dir(base), "libbbaot.verified"); }
+
+    /** Checks libbbaot.so against the SHA-256 in libbbaot.json (a damaged copy, or a library swapped by hand), at the game's start. The result
+     *  is remembered for this file (size and time), so the 125 MB are read once. Blocking. Returns the problem, or null when it is fine. */
+    static String checksumProblem(File base, Info info) {
+        File so = so(base);
+        String key = so.length() + ":" + so.lastModified() + ":" + info.soSha256.toLowerCase(Locale.ROOT);
+        try {
+            String cached = SafeWrite.readText(verifiedMarker(base));
+            if (cached != null && cached.trim().equals(key)) return null;
+        } catch (IOException ignored) {}
+        try (InputStream in = new java.io.FileInputStream(so)) {
+            MessageDigest sha = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) sha.update(buf, 0, n);
+            if (!hex(sha.digest()).equalsIgnoreCase(info.soSha256))
+                return "libbbaot.so does not match its libbbaot.json (checksum): the file is damaged. Copy or import it again from the PC.";
+        } catch (Exception e) { return "libbbaot.so cannot be read: " + e.getMessage(); }
+        try { SafeWrite.write(verifiedMarker(base), key + "\n"); } catch (IOException ignored) {}
+        return null;
     }
 
     // ---------------------------------------------------------------- import
@@ -272,7 +308,7 @@ final class NativeCpu {
     static final class Sync { SyncKind kind = SyncKind.NONE; Info info; String problem; }
 
     /** The game folder made by the rebuild tool (bb-recomp --pkgs) holds aot/libbbaot.so and aot/libbbaot.json. The runtime cannot load a
-     *  library from shared storage (noexec), so they are copied into bbport/aot/ here, and the native CPU is switched on. Nothing is copied
+     *  library from shared storage (noexec), so they are copied into bbport/aot/ here. Nothing is copied
      *  again while the installed pair is the folder's (same description, so same build and checksum, and the same size). A pair that fails
      *  the checks (ABI, game, checksum) is reported and leaves what is installed alone. Blocking: not for the UI thread. */
     static Sync syncFromGame(File base, File gameDir, String gameId, String gameVersion, Progress progress) {
@@ -300,7 +336,7 @@ final class NativeCpu {
 
     /** Removes the installed library and its description. */
     static void remove(File base) {
-        so(base).delete(); json(base).delete(); new File(dir(base), SO + ".part").delete();
+        so(base).delete(); json(base).delete(); new File(dir(base), SO + ".part").delete(); verifiedMarker(base).delete();
     }
 
     // ---------------------------------------------------------------- text
@@ -309,10 +345,10 @@ final class NativeCpu {
 
     /** The drawer row's second line (no hashing: the cached image hash only). */
     static String summary(State s) {
-        if (!s.installed) return "Not installed";
-        if (s.problem != null || s.info == null) return "Installed, but unusable";
         if (s.manualOverride) return "Set by bionic-local.sh";
-        if (s.match == Match.MISMATCH) return "Installed, another game version";
-        return s.active() ? "On" : "Installed, off";
+        if (!s.installed) return "Required: not installed";
+        if (s.problem != null || s.info == null) return "Installed, but unusable: rebuild it";
+        if (s.match == Match.MISMATCH) return "Another game version: rebuild it";
+        return "Ready";
     }
 }

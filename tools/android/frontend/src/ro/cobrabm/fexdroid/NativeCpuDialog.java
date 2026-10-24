@@ -18,23 +18,21 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.Switch;
 import android.widget.TextView;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-/** Menu -> Native CPU (recompiled): the game's code compiled ahead of time on the player's PC (bb-recomp, docs/NATIVE_CPU.md) and
- *  imported here as libbbaot.so + libbbaot.json (NativeCpu). Shows what is installed and whether it fits this game, imports a picked
- *  pair (the files are checked: ABI version, game, checksum), removes it, and holds the On/Off switch (bbport.ini native_cpu, read by
- *  run-bionic.sh at start). It cannot be downloaded: it is derived from the player's own game. Rows take the gamepad (D-pad, A, B)
- *  and touch. */
+/** Menu -> Native CPU: the status and import page of the game's native code, compiled ahead of time on the player's PC with the Rebuild
+ *  Tool (NativeCpu.TOOL_URL) and imported here as libbbaot.so + libbbaot.json (NativeCpu). The game cannot run without it, so there is no
+ *  switch: the page shows what is installed and whether it fits this game, imports a picked pair (the files are checked: ABI version,
+ *  game, checksum), removes it, and leads to the tool and to the game folder choice. It cannot be downloaded: it is derived from the
+ *  player's own game. Rows take the gamepad (D-pad, A, B) and touch. */
 final class NativeCpuDialog {
     static final int REQUEST_FILES = 11;
     private static final int TEXT = 0xffe8dfc9, GOLD = 0xffc6ad76, WARN = 0xffe5a04b, GOOD = 0xff8fbf7f, DIM = 0xff8e9097;
@@ -47,20 +45,18 @@ final class NativeCpuDialog {
         InputStream open(Uri document) throws IOException;
         void toast(String text);
         boolean gameRunning();
-        /** Whether the running game was started with the native CPU (valid while it runs). */
-        boolean startedNative();
-        void restart();
+        void chooseGameFolder();                      // the activity's own folder choice (it imports the folder's aot/ by itself)
+        void openUrl(String url);
+        void changed();                               // the installed library changed (imported, removed): the activity checks again
         void closed();                                // the dialog went away (the activity returns to immersive mode)
     }
 
     private final Activity activity;
-    private final SettingsDialog settings;
     private final Host host;
     private final Handler main = new Handler(Looper.getMainLooper());
     private AlertDialog dialog;
     private LinearLayout box;
-    private Switch toggle;
-    private Button importButton, removeButton, applyButton;
+    private Button importButton, removeButton, folderButton;
     private boolean busy, restartNote;
     /** The first file of a pair, kept while the player picks the other one. */
     private Uri pendingSo, pendingJson;
@@ -68,8 +64,8 @@ final class NativeCpuDialog {
     private String progressText;
     private volatile boolean closed;
 
-    NativeCpuDialog(Activity activity, SettingsDialog settings, Host host) {
-        this.activity = activity; this.settings = settings; this.host = host;
+    NativeCpuDialog(Activity activity, Host host) {
+        this.activity = activity; this.host = host;
     }
 
     private int dp(float n) { return Math.round(n * activity.getResources().getDisplayMetrics().density); }
@@ -92,7 +88,19 @@ final class NativeCpuDialog {
     /** The state for the drawer row and the activity (cached image hash only: cheap). */
     NativeCpu.State quickState() {
         String[] id = gameIdentity();
-        return NativeCpu.state(host.base(), settings.read(), NativeCpu.deviceImageHash(host.base(), false), id[0], id[1]);
+        return NativeCpu.state(host.base(), NativeCpu.deviceImageHash(host.base(), false), id[0], id[1]);
+    }
+
+    /** The state the game's start is decided by: the image hash computed when it is not cached yet, and the library's checksum checked. Blocking
+     *  (about a second on a phone, once per file): not for the UI thread. */
+    NativeCpu.State startState() {
+        String[] id = gameIdentity();
+        NativeCpu.State s = NativeCpu.state(host.base(), NativeCpu.deviceImageHash(host.base(), true), id[0], id[1]);
+        if (s.installed && s.info != null && s.problem == null && !s.manualOverride) {
+            String bad = NativeCpu.checksumProblem(host.base(), s.info);
+            if (bad != null) s.problem = bad;
+        }
+        return s;
     }
 
     void show() {
@@ -100,8 +108,8 @@ final class NativeCpuDialog {
         box = new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(24), dp(4), dp(24), dp(8));
         ScrollView scroll = new ScrollView(activity); scroll.addView(box);
-        dialog = new AlertDialog.Builder(activity).setTitle("Native CPU (recompiled)").setView(scroll)
-            .setPositiveButton("Apply & restart", null).setNeutralButton("Import libbbaot.so…", null)
+        dialog = new AlertDialog.Builder(activity).setTitle("Native CPU (required)").setView(scroll)
+            .setPositiveButton("Choose game folder", null).setNeutralButton("Import libbbaot.so…", null)
             .setNegativeButton("Close", null).create();
         dialog.setOnKeyListener((d, code, e) -> { // B closes it, A taps the focused control, like the drawer
             if (code == KeyEvent.KEYCODE_BUTTON_B || e.getScanCode() == 305) {
@@ -119,10 +127,10 @@ final class NativeCpuDialog {
         dialog.show();
         // Set after show(): these must not close the dialog by themselves.
         importButton = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
-        applyButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+        folderButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
         dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> { if (!busy) dialog.dismiss(); });
         importButton.setOnClickListener(v -> pickFiles());
-        applyButton.setOnClickListener(v -> apply());
+        folderButton.setOnClickListener(v -> { if (!busy) { dialog.dismiss(); host.chooseGameFolder(); } });
         render(null);
         refresh();
     }
@@ -138,7 +146,7 @@ final class NativeCpuDialog {
         final String[] id = gameIdentity();
         Thread t = new Thread(() -> {
             String hash = NativeCpu.deviceImageHash(host.base(), true);
-            NativeCpu.State s = NativeCpu.state(host.base(), settings.read(), hash, id[0], id[1]);
+            NativeCpu.State s = NativeCpu.state(host.base(), hash, id[0], id[1]);
             main.post(() -> { if (!closed) render(s); });
         }, "NativeCpu-state");
         t.setDaemon(true); t.start();
@@ -147,25 +155,24 @@ final class NativeCpuDialog {
     private void render(NativeCpu.State s) {
         if (box == null) return;
         box.removeAllViews();
-        box.addView(line("Runs the game's code as ARM64 that was compiled ahead of time, instead of translating it while you play: "
-            + "no translation stutter in new areas, and less CPU work.", 13, TEXT, false));
-        TextView help = line("Build it on a PC from your own game dump with the Rebuild Tool (bb-recomp). It cannot be downloaded.\n" + NativeCpu.DOCS
-            + "\nThe tool's output folder is a game folder with aot/ inside: choose it as the game folder and this is imported by itself. "
-            + "Or import libbbaot.so and libbbaot.json by hand below.", 13, GOLD, false);
-        help.setAutoLinkMask(Linkify.WEB_URLS); help.setLinksClickable(true); help.setMovementMethod(LinkMovementMethod.getInstance());
-        help.setLinkTextColor(GOLD);
+        box.addView(line(NativeCpu.REQUIRED_TEXT, 13, TEXT, false));
+        TextView help = line(NativeCpu.STEPS_TEXT, 13, GOLD, false);
         box.addView(help);
+        Button tool = new Button(activity); tool.setText("Open the Rebuild Tool page"); tool.setAllCaps(false);
+        tool.setOnClickListener(v -> host.openUrl(NativeCpu.TOOL_URL));
+        LinearLayout.LayoutParams toolParams = new LinearLayout.LayoutParams(-2, -2); toolParams.topMargin = dp(8);
+        box.addView(tool, toolParams);
 
         TextView heading = line("STATUS", 11, GOLD, true); heading.setLetterSpacing(0.15f); heading.setPadding(0, dp(14), 0, dp(2));
         box.addView(heading);
         if (s == null) {
             box.addView(line(progressText != null ? progressText : "Checking…", 15, progressText != null ? GOLD : DIM, false));
-            setButtons(false, false);
+            setButtons(false);
             return;
         }
         if (!s.installed) {
-            box.addView(line("Not installed", 16, TEXT, true));
-            box.addView(line("Import libbbaot.so and libbbaot.json from the PC.", 13, DIM, false));
+            box.addView(line("Not installed: the game cannot start", 16, WARN, true));
+            box.addView(line("Choose the game folder the tool made, or import libbbaot.so and libbbaot.json from the PC.", 13, DIM, false));
         } else if (s.problem != null || s.info == null) {
             box.addView(line("Installed, but it cannot be used", 16, WARN, true));
             box.addView(line(s.problem, 13, WARN, false));
@@ -174,14 +181,13 @@ final class NativeCpuDialog {
             String head;
             int color;
             if (s.match == NativeCpu.Match.MISMATCH) { head = "Installed: not for this game"; color = WARN; }
-            else if (s.manualOverride) { head = "Installed: set by hand in bionic-local.sh"; color = WARN; }
-            else if (s.active()) { head = "Installed and on"; color = GOOD; }
-            else { head = "Installed, off"; color = TEXT; }
+            else if (s.manualOverride) { head = "Set by hand in bionic-local.sh"; color = WARN; }
+            else { head = "Installed and ready"; color = GOOD; }
             box.addView(line(head, 16, color, true));
             if (s.match == NativeCpu.Match.MISMATCH) box.addView(line(s.matchNote, 13, WARN, false));
             else if (s.match == NativeCpu.Match.MATCH) box.addView(line("Matches this game (image " + i.imageHash + ").", 13, GOOD, false));
             else box.addView(line(s.matchNote, 13, DIM, false));
-            if (s.manualOverride) box.addView(line("bionic-local.sh sets BB_AOT, which wins over the switch below.", 13, WARN, false));
+            if (s.manualOverride) box.addView(line("bionic-local.sh sets BB_AOT: that library runs, not this one.", 13, WARN, false));
             String built = (i.gameTitle != null ? i.gameTitle + " · " : "") + (i.gameId != null ? i.gameId : "?")
                 + " version " + (i.gameVersion != null ? i.gameVersion : "?");
             box.addView(line("Built from: " + built, 13, DIM, false));
@@ -189,52 +195,29 @@ final class NativeCpuDialog {
             box.addView(line("Made by " + (i.tool != null ? i.tool : "bb-recomp") + (i.created != null ? " on " + i.created.replace('T', ' ').replace("Z", " UTC") : ""), 13, DIM, false));
         }
 
-        boolean usable = s.installed && s.info != null && s.problem == null;
-        toggle = new Switch(activity); toggle.setText("Use the native CPU"); toggle.setTextSize(15); toggle.setTextColor(TEXT);
-        toggle.setPadding(0, dp(14), 0, dp(2)); toggle.setChecked(s.enabled); toggle.setEnabled(usable);
-        toggle.setOnCheckedChangeListener((b, c) -> updateApply(s));
-        box.addView(toggle);
-        TextView note = line("Off: the game's code is translated while you play, as before. The switch is read when the game starts.", 13, DIM, false);
-        box.addView(note);
-        if (restartNote || (host.gameRunning() && s.active() != host.startedNative() && s.installed))
-            box.addView(line("Restart the game to apply.", 14, WARN, true));
-        box.addView(line("Code that was not compiled, or changed since (patches, mods), still runs on the translator.", 12, DIM, false));
-        setButtons(!busy, usable);
-        updateApply(s);
+        if (restartNote) box.addView(line("Restart the game to apply.", 14, WARN, true));
+        setButtons(!busy);
         if (s.installed) {
             removeButton = new Button(activity); removeButton.setText("Remove it"); removeButton.setAllCaps(false);
             removeButton.setOnClickListener(v -> new AlertDialog.Builder(activity).setTitle("Remove the native CPU?")
-                .setMessage("Deletes libbbaot.so and libbbaot.json from the app. You can import them again. Restart the game to apply.")
+                .setMessage("Deletes libbbaot.so and libbbaot.json from the app. The game cannot start without them: you can import them again, or choose the tool's game folder.")
                 .setNegativeButton("Cancel", null).setPositiveButton("Remove", (d, w) -> {
-                    NativeCpu.remove(host.base()); restartNote = host.gameRunning(); host.toast("Native CPU removed"); refresh();
+                    NativeCpu.remove(host.base()); restartNote = host.gameRunning(); host.toast("Native CPU removed"); refresh(); host.changed();
                 }).show());
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2); lp.topMargin = dp(12);
             box.addView(removeButton, lp);
         }
     }
 
-    private void setButtons(boolean importOn, boolean applyOn) {
-        if (importButton != null) importButton.setEnabled(importOn);
-        if (applyButton != null) applyButton.setEnabled(applyOn && !busy);
-    }
-
-    /** Apply is for a change of the switch only. */
-    private void updateApply(NativeCpu.State s) {
-        if (applyButton == null || toggle == null) return;
-        applyButton.setEnabled(!busy && toggle.isEnabled() && toggle.isChecked() != s.enabled);
-    }
-
-    private void apply() {
-        if (busy || toggle == null) return;
-        Map<String, String> changed = new LinkedHashMap<>();
-        changed.put(NativeCpu.SETTING, toggle.isChecked() ? "1" : "0");
-        if (!settings.setAll(changed)) { host.toast("The setting could not be saved."); return; }
-        dialog.dismiss();
-        if (host.gameRunning()) host.restart(); // the game reads it at start
-        else host.toast(toggle.isChecked() ? "Native CPU on from the next start" : "Native CPU off from the next start");
+    private void setButtons(boolean on) {
+        if (importButton != null) importButton.setEnabled(on);
+        if (folderButton != null) folderButton.setEnabled(on);
     }
 
     // ---------------------------------------------------------------- import
+
+    /** Opens the file picker for the pair (the full-screen message's Import button). */
+    void importNow() { pickFiles(); }
 
     private void pickFiles() {
         if (busy) return;
@@ -316,8 +299,6 @@ final class NativeCpuDialog {
                         main.post(() -> { if (!closed && busy) { progressText = p; updateProgress(); } });
                     });
                 }
-                // On after a successful import (an earlier Off would otherwise hide it).
-                Map<String, String> on = new LinkedHashMap<>(); on.put(NativeCpu.SETTING, "1"); settings.setAll(on);
             } catch (NativeCpu.Problem p) { problem = p.getMessage(); }
             catch (IOException | RuntimeException e) {
                 problem = "The files could not be read: " + (e.getMessage() != null ? e.getMessage() : e.toString());
@@ -334,6 +315,7 @@ final class NativeCpuDialog {
                     host.toast("Native CPU imported: " + (done.unitCount) + " units");
                 }
                 refresh();
+                if (failure == null) host.changed();
             });
         }, "NativeCpu-import");
         t.setDaemon(true); t.start();

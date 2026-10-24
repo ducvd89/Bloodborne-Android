@@ -86,24 +86,33 @@ public final class NativeCpuTest {
         check(tryInstall(base, goodJson, good, "CUSA00207", "01.09") == null, "good pair is installed");
         check(NativeCpu.so(base).length() == good.length && NativeCpu.json(base).isFile(), "files are in aot/");
         check(!new File(NativeCpu.dir(base), "libbbaot.so.part").exists(), "no .part left");
-        Map<String, String> ini = new HashMap<>();
-        NativeCpu.State s = NativeCpu.state(base, ini, hash, "CUSA00207", "01.09");
-        check(s.installed && s.info != null && s.problem == null && s.match == NativeCpu.Match.MATCH && s.enabled && s.active(), "state: installed, matches, active");
+        NativeCpu.State s = NativeCpu.state(base, hash, "CUSA00207", "01.09");
+        check(s.installed && s.info != null && s.problem == null && s.match == NativeCpu.Match.MATCH && s.ready() && s.blocker() == null, "state: installed, matches, ready");
         check(s.info.unitCount == 185934 && "CUSA00207".equals(s.info.gameId) && hash.equals(s.info.imageHash), "info fields");
-        check("On".equals(NativeCpu.summary(s)), "summary On");
-        ini.put("native_cpu", "0");
-        s = NativeCpu.state(base, ini, hash, "CUSA00207", "01.09");
-        check(!s.enabled && !s.active() && "Installed, off".equals(NativeCpu.summary(s)), "switch off");
-        ini.put("native_cpu", "1");
-        s = NativeCpu.state(base, ini, null, null, null);
-        check(s.match == NativeCpu.Match.UNKNOWN && s.active() && s.matchNote != null, "no image yet: unknown, still usable");
-        s = NativeCpu.state(base, ini, "0123456789abcdef", "CUSA00207", "01.09");
-        check(s.match == NativeCpu.Match.MISMATCH && !s.active() && s.matchNote.contains("another build"), "image mismatch: not active");
+        check("Ready".equals(NativeCpu.summary(s)), "summary Ready");
+        check(NativeCpu.checksumProblem(base, s.info) == null && new File(NativeCpu.dir(base), "libbbaot.verified").isFile(), "checksum fine, remembered");
+        check(NativeCpu.checksumProblem(base, s.info) == null, "checksum from the marker");
+        s = NativeCpu.state(base, null, null, null);
+        check(s.match == NativeCpu.Match.UNKNOWN && s.ready() && s.matchNote != null, "no image yet: unknown, still usable");
+        s = NativeCpu.state(base, "0123456789abcdef", "CUSA00207", "01.09");
+        check(s.match == NativeCpu.Match.MISMATCH && !s.ready() && s.matchNote.contains("another build") && s.blocker().contains("does not match this game")
+            && "Another game version: rebuild it".equals(NativeCpu.summary(s)), "image mismatch: the game cannot start");
         Files.write(new File(base, "bionic-local.sh").toPath(), "#!/bin/sh\n# export BB_AOT=0\nexport BB_AOT=0\n".getBytes(StandardCharsets.UTF_8));
-        s = NativeCpu.state(base, ini, hash, null, null);
-        check(s.manualOverride && !s.active() && "Set by bionic-local.sh".equals(NativeCpu.summary(s)), "bionic-local.sh BB_AOT wins");
+        s = NativeCpu.state(base, hash, null, null);
+        check(s.manualOverride && s.ready() && "Set by bionic-local.sh".equals(NativeCpu.summary(s)), "bionic-local.sh BB_AOT is what runs");
         Files.write(new File(base, "bionic-local.sh").toPath(), "# export BB_AOT=0\nexport BB_X=1\n".getBytes(StandardCharsets.UTF_8));
         check(!NativeCpu.manualOverride(base), "a commented BB_AOT is not an override");
+
+        // a library damaged after the import (the checksum is checked at the game's start)
+        {
+            File b4 = temp(); bootFile(b4, image);
+            check(tryInstall(b4, goodJson, good, "CUSA00207", "01.09") == null, "installed again");
+            NativeCpu.State st4 = NativeCpu.state(b4, hash, "CUSA00207", "01.09");
+            byte[] damaged = good.clone(); damaged[5000] ^= 1;
+            Files.write(NativeCpu.so(b4).toPath(), damaged);
+            check(NativeCpu.checksumProblem(b4, st4.info) != null && NativeCpu.checksumProblem(b4, st4.info).contains("checksum"), "a damaged library is caught by its checksum");
+            check(NativeCpu.REQUIRED_TEXT.startsWith("This version of the app runs Bloodborne as native code, which you build once on a PC from your own game files with the Bloodborne Android Rebuild Tool (Windows/Linux)."), "the message text");
+        }
 
         // refusals (each leaves the installed pair alone)
         File b2 = temp(); bootFile(b2, image);
@@ -139,14 +148,14 @@ public final class NativeCpuTest {
         byte[] other = so(183, 120000);
         check(tryInstall(b3, json("CUSA00207", "01.09", hash, other, 1, 1), other, null, null) == null && NativeCpu.so(b3).length() == 120000, "re-import replaces");
         Files.write(NativeCpu.json(b3).toPath(), goodJson.getBytes(StandardCharsets.UTF_8));
-        s = NativeCpu.state(b3, ini, null, null, null);
-        check(s.problem != null && s.problem.contains("not the one libbbaot.json describes") && !s.active(), "so and json of different builds");
+        s = NativeCpu.state(b3, null, null, null);
+        check(s.problem != null && s.problem.contains("not the one libbbaot.json describes") && !s.ready() && s.blocker() != null, "so and json of different builds");
         Files.delete(NativeCpu.json(b3).toPath());
-        s = NativeCpu.state(b3, ini, null, null, null);
+        s = NativeCpu.state(b3, null, null, null);
         check(s.problem != null && s.problem.contains("json is missing"), "json missing");
         NativeCpu.remove(b3);
-        s = NativeCpu.state(b3, ini, null, null, null);
-        check(!s.installed && "Not installed".equals(NativeCpu.summary(s)), "removed");
+        s = NativeCpu.state(b3, null, null, null);
+        check(!s.installed && !s.ready() && "libbbaot.so is missing.".equals(s.blocker()) && "Required: not installed".equals(NativeCpu.summary(s)), "removed: the game cannot start");
 
         // the game folder's aot/ (made by bb-recomp --pkgs)
         File phone = temp(), game = temp(), aot = new File(game, "aot");
