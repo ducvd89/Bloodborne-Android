@@ -35,6 +35,7 @@ fallback, compiled under the names bb_fb_* (`cpu/guest_cpu_rename.h`, BB_AOT_FAL
 ## Open suspects / not done
 
 - x86 flags are not passed to the fallback; flags are only stored by units at tail jumps. Fine at calls; unchecked for a tail jump into native code.
+- (Phase 4, branch recomp-hooks: patches with fixed bytes run as precompiled variants, and hook sites are native slots: docs/RECOMP_HOOKS.md, RECOMP_ABI.md "Variants" / "Hook slots".)
 - Hooks installed at run time rely on `guest_cpu_invalidate`; start-up hooks/patches are found by the unit hashes. Entry patching of dirty units needs a
   writable .so text (mprotect): refused by Android's policy probably, then direct calls from other units still run stale units (request: dirty flag in units).
 - `guest_call_sites` (wait profiling, runtime_kernel.c) scans the host stack on x86-64 and finds no guest frames in AOT mode (diagnostics only).
