@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the game-free Android runtime archive embedded in the release APK.
 
-Bionic only: the Android NDK build of the game process (build_bionic.sh: bb-probe, libbbgpu, libbbcpu,
+Bionic only: the Android NDK build of the game process (build_bionic.sh: bb-probe, libbbgpu, libbbcpu (the native units engine, no FEXCore),
 bb-prepare, kgsl-chip-id), the Bionic PKG tool (build_pkg_tool.sh android), the pre-compiled game patches
 (build_patch_parts.py) and the launch script. No Linux rootfs, no glibc libraries, no Python.
 
@@ -12,7 +12,7 @@ Archive layout (everything under bbport/, extracted into the app's files directo
                        libbbnet20.so: online play, loaded by bb-probe only with BB_ONLINE=1)
   bbport/bionic/share/ cacert.pem   (Mozilla's CA bundle: the online module's HTTPS trust, BB_CA_BUNDLE overrides)
   bbport/patch-parts/  the settings' BBPATCH2 files (effects, model LOD, resolutions, cheats, ...)
-  bbport/run-bionic.sh bbport/fex-compatible.json bbport/bbport.default.ini
+  bbport/run-bionic.sh bbport/bbport.default.ini
   bbport/licenses/     ps4-pkg-tool.NOTICE, bloodframe-* (the licences of what libbloodframe.so contains), cacert-source.txt and the
                        licences of what libbbnet20.so contains (OpenSSL, protobuf, miniupnpc, nlohmann/json, cpp-httplib)
   bbport/data bbport/logs bbport/user   (empty folders)
@@ -44,7 +44,6 @@ LSFG_LICENSES = ('bloodframe-lsfg-vk.LICENSE.md', 'bloodframe-dxbc.LICENSE', 'bl
                  'bloodframe-source.txt')
 FILES = (
     ('tools/android/run-bionic.sh', 'run-bionic.sh', 0o755),
-    ('tools/android/fex-compatible.json', 'fex-compatible.json', 0o644),
     ('tools/android/thor.ini', 'bbport.default.ini', 0o644),
     ('tools/android/ps4-pkg-tool.NOTICE', 'licenses/ps4-pkg-tool.NOTICE', 0o644),
 )
