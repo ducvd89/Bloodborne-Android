@@ -345,6 +345,10 @@ struct Lifter::Impl {
   std::vector<std::pair<uint64_t, uint64_t>> tables; // jump table bytes found so far in this function (host addresses)
   uint64_t imgLo = 0, imgHi = 0;                     // mapped image range (host addresses)
   bool onlyBounded = false;                          // gap units: only trust tables whose bound was found (the unit may be junk)
+  // Jump tables resolved by earlier units of the current function (pc -> the jump): a secondary unit entered inside a loop
+  // often holds the table jump without the lea that loads the table base (it sits before the loop, in the entry unit), so it
+  // reuses the entry unit's result (lift() clears this per function).
+  std::map<uint64_t, jt::Jump> fnJumps;
   fextl::set<uint64_t> external;                     // branch targets the decoder left out of the multiblock (more than 4 pages ahead, or behind the entry)
   using Step = StepKind;
   Step step(uint64_t pc, uint64_t lo, uint64_t hi, uint64_t end, uint64_t& len, std::string* why);
@@ -411,6 +415,14 @@ std::vector<jt::Jump> Lifter::Impl::analyseJumps(uint64_t lo, uint64_t hi, Gen* 
   env.lo = lo; env.hi = hi;
   env.readS32 = [this](uint64_t a, int32_t& v) { if (a < imgLo || a + 4 > imgHi) return false; memcpy(&v, (const void*)a, 4); return true; };
   auto r = jt::analyze(ins, env);
+  for (auto& j : r) {
+    if (j.why == jt::Why::Resolved && !j.targets.empty()) { fnJumps[j.pc] = j; continue; }
+    auto c = fnJumps.find(j.pc);
+    if (c == fnJumps.end()) continue;
+    jt::Jump k = c->second;
+    k.targets.erase(std::remove_if(k.targets.begin(), k.targets.end(), [&](uint64_t t) { return t < lo || t >= hi; }), k.targets.end());
+    if (!k.targets.empty()) j = k;
+  }
   if (getenv("BBR_DEBUG_JUMPS")) {
     // Debugging aid: the instructions before every indirect jump, as the analysis sees them.
     std::map<uint64_t, const X86Tables::DecodedInst*> raw;
@@ -640,6 +652,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
   const uint64_t lo = impl_->img.base + f.start, hi = impl_->img.base + f.end;
   tl_range = {lo, hi};
   tl_log = &log_;
+  impl_->fnJumps.clear();
   Impl::Gen g;
   std::vector<uint64_t> extraEntries, retSites, outTargets, leaTargets; // gap unit entries (host addresses), setjmp return sites and out-of-function branch targets (image vaddrs)
   impl_->tables.clear();
