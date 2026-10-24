@@ -45,6 +45,8 @@ struct Ins {
   K kind = K::Other;
   uint8_t cc = 0;           // Jcc: x86 condition code (7 = A, 3 = AE ...)
   Op dst, src;
+  bool flagSafe = false;    // leaves the flags alone (mov, lea, movzx, push, pop, nop ...): may sit between a cmp and its jcc
+  uint16_t clobber = 0xffff; // Clobber: the registers it writes (bit n: x86 register n); everything when the lifter does not know
 };
 
 enum class Why : uint8_t {

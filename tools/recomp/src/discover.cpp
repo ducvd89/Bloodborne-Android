@@ -1,5 +1,8 @@
 #include "discover.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <set>
 #include <thread>
@@ -17,7 +20,31 @@ struct Index {
 };
 } // namespace
 
-DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, std::map<uint64_t, std::vector<uint64_t>>& entryUnits, const LiftOptions& liftOpt, unsigned jobs) {
+std::vector<uint64_t> readEntryList(const char* path, std::string& err) {
+  std::vector<uint64_t> out;
+  FILE* f = fopen(path, "r");
+  if (!f) { err = std::string("cannot open ") + path; return out; }
+  char line[1024];
+  while (fgets(line, sizeof line, f)) {
+    const char* p = line;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '#' || *p == '\n' || *p == '\r' || !*p) continue;
+    if (!strncmp(p, "miss ", 5)) p += 5;
+    while (*p == ' ') ++p;
+    if (*p == '+') ++p;
+    char* e = nullptr;
+    const uint64_t a = strtoull(p, &e, 16);
+    if (e == p) continue;
+    out.push_back(a);
+  }
+  fclose(f);
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+  return out;
+}
+
+DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, std::map<uint64_t, std::vector<uint64_t>>& entryUnits, const LiftOptions& liftOpt, unsigned jobs,
+                               const std::vector<uint64_t>* extra) {
   DiscoverResult res;
   // Code range of each module: from its first FDE to its last (data pointers outside are not function pointers: rodata, strings).
   std::vector<std::pair<uint64_t, uint64_t>> code;
@@ -27,6 +54,17 @@ DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, st
     if (hi) code.push_back({lo, hi});
   }
   auto inCode = [&](uint64_t a) { for (auto& c : code) if (a >= c.first && a < c.second) return true; return false; };
+  // A direct call/jmp/jcc target found by lifting is certain control flow, not a data pointer that merely looks like one: it counts anywhere in
+  // an executable segment of a module, also before the first FDE and after the last (crt start-up code has no FDE: the eboot's static
+  // initialiser runner at +0x20, called from the entry point, lies before the first FDE function at +0xa0, and the units missed it).
+  auto inExec = [&](uint64_t a) {
+    if (inCode(a)) return true;
+    for (auto& m : img.modules) {
+      if (a < m.base || a >= m.base + m.size) continue;
+      for (auto& sg : img.loads) if ((sg.flags & 1) && a >= sg.vaddr && a < sg.vaddr + sg.filesz) return true;
+    }
+    return false;
+  };
 
   LiftOptions lo = liftOpt;
   // The units are lifted as they will be compiled (gap units, landing pads, setjmp sites and the entries found so far), because a
@@ -40,6 +78,15 @@ DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, st
     for (auto& r : img.links.relocs)
       if (r.kind == 0 && inCode(r.value)) fromReloc.insert(r.value);
   pending = fromReloc;
+  std::set<uint64_t> fromExtra;
+  if (extra)
+    for (uint64_t a : *extra) {
+      ++res.extraGiven;
+      bool inImage = false;
+      for (auto& m : img.modules) if (a >= m.base && a < m.base + m.size) inImage = true;
+      if (!inImage) { ++res.extraRejected; continue; }
+      fromExtra.insert(a); pending.insert(a);
+    }
 
   std::vector<Func> frontier = funcs;   // round 0: every function, to collect its outgoing targets
   std::set<uint64_t> midSeen, holeSeen, touched; // touched: functions that got a new extra entry (lifted again)
@@ -70,14 +117,14 @@ DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, st
       for (size_t k = 0; k < frontier.size(); ++k) if (!okay[k]) bad.insert(frontier[k].start);
       if (!bad.empty()) {
         funcs.erase(std::remove_if(funcs.begin(), funcs.end(), [&](const Func& f) { return f.kind == 3 && bad.count(f.start); }), funcs.end());
-        for (uint64_t b : bad) if (fromReloc.count(b)) ++res.relocRejected;
+        for (uint64_t b : bad) { if (fromReloc.count(b)) ++res.relocRejected; if (fromExtra.count(b)) { ++res.extraRejected; if (res.extraNew) --res.extraNew; fprintf(stderr, "bb-recomp: extra entry +%#llx does not decode as code: ignored\n", (unsigned long long)b); } }
       }
     }
 
     // New candidates: the targets found plus the pending relocation pointers (round 0).
     std::set<uint64_t> cand = std::move(pending);
     pending.clear();
-    for (auto& v : targets) for (uint64_t t : v) if (inCode(t)) cand.insert(t);
+    for (auto& v : targets) for (uint64_t t : v) if (inExec(t)) cand.insert(t);
     // Address-taken code (`lea reg, [rip+f]`): only targets outside every function count (a lea inside a function is a label or a jump table).
     {
       Index li{funcs};
@@ -88,6 +135,11 @@ DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, st
     std::vector<Func> added;
     for (uint64_t t : cand) {
       const long i = idx.find(t);
+      if (fromExtra.count(t)) {
+        if (i >= 0 && funcs[i].start == t) ++res.extraFuncStarts;
+        else if (i >= 0 && funcs[i].kind != 3) ++res.extraMid;
+        else ++res.extraNew;
+      }
       if (i < 0) {
         if (holeSeen.insert(t).second) { added.push_back({t, t + 1, 0, 3}); if (fromReloc.count(t)) ++res.relocCandidates; else if (fromLea.count(t)) ++res.leaCandidates; else ++res.branchCandidates; }
       } else if (funcs[i].kind == 3 && funcs[i].start != t) {

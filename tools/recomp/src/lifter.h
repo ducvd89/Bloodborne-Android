@@ -4,6 +4,7 @@
 #pragma once
 #include "elf_image.h"
 #include "fde_scan.h"
+#include "jumptable.h"
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -30,6 +31,10 @@ struct LiftOptions {
   bool collectTargets = false;                          // FuncResult::outTargets: direct call/jmp/jcc targets outside the function (discovery)
   const std::set<uint64_t>* forceGuestOpcode = nullptr; // image vaddrs of instructions that always get a GuestOpcode marker (hook sites, hook resume points; docs/RECOMP_ABI.md, "Hook slots")
   uint64_t maxInst = 0x10000;  // decoder limit per unit (FEX's own buffer limit is 0x10000)
+  // Granular entries (docs/RECOMP_ABI.md, "Granular entries"): every unit of these functions can be entered at every instruction boundary it holds
+  // (a dispatch switch at the unit entry, like the resume entries). granularFuncs: function starts (image vaddrs); granularAll: every function.
+  const std::set<uint64_t>* granularFuncs = nullptr;
+  bool granularAll = false;
 };
 
 enum class LiftStatus : uint8_t {
@@ -76,11 +81,21 @@ struct FuncResult {
   std::vector<uint64_t> leaTargets;      // collectTargets: `lea reg, [rip+x]` targets (address-taken code), image vaddrs, sorted, unique
   uint32_t entryUnitsLifted = 0;         // units lifted at entryUnits addresses
   std::vector<std::string> jmpExamples; // "vaddr reason" of unresolved jmp reg / table-like jumps (first few)
+  // Table-like indirect jumps whose case set is not known for sure: unresolved (the table was not found or has no usable bound) or resolved only by scanning
+  // the table to its first non-target entry. A function with one gets granular entries by default.
+  struct WeakJump { uint64_t pc; uint8_t why; uint64_t table; uint32_t entries; bool scanned; };
+  std::vector<WeakJump> weakJumps;
+  bool granular = false;                 // the function was lifted with granular entries
 };
 
 // What the lowering needs to know about a unit besides its IR: the resolved jump tables (image vaddrs).
 struct SwitchInfo { uint64_t jmpVaddr; std::vector<uint64_t> targets; };
-struct UnitMeta { std::vector<SwitchInfo> switches; uint64_t end = 0; /* image vaddr just past the last decoded byte of the unit (0: unknown) */ };
+struct UnitMeta {
+  std::vector<SwitchInfo> switches;
+  uint64_t end = 0; /* image vaddr just past the last decoded byte of the unit (0: unknown) */
+  bool granular = false;          // the unit gets an entry at every instruction boundary it holds (insts)
+  std::vector<uint64_t> insts;    // image vaddrs of the instruction boundaries the unit decoded (granular units only), sorted, unique
+};
 
 // Receives each lifted unit while its IR is alive (valid only inside the call): entry is the image vaddr,
 // irView a `const FEXCore::IR::IRListView*` (the lowering casts it back).

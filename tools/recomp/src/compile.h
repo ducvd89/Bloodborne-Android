@@ -30,6 +30,13 @@ struct CompileOptions {
   bool calleeSaved = true;        // see LowerOptions
   bool dirtyCheck = true;         // every unit tests bbr_dirty[its index] first (--no-dirty-check)
   bool resumeEntries = false;     // see LowerOptions
+  // Granular entries (docs/RECOMP_ABI.md, "Granular entries"): units that can be entered at every instruction boundary. Jumps (default): the functions
+  // with a table-like indirect jump whose cases are not known for sure; All: every function (a size and compile time experiment); Off.
+  enum class Granular { Off, Jumps, All } granular = Granular::Jumps;
+  std::string granularList;       // --granular-funcs: a file of image addresses; the functions holding them are granular too
+  std::string unitsDump;          // --dump-units: the unit table (entry, end, extra, function, granular) as text
+  std::vector<uint64_t> checkEntries; // --check-entries: image addresses that must be a unit entry or a granular entry (exit status 3 when one is not)
+  bool unitsOnly = false;         // --units-only: stop after the unit set is known (dump, check), no code
   std::vector<std::string> variantPaths; // variant catalogs (files or directories of *.txt): patch variants and native hook sites (docs/RECOMP_ABI.md)
   bool variantReport = false;     // list every variant and hook site in the summary
 };

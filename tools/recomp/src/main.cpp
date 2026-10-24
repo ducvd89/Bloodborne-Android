@@ -39,6 +39,7 @@ static void usage() {
         "  --no-switch-tables   do not resolve jump tables (indirect jmps go through the dispatcher)\n"
         "  --no-discovery       skip the search for code without an FDE (data pointers, branch targets outside every function)\n"
         "  --no-secondary       no extra units for C++ landing pads and setjmp return sites\n"
+        "  --extra-entries <file>  addresses that must be unit entries: the runtime's misses log (aot-misses.log, `miss +0x...` lines) or one hex address per line\n"
         "  --validate           run FEX's IR validation pass on every unit\n"
         "  --no-passes          skip the x87 and dead-flag passes\n"
         "  --no-size-hist       skip ir_ops_by_size.csv\n"
@@ -53,6 +54,12 @@ static void usage() {
         "                       worker count lower, until the peak fits in 60% of the available RAM; 1 for --emit-ll)\n"
         "  --plan-only          print the memory plan (jobs, shards, estimated peak) and stop\n"
         "  --mem-fraction <f>   share of the available memory the compile may use (default 0.6)\n"
+        "  --granular off|jumps|all   granular entries: units enterable at every instruction boundary (default jumps: the functions with table-like indirect\n"
+        "                       jumps the lifter could not resolve for sure; all: every function, a size and compile time experiment)\n"
+        "  --granular-funcs <file>   more granular functions: the functions holding the addresses in the file (a misses log works too)\n"
+        "  --dump-units <file>  write the unit table (entry, end, extra, function, granular) as text, then go on\n"
+        "  --check-entries <hex,hex,...>   image offsets that must be a unit entry or a granular entry; prints each, exit status 3 when one is not\n"
+        "  --units-only         stop once the unit set is known (with --dump-units / --check-entries): no code is generated\n"
         "  --verify-llvm        run the LLVM verifier on every module\n"
         "  --flags-at-calls     also store NZCV before calls and returns (x86 flags are dead there; off by default)\n"
         "  --no-dirty-check     no `if (bbr_dirty[unit]) bbr_dirty_entry()` at the start of every unit (default: on)\n"
@@ -66,7 +73,7 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
-  std::string elf = "out/eboot.elf", funcsFile, dumpArg, bootFile, prxDir;
+  std::string elf = "out/eboot.elf", funcsFile, dumpArg, bootFile, prxDir, extraFile;
   uint64_t base = 0x200000000ull;
   bool scanOnly = false, nice = true, dump = false, noSecondary = false, noDiscovery = false;
   CensusOptions co;
@@ -98,6 +105,7 @@ int main(int argc, char** argv) {
     else if (is("--no-switch-tables")) co.lift.switchTables = false;
     else if (is("--no-secondary")) noSecondary = true;
     else if (is("--no-discovery")) noDiscovery = true;
+    else if (is("--extra-entries")) extraFile = arg();
     else if (is("--validate")) co.lift.validate = true;
     else if (is("--no-passes")) co.lift.passes = false;
     else if (is("--no-size-hist")) co.sizeHist = false;
@@ -113,6 +121,21 @@ int main(int argc, char** argv) {
     else if (is("-O1")) cc.target.opt = 1;
     else if (is("-O2")) cc.target.opt = 2;
     else if (is("--shards")) { cc.shards = std::max(1, atoi(arg())); shardsSet = true; }
+    else if (is("--granular")) { std::string g = arg(); if (g == "off") cc.granular = CompileOptions::Granular::Off; else if (g == "jumps") cc.granular = CompileOptions::Granular::Jumps; else if (g == "all") cc.granular = CompileOptions::Granular::All; else { usage(); return 2; } }
+    else if (is("--granular-funcs")) cc.granularList = arg();
+    else if (is("--dump-units")) cc.unitsDump = arg();
+    else if (is("--check-entries")) {
+      std::string l = arg();
+      for (size_t p = 0; p < l.size();) {
+        char* e = nullptr; const char* c = l.c_str() + p;
+        if (*c == '+') ++c;
+        const uint64_t a = strtoull(c, &e, 16);
+        if (e == c) break;
+        cc.checkEntries.push_back(a);
+        p = e - l.c_str(); while (p < l.size() && (l[p] == ',' || l[p] == ' ')) ++p;
+      }
+    }
+    else if (is("--units-only")) cc.unitsOnly = true;
     else if (is("--verify-llvm")) cc.verify = true;
     else if (is("--plan-only")) cc.planOnly = true;
     else if (is("--mem-fraction")) cc.memFraction = std::max(0.05, atof(arg()));
@@ -181,15 +204,25 @@ int main(int argc, char** argv) {
     if (!rt.targets.empty() || !rt.gotSlots.empty()) { co.lift.retTwiceTargets = &rt.targets; co.lift.retTwiceSlots = &rt.gotSlots; }
   }
   co.lift.entryUnits = &entryUnits;
+  std::vector<uint64_t> extraEntries;
+  if (!extraFile.empty()) {
+    extraEntries = readEntryList(extraFile.c_str(), err);
+    if (!err.empty()) { fprintf(stderr, "bb-recomp: %s\n", err.c_str()); return 1; }
+    printf("extra entries: %zu addresses from %s\n", extraEntries.size(), extraFile.c_str());
+    if (noDiscovery) { fprintf(stderr, "bb-recomp: --extra-entries needs the discovery (not --no-discovery)\n"); return 2; }
+  }
   if (!noDiscovery && !scanOnly) {
-    const DiscoverResult d = discoverEntries(img, funcs, entryUnits, co.lift, co.jobs);
+    const DiscoverResult d = discoverEntries(img, funcs, entryUnits, co.lift, co.jobs, extraEntries.empty() ? nullptr : &extraEntries);
     printf("discovery (%u rounds): %zu relocation pointers into code outside any FDE function (%zu did not decode), %zu more through rip-relative lea, %zu through branches: %zu functions added (%.2f MB), %zu call/jmp targets inside functions that no unit started at\n",
            d.rounds, d.relocCandidates, d.relocRejected, d.leaCandidates, d.branchCandidates, d.pseudoFuncs, d.pseudoBytes / 1e6, d.midEntries);
+    if (!extraEntries.empty())
+      printf("  extra entries: %zu addresses: %zu already function starts, %zu in the middle of functions (units), %zu new pseudo-functions, %zu rejected (outside the image or not code)\n",
+             d.extraGiven, d.extraFuncStarts, d.extraMid, d.extraNew, d.extraRejected);
   }
   if (scanOnly) return 0;
   if (dump) return dumpFunction(img, funcs, strtoull(dumpArg.c_str(), nullptr, 16), co.lift);
 #ifdef BB_RECOMP_LLVM
-  if (!cc.llPath.empty() || !cc.objPath.empty() || !cc.soPath.empty() || cc.planOnly) {
+  if (!cc.llPath.empty() || !cc.objPath.empty() || !cc.soPath.empty() || cc.planOnly || cc.unitsOnly || !cc.unitsDump.empty() || !cc.checkEntries.empty()) {
     cc.lift = co.lift; cc.jobs = co.jobs; cc.limit = co.limit; cc.jobsFixed = jobsSet; cc.shardsFixed = shardsSet;
     if (!shardsSet && !cc.llPath.empty() && cc.objPath.empty() && cc.soPath.empty()) cc.shards = 1;
     return runCompile(img, funcs, cc);
