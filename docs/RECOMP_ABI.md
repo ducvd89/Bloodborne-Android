@@ -15,7 +15,10 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
 - **Unit table.** The `.so` exports `bbr_units[]`, a sorted array of `{ uint64_t vaddr; void (*fn)(GuestState*); }`
   with one entry per unit entry (every FDE start plus every gap unit). It also exports `bbr_unit_count`,
   `bbr_image_hash` (FNV-1a 64 of the patched image file the `.so` was built from), `bbr_abi_version` (1) and
-  the writable `bbr_image_base`. The unit functions themselves have hidden visibility: the table is the only
+  the writable `bbr_image_base`. Added by the runtime step (2026-10-24): `bbr_unit_hash[unit_count]` (FNV-1a 64 of the bytes
+  `[units[i], units[i+1])` of the executable segment, the last unit to `bbr_text_end`; byte 0x65 hashed as 0x64 because
+  bb-prepare turns `fs:` into `gs:` in the image) and `bbr_unit_extra[unit_count]` (1: a switch case body, part of the function
+  of the nearest preceding unit with 0). The unit functions themselves have hidden visibility: the table is the only
   way in.
   *Change from the first draft:* call-return blocks are **not** table entries. Re-entering the middle of a
   unit would need an entry stub per call site (about 1.6 M in the game) and a resume switch in every unit.
@@ -126,3 +129,43 @@ x86-64 and runs on the PC:
 - **Game functions** are checked against native x86 execution of the original code on the PC. Native
   x86 is the oracle, which is stronger than FEX.
 - **AArch64-only intrinsics** each need a generic fallback, so the x86-64 test build keeps working.
+
+## Runtime requests (cpu/guest_cpu_aot.cpp, 2026-10-24)
+
+What the runtime does with the units, and what it still wants from the tool.
+
+**Done in the runtime, no lowering change needed**
+
+- **Image check.** The runtime cannot hash the ELF (the prepared image differs: fs->gs prefixes, then start-up patches and
+  hooks), so before the first guest call it hashes each unit's range of the loaded image and compares with `bbr_unit_hash`.
+  More than 25 % different: the .so is refused (wrong image). Otherwise the differing units are *dirty*: patches and hooks are
+  found without any `guest_cpu_invalidate` call. `BB_AOT_ELF=<eboot.elf>` additionally compares `bbr_image_hash`.
+- **Dirty units** (the above, plus `guest_cpu_invalidate`/`guest_cpu_hook` ranges later) leave the dispatch table, and the whole
+  function goes (the `bbr_unit_extra` units follow their function: case bodies are entered by jumps with no return address on
+  top of the stack, so they cannot run on the fallback alone). Direct unit-to-unit calls bypass the table, so the runtime also
+  overwrites the entry of a dirty unit with a jump to `bbr_dirty_unit(s, vaddr)` (23 bytes on x86-64, 24 on ARM64; needs the
+  .so text writable for a moment: `mprotect`). **Android's SELinux policy may refuse that** (no execmod on app files); then
+  only the table changes and direct calls still run the stale unit. Request: *optional flag check at unit entry*, e.g. a
+  `bbr_dirty[unit]` byte array and `if (bbr_dirty[idx]) return bbr_dirty_unit(s, vaddr)` as the first thing in each unit (one
+  load and a predictable branch), or the same through a patchable slot table.
+- **Import thunks.** A call to the game's PLT (`jmp *[rip+disp]`, outside every FDE) has no unit; the dispatcher follows the
+  thunk to the host-function stub instead of running the fallback (5.7 M of these in 2 minutes of the title screen).
+
+**Requests**
+
+1. **Mid-unit jump targets.** `bbr_dispatch_tail` is called with targets that are inside a unit but start none (a switch whose
+   table the tool did not resolve, jumping into the middle of another case body; 20 in 2 minutes). The code runs natively
+   from there, but the stack holds no return address on top, so the runtime runs the fallback to the *end of the guest stack*
+   (everything above that frame becomes native/FEX too). Better: the tool makes those targets unit entries. The runtime can
+   list them (`BB_AOT_STATS=1` prints the miss addresses; the "mid-unit jumps" counter is separate): feed such a list back as
+   `--entries`, or resolve the jump tables. Alternatively export `bbr_unit_end[]` and CFA info so the runtime can find the
+   frame's return slot.
+2. **Direct calls are not counted**; to measure AOT versus fallback the tool could emit a per-unit counter (debug builds only).
+3. **Unit extents.** The runtime assumes a unit covers `[vaddr, next unit's vaddr)`; `bbr_unit_end[]` would make dirty marking exact.
+
+**Fallback CPU conventions** (what the lowering may rely on): the guest stack is real; at a miss the return address is on top of
+the stack and the fallback returns exactly there with `s->rip` = that address and rsp popped; if the guest returns anywhere else
+the fallback returns with `s->rip` = a sentinel and every unit frame unwinds through the `rip != retaddr` check up to
+`guest_cpu_call`, which continues from `s->rip` (a unit entry runs as a unit, anything else on the fallback to the sentinel).
+x86 flags are not transferred to the fallback (dead at calls). `GuestState.InlineJITBlockHeader` (offset 0) is used by the
+x86-64 native fallback to keep the host stack pointer; the lowering never touches it.

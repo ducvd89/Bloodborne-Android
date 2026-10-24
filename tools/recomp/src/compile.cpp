@@ -35,7 +35,7 @@ struct ShardStats {
   double liftLower = 0, opt = 0, codegen = 0;
   uint64_t funcs = 0, units = 0, unitsWithTrap = 0, trapSites = 0, irOps = 0, directCalls = 0, dispatchCalls = 0, relocConsts = 0;
   uint64_t liftFailed = 0, objBytes = 0, textBytes = 0;
-  std::vector<uint64_t> unitVaddrs;
+  std::vector<uint64_t> unitVaddrs, extraVaddrs; // extra: units the entry unit does not reach (switch case bodies), entered by jumps
   std::map<std::string, uint64_t> opUnits; // op name -> units containing a trap for it
 };
 
@@ -60,10 +60,11 @@ uint64_t textSize(const std::string& obj) {
 struct Sink : UnitSink {
   UnitLowerer& ul; ShardStats& st;
   Sink(UnitLowerer& u, ShardStats& s) : ul(u), st(s) {}
-  void unit(uint64_t entry, bool, const void* ir) override {
+  void unit(uint64_t entry, bool extra, const void* ir) override {
     LowerResult lr;
     ul.lower(entry, ir, &lr);
     ++st.units; st.unitVaddrs.push_back(entry);
+    if (extra) st.extraVaddrs.push_back(entry);
     st.trapSites += lr.trapSites; st.irOps += lr.irOps; st.directCalls += lr.directCalls; st.dispatchCalls += lr.dispatchCalls;
     st.relocConsts += lr.relocConstants;
     if (!lr.unsupported.empty()) { ++st.unitsWithTrap; for (auto& n : lr.unsupported) ++st.opUnits[n]; }
@@ -76,8 +77,32 @@ uint64_t fnv1a(const std::vector<uint8_t>& d) {
   return h;
 }
 
-// bbr_units[] (sorted), bbr_unit_count, bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
-bool emitTable(const std::vector<uint64_t>& units, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
+// bbr_unit_hash[i]: FNV-1a 64 of the executable segment's bytes [units[i], units[i+1]) (the last unit: to the end of the segment),
+// as the runtime sees them in memory. The runtime hashes the same ranges of the loaded image once, before the first guest
+// call: a different hash means the code was patched (hooks, byte patches) or the image is another one, and that unit runs on
+// the fallback CPU. bb-prepare patches fs -> gs segment prefixes (0x64 -> 0x65) in the image, so 0x65 hashes as 0x64.
+std::vector<uint64_t> unitHashes(const ElfImage& img, const std::vector<uint64_t>& units) {
+  std::vector<uint64_t> out(units.size(), 0);
+  for (auto& s : img.loads) {
+    if (!(s.flags & 1)) continue;
+    for (size_t i = 0; i < units.size(); ++i) {
+      const uint64_t lo = units[i] - s.vaddr, hi = (i + 1 < units.size() ? units[i + 1] : s.vaddr + s.memsz) - s.vaddr;
+      uint64_t h = 1469598103934665603ull;
+      for (uint64_t k = lo; k < hi && k < s.memsz; ++k) {
+        uint8_t b = k < s.filesz ? img.file[s.offset + k] : 0;
+        if (b == 0x65) b = 0x64;
+        h ^= b; h *= 1099511628211ull;
+      }
+      out[i] = h;
+    }
+    break;
+  }
+  return out;
+}
+
+// bbr_units[] (sorted), bbr_unit_count, bbr_unit_hash[], bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
+bool emitTable(const std::vector<uint64_t>& units, uint64_t imageHash, const std::vector<uint64_t>& hashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
+               const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
   LLVMContext ctx;
   Module m("bbr_table", ctx);
   setModuleTarget(m, tm);
@@ -95,6 +120,21 @@ bool emitTable(const std::vector<uint64_t>& units, uint64_t imageHash, const Com
   new GlobalVariable(m, aty, true, GlobalValue::ExternalLinkage, ConstantArray::get(aty, es), "bbr_units");
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, units.size()), "bbr_unit_count");
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, imageHash), "bbr_image_hash");
+  {
+    std::vector<Constant*> hs;
+    hs.reserve(hashes.size());
+    for (uint64_t h : hashes) hs.push_back(ConstantInt::get(i64, h));
+    auto* hty = ArrayType::get(i64, hs.size());
+    new GlobalVariable(m, hty, true, GlobalValue::ExternalLinkage, ConstantArray::get(hty, hs), "bbr_unit_hash");
+    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, textEnd), "bbr_text_end"); // end of the last unit's hashed range
+    // bbr_unit_extra[i]: 1 for a unit that is not a function start (a switch case body): it belongs to the function of the
+    // nearest preceding unit with 0, and is entered by jumps, not calls.
+    std::vector<Constant*> xs;
+    xs.reserve(extra.size());
+    for (uint8_t e : extra) xs.push_back(ConstantInt::get(Type::getInt8Ty(ctx), e));
+    auto* xty = ArrayType::get(Type::getInt8Ty(ctx), xs.size());
+    new GlobalVariable(m, xty, true, GlobalValue::ExternalLinkage, ConstantArray::get(xty, xs), "bbr_unit_extra");
+  }
   new GlobalVariable(m, i32, true, GlobalValue::ExternalLinkage, ConstantInt::get(i32, 1), "bbr_abi_version");
   new GlobalVariable(m, i64, false, GlobalValue::ExternalLinkage, ConstantInt::get(i64, 0), "bbr_image_base");
   std::string obj;
@@ -226,7 +266,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
 
   // Totals.
   ShardStats tot;
-  std::vector<uint64_t> units;
+  std::vector<uint64_t> units, extraAll;
   for (auto& s : stats) {
     tot.liftLower += s.liftLower; tot.opt += s.opt; tot.codegen += s.codegen;
     tot.funcs += s.funcs; tot.units += s.units; tot.unitsWithTrap += s.unitsWithTrap; tot.trapSites += s.trapSites; tot.irOps += s.irOps;
@@ -234,7 +274,9 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     tot.objBytes += s.objBytes; tot.textBytes += s.textBytes;
     for (auto& [n, c] : s.opUnits) tot.opUnits[n] += c;
     units.insert(units.end(), s.unitVaddrs.begin(), s.unitVaddrs.end());
+    extraAll.insert(extraAll.end(), s.extraVaddrs.begin(), s.extraVaddrs.end());
   }
+  std::sort(extraAll.begin(), extraAll.end());
   std::sort(units.begin(), units.end());
   units.erase(std::unique(units.begin(), units.end()), units.end());
 
@@ -246,21 +288,33 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     tablePath = (opt.objPath.empty() ? opt.soPath : opt.objPath);
     const size_t dot = tablePath.rfind('.');
     tablePath = (dot == std::string::npos ? tablePath : tablePath.substr(0, dot)) + ".table.o";
-    if (!emitTable(units, fnv1a(img.file), opt, *tm, tablePath)) return 1;
+    uint64_t textEnd = 0;
+    for (auto& sg : img.loads) if (sg.flags & 1) { textEnd = sg.vaddr + sg.memsz; break; }
+    std::vector<uint8_t> extraFlags(units.size(), 0);
+    for (size_t i = 0; i < units.size(); ++i) extraFlags[i] = std::binary_search(extraAll.begin(), extraAll.end(), units[i]);
+    if (!emitTable(units, fnv1a(img.file), unitHashes(img, units), extraFlags, textEnd, opt, *tm, tablePath)) return 1;
     tableTime = since(t);
   }
 
   double linkTime = 0;
   uint64_t soBytes = 0;
   if (!opt.soPath.empty()) {
-    if (!opt.target.aarch64) { fprintf(stderr, "bb-recomp: --so needs --target aarch64\n"); return 1; }
     auto t = clk::now();
-    const std::string bin = opt.ndk + "/toolchains/llvm/prebuilt/linux-x86_64";
-    std::string cmd = "nice -n 19 " + bin + "/bin/ld.lld -shared -m aarch64linux --hash-style=gnu -z noexecstack -z max-page-size=16384 -Bsymbolic --build-id=none "
-                      "-soname " + opt.soPath.substr(opt.soPath.rfind('/') + 1) + " -o " + opt.soPath;
-    for (auto& o : objFiles) cmd += " " + o;
-    if (!tablePath.empty()) cmd += " " + tablePath;
-    cmd += " " + bin + "/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a";
+    std::string cmd;
+    if (opt.target.aarch64) {
+      const std::string bin = opt.ndk + "/toolchains/llvm/prebuilt/linux-x86_64";
+      cmd = "nice -n 19 " + bin + "/bin/ld.lld -shared -m aarch64linux --hash-style=gnu -z noexecstack -z max-page-size=16384 -Bsymbolic --build-id=none "
+            "-soname " + opt.soPath.substr(opt.soPath.rfind('/') + 1) + " -o " + opt.soPath;
+      for (auto& o : objFiles) cmd += " " + o;
+      if (!tablePath.empty()) cmd += " " + tablePath;
+      cmd += " " + bin + "/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a";
+    } else {
+      // The PC runtime (BB_AOT with an x86-64 host): the system clang links it with ld.lld and adds the builtins
+      // (__divti3, __udivti3). The bbr_* helpers stay undefined here: the executable provides them.
+      cmd = "nice -n 19 clang -shared -fuse-ld=lld -Wl,-Bsymbolic -Wl,-z,noexecstack -Wl,--build-id=none -o " + opt.soPath;
+      for (auto& o : objFiles) cmd += " " + o;
+      if (!tablePath.empty()) cmd += " " + tablePath;
+    }
     const int rc = system(cmd.c_str());
     linkTime = since(t);
     if (rc != 0) { fprintf(stderr, "bb-recomp: link failed (%d): %s\n", rc, cmd.c_str()); return 1; }

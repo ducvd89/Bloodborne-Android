@@ -38,7 +38,7 @@ static void usage() {
         "LLVM modes (need -DBB_RECOMP_LLVM=ON):\n"
         "  --emit-ll <hex vaddr|all> <file>   LLVM IR text (one function, or --limit N / all functions)\n"
         "  --obj <file>         compile to object files (<file> for 1 shard, else <base>.NNN.o + <base>.table.o)\n"
-        "  --so <file>          compile and link an Android ARM64 shared object (needs --target aarch64)\n"
+        "  --so <file>          compile and link a shared object: Android ARM64 (NDK ld.lld) or, with --target x86_64, a PC one (clang + lld)\n"
         "  --target aarch64|x86_64   (default aarch64)     -O0 | -O1 (default) | -O2\n"
         "  --shards <n>         modules compiled in parallel (default 64; 1 for --emit-ll)\n"
         "  --verify-llvm        run the LLVM verifier on every module\n"
