@@ -41,6 +41,7 @@ struct ShardStats {
   uint64_t liftFailed = 0, objBytes = 0, textBytes = 0;
   uint64_t resumeCases = 0, switches = 0, switchCases = 0, indJmps = 0, jmpResolved = 0, jmpScanned = 0, jmpMem = 0, jmpReg = 0, jmpFailed = 0, tableBytes = 0;
   std::vector<uint64_t> unitVaddrs;
+  std::vector<uint64_t> trapVaddrs; // units with an unsupported-op trap: bbr_dirty starts at 1 for them (the fallback CPU runs them)
   std::map<std::string, uint64_t> opUnits; // op name -> units containing a trap for it
 };
 
@@ -71,7 +72,7 @@ struct Sink : UnitSink {
     ++st.units; st.unitVaddrs.push_back(entry);
     st.trapSites += lr.trapSites; st.irOps += lr.irOps; st.directCalls += lr.directCalls; st.dispatchCalls += lr.dispatchCalls;
     st.relocConsts += lr.relocConstants; st.switches += lr.switches; st.switchCases += lr.switchCases; st.resumeCases += lr.resumeCases;
-    if (!lr.unsupported.empty()) { ++st.unitsWithTrap; for (auto& n : lr.unsupported) ++st.opUnits[n]; }
+    if (!lr.unsupported.empty()) { ++st.unitsWithTrap; st.trapVaddrs.push_back(entry); for (auto& n : lr.unsupported) ++st.opUnits[n]; }
   }
 };
 
@@ -115,7 +116,7 @@ std::vector<uint64_t> unitHashes(const ElfImage& img, const std::vector<uint64_t
 // bbr_units[] (sorted), bbr_unit_count, bbr_unit_end[], bbr_unit_hash[], bbr_unit_extra[], bbr_text_end, bbr_dirty[], bbr_funcs[],
 // bbr_func_count, bbr_abi_flags, bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
 bool emitTable(const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends, const std::vector<uint64_t>& hashes, const std::vector<uint64_t>& ehashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
-               const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
+               const std::vector<uint8_t>& dirtyInit, const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
   LLVMContext ctx;
   Module m("bbr_table", ctx);
   setModuleTarget(m, tm);
@@ -150,8 +151,16 @@ bool emitTable(const std::vector<uint64_t>& units, const std::vector<uint64_t>& 
     auto* xty = ArrayType::get(i8, xs.size());
     new GlobalVariable(m, xty, true, GlobalValue::ExternalLinkage, ConstantArray::get(xty, xs), "bbr_unit_extra");
     // bbr_dirty[i]: written by the runtime (1: the code of unit i changed); every unit tests its byte first (opt.dirtyCheck)
+    // A unit holding a bbr_trap for an IR op the lowering lacks starts dirty: a trap in the middle of a unit cannot be resumed,
+    // so the runtime runs that unit's code on the fallback CPU from its entry (the unit itself never runs).
     auto* dty = ArrayType::get(i8, units.size());
-    new GlobalVariable(m, dty, false, GlobalValue::ExternalLinkage, ConstantAggregateZero::get(dty), "bbr_dirty");
+    Constant* dinit = ConstantAggregateZero::get(dty);
+    if (std::find(dirtyInit.begin(), dirtyInit.end(), 1) != dirtyInit.end()) {
+      std::vector<Constant*> ds; ds.reserve(dirtyInit.size());
+      for (uint8_t d : dirtyInit) ds.push_back(ConstantInt::get(i8, d));
+      dinit = ConstantArray::get(dty, ds);
+    }
+    new GlobalVariable(m, dty, false, GlobalValue::ExternalLinkage, dinit, "bbr_dirty");
   }
   // bbr_funcs[]: the functions in address order with the contiguous run of bbr_units[] entries inside each (the entry unit
   // first, then gap and secondary units): how a dispatcher finds the units that may hold a mid-function address.
@@ -400,7 +409,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
 
   // Totals.
   ShardStats tot;
-  std::vector<uint64_t> units;
+  std::vector<uint64_t> units, trapUnits;
   for (auto& s : stats) {
     tot.liftLower += s.liftLower; tot.opt += s.opt; tot.codegen += s.codegen;
     tot.funcs += s.funcs; tot.units += s.units; tot.unitsWithTrap += s.unitsWithTrap; tot.trapSites += s.trapSites; tot.irOps += s.irOps;
@@ -410,7 +419,9 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     tot.jmpMem += s.jmpMem; tot.jmpReg += s.jmpReg; tot.jmpFailed += s.jmpFailed; tot.tableBytes += s.tableBytes;
     for (auto& [n, c] : s.opUnits) tot.opUnits[n] += c;
     units.insert(units.end(), s.unitVaddrs.begin(), s.unitVaddrs.end());
+    trapUnits.insert(trapUnits.end(), s.trapVaddrs.begin(), s.trapVaddrs.end());
   }
+  std::sort(trapUnits.begin(), trapUnits.end());
   std::sort(units.begin(), units.end());
   units.erase(std::unique(units.begin(), units.end()), units.end());
 
@@ -433,7 +444,9 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     for (size_t i : todo) compiled.push_back(funcs[i]);
     std::vector<uint64_t> nexts(pre.size());
     for (size_t i = 0; i < pre.size(); ++i) nexts[i] = i + 1 < pre.size() ? pre[i + 1].entry : textEnd;
-    if (!emitTable(units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, compiled, fnv1a(img.file), opt, *tm, tablePath)) return 1;
+    std::vector<uint8_t> dirtyInit(units.size(), 0);
+    for (size_t i = 0; i < units.size(); ++i) dirtyInit[i] = std::binary_search(trapUnits.begin(), trapUnits.end(), units[i]);
+    if (!emitTable(units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, dirtyInit, compiled, fnv1a(img.file), opt, *tm, tablePath)) return 1;
     tableTime = since(t);
   }
 
@@ -449,6 +462,14 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       for (auto& o : objFiles) cmd += " " + o;
       if (!tablePath.empty()) cmd += " " + tablePath;
       cmd += " " + bin + "/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a";
+      // DT_NEEDED libbbcpu.so: the bbr_* helpers live there, and Android's linker resolves a dlopen()ed library's symbols only
+      // against the global group (the executable, LD_PRELOAD) and the library's own DT_NEEDED tree, not against the
+      // executable's DT_NEEDED libraries as glibc does (dlopen failed: cannot locate symbol "bbr_dispatch"). A soname stub
+      // made here gives the entry; at run time it is the libbbcpu.so already loaded.
+      const std::string stub = opt.soPath + ".libbbcpu-stub.so";
+      const std::string mk = "nice -n 19 " + bin + "/bin/clang --target=aarch64-linux-android30 -shared -nostdlib -Wl,-soname,libbbcpu.so -x c /dev/null -o " + stub;
+      if (system(mk.c_str()) != 0) { fprintf(stderr, "bb-recomp: cannot make %s\n", stub.c_str()); return 1; }
+      cmd += " --no-as-needed " + stub;
     } else {
       // The PC runtime (BB_AOT with an x86-64 host): the system clang links it with ld.lld and adds the builtins
       // (__divti3, __udivti3). The bbr_* helpers stay undefined here: the executable provides them.
