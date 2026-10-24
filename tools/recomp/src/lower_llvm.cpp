@@ -2,6 +2,7 @@
 // lower_ops.cpp, vector and FP ops in lower_vector.cpp.
 #include "lower_impl.h"
 
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Verifier.h>
 
 #include <algorithm>
@@ -555,7 +556,35 @@ void Lower::run() {
   S->setName("s");
   allocaBB = BasicBlock::Create(C, "entry", F);
   auto* proBB = BasicBlock::Create(C, "pro", F);
-  IRBuilder<>(allocaBB).CreateBr(proBB);
+  if (m.O.dirtyCheck && m.O.unitIndex) {
+    // The runtime sets bbr_dirty[i] when the code of unit i was modified (hooks, patches): the unit then does not run, the
+    // dispatcher's slow path (the fallback CPU) does. First thing in the unit; one byte load and a predictable branch.
+    const int64_t idx = m.O.unitIndex(entryVaddr);
+    if (idx < 0) fprintf(stderr, "bb-recomp: unit %s has no index in bbr_units\n", name.c_str());
+    auto* chk = BasicBlock::Create(C, "chk", F);
+    auto* dirtyBB = BasicBlock::Create(C, "dirty", F);
+    IRBuilder<>(allocaBB).CreateBr(chk);
+    B.SetInsertPoint(chk);
+    Value* p = B.CreateConstInBoundsGEP1_64(I8, m.dirtyVar, idx < 0 ? 0 : (uint64_t)idx);
+    Value* d = B.CreateLoad(I8, p);
+    auto* br = B.CreateCondBr(B.CreateICmpNE(d, ConstantInt::get(I8, 0)), dirtyBB, proBB);
+    br->setMetadata(LLVMContext::MD_prof, MDBuilder(C).createBranchWeights(1, 2000));
+    B.SetInsertPoint(dirtyBB);
+    if (m.O.resumeEntries) {
+      // a resume request (flag set, rip = the return address wanted) at a dirty unit: not here, the dispatcher tries the next unit
+      auto* go = BasicBlock::Create(C, "dirty_go", F);
+      auto* rs = BasicBlock::Create(C, "dirty_resume", F);
+      B.CreateCondBr(B.CreateICmpNE(B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, _pad1)), Align(8)), c64(0)), rs, go);
+      B.SetInsertPoint(rs); B.CreateRetVoid();
+      B.SetInsertPoint(go);
+    }
+    // the unit's image-relative vaddr: the runtime adds the image base and sets rip itself (a two-instruction tail call here)
+    auto* c = B.CreateCall(m.helper("bbr_dirty_entry", m.Void, {Ptr, I64}), {S, c64(entryVaddr)});
+    c->setTailCall(true);
+    B.CreateRetVoid();
+  } else {
+    IRBuilder<>(allocaBB).CreateBr(proBB);
+  }
   B.SetInsertPoint(proBB);
   prologue();
 
@@ -727,6 +756,10 @@ struct UnitLowerer::Impl {
     if (!o.fixedImageBase) {
       m.imageBaseVar = new GlobalVariable(mod, m.I64, false, GlobalValue::ExternalLinkage, nullptr, "bbr_image_base");
       m.imageBaseVar->setDSOLocal(true);
+    }
+    if (o.dirtyCheck) {
+      m.dirtyVar = new GlobalVariable(mod, m.I8, false, GlobalValue::ExternalLinkage, nullptr, "bbr_dirty");
+      m.dirtyVar->setDSOLocal(true);
     }
   }
 };

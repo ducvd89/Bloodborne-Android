@@ -47,7 +47,7 @@ static void usage() {
         "LLVM modes (need -DBB_RECOMP_LLVM=ON):\n"
         "  --emit-ll <hex vaddr|all> <file>   LLVM IR text (one function, or --limit N / all functions)\n"
         "  --obj <file>         compile to object files (<file> for 1 shard, else <base>.NNN.o + <base>.table.o)\n"
-        "  --so <file>          compile and link an Android ARM64 shared object (needs --target aarch64)\n"
+        "  --so <file>          compile and link a shared object: Android ARM64 (NDK ld.lld) or, with --target x86_64, a PC one (clang + lld)\n"
         "  --target aarch64|x86_64   (default aarch64)     -O0 | -O1 (default) | -O2\n"
         "  --shards <n>         modules compiled in parallel (default 64 or more: the memory plan makes the shards smaller, then the\n"
         "                       worker count lower, until the peak fits in 60% of the available RAM; 1 for --emit-ll)\n"
@@ -55,6 +55,7 @@ static void usage() {
         "  --mem-fraction <f>   share of the available memory the compile may use (default 0.6)\n"
         "  --verify-llvm        run the LLVM verifier on every module\n"
         "  --flags-at-calls     also store NZCV before calls and returns (x86 flags are dead there; off by default)\n"
+        "  --no-dirty-check     no `if (bbr_dirty[unit]) bbr_dirty_entry()` at the start of every unit (default: on)\n"
         "  --resume-entries     every call-return block is also an entry of its unit (resume flag in the guest state)\n"
         "  --no-callee-saved    reload rbx, rbp, r12-r15 after calls too (default: the SysV callee-saved set is trusted)\n"
         "  --ndk <dir>          Android NDK for --so\n"
@@ -114,6 +115,7 @@ int main(int argc, char** argv) {
     else if (is("--mem-fraction")) cc.memFraction = std::max(0.05, atof(arg()));
     else if (is("--flags-at-calls")) cc.storeFlagsAtCalls = true;
     else if (is("--resume-entries")) cc.resumeEntries = true;
+    else if (is("--no-dirty-check")) cc.dirtyCheck = false;
     else if (is("--no-callee-saved")) cc.calleeSaved = false;
     else if (is("--ndk")) cc.ndk = arg();
     else if (is("--stats")) cc.statsPath = arg();
@@ -159,12 +161,6 @@ int main(int argc, char** argv) {
     if (nf.entries || nf.stubs) printf("non-FDE code the runtime enters: %zu start entries (eboot entry, module starts), %zu PLT stubs (%zu pseudo-functions added to the %zu FDE functions)\n", nf.entries, nf.stubs, funcs.size() - nFde, nFde);
   }
   static std::map<uint64_t, std::vector<uint64_t>> entryUnits;
-  if (!noDiscovery && !scanOnly) {
-    const DiscoverResult d = discoverEntries(img, funcs, entryUnits, co.lift, co.jobs);
-    printf("discovery (%u rounds): %zu relocation pointers into code outside any FDE function (%zu did not decode), %zu more through rip-relative lea, %zu through branches: %zu functions added (%.2f MB), %zu call/jmp targets inside functions that no unit started at\n",
-           d.rounds, d.relocCandidates, d.relocRejected, d.leaCandidates, d.branchCandidates, d.pseudoFuncs, d.pseudoBytes / 1e6, d.midEntries);
-    co.lift.entryUnits = &entryUnits;
-  }
   static EhScan eh;
   static ReturnsTwice rt;
   if (!noSecondary && !scanOnly) {
@@ -177,6 +173,12 @@ int main(int argc, char** argv) {
     } else printf("  returns-twice: not looked for (plain eboot.elf has no import information; use --boot)\n");
     co.lift.landingPads = &eh.landingPads;
     if (!rt.targets.empty() || !rt.gotSlots.empty()) { co.lift.retTwiceTargets = &rt.targets; co.lift.retTwiceSlots = &rt.gotSlots; }
+  }
+  co.lift.entryUnits = &entryUnits;
+  if (!noDiscovery && !scanOnly) {
+    const DiscoverResult d = discoverEntries(img, funcs, entryUnits, co.lift, co.jobs);
+    printf("discovery (%u rounds): %zu relocation pointers into code outside any FDE function (%zu did not decode), %zu more through rip-relative lea, %zu through branches: %zu functions added (%.2f MB), %zu call/jmp targets inside functions that no unit started at\n",
+           d.rounds, d.relocCandidates, d.relocRejected, d.leaCandidates, d.branchCandidates, d.pseudoFuncs, d.pseudoBytes / 1e6, d.midEntries);
   }
   if (scanOnly) return 0;
   if (dump) return dumpFunction(img, funcs, strtoull(dumpArg.c_str(), nullptr, 16), co.lift);

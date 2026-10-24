@@ -46,6 +46,7 @@ struct ModuleCtx {
   LowerOptions O;
   llvm::Type *I1, *I8, *I16, *I32, *I64, *I128, *Ptr, *V128, *Void;
   llvm::GlobalVariable* imageBaseVar = nullptr;
+  llvm::GlobalVariable* dirtyVar = nullptr; // bbr_dirty[]
   ModuleCtx(llvm::LLVMContext& c, llvm::Module& m, const LowerOptions& o);
   llvm::FunctionCallee helper(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> args);
   llvm::FunctionCallee unitFn(uint64_t vaddr); // declaration of bbr_<vaddr>

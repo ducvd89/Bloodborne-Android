@@ -66,7 +66,7 @@ carries the import names and relocations, which discovery needs. `--elf` then on
 `--boot` (plain `eboot.elf`) there are no relocations and no setjmp detection. The module names come from `link.json` next to the
 boot file. Steps before lifting (each prints a line): the non-FDE entries (module starts, PLT stubs), discovery
 (`--no-discovery`), landing pads and setjmp sites (`--no-secondary`). Switch tables are resolved unless `--no-switch-tables`.
-`--resume-entries` adds the resume switch to every unit (docs/RECOMP_ABI.md). `bbr_image_hash` is the FNV-1a of the flat image.
+`--no-dirty-check` drops the per-unit `bbr_dirty[]` test (default on, +8.5 % `.text`). `--target x86_64 --so` links a PC runtime library with clang+lld. `--resume-entries` adds the resume switch to every unit (docs/RECOMP_ABI.md). `bbr_image_hash` is the FNV-1a of the flat image.
 
 Compile resources: `--plan-only` prints the plan; the shard and worker counts follow the available RAM (`--mem-fraction`, default
 0.6; `BBR_FAKE_MEM_GB=12` pretends a smaller PC). `BBR_DEBUG_JUMPS=1` prints the instructions before every indirect jump.

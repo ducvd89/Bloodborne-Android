@@ -75,18 +75,51 @@ struct Sink : UnitSink {
   }
 };
 
+// What the pre-pass learns about each unit: whether it is a function start, and where its code ends.
+struct UnitInfo { uint64_t entry; uint64_t end; bool extra; };
+struct RecordSink : UnitSink {
+  std::vector<UnitInfo>& out;
+  explicit RecordSink(std::vector<UnitInfo>& o) : out(o) {}
+  void unit(uint64_t entry, bool extra, const void*, const UnitMeta& meta) override { out.push_back({entry, meta.end, extra}); }
+};
+
 uint64_t fnv1a(const std::vector<uint8_t>& d) {
   uint64_t h = 1469598103934665603ull;
   for (uint8_t b : d) { h ^= b; h *= 1099511628211ull; }
   return h;
 }
 
-// bbr_units[] (sorted), bbr_unit_count, bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
-bool emitTable(const std::vector<uint64_t>& units, const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
+// unitHashes(ends)[i]: FNV-1a 64 of the image bytes [units[i], ends[i]) (clamped to the unit's executable segment) as the runtime sees them in memory. The runtime hashes the
+// same ranges of the loaded image once, before the first guest call: a different hash means the code was patched (hooks, byte
+// patches) or the image is another one, and that unit is dirty. bb-prepare patches fs -> gs segment prefixes (0x64 -> 0x65) in the
+// image, so 0x65 hashes as 0x64. Units in every executable segment (the eboot and the linked modules) are covered.
+std::vector<uint64_t> unitHashes(const ElfImage& img, const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends) {
+  std::vector<uint64_t> out(units.size(), 0);
+  for (size_t i = 0; i < units.size(); ++i) {
+    for (auto& s : img.loads) {
+      if (!(s.flags & 1) || units[i] < s.vaddr || units[i] >= s.vaddr + s.memsz) continue;
+      const uint64_t lo = units[i] - s.vaddr, hi = std::min(ends[i] - s.vaddr, s.memsz);
+      uint64_t h = 1469598103934665603ull;
+      for (uint64_t k = lo; k < hi; ++k) {
+        uint8_t b = k < s.filesz ? img.file[s.offset + k] : 0;
+        if (b == 0x65) b = 0x64;
+        h ^= b; h *= 1099511628211ull;
+      }
+      out[i] = h;
+      break;
+    }
+  }
+  return out;
+}
+
+// bbr_units[] (sorted), bbr_unit_count, bbr_unit_end[], bbr_unit_hash[], bbr_unit_extra[], bbr_text_end, bbr_dirty[], bbr_funcs[],
+// bbr_func_count, bbr_abi_flags, bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
+bool emitTable(const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends, const std::vector<uint64_t>& hashes, const std::vector<uint64_t>& ehashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
+               const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
   LLVMContext ctx;
   Module m("bbr_table", ctx);
   setModuleTarget(m, tm);
-  auto* i64 = Type::getInt64Ty(ctx); auto* i32 = Type::getInt32Ty(ctx); auto* ptr = PointerType::getUnqual(ctx);
+  auto* i64 = Type::getInt64Ty(ctx); auto* i32 = Type::getInt32Ty(ctx); auto* i8 = Type::getInt8Ty(ctx); auto* ptr = PointerType::getUnqual(ctx);
   auto* ent = StructType::get(ctx, {i64, ptr});
   std::vector<Constant*> es;
   es.reserve(units.size());
@@ -99,7 +132,28 @@ bool emitTable(const std::vector<uint64_t>& units, const std::vector<Func>& func
   auto* aty = ArrayType::get(ent, es.size());
   new GlobalVariable(m, aty, true, GlobalValue::ExternalLinkage, ConstantArray::get(aty, es), "bbr_units");
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, units.size()), "bbr_unit_count");
-  // bbr_funcs[]: the FDE functions in address order with the contiguous run of bbr_units[] entries inside each (the entry unit
+  auto arr64 = [&](const std::vector<uint64_t>& v, const char* name) {
+    std::vector<Constant*> xs; xs.reserve(v.size());
+    for (uint64_t h : v) xs.push_back(ConstantInt::get(i64, h));
+    auto* t = ArrayType::get(i64, xs.size());
+    new GlobalVariable(m, t, true, GlobalValue::ExternalLinkage, ConstantArray::get(t, xs), name);
+  };
+  arr64(ends, "bbr_unit_end");       // end vaddr of each unit's code (just past its last decoded byte)
+  arr64(hashes, "bbr_unit_hash");    // over [units[i], units[i+1]) (the last unit of a segment: to its end)
+  arr64(ehashes, "bbr_unit_ehash");  // over [units[i], bbr_unit_end[i]): exact, for marking units dirty
+  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, textEnd), "bbr_text_end"); // end of the last executable segment
+  {
+    // bbr_unit_extra[i]: 1 for a unit that is not the start of a function (case bodies, landing pads, setjmp return sites, jump targets
+    // into the middle of a function): it belongs to the function of the nearest preceding unit with 0, and is entered by jumps.
+    std::vector<Constant*> xs; xs.reserve(extra.size());
+    for (uint8_t e : extra) xs.push_back(ConstantInt::get(i8, e));
+    auto* xty = ArrayType::get(i8, xs.size());
+    new GlobalVariable(m, xty, true, GlobalValue::ExternalLinkage, ConstantArray::get(xty, xs), "bbr_unit_extra");
+    // bbr_dirty[i]: written by the runtime (1: the code of unit i changed); every unit tests its byte first (opt.dirtyCheck)
+    auto* dty = ArrayType::get(i8, units.size());
+    new GlobalVariable(m, dty, false, GlobalValue::ExternalLinkage, ConstantAggregateZero::get(dty), "bbr_dirty");
+  }
+  // bbr_funcs[]: the functions in address order with the contiguous run of bbr_units[] entries inside each (the entry unit
   // first, then gap and secondary units): how a dispatcher finds the units that may hold a mid-function address.
   {
     auto* fent = StructType::get(ctx, {i32, i32, i32, i32}); // start, end, first unit index, unit count
@@ -114,7 +168,7 @@ bool emitTable(const std::vector<uint64_t>& units, const std::vector<Func>& func
     new GlobalVariable(m, faty, true, GlobalValue::ExternalLinkage, ConstantArray::get(faty, fs), "bbr_funcs");
     new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, fs.size()), "bbr_func_count");
   }
-  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, opt.resumeEntries ? 1 : 0), "bbr_abi_flags");
+  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, (opt.resumeEntries ? 1 : 0) | (opt.dirtyCheck ? 2 : 0)), "bbr_abi_flags");
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, imageHash), "bbr_image_hash");
   new GlobalVariable(m, i32, true, GlobalValue::ExternalLinkage, ConstantInt::get(i32, 1), "bbr_abi_version");
   new GlobalVariable(m, i64, false, GlobalValue::ExternalLinkage, ConstantInt::get(i64, 0), "bbr_image_base");
@@ -234,10 +288,35 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     bound[nshards] = todo.size();
   }
 
-  // Direct calls go to function starts.
-  std::vector<uint64_t> starts;
-  starts.reserve(funcs.size());
-  for (auto& f : funcs) starts.push_back(f.start);
+  // Pre-pass: lift every function once, only to learn the unit set (entries, ends, which are not function starts). Direct calls and
+  // jumps then go straight to any unit, not only to function starts, and bbr_dirty[] gets a fixed index per unit. Lifting is about
+  // a tenth of the work, and the units it makes are the ones the second pass makes (same lifter, same options).
+  std::vector<UnitInfo> pre;
+  {
+    std::vector<std::vector<UnitInfo>> part(std::max(1u, plan.jobs));
+    std::atomic<size_t> nextF {0};
+    auto w = [&](unsigned id) {
+      Lifter lifter(img, opt.lift);
+      RecordSink rs(part[id]);
+      for (;;) {
+        const size_t j = nextF++;
+        if (j >= todo.size()) break;
+        const Func& f = funcs[todo[j]];
+        FuncResult fr;
+        lifter.lift(f, fr, nullptr, nullptr, nullptr, &rs);
+        if (fr.status == LiftStatus::Failed || fr.status == LiftStatus::Crashed) part[id].push_back({f.start, f.end, false});
+      }
+    };
+    std::vector<std::thread> th;
+    for (unsigned i = 0; i < part.size(); ++i) th.emplace_back(w, i);
+    for (auto& t : th) t.join();
+    for (auto& p : part) pre.insert(pre.end(), p.begin(), p.end());
+    std::sort(pre.begin(), pre.end(), [](const UnitInfo& a, const UnitInfo& b) { return a.entry < b.entry || (a.entry == b.entry && a.end > b.end); });
+    pre.erase(std::unique(pre.begin(), pre.end(), [](const UnitInfo& a, const UnitInfo& b) { return a.entry == b.entry; }), pre.end());
+  }
+  std::vector<uint64_t> starts; // sorted unit entries
+  starts.reserve(pre.size());
+  for (auto& u : pre) starts.push_back(u.entry);
   const bool wantCode = !opt.objPath.empty() || !opt.soPath.empty();
   const bool emitLl = !opt.llPath.empty();
   LowerOptions lo;
@@ -249,6 +328,8 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   lo.calleeSaved = opt.calleeSaved;
   lo.resumeEntries = opt.resumeEntries;
   lo.isKnownUnit = [&starts](uint64_t v) { return std::binary_search(starts.begin(), starts.end(), v); };
+  lo.dirtyCheck = opt.dirtyCheck;
+  lo.unitIndex = [&starts](uint64_t v) -> int64_t { auto it = std::lower_bound(starts.begin(), starts.end(), v); return it != starts.end() && *it == v ? it - starts.begin() : -1; };
 
   std::vector<ShardStats> stats(nshards);
   std::vector<std::string> objFiles(nshards);
@@ -341,24 +422,40 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     tablePath = (opt.objPath.empty() ? opt.soPath : opt.objPath);
     const size_t dot = tablePath.rfind('.');
     tablePath = (dot == std::string::npos ? tablePath : tablePath.substr(0, dot)) + ".table.o";
+    uint64_t textEnd = 0;
+    for (auto& sg : img.loads) if (sg.flags & 1) textEnd = std::max(textEnd, sg.vaddr + sg.memsz);
+    if (units != starts) { fprintf(stderr, "bb-recomp: the units of the second pass (%zu) differ from the pre-pass (%zu)\n", units.size(), starts.size()); return 1; }
+    std::vector<uint64_t> ends(pre.size());
+    std::vector<uint8_t> extraFlags(pre.size());
+    for (size_t i = 0; i < pre.size(); ++i) { ends[i] = pre[i].end > pre[i].entry ? pre[i].end : (i + 1 < pre.size() ? pre[i + 1].entry : textEnd); extraFlags[i] = pre[i].extra; }
     std::vector<Func> compiled;
     compiled.reserve(todo.size());
     for (size_t i : todo) compiled.push_back(funcs[i]);
-    if (!emitTable(units, compiled, fnv1a(img.file), opt, *tm, tablePath)) return 1;
+    std::vector<uint64_t> nexts(pre.size());
+    for (size_t i = 0; i < pre.size(); ++i) nexts[i] = i + 1 < pre.size() ? pre[i + 1].entry : textEnd;
+    if (!emitTable(units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, compiled, fnv1a(img.file), opt, *tm, tablePath)) return 1;
     tableTime = since(t);
   }
 
   double linkTime = 0;
   uint64_t soBytes = 0;
   if (!opt.soPath.empty()) {
-    if (!opt.target.aarch64) { fprintf(stderr, "bb-recomp: --so needs --target aarch64\n"); return 1; }
     auto t = clk::now();
-    const std::string bin = opt.ndk + "/toolchains/llvm/prebuilt/linux-x86_64";
-    std::string cmd = "nice -n 19 " + bin + "/bin/ld.lld -shared -m aarch64linux --hash-style=gnu -z noexecstack -z max-page-size=16384 -Bsymbolic --build-id=none "
-                      "-soname " + opt.soPath.substr(opt.soPath.rfind('/') + 1) + " -o " + opt.soPath;
-    for (auto& o : objFiles) cmd += " " + o;
-    if (!tablePath.empty()) cmd += " " + tablePath;
-    cmd += " " + bin + "/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a";
+    std::string cmd;
+    if (opt.target.aarch64) {
+      const std::string bin = opt.ndk + "/toolchains/llvm/prebuilt/linux-x86_64";
+      cmd = "nice -n 19 " + bin + "/bin/ld.lld -shared -m aarch64linux --hash-style=gnu -z noexecstack -z max-page-size=16384 -Bsymbolic --build-id=none "
+            "-soname " + opt.soPath.substr(opt.soPath.rfind('/') + 1) + " -o " + opt.soPath;
+      for (auto& o : objFiles) cmd += " " + o;
+      if (!tablePath.empty()) cmd += " " + tablePath;
+      cmd += " " + bin + "/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a";
+    } else {
+      // The PC runtime (BB_AOT with an x86-64 host): the system clang links it with ld.lld and adds the builtins
+      // (__divti3, __udivti3). The bbr_* helpers stay undefined here: the executable provides them.
+      cmd = "nice -n 19 clang -shared -fuse-ld=lld -Wl,-Bsymbolic -Wl,-z,noexecstack -Wl,--build-id=none -o " + opt.soPath;
+      for (auto& o : objFiles) cmd += " " + o;
+      if (!tablePath.empty()) cmd += " " + tablePath;
+    }
     const int rc = system(cmd.c_str());
     linkTime = since(t);
     if (rc != 0) { fprintf(stderr, "bb-recomp: link failed (%d): %s\n", rc, cmd.c_str()); return 1; }

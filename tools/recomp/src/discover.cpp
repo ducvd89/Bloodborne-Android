@@ -29,7 +29,9 @@ DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, st
   auto inCode = [&](uint64_t a) { for (auto& c : code) if (a >= c.first && a < c.second) return true; return false; };
 
   LiftOptions lo = liftOpt;
-  lo.collectTargets = true; lo.gapUnits = false; lo.landingPads = nullptr; lo.retTwiceTargets = nullptr; lo.retTwiceSlots = nullptr; lo.entryUnits = nullptr;
+  // The units are lifted as they will be compiled (gap units, landing pads, setjmp sites and the entries found so far), because a
+  // jump from one unit into the middle of another is a target outside its range that only shows up there.
+  lo.collectTargets = true; lo.entryUnits = &entryUnits;
 
   // Candidate entries: data pointers (relocations) into code.
   std::set<uint64_t> pending;   // addresses to examine (image vaddrs)
@@ -40,7 +42,7 @@ DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, st
   pending = fromReloc;
 
   std::vector<Func> frontier = funcs;   // round 0: every function, to collect its outgoing targets
-  std::set<uint64_t> midSeen, holeSeen;
+  std::set<uint64_t> midSeen, holeSeen, touched; // touched: functions that got a new extra entry (lifted again)
   for (unsigned round = 0; round < 16; ++round) {
     res.rounds = round + 1;
     // Lift the frontier in parallel; gather the branch targets that leave their function.
@@ -94,10 +96,11 @@ DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, st
       } else if (funcs[i].start != t && midSeen.insert(t).second) {
         // a call/jmp/pointer into the middle of another function: a unit entry of that function
         entryUnits[funcs[i].start].push_back(t);
+        touched.insert(funcs[i].start);
         ++res.midEntries;
       }
     }
-    if (added.empty()) break;
+    if (added.empty() && touched.empty()) break;
     // Bounds of the new pseudo-functions: up to the next function or candidate (an entry ends the previous one), at most the end of its code range.
     funcs.insert(funcs.end(), added.begin(), added.end());
     std::sort(funcs.begin(), funcs.end(), [](const Func& a, const Func& b) { return a.start < b.start; });
@@ -110,6 +113,8 @@ DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, st
       if (f.end <= f.start) f.end = f.start + 1;
     }
     frontier.clear();
+    for (uint64_t st : touched) { auto it = std::lower_bound(funcs.begin(), funcs.end(), st, [](const Func& f, uint64_t v) { return f.start < v; }); if (it != funcs.end() && it->start == st) frontier.push_back(*it); }
+    touched.clear();
     for (auto& a : added) { auto it = std::lower_bound(funcs.begin(), funcs.end(), a.start, [](const Func& f, uint64_t v) { return f.start < v; }); if (it != funcs.end() && it->start == a.start) frontier.push_back(*it); }
   }
   for (auto& f : funcs) if (f.kind == 3) { ++res.pseudoFuncs; res.pseudoBytes += f.end - f.start; }

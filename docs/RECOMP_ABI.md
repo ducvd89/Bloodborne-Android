@@ -22,6 +22,28 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
   `bbr_unit_count`, `bbr_image_hash` (FNV-1a 64 of the image the `.so` was built from: the flat boot image, or the ELF file for a
   plain `--elf` build), `bbr_abi_version` (1) and the writable `bbr_image_base`. The unit functions themselves have hidden
   visibility: the table is the only way in.
+- **Per-unit tables** (additive, ABI version still 1; indexed like `bbr_units[]`): `bbr_unit_end[i]` (u64: the vaddr just past the
+  last decoded byte of unit i; the unit's code lies in `[vaddr, end)`, with holes where other units' code or table data sit),
+  `bbr_unit_extra[i]` (u8: 1 = not the start of a function: case body, landing pad, setjmp return site, jump target into the middle
+  of a function; it belongs to the function of the nearest preceding unit with 0 and is entered by jumps), `bbr_unit_hash[i]`
+  (u64 FNV-1a of the image bytes `[units[i], units[i+1])`, the last unit of a segment to the segment end; byte 0x65 hashed as
+  0x64 because bb-prepare turns `fs:` into `gs:`), `bbr_unit_ehash[i]` (the same over the exact range `[vaddr, bbr_unit_end[i])`,
+  for marking units dirty without false positives from neighbours), `bbr_text_end` (end of the last executable segment).
+- **Dirty units (default on; `--no-dirty-check` removes it).** The runtime must be able to take a unit out of service when its
+  code was patched or hooked without touching the `.so` text (Android's SELinux may refuse `execmod`). The `.so` exports a
+  writable `uint8_t bbr_dirty[unit_count]`; the first thing every unit does is
+  `if (__builtin_expect(bbr_dirty[i], 0)) { bbr_dirty_entry(s, vaddr); return; }` (a tail call, `vaddr` image-relative) (i = the unit's index in `bbr_units[]`;
+  one byte load and a predictable branch). `bbr_dirty_entry(GuestState*, uint64_t vaddr)` has the contract of `bbr_dispatch`
+  with the table lookup skipped (the unit does not set `s->rip`: the runtime sets it to `image_base + vaddr`): run the guest code at that address on the fallback CPU until the guest returns to the address on top
+  of the stack (a call) or leaves (a jump). With resume entries on, a dirty unit entered with the resume flag set returns at
+  once with the flag still set (it is not the place to resume). Direct calls and tail jumps between units go straight to the
+  target unit, which tests its own byte, so no stale unit runs. `bbr_abi_flags` bit 1 = the check is present. The runtime
+  marks a function dirty by setting the bytes of all its units (`bbr_funcs[]`). Cost: about 6 MB of code for 184 k units (see the plan).
+- **Direct jumps and calls to any unit.** A constant call or jump target that is the entry of any unit (not only a function
+  start) is a direct call (`musttail` for jumps), and every in-function target that another unit jumps or calls into, or that
+  can be entered from outside its own unit (a tail jump into the middle of a function, a case body reached from a gap unit), is a
+  unit entry: the tool finds them by lifting every unit and collecting its direct branch/call targets that lie outside its own range
+  (432 in the game, mostly in a handful of large functions), lifts them as units (`bbr_unit_extra` = 1) and repeats to a fixpoint.
 - **Function table** (additive, ABI version still 1). `bbr_funcs[]`, `bbr_func_count`: `{ uint32_t start, end, first_unit, unit_count; }`
   per FDE function in address order, where `first_unit .. first_unit+unit_count` is the run of `bbr_units[]` entries that lie in
   `[start, end)` (entry unit first). A dispatcher that has to resume in the middle of a function (below) finds the function by

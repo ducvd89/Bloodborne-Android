@@ -19,6 +19,8 @@ struct LowerOptions {
   bool aarch64 = true;         // target: picks the few target-specific bits (yield hint)
   bool storeFlagsAtCalls = false; // also store NZCV before calls and returns (x86 flags are dead there; tail jumps always store)
   bool calleeSaved = true;       // after a call, rbx rbp r12-r15 are still what they were (the SysV ABI), so they are not reloaded
+  bool dirtyCheck = false;       // each unit starts with `if (bbr_dirty[index]) bbr_dirty_entry(s, vaddr)` (docs/RECOMP_ABI.md, "Dirty units")
+  std::function<int64_t(uint64_t)> unitIndex; // image vaddr -> index in bbr_units[] (dirtyCheck); -1: not a unit
   bool resumeEntries = false;    // every call-return block is a resume entry of its unit (docs/RECOMP_ABI.md, "Resume entries")
   bool hiddenUnits = true;       // hidden visibility for the unit functions (off for the in-process JIT)
   std::function<bool(uint64_t)> isKnownUnit; // image vaddr -> a unit with that entry exists (direct call)

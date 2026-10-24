@@ -26,6 +26,7 @@ struct CompileOptions {
   bool verify = false;           // run the LLVM verifier on every module
   bool storeFlagsAtCalls = false; // see LowerOptions
   bool calleeSaved = true;        // see LowerOptions
+  bool dirtyCheck = true;         // every unit tests bbr_dirty[its index] first (--no-dirty-check)
   bool resumeEntries = false;     // see LowerOptions
 };
 

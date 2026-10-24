@@ -211,15 +211,15 @@ gap units = 202,525 units, 11.81 M x86 instructions, 58.7 M FEX IR ops. All ops 
   (78 KB, 16 k instructions, 3,094 blocks) compiles in 1.1 s, and the one with the most IR (0x26bc320: 64 KB, 358 units,
   570 k IR ops) in 5.2 s, alone.
 
-**Update after step 2c (whole image: eboot + libc.prx + libSceFios2.prx, 182,663 functions, 184,271 units, 54.0 M IR ops, with jump tables resolved
+**Update after step 2c (whole image: eboot + libc.prx + libSceFios2.prx, 182,663 functions, 184,695 units, 54.0 M IR ops, with jump tables resolved
 and the discovery above; same machine, -O1, 22 threads, `nice 19`, another agent building at the same time, load average 11-23):**
 
 | | -O1 |
 |---|---|
-| Wall time, lift to objects + table + link | **67.1 s** |
+| Wall time, lift to objects + table + link | **65.6 s** (64 s without the dirty check; includes the 1 s unit pre-pass) |
 | Thread-seconds: lift + lower / optimise / codegen | 52.7 / 235.4 / 970.9 (1,259 total) |
-| `.text` | **94.07 MB** (was 102.97 MB: resolving the tables removed the 39 k duplicated gap units) |
-| Objects / `.so` | 124.6 MB / 110.5 MB |
+| `.text` | **94.80 MB** without the dirty check (was 102.97 MB: resolving the tables removed the 39 k duplicated gap units); **102.90 MB with the dirty check, the default** (+8.1 MB, +8.5 %: a byte load and branch per unit and its cold exit, which also keeps the frame setup before the test) |
+| Objects / `.so` | 146.3 MB / 129.7 MB (with the dirty check) |
 | Peak RSS (22 workers, 64 shards of 0.71 MB) | 13.7 GB |
 | With `--resume-entries` | 115.69 MB `.text`, 83.2 s, 16.3 GB |
 | 12 GB machine (`BBR_FAKE_MEM_GB=12`, target 60 % = 7.2 GB) | 22 workers, **197 shards of 0.23 MB: peak 5.5 GB, 67.5 s** |
@@ -242,7 +242,7 @@ one `.so` and one unit table cover everything. Census (lift only, 0.7 s wall on 
 |---|---|---|
 | FDE bytes reached from function entries alone (no gap sweep, eboot) | 92.00 % | **98.84 %** (the rest: 0.18 MB padding, 0.27 MB table data, 0.03 MB dead or unresolved: 99.9 % of the real code) |
 | Extra (gap) units with the sweep on | 39,566 in 2,525 functions | 1,159 in 505 functions |
-| Functions / units in the `.so` | 162,959 / 202,525 | 165,773 FDE + 16,890 without an FDE / 184,271 |
+| Functions / units in the `.so` | 162,959 / 202,525 | 165,773 FDE + 16,890 without an FDE / 184,695 |
 
 - **Switch tables.** 15,562 indirect `jmp reg/mem` in the eboot (16,780 with the modules): **3,847 are jump tables and resolve**
   (3,741 bounded by the `cmp`/`ja` or an `and` mask, 106 scanned to the first entry that is no code address; 66,347 case
@@ -267,6 +267,9 @@ one `.so` and one unit table cover everything. Census (lift only, 0.7 s wall on 
   (1,597 + 165) are FDE starts. **New op gaps from libc.prx**: 118 units contain a `bbr_trap` for an op the eboot never
   used: x87 conversions to and from the 80-bit format (`F80CVT` 104 units, `F80CVTTo` 82: `fld/fstp tbyte` in
   `printf`/`strtold`), `F64FPREM1` 6, `F64SCALE` 3, `NZCVSelectV` 1.
+- **Entries for jumps from other units.** Every direct call or jump target that lies in another function's middle, or in the same
+  function below a gap unit, and is no unit start: **432** (424 new units; the runtime had seen such tail jumps into case bodies
+  as dispatcher misses). Direct calls and tail jumps now go straight to any unit.
 - **Mid-function resume entries** (every call-return block, `--resume-entries`): 639,660 call-return blocks. Measured on the
   whole game at -O1: `.text` 94.07 -> 115.69 MB (**+23.0 %**), wall 67 -> 83 s (+24 %), codegen +31 %, peak RSS 13.7 -> 16.3 GB. Under the 30 % limit, so it is implemented
   (and tested: `bb-recomp-asmtest --resume-selftest`, plus the LLVM verifier on every module), but **off by default**:
