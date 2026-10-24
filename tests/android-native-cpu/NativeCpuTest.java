@@ -66,6 +66,18 @@ public final class NativeCpuTest {
         catch (NativeCpu.Problem p) { return p; }
     }
 
+    /** NativeCpu.neededLead as MainActivity.startGame gets it: sync the folder, then the start state (null: no dialog). */
+    static String needed(File phone, File game) {
+        NativeCpu.Sync sync = NativeCpu.syncFromGame(phone, game, "CUSA00207", "01.09", null);
+        String hash = NativeCpu.deviceImageHash(phone, true);
+        NativeCpu.State state = NativeCpu.state(phone, hash, "CUSA00207", "01.09");
+        if (state.installed && state.info != null && state.problem == null && !state.manualOverride) {
+            String bad = NativeCpu.checksumProblem(phone, state.info);
+            if (bad != null) state.problem = bad;
+        }
+        return NativeCpu.neededLead(game, sync, state);
+    }
+
     public static void main(String[] args) throws Exception {
         byte[] image = new byte[5000];
         for (int i = 0; i < image.length; ++i) image[i] = (byte) (i * 7 + 3);
@@ -111,7 +123,8 @@ public final class NativeCpuTest {
             byte[] damaged = good.clone(); damaged[5000] ^= 1;
             Files.write(NativeCpu.so(b4).toPath(), damaged);
             check(NativeCpu.checksumProblem(b4, st4.info) != null && NativeCpu.checksumProblem(b4, st4.info).contains("checksum"), "a damaged library is caught by its checksum");
-            check(NativeCpu.REQUIRED_TEXT.startsWith("This version of the app runs Bloodborne as native code, which you build once on a PC from your own game files with the Bloodborne Android Rebuild Tool (Windows/Linux)."), "the message text");
+            check(NativeCpu.NEEDED_TEXT.startsWith("Bloodborne on Android 2.0 runs as native ARM64 code that you build once on a PC (Windows or Linux)") && NativeCpu.NEEDED_TEXT.endsWith("then choose it here."), "the message text");
+            check("https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/latest".equals(NativeCpu.DOWNLOAD_URL) && "https://github.com/ducvd89/Bloodborne-android-rebuild-tool#how-to-use-it".equals(NativeCpu.GUIDE_URL), "the two links");
         }
 
         // refusals (each leaves the installed pair alone)
@@ -175,6 +188,51 @@ public final class NativeCpuTest {
         Files.write(new File(aot, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 2, 1).getBytes(StandardCharsets.UTF_8));
         sy = NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null);
         check(sy.kind == NativeCpu.SyncKind.FAILED && sy.problem.contains("ABI version 2"), "ABI mismatch in the game folder is reported");
+
+        // the "Native code needed" dialog: when it is due and what it leads with (what MainActivity.startGame does with a game folder)
+        File p1 = temp(); bootFile(p1, image);
+        File g1 = temp();
+        check(NativeCpu.NEEDED_MISSING.equals(needed(p1, g1)), "no native code anywhere: the folder has none");
+        check(needed(p1, null) == null, "no game folder: no dialog");
+        File a1 = new File(g1, "aot"); a1.mkdirs();
+        Files.write(new File(a1, "libbbaot.so").toPath(), good);
+        check(needed(p1, g1).contains("libbbaot.so but no libbbaot.json") && needed(p1, g1).contains("both are needed"), "only the library in aot/");
+        new File(a1, "libbbaot.so").delete();
+        Files.write(new File(a1, "libbbaot.json").toPath(), goodJson.getBytes(StandardCharsets.UTF_8));
+        check(needed(p1, g1).contains("libbbaot.json but no libbbaot.so"), "only the description in aot/");
+        Files.write(new File(a1, "libbbaot.so").toPath(), good);
+        check(needed(p1, g1) == null && NativeCpu.state(p1, hash, null, null).ready(), "a good aot/: imported, no dialog");
+        check(needed(p1, g1) == null, "good aot/, imported already: no dialog");
+        File g2 = temp(); // no aot/ at all, but the library was imported earlier: fine
+        check(needed(p1, g2) == null, "folder without aot/, library installed in the app and fitting: no dialog");
+        Files.write(new File(a1, "libbbaot.json").toPath(), json("CUSA00207", "01.09", "0123456789abcdef", good, 1, 1).getBytes(StandardCharsets.UTF_8));
+        check(needed(p1, g1) == null, "bad aot/ but a fitting library installed: no dialog");
+
+        File p2 = temp(); bootFile(p2, image);
+        File g3 = temp(), a3 = new File(g3, "aot"); a3.mkdirs();
+        Files.write(new File(a3, "libbbaot.so").toPath(), good);
+        Files.write(new File(a3, "libbbaot.json").toPath(), json("CUSA00207", "01.09", "0123456789abcdef", good, 1, 1).getBytes(StandardCharsets.UTF_8));
+        String lead = needed(p2, g3);
+        check(lead != null && lead.contains("not used") && lead.contains("another build of the game's code"), "aot/ built from another game build: that reason");
+        Files.write(new File(a3, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 2, 1).getBytes(StandardCharsets.UTF_8));
+        lead = needed(p2, g3);
+        check(lead != null && lead.contains("ABI version 2"), "aot/ with another ABI version: that reason");
+        Files.write(new File(a3, "libbbaot.json").toPath(), goodJson.getBytes(StandardCharsets.UTF_8));
+        Files.write(new File(a3, "libbbaot.so").toPath(), flipped);
+        lead = needed(p2, g3);
+        check(lead != null && lead.contains("checksum"), "aot/ with a damaged library: the checksum reason");
+        Files.write(new File(a3, "libbbaot.so").toPath(), good);
+        check(needed(p2, g3) == null && NativeCpu.so(p2).isFile(), "fixed aot/: imported, no dialog");
+
+        File p3 = temp(); // a library kept in the app that is for another game build, and a folder without aot/
+        bootFile(p3, image);
+        check(tryInstall(p3, goodJson, good, null, null) == null, "installed");
+        File boot3 = NativeCpu.bootImage(p3); byte[] other3 = image.clone(); other3[100] ^= 1; bootFile(p3, other3);
+        boot3.setLastModified(boot3.lastModified() + 5000);
+        lead = needed(p3, temp());
+        check(lead != null && lead.contains("does not match this game"), "installed library for another build, folder without aot/: that reason");
+        Files.write(new File(p3, "bionic-local.sh").toPath(), "export BB_AOT=/x/libbbaot.so\n".getBytes(StandardCharsets.UTF_8));
+        check(needed(p3, temp()) == null, "BB_AOT set by hand: no dialog");
 
         System.out.println(checks + " checks, " + failed + " failed");
         if (failed != 0) System.exit(1);

@@ -94,6 +94,10 @@ public final class MainActivity extends Activity {
     /** Native CPU (the recompiled game code, required to play): its status/import page, its drawer row, and the full-screen message
      *  shown instead of the game when the library is missing or does not fit. */
     private NativeCpuDialog nativeCpu;
+    private NativeNeededDialog nativeNeeded;
+    /** The game folders the "Native code needed" dialog was shown for since the app started (UI thread): once each, unless the player chooses
+     *  the folder again or installs a game into it. */
+    private final java.util.Set<String> neededShown=new java.util.HashSet<>();
     private LinearLayout nativeCpuItem;
     private NativeRequiredView nativeRequired;
     private AtlasView atlasMini, atlasFull;
@@ -138,6 +142,11 @@ public final class MainActivity extends Activity {
         GameInstaller.Host host=modsHost();
         mods=new ModsDialog(this,host); installer=new GameInstaller(this,host);
         nativeCpu=new NativeCpuDialog(this,nativeCpuHost());
+        nativeNeeded=new NativeNeededDialog(this,new NativeNeededDialog.Host() {
+            @Override public void openUrl(String url) { MainActivity.this.openUrl(url); }
+            @Override public void importFiles() { nativeCpu.show(); nativeCpu.importNow(); }
+            @Override public void closed() { if (!destroyed) immersive(); }
+        });
         updater=new AppUpdater(this,new AppUpdater.Host() {
             @Override public void stopGame() { MainActivity.this.stopGame(); }
             @Override public void restartGame() { if (!destroyed && displayReady) MainActivity.this.restartGame(); }
@@ -227,7 +236,8 @@ public final class MainActivity extends Activity {
         screen.addView(atlasFull,frame(-1,-1,Gravity.FILL));
         // Instead of the game when its native code is missing or does not fit: above the controller, below the handle and the drawer.
         nativeRequired=new NativeRequiredView(this,new NativeRequiredView.Actions() {
-            @Override public void openTool() { openUrl(NativeCpu.TOOL_URL); }
+            @Override public void openDownload() { openUrl(NativeCpu.DOWNLOAD_URL); }
+            @Override public void openGuide() { openUrl(NativeCpu.GUIDE_URL); }
             @Override public void chooseGameFolder() { askGameFolder(gameDir!=null); }
             @Override public void importFiles() { nativeCpu.show(); nativeCpu.importNow(); }
         });
@@ -1136,6 +1146,7 @@ public final class MainActivity extends Activity {
         }
         boolean changed=gameDir!=null && !gameDir.equals(dir.getPath());
         gameDir=dir.getPath();
+        neededShown.remove(gameDir); // chosen on purpose: the "Native code needed" dialog may show again for it
         getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putString("game_dir",gameDir).apply();
         status.setText("Starting Bloodborne…"); status.setVisibility(View.VISIBLE);
         if (changed && game!=null) restartGame();
@@ -1326,6 +1337,7 @@ public final class MainActivity extends Activity {
     /** The game was installed from PKGs: the same as choosing its folder, and the game starts (again). */
     private void useInstalledGame(File dir) {
         gameDir=dir.getPath();
+        neededShown.remove(gameDir);
         getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putString("game_dir",gameDir).apply();
         status.setText("Starting Bloodborne…"); status.setVisibility(View.VISIBLE);
         if (displayReady) restartGame(); else startPending(); // the display runs already when the game was stopped for the install
@@ -1352,15 +1364,15 @@ public final class MainActivity extends Activity {
     /** The game folder made by the rebuild tool holds aot/libbbaot.so + .json: copy them into the app's own files (a library cannot be
      *  loaded from shared storage); again only when they changed. Off the UI thread (a copy of ~125 MB). */
     private String nativeSyncShown="";
-    private void syncNativeCpu() {
-        if (gameDir==null) return;
+    private NativeCpu.Sync syncNativeCpu() {
+        if (gameDir==null) return null;
         String id=null, version=null;
         try {
             java.util.Map<String,Object> sfo=Sfo.parse(java.nio.file.Files.readAllBytes(new File(gameDir,"sce_sys/param.sfo").toPath()));
             id=Sfo.text(sfo,"TITLE_ID"); version=Sfo.text(sfo,"APP_VER");
         } catch (Exception ignored) {}
         File aot=new File(gameDir,"aot");
-        if (!new File(aot,NativeCpu.SO).isFile()) return;
+        if (!new File(aot,NativeCpu.SO).isFile()) return null;
         main.post(() -> { if (!destroyed) { status.setText("Native CPU: checking the game folder's aot/…"); status.setVisibility(View.VISIBLE); } });
         NativeCpu.Sync result=NativeCpu.syncFromGame(new File(BASE),new File(gameDir),id,version,(done,total) -> {
             final String text="Native CPU: copying libbbaot.so… "+(done>>20)+" of "+(total>>20)+" MB";
@@ -1374,6 +1386,7 @@ public final class MainActivity extends Activity {
             android.util.Log.w("Bloodborne",result.problem);
             main.post(() -> { if (!destroyed) toast(result.problem); });
         }
+        return result;
     }
     private NativeCpuDialog.Host nativeCpuHost() {
         return new NativeCpuDialog.Host() {
@@ -1743,13 +1756,19 @@ public final class MainActivity extends Activity {
     private void startGame() {
         if (destroyed) return;
         hadError=false;
-        syncNativeCpu(); // the game folder's aot/ (from the rebuild tool) into bbport/aot/
+        final NativeCpu.Sync synced=syncNativeCpu(); // the game folder's aot/ (from the rebuild tool) into bbport/aot/
         // The game runs as native code only: without a library that fits, the message below stays instead of the game.
         final NativeCpu.State native_=nativeCpu.startState();
         final String blocker=native_.blocker();
         if (blocker!=null) {
             android.util.Log.w("Bloodborne","native code: "+blocker);
-            main.post(() -> { if (!destroyed) { status.setVisibility(View.GONE); nativeRequired.show(blocker); if (drawerOpen) refreshDrawer(); } });
+            final String folder=gameDir, lead=NativeCpu.neededLead(folder==null ? null : new File(folder),synced,native_);
+            main.post(() -> {
+                if (destroyed) return;
+                status.setVisibility(View.GONE); nativeRequired.show(blocker); if (drawerOpen) refreshDrawer();
+                // The dialog explains the way out once per folder; closing it leaves the message above, which blocks the start.
+                if (lead!=null && !nativeNeeded.showing() && neededShown.add(folder)) nativeNeeded.show(lead);
+            });
             return;
         }
         main.post(() -> { if (!destroyed) nativeRequired.hide(); });
@@ -1853,7 +1872,7 @@ public final class MainActivity extends Activity {
         if (p!=null) { p.destroyForcibly(); try { p.waitFor(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
     @Override protected void onDestroy() {
-        destroyed=true; if (nativeCpu!=null) nativeCpu.close(); if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); rumble.close(); audio.stop(); main.removeCallbacksAndMessages(null);
+        destroyed=true; if (nativeCpu!=null) nativeCpu.close(); if (nativeNeeded!=null) nativeNeeded.close(); if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); rumble.close(); audio.stop(); main.removeCallbacksAndMessages(null);
         stopGame();
         worker.shutdownNow(); super.onDestroy();
     }

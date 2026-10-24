@@ -155,13 +155,9 @@ final class NativeCpuDialog {
     private void render(NativeCpu.State s) {
         if (box == null) return;
         box.removeAllViews();
-        box.addView(line(NativeCpu.REQUIRED_TEXT, 13, TEXT, false));
-        TextView help = line(NativeCpu.STEPS_TEXT, 13, GOLD, false);
-        box.addView(help);
-        Button tool = new Button(activity); tool.setText("Open the Rebuild Tool page"); tool.setAllCaps(false);
-        tool.setOnClickListener(v -> host.openUrl(NativeCpu.TOOL_URL));
-        LinearLayout.LayoutParams toolParams = new LinearLayout.LayoutParams(-2, -2); toolParams.topMargin = dp(8);
-        box.addView(tool, toolParams);
+        box.addView(line(NativeCpu.NEEDED_TEXT, 13, TEXT, false));
+        box.addView(linkButton("Download the Rebuild Tool", NativeCpu.DOWNLOAD_URL, 8));
+        box.addView(linkButton("How to use it", NativeCpu.GUIDE_URL, 4));
 
         TextView heading = line("STATUS", 11, GOLD, true); heading.setLetterSpacing(0.15f); heading.setPadding(0, dp(14), 0, dp(2));
         box.addView(heading);
@@ -207,6 +203,14 @@ final class NativeCpuDialog {
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2); lp.topMargin = dp(12);
             box.addView(removeButton, lp);
         }
+    }
+
+    private Button linkButton(String label, String url, int topDp) {
+        Button b = new Button(activity); b.setText(label); b.setAllCaps(false);
+        b.setOnClickListener(v -> host.openUrl(url));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2); lp.topMargin = dp(topDp);
+        b.setLayoutParams(lp);
+        return b;
     }
 
     private void setButtons(boolean on) {
