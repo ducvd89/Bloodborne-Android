@@ -150,7 +150,10 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
   uint64_t nf = todo.size();
   FILE* sf = g_sf = open("census.txt");
   both("== bb-recomp census ==\n");
-  both("image:            %s functions (FDEs) in %.1f MB; %" PRIu64 " functions censused (every %" PRIu64 ")\n", std::to_string(funcs.size()).c_str(), t.bytes / 1e6, nf, opt.every);
+  {
+    size_t pseudo = 0; for (auto& f : funcs) pseudo += f.kind != 0;
+    both("image:            %zu functions (%zu FDE functions + %zu without an FDE: module starts, PLT stubs, discovered thunks) in %.1f MB; %" PRIu64 " functions censused (every %" PRIu64 ")\n", funcs.size(), funcs.size() - pseudo, pseudo, t.bytes / 1e6, nf, opt.every);
+  }
   both("config:           multiblock=%d tso=%d passes=%d host=%s jobs=%u\n", opt.lift.multiblock, opt.lift.tso, opt.lift.passes, opt.lift.host.c_str(), opt.jobs);
   both("time:             %.2f s wall (%.0f functions/s, %.0f x86 instr/s)\n", secs, nf / secs, (t.insts + t.extraInsts) / secs);
   both("clean:            %" PRIu64 " (%.3f%%)\n", t.byStatus[0], 100.0 * t.byStatus[0] / nf);
@@ -163,10 +166,28 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
   both("  excluding Inline* constants, block markers and GuestOpcode: %" PRIu64 " = %.2f per x86 instruction\n", t.realOps, t.insts ? (double)t.realOps / (t.insts + t.extraInsts) : 0.0);
   both("distinct IR ops:  %zu of %zu in IR.json used; %zu never emitted\n", used, nOps, nOps - used);
   both("bytes:            %.1f MB in FDEs, %.1f MB covered by lifted blocks (%.2f%%), %.1f MB gap\n", t.bytes / 1e6, t.covered / 1e6, 100.0 * t.covered / t.bytes, t.gap / 1e6);
+  { uint64_t fb = 0, fc = 0;
+    for (size_t k = 0; k < todo.size(); ++k) if (funcs[todo[k]].kind == 0) { fb += funcs[todo[k]].end - funcs[todo[k]].start; fc += results[k].coveredBytes; }
+    both("  FDE functions only: %.1f MB, %.1f MB covered (%.2f%%)\n", fb / 1e6, fc / 1e6, fb ? 100.0 * fc / fb : 0.0); }
   both("  gap contents:   %.2f MB padding (int3/nop/ud2), %.2f MB switch table data, %.2f MB other instructions (dead or dropped), %" PRIu64 " undecodable bytes\n", t.gapPad / 1e6, t.gapData / 1e6, t.gapInsts / 1e6, t.gapInvalid);
   both("  units past FDE end: %" PRIu64 "\n", t.pastEnd);
   both("secondary units: %" PRIu64 " landing pads (of %" PRIu64 " in the functions: %" PRIu64 " were already a unit entry), %" PRIu64 " setjmp return sites; %" PRIu64 " not clean; %" PRIu64 " x86 instructions\n",
        t.padUnits, t.padsKnown, t.padsInUnit, t.setjmpUnits, t.secondaryFailed, t.secondaryInsts);
+  if (img.modules.size() > 1) {
+    both("per module (functions incl. pseudo-functions for module starts and PLT stubs):\n");
+    for (auto& m : img.modules) {
+      uint64_t n = 0, fb = 0, cov = 0, ins = 0, units = 0, extra = 0, pseudo = 0, bad = 0;
+      for (size_t k = 0; k < todo.size(); ++k) {
+        const Func& fn = funcs[todo[k]];
+        if (fn.start < m.base || fn.start >= m.base + m.size) continue;
+        const FuncResult& r = results[k];
+        ++n; fb += fn.end - fn.start; cov += r.coveredBytes; ins += r.insts + r.extraInsts + r.secondaryInsts; units += 1 + r.extraUnits + r.padUnits + r.setjmpUnits;
+        extra += r.extraUnits + r.padUnits + r.setjmpUnits; pseudo += fn.kind != 0; bad += r.status != LiftStatus::Clean;
+      }
+      both("  %-16s %7" PRIu64 " functions (%" PRIu64 " pseudo), %6.2f MB, %5.2f%% of the bytes in lifted blocks, %8" PRIu64 " x86 instructions, %7" PRIu64 " units (%" PRIu64 " extra), %" PRIu64 " not clean\n",
+           m.name.c_str(), n, pseudo, fb / 1e6, fb ? 100.0 * cov / fb : 0.0, ins, units, extra, bad);
+    }
+  }
   both("indirect jmps:    %" PRIu64 " (jmp reg/mem): %" PRIu64 " jump tables resolved (%" PRIu64 " bounded by cmp/ja or and, %" PRIu64 " scanned without a bound; %" PRIu64 " case entries, %.2f MB of tables),\n"
        "                  %" PRIu64 " jmp [mem] (%" PRIu64 " [rip+x] import stubs, %" PRIu64 " [base+index*scale+x], rest [reg+x] vtable tail calls), %" PRIu64 " jmp reg that is no table (register tail calls), %" PRIu64 " table-like but unresolved\n",
        t.indJmps, t.jmpResolved + t.jmpScanned, t.jmpResolved, t.jmpScanned, t.tableEntries, t.tableBytes / 1e6, t.jmpMem, t.jmpMemRip, t.jmpMemIdx, t.jmpReg, t.jmpFailed);

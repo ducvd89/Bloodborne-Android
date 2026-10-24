@@ -26,6 +26,8 @@ struct LiftOptions {
   const std::map<uint64_t, std::vector<uint64_t>>* landingPads = nullptr;
   const std::set<uint64_t>* retTwiceTargets = nullptr;  // direct call targets (setjmp, its PLT stubs)
   const std::set<uint64_t>* retTwiceSlots = nullptr;    // GOT slots of `call [rip+slot]`
+  const std::map<uint64_t, std::vector<uint64_t>>* entryUnits = nullptr; // function start -> extra unit entries (direct call/jmp targets inside it that no unit starts at)
+  bool collectTargets = false;                          // FuncResult::outTargets: direct call/jmp/jcc targets outside the function (discovery)
   uint64_t maxInst = 0x10000;  // decoder limit per unit (FEX's own buffer limit is 0x10000)
 };
 
@@ -69,6 +71,9 @@ struct FuncResult {
   uint32_t jmpFailed = 0;        // ... table-like but not resolved (reasons in jmpExamples)
   uint32_t tableEntries = 0;     // case targets read from resolved tables (before de-duplication)
   uint64_t tableBytes = 0;       // bytes of resolved tables
+  std::vector<uint64_t> outTargets;      // collectTargets: direct branch/call targets outside [start, end) inside the image (image vaddrs, sorted, unique)
+  std::vector<uint64_t> leaTargets;      // collectTargets: `lea reg, [rip+x]` targets (address-taken code), image vaddrs, sorted, unique
+  uint32_t entryUnitsLifted = 0;         // units lifted at entryUnits addresses
   std::vector<std::string> jmpExamples; // "vaddr reason" of unresolved jmp reg / table-like jumps (first few)
 };
 

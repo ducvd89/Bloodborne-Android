@@ -227,6 +227,56 @@ std::string runTest(const Test& t, int opt) {
   return "PASS";
 }
 
+// Resume entries (docs/RECOMP_ABI.md): a unit entered with the resume flag set and rip at a call-return address continues there
+// with the registers in the guest state; at an address that is not a call-return block it returns at once with the flag still set.
+//     mov rbx, 5 ; call f ; R: mov rax, rbx ; add rax, 3 ; hlt ; f: ret
+std::string runResumeTest(int opt) {
+  static const uint8_t code[] = {0x48, 0xc7, 0xc3, 5, 0, 0, 0,  0xe8, 8, 0, 0, 0,  0x48, 0x89, 0xd8,  0x48, 0x83, 0xc0, 3,  0xf4,  0xc3};
+  constexpr uint64_t R = CodeBase + 12;
+  mapFixed(0xe8000000 - PageSz, PageSz * 2);
+  mapFixed(CodeBase, PageSz);
+  memcpy((void*)CodeBase, code, sizeof code);
+  static ElfImage img; img.base = 0;
+  LiftOptions lo; lo.gapUnits = false; lo.multiblock = true;
+  TargetSpec ts; ts.aarch64 = false; ts.opt = opt;
+  Jit jit(img, lo, ts);
+  jit.resumeEntries = true;
+  g_jit = &jit;
+  jit.rangeEnd = [](uint64_t t) -> uint64_t { return t >= CodeBase && t < CodeBase + sizeof code ? CodeBase + sizeof code : 0; };
+  if (!jit.err.empty()) return "FAIL jit init: " + jit.err;
+  alignas(64) static CPUState st;
+  static CPUState::gdt_segment gdt[32];
+  auto reset = [&] {
+    new (&st) CPUState();
+    st.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_GDT] = gdt;
+    st.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_LDT] = gdt;
+    st.cs_idx = CPUState::DEFAULT_USER_CS << 3;
+    auto* cs = CPUState::GetSegmentFromIndex(st, st.cs_idx);
+    CPUState::SetGDTBase(cs, 0); CPUState::SetGDTLimit(cs, 0xFFFFFu); cs->L = 1; cs->D = 0;
+    st.gregs[4] = 0xe8000000;
+  };
+  if (!jit.compile(CodeBase, CodeBase + sizeof code)) return "FAIL compile: " + jit.err + jit.liftFailure;
+  Jit::Fn entry = jit.find(CodeBase);
+  if (!entry) return "FAIL no entry";
+  struct sigaction sa {}; sa.sa_handler = jitOnSignal; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_NODEFER | SA_ONSTACK;
+  static char altstack[1 << 16];
+  stack_t ss {}; ss.ss_sp = altstack; ss.ss_size = sizeof altstack; sigaltstack(&ss, nullptr);
+  for (int sg : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(sg, &sa, nullptr);
+  alarm(20);
+  auto run = [&](uint64_t rip, uint64_t flag, uint64_t rbx) -> int { // 0 reached hlt, 1 returned without hlt, 2 failed
+    reset(); st.rip = rip; st.gregs[3] = rbx; st._pad1 = flag;
+    g_haltKind = 0;
+    if (sigsetjmp(g_halt, 1) == 0) { entry(&st); return 1; }
+    return g_haltKind == 1 ? 0 : 2;
+  };
+  if (run(CodeBase, 0, 0) != 0 || st.gregs[0] != 8) return "FAIL ordinary run: rax " + std::to_string(st.gregs[0]);
+  if (run(R, 1, 5) != 0 || st.gregs[0] != 8 || st._pad1 != 0) return "FAIL resume at the call-return address: rax " + std::to_string(st.gregs[0]) + " flag " + std::to_string(st._pad1);
+  if (run(R, 1, 40) != 0 || st.gregs[0] != 43) return "FAIL resume keeps the registers: rax " + std::to_string(st.gregs[0]);
+  if (run(R + 1, 1, 5) != 1 || st._pad1 != 1) return "FAIL a non-call-return address must return with the flag set: flag " + std::to_string(st._pad1);
+  alarm(0);
+  return "PASS";
+}
+
 // ------------------------------------------------------------------------------------ the parent ----
 struct Counts { unsigned pass = 0, fail = 0, unsup = 0, lift = 0, skip = 0, crash = 0; };
 
@@ -247,7 +297,7 @@ std::string skipReason(const Test& t, const std::set<std::string>& disabled) {
 int main(int argc, char** argv) {
   setpriority(PRIO_PROCESS, 0, 19);
   std::string fexDir = "out/recomp-fex", nasm = BBR_NASM, outFile = "out/recomp/asmtest.txt", filter;
-  int opt = 1; unsigned jobs = 22; bool verbose = false; bool listAll = false;
+  int opt = 1; unsigned jobs = 22; bool verbose = false; bool listAll = false, resumeTest = false;
   for (int i = 1; i < argc; ++i) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s); };
     auto arg = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "missing argument\n"); exit(2); } return argv[++i]; };
@@ -259,9 +309,17 @@ int main(int argc, char** argv) {
     else if (is("-O0")) opt = 0; else if (is("-O1")) opt = 1; else if (is("-O2")) opt = 2;
     else if (is("-v")) verbose = true;
     else if (is("--list")) listAll = true;
+    else if (is("--resume-selftest")) resumeTest = true;
     else { fprintf(stderr, "usage: bb-recomp-asmtest [--fex <FEX tree>] [--nasm <nasm>] [--filter <substr>] [--out <file>] [--jobs n] [-O0|-O1|-O2] [-v]\n"); return 2; }
   }
   jobs = std::min(jobs, 22u);
+  if (resumeTest) {
+    const pid_t pid = fork();
+    if (pid == 0) { const std::string v = runResumeTest(opt); puts(v.c_str()); _exit(v == "PASS" ? 0 : 1); }
+    int st = 0; waitpid(pid, &st, 0);
+    printf("resume entries self-test: %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "PASS" : "FAIL");
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
+  }
   const fs::path asmDir = fs::path(fexDir) / "unittests/ASM";
   if (!fs::exists(asmDir)) { fprintf(stderr, "no %s\n", asmDir.c_str()); return 1; }
   std::set<std::string> disabled;

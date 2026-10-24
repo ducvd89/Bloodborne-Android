@@ -336,6 +336,8 @@ struct Lifter::Impl {
     uint32_t insts = 0; std::string reason; bool dispatchFail = false; std::vector<std::pair<uint64_t, uint64_t>> cover; bool pastEnd = false;
     std::vector<jt::Jump> jumps;    // the indirect jumps of the unit and what became of them
     std::vector<uint64_t> retSites; // return addresses (image vaddrs) of calls to returns-twice targets (setjmp)
+    std::vector<uint64_t> leaTargets; // rip-relative lea targets (collectTargets)
+    std::vector<uint64_t> outTargets; // direct call/jmp/jcc targets outside the unit's function range (image vaddrs; collectTargets)
   };
   bool generate(uint64_t rip, uint64_t lo, uint64_t hi, Gen& g);
   void decode(uint64_t rip, uint64_t lo, uint64_t hi, const std::set<uint64_t>& seeds);
@@ -369,6 +371,19 @@ std::vector<jt::Jump> Lifter::Impl::analyseJumps(uint64_t lo, uint64_t hi, Gen* 
     for (uint32_t i = 0; i < b.NumInstructions; ++i) ins.push_back(jtInst(b.DecodedInstructions[i]));
   std::sort(ins.begin(), ins.end(), [](const jt::Ins& a, const jt::Ins& b) { return a.pc < b.pc; });
   ins.erase(std::unique(ins.begin(), ins.end(), [](const jt::Ins& a, const jt::Ins& b) { return a.pc == b.pc; }), ins.end());
+  if (g && opt.collectTargets)
+    for (auto& i : ins) {
+      if (i.kind == jt::K::Lea && i.src.k == jt::Op::Mem && i.src.rip) {
+        const uint64_t t = i.pc + i.size + i.src.imm;
+        if (t >= imgLo && t < imgHi) g->leaTargets.push_back(t - img.base);
+      }
+    }
+  if (g && opt.collectTargets)
+    for (auto& i : ins)
+      if ((i.kind == jt::K::Call || i.kind == jt::K::Jmp || i.kind == jt::K::Jcc) && i.src.k == jt::Op::Imm) {
+        const uint64_t t = i.pc + i.size + i.src.imm;
+        if ((t < lo || t >= hi) && t >= imgLo && t < imgHi) g->outTargets.push_back(t - img.base);
+      }
   if (g && opt.retTwiceTargets)
     for (auto& i : ins) {
       uint64_t site = 0;
@@ -411,8 +426,9 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
     std::set<uint64_t> seeds;
     for (int round = 0;; ++round) {
       decode(GuestRIP, lo, hi, seeds);
-      if (!opt.switchTables && !opt.retTwiceTargets) break;
+      if (!opt.switchTables && !opt.retTwiceTargets && !opt.collectTargets) break;
       g.retSites.clear();
+      g.outTargets.clear(); g.leaTargets.clear();
       g.jumps = analyseJumps(lo, hi, &g);
       if (!opt.switchTables) { g.jumps.clear(); break; }
       std::set<uint64_t> have;
@@ -609,7 +625,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
   tl_range = {lo, hi};
   tl_log = &log_;
   Impl::Gen g;
-  std::vector<uint64_t> extraEntries, retSites; // gap unit entries (host addresses), setjmp return sites (image vaddrs)
+  std::vector<uint64_t> extraEntries, retSites, outTargets, leaTargets; // gap unit entries (host addresses), setjmp return sites and out-of-function branch targets (image vaddrs)
   impl_->tables.clear();
   std::map<uint64_t, jt::Jump> jmps; // distinct indirect jumps of the function (image vaddr -> best outcome over its units)
   auto noteJumps = [&](const Impl::Gen& gu) {
@@ -663,8 +679,10 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       account(lo, false, g);
       noteJumps(g);
       retSites.insert(retSites.end(), g.retSites.begin(), g.retSites.end());
+      outTargets.insert(outTargets.end(), g.outTargets.begin(), g.outTargets.end());
+      leaTargets.insert(leaTargets.end(), g.leaTargets.begin(), g.leaTargets.end());
       // Code no block of the entry unit reaches (switch case bodies): lift each run as a unit of its own.
-      if (impl_->opt.gapUnits) {
+      if (impl_->opt.gapUnits && f.kind == 0) { // (pseudo-functions have no FDE bounds: a sweep could decode the data around them)
         uint64_t from = lo;
         for (int n = 0; n < 4096; ++n) {
           const uint64_t pc = impl_->findEntry(g, lo, hi, from);
@@ -685,6 +703,8 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
             noteJumps(g2);
             extraEntries.push_back(pc);
             retSites.insert(retSites.end(), g2.retSites.begin(), g2.retSites.end());
+            outTargets.insert(outTargets.end(), g2.outTargets.begin(), g2.outTargets.end());
+            leaTargets.insert(leaTargets.end(), g2.leaTargets.begin(), g2.leaTargets.end());
           }
           from = pc;
         }
@@ -692,28 +712,32 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
     }
     // Secondary entries: landing pads of the function and the return sites of its setjmp calls become units of their
     // own (the unwinder and longjmp resume there, which no unit entry covers).
-    if (impl_->opt.landingPads || impl_->opt.retTwiceTargets) {
+    if (impl_->opt.landingPads || impl_->opt.retTwiceTargets || impl_->opt.entryUnits) {
       std::set<uint64_t> entries;           // host addresses that already are a unit entry
       entries.insert(lo);
       for (auto& e : extraEntries) entries.insert(e);
-      std::vector<std::pair<uint64_t, bool>> want; // (image vaddr, is setjmp site)
+      std::vector<std::pair<uint64_t, int>> want; // (image vaddr, kind: 0 landing pad, 1 setjmp site, 2 call/jmp target inside the function)
       if (impl_->opt.landingPads) {
         auto it = impl_->opt.landingPads->find(f.start);
-        if (it != impl_->opt.landingPads->end()) for (uint64_t a : it->second) { want.push_back({a, false}); ++r.padsKnown; }
+        if (it != impl_->opt.landingPads->end()) for (uint64_t a : it->second) { want.push_back({a, 0}); ++r.padsKnown; }
       }
-      for (uint64_t a : retSites) want.push_back({a, true});
+      for (uint64_t a : retSites) want.push_back({a, 1});
+      if (impl_->opt.entryUnits) {
+        auto it = impl_->opt.entryUnits->find(f.start);
+        if (it != impl_->opt.entryUnits->end()) for (uint64_t a : it->second) want.push_back({a, 2});
+      }
       std::sort(want.begin(), want.end());
       want.erase(std::unique(want.begin(), want.end()), want.end());
-      for (auto [a, isSetjmp] : want) {
+      for (auto [a, kind] : want) {
         const uint64_t pc = impl_->img.base + a;
         if (pc < lo || pc >= hi) continue;
-        if (entries.count(pc)) { if (!isSetjmp) ++r.padsInUnit; continue; }
+        if (entries.count(pc)) { if (kind == 0) ++r.padsInUnit; continue; }
         Impl::Gen g3;
         impl_->onlyBounded = true;
         const bool ok3 = impl_->generate(pc, pc, hi, g3);
         impl_->onlyBounded = false;
         entries.insert(pc);
-        (isSetjmp ? r.setjmpUnits : r.padUnits) += 1;
+        (kind == 1 ? r.setjmpUnits : kind == 2 ? r.entryUnitsLifted : r.padUnits) += 1;
         g.cover.insert(g.cover.end(), g3.cover.begin(), g3.cover.end());
         if (!ok3 || g3.cover.empty()) {
           ++r.secondaryFailed;
@@ -731,6 +755,12 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       if (r.status == LiftStatus::Clean) r.status = LiftStatus::Partial;
       if (r.reason.empty()) r.reason = "ir validation: " + e;
     }
+    std::sort(outTargets.begin(), outTargets.end());
+    outTargets.erase(std::unique(outTargets.begin(), outTargets.end()), outTargets.end());
+    r.outTargets = std::move(outTargets);
+    std::sort(leaTargets.begin(), leaTargets.end());
+    leaTargets.erase(std::unique(leaTargets.begin(), leaTargets.end()), leaTargets.end());
+    r.leaTargets = std::move(leaTargets);
     impl_->gaps(lo, hi, g, r);
     {
       std::set<uint64_t> seenTables;

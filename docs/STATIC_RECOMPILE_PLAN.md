@@ -19,7 +19,7 @@ third implementation behind the same interface, so the runtime, GPU code and app
 | Indirect jumps | 7,513 `jmp *mem` and 14,644 `jmp *reg` (switch tables, tail calls) |
 | Atomics | about 12 k `lock` instructions (xadd, cmpxchg, inc), 14.6 k `xchg`, 60 `mfence` |
 | Other | 3,161 `rdtsc`, 4 `cpuid`, BMI1 (`bextr`, `andn`, `tzcnt`), `lzcnt`, `movbe`, `popcnt` |
-| Linked modules | `libc.prx` (0.9 MB) and other `sce_module/*.prx`: translated the same way |
+| Linked modules | `libc.prx` (0.9 MB) and `libSceFios2.prx` are linked into the runtime image (`boot-linked.bin`) and translated the same way (the other five `sce_module/*.prx` are not loaded) |
 
 The memory model is already de-risked: the shipped `fex-compatible.json` turns TSO emulation off
 (`TSOEnabled=0`, `VectorTSOEnabled=0`) and the game runs. Plain ARM64 loads and stores are therefore
@@ -210,6 +210,74 @@ gap units = 202,525 units, 11.81 M x86 instructions, 58.7 M FEX IR ops. All ops 
 - Guest memory is plain align-1 loads and stores with no TBAA. Huge functions did not blow up: the largest function
   (78 KB, 16 k instructions, 3,094 blocks) compiles in 1.1 s, and the one with the most IR (0x26bc320: 64 KB, 358 units,
   570 k IR ops) in 5.2 s, alone.
+
+**Update after step 2c (whole image: eboot + libc.prx + libSceFios2.prx, 182,663 functions, 184,271 units, 54.0 M IR ops, with jump tables resolved
+and the discovery above; same machine, -O1, 22 threads, `nice 19`, another agent building at the same time, load average 11-23):**
+
+| | -O1 |
+|---|---|
+| Wall time, lift to objects + table + link | **67.1 s** |
+| Thread-seconds: lift + lower / optimise / codegen | 52.7 / 235.4 / 970.9 (1,259 total) |
+| `.text` | **94.07 MB** (was 102.97 MB: resolving the tables removed the 39 k duplicated gap units) |
+| Objects / `.so` | 124.6 MB / 110.5 MB |
+| Peak RSS (22 workers, 64 shards of 0.71 MB) | 13.7 GB |
+| With `--resume-entries` | 115.69 MB `.text`, 83.2 s, 16.3 GB |
+| 12 GB machine (`BBR_FAKE_MEM_GB=12`, target 60 % = 7.2 GB) | 22 workers, **197 shards of 0.23 MB: peak 5.5 GB, 67.5 s** |
+
+- **The compile adapts to the RAM** (`--mem-fraction`, default 0.6 of MemAvailable, also limited by a cgroup v2 `memory.max`).
+  Measured: a worker holds its shard as an LLVM module, about **0.93 GB per MB of x86 code in the shard** (+ 0.04 GB); on a
+  30,000-function sample with 2 workers the peak was 1.47 GB at 16 shards, 0.61 GB at 64, 0.40 GB at 256, and the wall
+  time did not grow (133, 124, 101 s). So the plan makes the shards smaller before it lowers the worker count (the model
+  uses 1.15 GB/MB to stay on the safe side): 44 GB free -> 64 shards, 22 workers (est. 18 GB, measured 13.7); 20 GB free -> 102 shards;
+  12 GB -> 197 shards; 8 GB -> 315 shards; 4 GB -> 511 shards and 14 workers; 2 GB -> 5 workers. A 16 GB PC fits with every core.
+- Code size fell although more code is compiled: gap units had duplicated the code after every switch.
+
+## Discovery: how complete the unit set is (2026-10-24, step 2c)
+
+`bb-recomp --elf out/eboot.elf --boot out/boot-linked.bin` lifts the runtime's own image: the eboot plus `libc.prx` and
+`libSceFios2.prx` (the only linked modules; the other five `.prx` in `sce_module/` are not loaded) at their image offsets, so
+one `.so` and one unit table cover everything. Census (lift only, 0.7 s wall on 22 threads):
+
+| | before (2c start) | now |
+|---|---|---|
+| FDE bytes reached from function entries alone (no gap sweep, eboot) | 92.00 % | **98.84 %** (the rest: 0.18 MB padding, 0.27 MB table data, 0.03 MB dead or unresolved: 99.9 % of the real code) |
+| Extra (gap) units with the sweep on | 39,566 in 2,525 functions | 1,159 in 505 functions |
+| Functions / units in the `.so` | 162,959 / 202,525 | 165,773 FDE + 16,890 without an FDE / 184,271 |
+
+- **Switch tables.** 15,562 indirect `jmp reg/mem` in the eboot (16,780 with the modules): **3,847 are jump tables and resolve**
+  (3,741 bounded by the `cmp`/`ja` or an `and` mask, 106 scanned to the first entry that is no code address; 66,347 case
+  entries, 0.27 MB of tables; 4,002 / 68,435 with the modules). Not resolved: 8,848 `jmp reg` that are no table (register tail
+  calls: a vtable slot loaded, then `jmp rax`), 2,810 `jmp [reg+x]` (vtable tail calls; the 828 `[rip+x]` import stubs are in the
+  PLT), and **57 table-like jumps** (53 with the table base set somewhere the walk does not reach, e.g. `jmp at 0x210e7c1`;
+  4 where the index is loaded from the stack, e.g. `0x6ce423`). All of them still work through `bbr_dispatch_tail`. Absolute
+  8-byte tables do not occur (1 `jmp [base+index*scale+x]`). The census (`out/recomp/census.txt`, `failures.txt`) lists them.
+- **Landing pads.** 225 of the 165,773 FDEs have an LSDA: 1,223 call-site records, **692 landing pads**; 317 are new units, 375
+  were already gap-unit entries.
+- **setjmp.** The eboot imports `setjmp` (NID `gNQ1V2vfXDE`; `longjmp` ends in a jump to the saved return address): 1 GOT slot, the
+  PLT stub at `0x2bbe8f8` and libc's export `0x570fcb0`; **132 call sites**, so 132 return-site units (cross-checked with an
+  independent byte scan). No other returns-twice import exists in the game.
+- **Code without an FDE, 16,890 pseudo-functions.** 4.1 MB of the eboot's code range lies between FDEs: 1.3 MB is
+  alignment padding, **2.8 MB is real code**: 16,069 functions that data relocations point to (vtable thunks and static
+  initialisers, such as a 62 KB run of `__cxx_global_var_init` at `0x392380`), 2 reached through `lea [rip+f]`, 1 through a
+  branch, plus 816 PLT stubs and the two module start routines. They are lifted as units; after that only padding remains
+  between functions. Plain `--elf` has no relocations and finds only 3 of them: use `--boot`.
+- **Linked modules** (per module, functions incl. pseudo-functions): eboot 179,692, 98.76 % of the bytes in lifted blocks, 10.67 M
+  x86 instructions; libc.prx 2,242 (2,164 FDE, 0.51 MB, 98.22 %, 148,771 instructions, 595 gap units: assembly with
+  switch bodies); libSceFios2.prx 729 (650 FDE, 0.23 MB, 98.33 %, 58,575 instructions). All exported function symbols of both
+  (1,597 + 165) are FDE starts. **New op gaps from libc.prx**: 118 units contain a `bbr_trap` for an op the eboot never
+  used: x87 conversions to and from the 80-bit format (`F80CVT` 104 units, `F80CVTTo` 82: `fld/fstp tbyte` in
+  `printf`/`strtold`), `F64FPREM1` 6, `F64SCALE` 3, `NZCVSelectV` 1.
+- **Mid-function resume entries** (every call-return block, `--resume-entries`): 639,660 call-return blocks. Measured on the
+  whole game at -O1: `.text` 94.07 -> 115.69 MB (**+23.0 %**), wall 67 -> 83 s (+24 %), codegen +31 %, peak RSS 13.7 -> 16.3 GB. Under the 30 % limit, so it is implemented
+  (and tested: `bb-recomp-asmtest --resume-selftest`, plus the LLVM verifier on every module), but **off by default**:
+  nothing in the game is known to enter a call-return address other than setjmp and unwinding, and the cost is paid by every
+  unit (a flag load and branch at entry, a switch, phi moves). The runtime asks for it with `--resume-entries` and sees it in
+  `bbr_abi_flags`. Design in `RECOMP_ABI.md`.
+- **Remaining gaps.** (1) The 57 unresolved table-like jumps and any table whose pattern is not clang's (none seen) go
+  through the dispatcher. (2) Code the game generates or maps at run time is not in the image. (3) Function pointers built
+  from computed values (not stored as relocations or `lea`) that land in FDE-less code of the eboot would miss: none found;
+  every function-pointer-like relocation target outside an FDE is now a unit. (4) Plain `eboot.elf` mode cannot find the
+  relocation-reached thunks. (5) Mid-function returns (fibers, stack switching) rely on `--resume-entries` or the fallback.
 
 ## Risks
 

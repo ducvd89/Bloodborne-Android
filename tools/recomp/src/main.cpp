@@ -3,6 +3,7 @@
 //   bb-recomp --elf out/eboot.elf --dump 0x1234560   FEX IR of the function containing that vaddr
 //   bb-recomp --elf out/eboot.elf --scan             just the function list
 #include "census.h"
+#include "discover.h"
 #include "eh_frame.h"
 #include "fde_scan.h"
 #ifdef BB_RECOMP_LLVM
@@ -36,6 +37,7 @@ static void usage() {
         "  --tso                lift with x86 TSO memory ordering (the game runs with it off)\n"
         "  --no-gap-units       do not lift code the entry unit does not reach as extra units\n"
         "  --no-switch-tables   do not resolve jump tables (indirect jmps go through the dispatcher)\n"
+        "  --no-discovery       skip the search for code without an FDE (data pointers, branch targets outside every function)\n"
         "  --no-secondary       no extra units for C++ landing pads and setjmp return sites\n"
         "  --validate           run FEX's IR validation pass on every unit\n"
         "  --no-passes          skip the x87 and dead-flag passes\n"
@@ -62,7 +64,7 @@ static void usage() {
 int main(int argc, char** argv) {
   std::string elf = "out/eboot.elf", funcsFile, dumpArg, bootFile, prxDir;
   uint64_t base = 0x200000000ull;
-  bool scanOnly = false, nice = true, dump = false, noSecondary = false;
+  bool scanOnly = false, nice = true, dump = false, noSecondary = false, noDiscovery = false;
   CensusOptions co;
 #ifdef BB_RECOMP_LLVM
   CompileOptions cc;
@@ -91,6 +93,7 @@ int main(int argc, char** argv) {
     else if (is("--no-gap-units")) co.lift.gapUnits = false;
     else if (is("--no-switch-tables")) co.lift.switchTables = false;
     else if (is("--no-secondary")) noSecondary = true;
+    else if (is("--no-discovery")) noDiscovery = true;
     else if (is("--validate")) co.lift.validate = true;
     else if (is("--no-passes")) co.lift.passes = false;
     else if (is("--no-size-hist")) co.sizeHist = false;
@@ -154,6 +157,13 @@ int main(int argc, char** argv) {
     const size_t nFde = funcs.size();
     const NonFde nf = addNonFdeEntries(img, funcs);
     if (nf.entries || nf.stubs) printf("non-FDE code the runtime enters: %zu start entries (eboot entry, module starts), %zu PLT stubs (%zu pseudo-functions added to the %zu FDE functions)\n", nf.entries, nf.stubs, funcs.size() - nFde, nFde);
+  }
+  static std::map<uint64_t, std::vector<uint64_t>> entryUnits;
+  if (!noDiscovery && !scanOnly) {
+    const DiscoverResult d = discoverEntries(img, funcs, entryUnits, co.lift, co.jobs);
+    printf("discovery (%u rounds): %zu relocation pointers into code outside any FDE function (%zu did not decode), %zu more through rip-relative lea, %zu through branches: %zu functions added (%.2f MB), %zu call/jmp targets inside functions that no unit started at\n",
+           d.rounds, d.relocCandidates, d.relocRejected, d.leaCandidates, d.branchCandidates, d.pseudoFuncs, d.pseudoBytes / 1e6, d.midEntries);
+    co.lift.entryUnits = &entryUnits;
   }
   static EhScan eh;
   static ReturnsTwice rt;

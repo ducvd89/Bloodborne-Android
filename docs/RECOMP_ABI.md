@@ -26,6 +26,14 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
   per FDE function in address order, where `first_unit .. first_unit+unit_count` is the run of `bbr_units[]` entries that lie in
   `[start, end)` (entry unit first). A dispatcher that has to resume in the middle of a function (below) finds the function by
   binary search and tries those units. `bbr_abi_flags` (u64): bit 0 = the units have resume entries.
+- **Code without an FDE** (needs the boot-linked image, which carries the relocations). The runtime also enters code no FDE
+  describes; each of these is a pseudo-function (a unit bounded by the next function or entry): the eboot entry and the
+  linked modules' start routines (`image +0x56e0000`, `+0x57c0000`: hand-written, run by `guest_cpu_call` at start-up), the
+  816 PLT stubs (`jmp [rip+GOT]`, which an import call or a vtable reaches), and **16,070 thunks and static initialisers**
+  (2.8 MB) that data pointers reach: every relocation that stores an image address inside a module's code range and lands
+  outside any FDE function (vtable thunks, `.init_array`), plus branch and `lea [rip+x]` targets outside every function,
+  iterated to a fixpoint. Without them every virtual call through a thunk and every static initialiser would miss the unit table.
+  A call or jump target that lies inside another function but is no unit entry gets a unit too (none in the game).
 - **Secondary entries.** Addresses the runtime can enter without a function start get units of their own, bounded to their FDE
   (a multiblock lifted from that address; the code that follows is duplicated from the entry unit, which costs little because
   there are few):
