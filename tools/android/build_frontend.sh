@@ -72,9 +72,13 @@ mapfile -t classes < <(rg --files "$out/classes" -g '*.class')
 "$build_tools/d8" --release --min-api 28 --lib "$android_jar" --output "$out/dex" "${classes[@]}" "${lib_jars[@]}"
 # BB_VERSION_NAME overrides the manifest's versionName (build_release_apk.sh: test builds are "<version>-test.<commit>", which the app's update
 # checker reads as <version>, never as a downgrade or a newer release than the one it is built from).
-version_args=()
-[[ -z ${BB_VERSION_NAME:-} ]] || version_args=(--version-name "$BB_VERSION_NAME")
-"$build_tools/aapt" package -f -M tools/android/frontend/AndroidManifest.xml "${version_args[@]}" \
+manifest=tools/android/frontend/AndroidManifest.xml
+if [[ -n ${BB_VERSION_NAME:-} ]]; then
+    manifest="$out/AndroidManifest.xml"
+    sed "s/android:versionName=\"[^\"]*\"/android:versionName=\"$BB_VERSION_NAME\"/" tools/android/frontend/AndroidManifest.xml > "$manifest"
+    grep -q "android:versionName=\"$BB_VERSION_NAME\"" "$manifest" || { echo "BB_VERSION_NAME did not apply to the manifest" >&2; exit 1; }
+fi
+"$build_tools/aapt" package -f -M "$manifest" \
     -S "$out/res" -A "$out/assets" -I "$android_jar" -0 payload -0 zip -F "$out/unsigned.apk"
 python3 - "$out" <<'PY'
 import sys, zipfile
