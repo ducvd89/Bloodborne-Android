@@ -35,6 +35,10 @@ int bb_fb_wide_xmm(void);
  * is bb_fb_sentinel(). Not `call`: the code at `target` runs in the frame the stack already holds, to the sentinel at
  * the bottom of the guest stack (a return to it ends the run), and rip is the sentinel. */
 void bb_fb_run(GuestState *s, uint64_t target, int call);
+/* Runs from `target` in the current frame (rsp unchanged) until the guest returns through the return address slot `slot`
+ * (replaced by a trap meanwhile): 1, rip = that return address, rsp past the slot. 0: the guest left otherwise (to the
+ * sentinel at the bottom of the stack), rip = bb_fb_sentinel(). */
+int bb_fb_run_until(GuestState *s, uint64_t target, uint64_t slot);
 /* A guest address that ends a bb_fb_run / returns control to the host when the guest jumps or returns to it. */
 uint64_t bb_fb_sentinel(void);
 /* The 16-byte host-function stubs: the host function of the stub at base + 16 * i is table[i] (NULL: none). */

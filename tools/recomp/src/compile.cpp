@@ -115,7 +115,7 @@ std::vector<uint64_t> unitHashes(const ElfImage& img, const std::vector<uint64_t
 
 // bbr_units[] (sorted), bbr_unit_count, bbr_unit_end[], bbr_unit_hash[], bbr_unit_extra[], bbr_text_end, bbr_dirty[], bbr_funcs[],
 // bbr_func_count, bbr_abi_flags, bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
-bool emitTable(const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends, const std::vector<uint64_t>& hashes, const std::vector<uint64_t>& ehashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
+bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends, const std::vector<uint64_t>& hashes, const std::vector<uint64_t>& ehashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
                const std::vector<uint8_t>& dirtyInit, const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
   LLVMContext ctx;
   Module m("bbr_table", ctx);
@@ -178,6 +178,16 @@ bool emitTable(const std::vector<uint64_t>& units, const std::vector<uint64_t>& 
     new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, fs.size()), "bbr_func_count");
   }
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, (opt.resumeEntries ? 1 : 0) | (opt.dirtyCheck ? 2 : 0)), "bbr_abi_flags");
+  {
+    // bbr_eh_frame_hdr[3 * n]: per module {base, size, .eh_frame_hdr vaddr}, image-relative; bbr_eh_frame_hdr_count = n. The
+    // runtime reads the CFI of a function it enters in the middle (a jump the units do not cover) to find the function's
+    // return address slot, so the fallback CPU only runs to the end of that function.
+    std::vector<Constant*> xs; xs.reserve(ehHdrs.size());
+    for (uint64_t v : ehHdrs) xs.push_back(ConstantInt::get(i64, v));
+    auto* t = ArrayType::get(i64, xs.size());
+    new GlobalVariable(m, t, true, GlobalValue::ExternalLinkage, ConstantArray::get(t, xs), "bbr_eh_frame_hdr");
+    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, ehHdrs.size() / 3), "bbr_eh_frame_hdr_count");
+  }
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, imageHash), "bbr_image_hash");
   new GlobalVariable(m, i32, true, GlobalValue::ExternalLinkage, ConstantInt::get(i32, 1), "bbr_abi_version");
   new GlobalVariable(m, i64, false, GlobalValue::ExternalLinkage, ConstantInt::get(i64, 0), "bbr_image_base");
@@ -446,7 +456,10 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     for (size_t i = 0; i < pre.size(); ++i) nexts[i] = i + 1 < pre.size() ? pre[i + 1].entry : textEnd;
     std::vector<uint8_t> dirtyInit(units.size(), 0);
     for (size_t i = 0; i < units.size(); ++i) dirtyInit[i] = std::binary_search(trapUnits.begin(), trapUnits.end(), units[i]);
-    if (!emitTable(units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, dirtyInit, compiled, fnv1a(img.file), opt, *tm, tablePath)) return 1;
+    std::vector<uint64_t> ehHdrs;
+    for (auto& md : img.modules) if (md.ehFrameHdrVaddr) { ehHdrs.push_back(md.base); ehHdrs.push_back(md.size); ehHdrs.push_back(md.ehFrameHdrVaddr); }
+    if (ehHdrs.empty() && img.ehFrameHdrVaddr) { ehHdrs.push_back(0); ehHdrs.push_back(img.textHi); ehHdrs.push_back(img.ehFrameHdrVaddr); }
+    if (!emitTable(ehHdrs, units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, dirtyInit, compiled, fnv1a(img.file), opt, *tm, tablePath)) return 1;
     tableTime = since(t);
   }
 

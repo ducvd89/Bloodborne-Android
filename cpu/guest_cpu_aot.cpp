@@ -127,6 +127,9 @@ struct Engine {
     const uint64_t* ends = nullptr;       // bbr_unit_end[] or null
     const uint64_t* ehashes = nullptr;    // bbr_unit_ehash[] or null
     uint64_t trap_units = 0;              // units the tool started dirty (unsupported IR ops)
+    const uint64_t* eh = nullptr;         // bbr_eh_frame_hdr: per module base, size, .eh_frame_hdr (image-relative)
+    uint64_t eh_count = 0;
+    bool cfi = true;                      // BB_AOT_CFI=0: jumps into the middle of a function run on the fallback to the stack's end
     std::mutex lock;
     // Host-function stubs (x86-64: ours; ARM64: FEX's).
     uintptr_t stub_base = 0;
@@ -215,6 +218,7 @@ std::atomic<uint64_t> mid_unit_jumps {0};
 std::atomic<uint64_t> plt_hops {0};
 std::atomic<uint64_t> unaligned_atomics {0};
 std::atomic<uint64_t> dirty_entries {0};
+std::atomic<uint64_t> bounded_runs {0};
 
 void CountMiss(uint64_t address, bool dirty_unit) {
     const uint64_t key = address | 1ull << 63;  // address 0 stays distinguishable
@@ -241,8 +245,9 @@ void Report(const char* why) {
         unit += t->unit_dispatch; host += t->host_calls; misses += t->misses; dirty_runs += t->dirty_runs; cycles += t->fb_cycles;
     }
     std::fprintf(stderr, "AOT stats (%s): %llu PLT thunks followed; %llu mid-unit jumps run to the end of the stack on the fallback; "
-                 "%llu unaligned atomics emulated\n", why,
-                 (unsigned long long)plt_hops.load(), (unsigned long long)mid_unit_jumps.load(), (unsigned long long)unaligned_atomics.load());
+                 "%llu unaligned atomics emulated; %llu fallback runs bounded to their function (CFI)\n", why,
+                 (unsigned long long)plt_hops.load(), (unsigned long long)mid_unit_jumps.load(), (unsigned long long)unaligned_atomics.load(),
+                 (unsigned long long)bounded_runs.load());
     std::fprintf(stderr, "AOT stats (%s): %llu units, %llu dirty (%llu without an entry check: direct calls still run them), %llu dirty entries\n"
                  "  via the dispatcher (indirect calls, tail jumps; direct unit-to-unit calls are not counted): %llu unit entries, "
                  "%llu host function calls\n"
@@ -568,6 +573,25 @@ void FallbackRun(GuestState* s, uint64_t target, bool call, Thread* t) {
     s->gregs[R11] = 0;
     s->rip = (call && returned_here) ? original : Sentinel();
 }
+// Runs from `target` in the frame the stack holds (rsp as it is) until the function returns through its return address slot
+// `slot` (found from the CFI): rip ends as that return address and rsp past it. If the guest leaves otherwise (a longjmp
+// past it), rip ends as the sentinel. Returns 1 when the function returned through the slot.
+bool FallbackRunUntil(GuestState* s, uint64_t target, uint64_t slot, Thread* t) {
+    auto* p = reinterpret_cast<uint64_t*>(slot);
+    const uint64_t original = *p;
+    *p = reinterpret_cast<uint64_t>(&bbaot_native_ret_a);
+    const uint64_t saved_sp = s->InlineJITBlockHeader;
+    bbaot_state_ptr = s;
+    ++t->native;
+    bbaot_native_enter(s, target);
+    --t->native;
+    s->InlineJITBlockHeader = saved_sp;
+    const bool here = s->gregs[R11] == 0 && s->gregs[RSP] == slot + 8;
+    s->gregs[R11] = 0;
+    s->rip = here ? original : Sentinel();
+    if (!here) *p = original;
+    return here;
+}
 void CallHostFn(GuestState* s, void* fn) {
     HostArgs a;
     a.x[0] = s->gregs[RDI]; a.x[1] = s->gregs[RSI]; a.x[2] = s->gregs[RDX];
@@ -608,6 +632,13 @@ void FallbackRun(GuestState* s, uint64_t target, bool call, Thread* t) {
     if (outer) { t->fb_start = Ticks(); t->fb_running = true; }
     bb_fb_run(s, target, call);
     if (outer) { t->fb_ticks += Ticks() - t->fb_start; t->fb_running = false; }
+}
+bool FallbackRunUntil(GuestState* s, uint64_t target, uint64_t slot, Thread* t) {
+    const bool outer = E.stats && !t->fb_running;
+    if (outer) { t->fb_start = Ticks(); t->fb_running = true; }
+    const bool here = bb_fb_run_until(s, target, slot) != 0;
+    if (outer) { t->fb_ticks += Ticks() - t->fb_start; t->fb_running = false; }
+    return here;
 }
 void CallHostFn(GuestState* s, void* fn) {
     HostArgs a;
@@ -691,6 +722,160 @@ bool IsUnitEntry(uint64_t offset) {
     return at != end && at->vaddr == offset;
 }
 
+// ------------------------------------------------------------------------- CFI (.eh_frame) of the image ----
+// Where a function entered in the middle keeps its return address: the CFA rule at that pc, from the module's
+// .eh_frame_hdr (bbr_eh_frame_hdr: per module base, size, header vaddr). x86-64 DWARF registers: rax rdx rcx rbx rsi rdi
+// rbp rsp r8-r15.
+namespace cfi {
+constexpr unsigned DwarfToGpr[16] = {RAX, RDX, RCX, RBX, RSI, RDI, RBP, RSP, R8, R9, R10, R11, R12, R13, R14, R15};
+struct Reader {
+    const uint8_t* p;
+    const uint8_t* end;
+    bool ok = true;
+    template <class T> T get() { T v {}; if (p + sizeof(T) > end) { ok = false; return v; } std::memcpy(&v, p, sizeof(T)); p += sizeof(T); return v; }
+    uint64_t uleb() { uint64_t v = 0; unsigned sh = 0; for (;;) { if (p >= end) { ok = false; return 0; } const uint8_t b = *p++; v |= uint64_t(b & 0x7f) << sh; sh += 7; if (!(b & 0x80)) return v; } }
+    int64_t sleb() { int64_t v = 0; unsigned sh = 0; uint8_t b; do { if (p >= end) { ok = false; return 0; } b = *p++; v |= int64_t(b & 0x7f) << sh; sh += 7; } while (b & 0x80); if (sh < 64 && (b & 0x40)) v |= -(int64_t(1) << sh); return v; }
+    uint64_t encoded(uint8_t enc, uint64_t datarel) {
+        if (enc == 0xff) return 0;
+        const uint64_t at = reinterpret_cast<uint64_t>(p);
+        int64_t v;
+        switch (enc & 0x0f) {
+        case 0x00: case 0x04: case 0x0c: v = get<int64_t>(); break;
+        case 0x01: v = int64_t(uleb()); break;
+        case 0x02: v = get<uint16_t>(); break;
+        case 0x03: v = get<uint32_t>(); break;
+        case 0x09: v = sleb(); break;
+        case 0x0a: v = get<int16_t>(); break;
+        case 0x0b: v = get<int32_t>(); break;
+        default: ok = false; return 0;
+        }
+        switch (enc & 0x70) {
+        case 0x00: return uint64_t(v);
+        case 0x10: return at + uint64_t(v);
+        case 0x30: return datarel + uint64_t(v);
+        default: ok = false; return 0;
+        }
+    }
+};
+struct Rule { unsigned reg = 7; int64_t off = 8; };
+
+// The CFA rule at `pc` (host address in the image). false: no FDE, or CFI this reader does not follow.
+bool CfaAt(uint64_t pc, Rule* out) {
+    const uint64_t off = pc - E.base;
+    const uint8_t* hdr = nullptr;
+    for (uint64_t m = 0; m < E.eh_count; ++m)
+        if (off - E.eh[3 * m] < E.eh[3 * m + 1]) { hdr = reinterpret_cast<const uint8_t*>(E.base + E.eh[3 * m + 2]); break; }
+    if (!hdr || hdr[0] != 1) return false;
+    const uint64_t datarel = reinterpret_cast<uint64_t>(hdr);
+    Reader r {hdr + 4, hdr + (1 << 24)};
+    r.encoded(hdr[1], datarel);                       // eh_frame_ptr
+    const uint64_t count = r.encoded(hdr[2], datarel);
+    if (!r.ok || hdr[3] != 0x3b || !count) return false;  // table: datarel sdata4 pairs
+    const auto* table = reinterpret_cast<const int32_t*>(r.p);
+    uint64_t lo = 0, hi = count;                      // the last entry with initial_loc <= pc
+    while (hi - lo > 1) { const uint64_t mid = (lo + hi) / 2; if (datarel + int64_t(table[2 * mid]) <= pc) lo = mid; else hi = mid; }
+    if (datarel + int64_t(table[2 * lo]) > pc) return false;
+    const uint8_t* fde = reinterpret_cast<const uint8_t*>(datarel + int64_t(table[2 * lo + 1]));
+    // FDE and its CIE.
+    Reader f {fde, fde + 8};
+    const uint32_t flen = f.get<uint32_t>();
+    if (!flen || flen == 0xffffffffu) return false;
+    const uint8_t* fend = fde + 4 + flen;
+    f.end = fend;
+    const uint8_t* cie_ptr_at = f.p;
+    const uint32_t cie_off = f.get<uint32_t>();
+    const uint8_t* cie = cie_ptr_at - cie_off;
+    Reader c {cie, cie + 8};
+    const uint32_t clen = c.get<uint32_t>();
+    if (!clen || clen == 0xffffffffu) return false;
+    c.end = cie + 4 + clen;
+    if (c.get<uint32_t>() != 0) return false;
+    const uint8_t version = c.get<uint8_t>();
+    const char* aug = reinterpret_cast<const char*>(c.p);
+    while (c.p < c.end && *c.p) ++c.p;
+    ++c.p;
+    const uint64_t code_align = c.uleb();
+    const int64_t data_align = c.sleb();
+    if (version == 1) c.get<uint8_t>(); else c.uleb();
+    uint8_t fde_enc = 0;
+    if (aug[0] == 'z') {
+        const uint64_t n = c.uleb();
+        const uint8_t* data_end = c.p + n;
+        for (const char* a = aug + 1; *a && c.ok; ++a) {
+            if (*a == 'R') fde_enc = c.get<uint8_t>();
+            else if (*a == 'P') { const uint8_t e = c.get<uint8_t>(); c.encoded(e, datarel); }
+            else if (*a == 'L') c.get<uint8_t>();
+            else if (*a == 'S') {}
+            else return false;
+        }
+        c.p = data_end;
+    } else if (aug[0]) return false;
+    const uint64_t begin = f.encoded(fde_enc, datarel);
+    const uint64_t range = f.encoded(fde_enc & 0x0f, datarel);
+    if (!f.ok || !c.ok || pc < begin || pc - begin >= range) return false;
+    if (aug[0] == 'z') { const uint64_t n = f.uleb(); f.p += n; }
+    Rule rule, stack[8];
+    unsigned depth = 0;
+    uint64_t loc = begin;
+    auto run = [&](Reader& in, bool advance) -> bool {
+        while (in.p < in.end && in.ok) {
+            const uint8_t op = in.get<uint8_t>();
+            uint64_t delta = 0;
+            switch (op & 0xc0) {
+            case 0x40: delta = op & 0x3f; break;
+            case 0x80: in.uleb(); continue;      // offset: where a register is saved (not needed)
+            case 0xc0: continue;                 // restore
+            default:
+                switch (op) {
+                case 0x00: continue;
+                case 0x01: { const uint64_t a = in.encoded(fde_enc, datarel); if (advance && a > pc) return true; loc = a; continue; }
+                case 0x02: delta = in.get<uint8_t>(); break;
+                case 0x03: delta = in.get<uint16_t>(); break;
+                case 0x04: delta = in.get<uint32_t>(); break;
+                case 0x05: in.uleb(); in.uleb(); continue;
+                case 0x06: case 0x07: case 0x08: in.uleb(); continue;
+                case 0x09: in.uleb(); in.uleb(); continue;
+                case 0x0a: if (depth < 8) stack[depth++] = rule; else return false; continue;
+                case 0x0b: if (depth) rule = stack[--depth]; else return false; continue;
+                case 0x0c: rule.reg = unsigned(in.uleb()); rule.off = int64_t(in.uleb()); continue;
+                case 0x0d: rule.reg = unsigned(in.uleb()); continue;
+                case 0x0e: rule.off = int64_t(in.uleb()); continue;
+                case 0x0f: return false;          // def_cfa_expression
+                case 0x10: case 0x16: { in.uleb(); const uint64_t n = in.uleb(); in.p += n; continue; }
+                case 0x11: case 0x14: case 0x15: in.uleb(); in.sleb(); continue;
+                case 0x12: rule.reg = unsigned(in.uleb()); rule.off = in.sleb() * data_align; continue;
+                case 0x13: rule.off = in.sleb() * data_align; continue;
+                case 0x2e: in.uleb(); continue;
+                case 0x2f: in.uleb(); in.uleb(); continue;
+                default: return false;
+                }
+            }
+            if (advance && loc + delta * code_align > pc) return true;
+            loc += delta * code_align;
+        }
+        return in.ok;
+    };
+    if (!run(c, false)) return false;
+    if (!run(f, true)) return false;
+    if (rule.reg >= 16) return false;
+    *out = rule;
+    return true;
+}
+}  // namespace cfi
+
+// The guest stack slot holding the return address of the function that contains `target`, in the frame the state is in
+// (rsp, rbp...): CFA - 8. 0 when the CFI does not say or the slot does not look like a frame of this stack.
+uint64_t ReturnSlot(const GuestState* s, uint64_t target) {
+    if (!E.eh_count || !E.cfi) return 0;
+    cfi::Rule rule;
+    if (!cfi::CfaAt(target, &rule)) return 0;
+    const uint64_t slot = s->gregs[cfi::DwarfToGpr[rule.reg]] + uint64_t(rule.off) - 8;
+    const uint64_t rsp = s->gregs[RSP];
+    if (slot < rsp || slot - rsp > (1u << 20) || (slot & 7)) return 0;
+    const uint64_t ret = *reinterpret_cast<const uint64_t*>(slot);
+    if (ret - E.base >= E.size && ret != Sentinel()) return 0;
+    return slot;
+}
 // A jump (not a call) into the middle of a unit, which no unit starts: the case of a switch the tool did not resolve whose
 // target lies inside another case body. The code runs natively from there, but nothing says where its function's return
 // address is on the guest stack (the frame is mid-function), so it cannot return to the unit: it runs to the end of the
@@ -699,6 +884,13 @@ bool IsUnitEntry(uint64_t offset) {
     mid_unit_jumps.fetch_add(1, std::memory_order_relaxed);
     if (E.stats) { ++t->misses; CountMiss(target, false); }
     Trace(t, EvFree, target, s->gregs[RSP]);
+    // The function's return address slot from its CFI: the fallback runs only to the end of that function, and the caller's
+    // unit goes on (its rip check sees its own return address).
+    if (const uint64_t slot = ReturnSlot(s, target)) {
+        bounded_runs.fetch_add(1, std::memory_order_relaxed);
+        FallbackRunUntil(s, target, slot, t);
+        return;
+    }
     NoteFreeRun("jump into the middle of a unit", target, s->gregs[RSP]);
     FallbackRun(s, target, false, t);
 }
@@ -829,6 +1021,19 @@ void PrepareImage() {
         std::lock_guard<std::mutex> guard(E.lock);
         for (uint64_t i : bad_units) DirtyUnit(i);
     }
+    // BB_AOT_FALLBACK_RANGES=lo-hi[,lo-hi...] (image offsets, hex): code there runs on the fallback CPU (A/B tests of the units).
+    if (const char* list = std::getenv("BB_AOT_FALLBACK_RANGES")) {
+        for (const char* p = list; *p;) {
+            char* end;
+            const uint64_t lo = std::strtoull(p, &end, 16);
+            if (*end != '-') break;
+            const uint64_t hi = std::strtoull(end + 1, &end, 16);
+            if (hi > lo) MarkDirty(E.base + lo, hi - lo);
+            std::printf("AOT: image +%#llx-+%#llx runs on the fallback CPU (BB_AOT_FALLBACK_RANGES)\n", (unsigned long long)lo, (unsigned long long)hi);
+            p = *end == ',' ? end + 1 : end;
+            if (*end != ',') break;
+        }
+    }
     std::printf("AOT: image checked in %.0f ms: %llu units; %llu differ (patched or hooked), %llu units with their functions' other units "
                 "run on the fallback CPU\n", ms, (unsigned long long)E.count, (unsigned long long)bad, (unsigned long long)E.dirty_count.load());
     if (std::getenv("BB_AOT_DEBUG"))
@@ -886,11 +1091,16 @@ void Load(const char* path) {
     E.text_end = *text_end;
     E.ends = static_cast<const uint64_t*>(dlsym(so, "bbr_unit_end"));
     E.ehashes = E.ends ? static_cast<const uint64_t*>(dlsym(so, "bbr_unit_ehash")) : nullptr;
+    if (const auto* n = static_cast<const uint64_t*>(dlsym(so, "bbr_eh_frame_hdr_count"))) {
+        E.eh = static_cast<const uint64_t*>(dlsym(so, "bbr_eh_frame_hdr"));
+        E.eh_count = E.eh ? *n : 0;
+    }
     if (abi_flags && (*abi_flags & 2)) E.dirty_flags = static_cast<uint8_t*>(dlsym(so, "bbr_dirty"));
     if (abi_flags && (*abi_flags & 1))
         std::fprintf(stderr, "AOT: %s has resume entries (bbr_abi_flags bit 0); this runtime does not use them\n", path);
     E.stats = std::getenv("BB_AOT_STATS") != nullptr;
     E.trace = std::getenv("BB_AOT_TRACE") != nullptr;
+    if (const char* c = std::getenv("BB_AOT_CFI")) E.cfi = std::strcmp(c, "0") != 0;
     if (!BuildTable()) { std::fprintf(stderr, "AOT: cannot build the dispatch table\n"); return; }
     if (E.dirty_flags)  // units the tool could not lower completely start dirty
         for (uint64_t i = 0; i < E.count; ++i)
@@ -947,6 +1157,11 @@ BBR_EXPORT void bbr_dirty_entry(GuestState* s, uint64_t vaddr) {
     if (at != end && at->vaddr == vaddr && E.extra[at - E.units]) {
         if (E.stats) { ++t->misses; ++t->dirty_runs; CountMiss(target, true); }
         Trace(t, EvFree, target, s->gregs[RSP]);
+        if (const uint64_t slot = ReturnSlot(s, target)) {
+            bounded_runs.fetch_add(1, std::memory_order_relaxed);
+            FallbackRunUntil(s, target, slot, t);
+            return;
+        }
         NoteFreeRun("dirty unit entered by a jump", target, s->gregs[RSP]);
         FallbackRun(s, target, false, t);
         return;
@@ -1186,6 +1401,11 @@ uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t* args) {
         else {
             if (E.stats) { ++t->misses; CountMiss(rip, false); }
             Trace(t, EvFree, rip, s.gregs[RSP]);
+            if (const uint64_t slot = ReturnSlot(&s, rip)) {
+                bounded_runs.fetch_add(1, std::memory_order_relaxed);
+                FallbackRunUntil(&s, rip, slot, t);
+                continue;
+            }
             NoteFreeRun("unwound to an address with no unit", rip, s.gregs[RSP]);
             FallbackRun(&s, rip, false, t);
         }

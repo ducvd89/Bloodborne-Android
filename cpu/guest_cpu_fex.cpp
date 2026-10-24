@@ -619,6 +619,32 @@ void bb_fb_run(FEXCore::Core::CPUState* s, uint64_t target, int call) {
     }
 }
 
+int bb_fb_run_until(FEXCore::Core::CPUState* s, uint64_t target, uint64_t slot) {
+    using namespace FEXCore::X86State;
+    GuestThread* t = Current();
+    auto& st = t->thread->CurrentFrame->State;
+    if (&st != s) {
+        Fatal("bb_fb_run_until on a state that is not this thread's");
+    }
+    // The function's return goes to a CALLBACKRET (the sentinel stub), which ends HandleCallback with RSP = slot + 16 (the
+    // ret's pop plus CallbackReturn's 8). The run itself starts as a free run (RSP kept, the stub undoes HandleCallback's push).
+    auto* p = reinterpret_cast<uint64_t*>(slot);
+    const uint64_t original = *p;
+    *p = sentinel_ret;
+    const uint64_t rsp = st.gregs[REG_RSP];
+    *reinterpret_cast<uint64_t*>(rsp - 136) = target;
+    st.gregs[REG_RSP] = rsp - 128;
+    ctx->HandleCallback(t->thread, free_run_entry);
+    *p = original;
+    if (st.gregs[REG_RSP] == slot + 16) {
+        st.rip = original;
+        st.gregs[REG_RSP] = slot + 8;
+        return 1;
+    }
+    st.rip = sentinel_ret;
+    return 0;
+}
+
 void bb_fb_cpuid(uint64_t function, uint64_t leaf, uint32_t out[4]) {
     const auto r = ctx->RunCPUIDFunction(uint32_t(function), uint32_t(leaf));
     out[0] = r.eax;
