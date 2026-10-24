@@ -11,3 +11,5 @@ struct Problem {
 std::optional<Problem> game_problem(const std::string& game, const std::string& image_hash);
 std::string game_explain(const Problem& p);
 bool game_check_skipped();
+// True for the TITLE_IDs of the Bloodborne releases bbport supports (any region; the PKG step of bb-recomp checks them before unpacking).
+bool is_supported_title(const std::string& title_id);

@@ -1,5 +1,6 @@
 #include "compile.h"
 #include "bundle.h"
+#include "progress.h"
 #include "lower_llvm.h"
 
 #include <llvm/IR/Constants.h>
@@ -351,6 +352,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   lo.dirtyCheck = opt.dirtyCheck;
   lo.unitIndex = [&starts](uint64_t v) -> int64_t { auto it = std::lower_bound(starts.begin(), starts.end(), v); return it != starts.end() && *it == v ? it - starts.begin() : -1; };
 
+  bbrStage("compile", "Recompiling");
   std::vector<ShardStats> stats(nshards);
   std::vector<std::string> objFiles(nshards);
   std::atomic<unsigned> next {0};
@@ -365,6 +367,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     for (;;) {
       const unsigned k = next++;
       if (k >= nshards) break;
+      bbrProgress(k, nshards);
       ShardStats& st = stats[k];
       LLVMContext ctx;
       auto mod = std::make_unique<Module>("bbr_shard_" + std::to_string(k), ctx);
@@ -484,6 +487,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     helperTime = since(t);
   }
 
+  bbrStage("link", "Linking");
   double linkTime = 0;
   uint64_t soBytes = 0;
   if (!opt.soPath.empty()) {

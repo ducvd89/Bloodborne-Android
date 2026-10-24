@@ -1318,6 +1318,33 @@ public final class MainActivity extends Activity {
                 android.os.Environment.getExternalStorageDirectory());
         } catch (Exception ex) { return null; }
     }
+    /** The game folder made by the rebuild tool holds aot/libbbaot.so + .json: copy them into the app's own files (a library cannot be
+     *  loaded from shared storage) and switch the native CPU on; again only when they changed. Off the UI thread (a copy of ~125 MB). */
+    private String nativeSyncShown="";
+    private void syncNativeCpu() {
+        if (gameDir==null) return;
+        String id=null, version=null;
+        try {
+            java.util.Map<String,Object> sfo=Sfo.parse(java.nio.file.Files.readAllBytes(new File(gameDir,"sce_sys/param.sfo").toPath()));
+            id=Sfo.text(sfo,"TITLE_ID"); version=Sfo.text(sfo,"APP_VER");
+        } catch (Exception ignored) {}
+        File aot=new File(gameDir,"aot");
+        if (!new File(aot,NativeCpu.SO).isFile()) return;
+        main.post(() -> { if (!destroyed) { status.setText("Native CPU: checking the game folder's aot/…"); status.setVisibility(View.VISIBLE); } });
+        NativeCpu.Sync result=NativeCpu.syncFromGame(new File(BASE),new File(gameDir),id,version,(done,total) -> {
+            final String text="Native CPU: copying libbbaot.so… "+(done>>20)+" of "+(total>>20)+" MB";
+            main.post(() -> { if (!destroyed) { status.setText(text); status.setVisibility(View.VISIBLE); } });
+        });
+        if (result.kind==NativeCpu.SyncKind.IMPORTED) {
+            new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame).set(NativeCpu.SETTING,"1");
+            nativeSyncShown="";
+            main.post(() -> { if (!destroyed) toast("Native CPU imported from the game folder ("+String.format(java.util.Locale.ROOT,"%,d",result.info.unitCount)+" units) and switched on."); });
+        } else if (result.kind==NativeCpu.SyncKind.FAILED && !result.problem.equals(nativeSyncShown)) {
+            nativeSyncShown=result.problem;
+            android.util.Log.w("Bloodborne",result.problem);
+            main.post(() -> { if (!destroyed) toast(result.problem); });
+        }
+    }
     private NativeCpuDialog.Host nativeCpuHost() {
         return new NativeCpuDialog.Host() {
             @Override public File base() { return new File(BASE); }
@@ -1674,6 +1701,7 @@ public final class MainActivity extends Activity {
     private void startGame() {
         if (destroyed) return;
         hadError=false;
+        syncNativeCpu(); // the game folder's aot/ (from the rebuild tool) into bbport/aot/
         startedNative=nativeCpu.quickState().active(); // run-bionic.sh reads native_cpu and finds libbbaot.so now
         releasePause(false);
         playing=false; gameState(true);

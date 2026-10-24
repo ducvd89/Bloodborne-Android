@@ -79,6 +79,12 @@ bool any_broken(const std::string& dir, bool* unreadable) {
 }
 }  // namespace
 
+bool is_supported_title(const std::string& title_id) {
+    for (auto t : SUPPORTED_TITLES)
+        if (title_id == t) return true;
+    return false;
+}
+
 bool game_check_skipped() {
     const char* v = std::getenv("BB_SKIP_GAME_CHECK");
     return v && std::string(v) == "1";

@@ -21,7 +21,7 @@
 #endif
 
 static void usage() {
-  fputs("usage: bb-recomp --game <game dump folder> [--out <dir>]    (player mode: one command, see --help-player)\n"
+  fputs("usage: bb-recomp --pkgs <folder with the game PKGs> --out <dir>    (player mode: one command, see --help-player)\n"
         "       bb-recomp --elf <eboot.elf> [options]\n"
         "  --boot <file>        boot-linked image (scripts/link_modules.py, out/boot-linked.bin): the eboot plus the linked\n"
         "                       system modules (libc.prx ...) at their image offsets, one image, one unit table. --elf then only\n"
@@ -205,7 +205,7 @@ int playerMain(int argc, char** argv);
 #endif
 int main(int argc, char** argv) {
 #ifdef BB_RECOMP_PLAYER
-  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--game") || !strcmp(argv[i], "--help-player")) return playerMain(argc, argv);
+  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--game") || !strcmp(argv[i], "--pkgs") || !strcmp(argv[i], "--help-player")) return playerMain(argc, argv);
 #endif
   return recompMain(argc, argv);
 }

@@ -15,3 +15,6 @@ std::string bundleDirDefault();
 
 // Runs `cmd` the way system() would, except for the bundled replacements above.
 int bbrSystem(const std::string& bundleDir, const std::string& cmd);
+
+// The directory of this executable (".": unknown).
+std::string bundleExeDir();

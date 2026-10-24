@@ -136,15 +136,21 @@ final class NativeCpu {
         } catch (IOException e) { return null; }
     }
 
-    /** The reason a library is not for this phone's game, or null. `imageHash` may be null (no image yet); the game's id and
-     *  version (its param.sfo) may be null (no game folder chosen). */
+    /** The reason a library is not for this phone's game, or null. The game image decides: every region's 1.09 shares one eboot
+     *  (GameCheck.SUPPORTED_IMAGE), so a library built from CUSA03173 serves a CUSA00207 dump too. `imageHash` null means the game
+     *  was not prepared yet: then the game version and the title id (it has to be a Bloodborne one) are all there is to compare.
+     *  The game's id and version (its param.sfo) may be null (no game folder chosen). */
     static String mismatch(Info info, String imageHash, String gameId, String gameVersion) {
-        if (imageHash != null && !imageHash.equalsIgnoreCase(info.imageHash))
+        if (imageHash != null) {
+            if (imageHash.equalsIgnoreCase(info.imageHash)) return null;
             return "It was built from another build of the game's code (image " + info.imageHash + ", " + describe(info.gameId, info.gameVersion)
                 + "; this phone has image " + imageHash + (gameId != null ? ", " + describe(gameId, gameVersion) : "")
                 + "). Build it from the same game folder the app uses, with the 1.09 update merged in.";
-        if (gameId != null && info.gameId != null && !gameId.equals(info.gameId))
-            return "It was built from " + info.gameId + ", but the game on this phone is " + gameId + ".";
+        }
+        if (info.gameId != null && !GameCheck.SUPPORTED_TITLES.contains(info.gameId))
+            return "It was built from " + info.gameId + ", which is not a Bloodborne game folder the app supports.";
+        if (info.gameVersion != null && !GameCheck.SUPPORTED_VERSION.equals(info.gameVersion))
+            return "It was built from game version " + info.gameVersion + "; the app runs version " + GameCheck.SUPPORTED_VERSION + ".";
         if (gameVersion != null && info.gameVersion != null && !gameVersion.equals(info.gameVersion))
             return "It was built from game version " + info.gameVersion + ", but the game on this phone is version " + gameVersion + ".";
         return null;
@@ -256,6 +262,39 @@ final class NativeCpu {
         if (!part.renameTo(so)) { part.delete(); throw new IOException("Could not save " + so); }
         SafeWrite.write(json(base), jsonText);
         return info;
+    }
+
+    // ---------------------------------------------------------------- the game folder's own copy
+
+    enum SyncKind { NONE, UNCHANGED, IMPORTED, FAILED }
+    /** What syncFromGame did. */
+    static final class Sync { SyncKind kind = SyncKind.NONE; Info info; String problem; }
+
+    /** The game folder made by the rebuild tool (bb-recomp --pkgs) holds aot/libbbaot.so and aot/libbbaot.json. The runtime cannot load a
+     *  library from shared storage (noexec), so they are copied into bbport/aot/ here, and the native CPU is switched on. Nothing is copied
+     *  again while the installed pair is the folder's (same description, so same build and checksum, and the same size). A pair that fails
+     *  the checks (ABI, game, checksum) is reported and leaves what is installed alone. Blocking: not for the UI thread. */
+    static Sync syncFromGame(File base, File gameDir, String gameId, String gameVersion, Progress progress) {
+        Sync result = new Sync();
+        if (gameDir == null) return result;
+        File srcSo = new File(new File(gameDir, "aot"), SO), srcJson = new File(new File(gameDir, "aot"), JSON);
+        if (!srcSo.isFile() || !srcJson.isFile()) return result;
+        try {
+            String jsonText = SafeWrite.readText(srcJson);
+            if (jsonText == null) { result.kind = SyncKind.FAILED; result.problem = "aot/libbbaot.json in the game folder is empty."; return result; }
+            Info info = parse(jsonText);
+            String installedJson = SafeWrite.readText(json(base));
+            File so = so(base);
+            if (installedJson != null && installedJson.equals(jsonText) && so.isFile() && so.length() == srcSo.length() && so.length() == info.soSize) {
+                result.kind = SyncKind.UNCHANGED; result.info = info; return result;
+            }
+            try (InputStream in = new java.io.FileInputStream(srcSo)) {
+                result.info = install(base, jsonText, in, srcSo.length(), gameId, gameVersion, progress);
+            }
+            result.kind = SyncKind.IMPORTED;
+        } catch (Problem p) { result.kind = SyncKind.FAILED; result.problem = "The native CPU files in the game folder were not used: " + p.getMessage(); }
+        catch (IOException | RuntimeException e) { result.kind = SyncKind.FAILED; result.problem = "The native CPU files in the game folder could not be read: " + e; }
+        return result;
     }
 
     /** Removes the installed library and its description. */

@@ -1,4 +1,5 @@
 #include "bundle.h"
+#include "progress.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -29,12 +30,15 @@ BBR_NO_TARGET(Mips) BBR_NO_TARGET(MSP430) BBR_NO_TARGET(NVPTX) BBR_NO_TARGET(Pow
 BBR_NO_TARGET(SystemZ) BBR_NO_TARGET(VE) BBR_NO_TARGET(WebAssembly) BBR_NO_TARGET(XCore)
 #endif
 
+ProgressHooks g_progress;
+
 namespace {
 #ifdef BBR_BUNDLED
 bool dirExists(const std::string& d) {
   std::ifstream f(d + "/helpers-aarch64.o", std::ios::binary);
   return f.good();
 }
+#endif
 
 std::string exeDir() {
 #ifdef _WIN32
@@ -50,7 +54,6 @@ std::string exeDir() {
   return s == std::string::npos ? "." : p.substr(0, s);
 #endif
 }
-#endif
 
 #ifdef BBR_BUNDLED
 // LLD 23 writes VER_NDX_LOCAL (0) in .gnu.version for undefined symbols that carry no version (the bbr_* imports of libbbcpu), the NDK's
@@ -102,6 +105,8 @@ std::string after(const std::vector<std::string>& v, const char* flag) {
 }
 bool has(const std::string& s, const char* sub) { return s.find(sub) != std::string::npos; }
 } // namespace
+
+std::string bundleExeDir() { return exeDir(); }
 
 std::string bundleDirDefault() {
 #ifdef BBR_BUNDLED

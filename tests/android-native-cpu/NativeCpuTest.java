@@ -110,8 +110,13 @@ public final class NativeCpuTest {
         refuses("format 2", "format 2", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 1, 2), good, "CUSA00207", "01.09"));
         refuses("not json", "not readable", tryInstall(b2, "hello", good, null, null));
         refuses("not a bb-recomp file", "not a bb-recomp", tryInstall(b2, "{\"a\": 1}", good, null, null));
-        refuses("another game", "CUSA03014", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA03014", "01.09"));
-        refuses("another version", "version 01.08", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA00207", "01.08"));
+        // (b2 has its game image: the hash decides, whatever the ids say; without an image the version and the title id are compared)
+        check(tryInstall(temp(), json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA03173", "01.09") == null, "another region of the same 1.09, game not prepared: accepted");
+        File b2b = temp(); bootFile(b2b, image);
+        check(tryInstall(b2b, json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA03173", "01.09") == null, "same image, another title id: accepted");
+        refuses("other title", "not a Bloodborne", tryInstall(temp(), json("CUSA12345", "01.09", hash, good, 1, 1), good, null, null));
+        refuses("library from 1.08", "version 01.08", tryInstall(temp(), json("CUSA00207", "01.08", hash, good, 1, 1), good, null, null));
+        refuses("another version on the phone", "version 01.08", tryInstall(temp(), json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA00207", "01.08"));
         refuses("another image", "another build", tryInstall(b2, json("CUSA00207", "01.09", "ffffffffffffffff", good, 1, 1), good, "CUSA00207", "01.09"));
         byte[] x86 = so(62, 100000);
         refuses("x86 library", "not for ARM64", tryInstall(b2, json("CUSA00207", "01.09", hash, x86, 1, 1), x86, "CUSA00207", "01.09"));
@@ -141,6 +146,25 @@ public final class NativeCpuTest {
         NativeCpu.remove(b3);
         s = NativeCpu.state(b3, ini, null, null, null);
         check(!s.installed && "Not installed".equals(NativeCpu.summary(s)), "removed");
+
+        // the game folder's aot/ (made by bb-recomp --pkgs)
+        File phone = temp(), game = temp(), aot = new File(game, "aot");
+        bootFile(phone, image);
+        check(NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null).kind == NativeCpu.SyncKind.NONE, "no aot/ in the game folder");
+        aot.mkdirs();
+        Files.write(new File(aot, "libbbaot.so").toPath(), good); Files.write(new File(aot, "libbbaot.json").toPath(), goodJson.getBytes(StandardCharsets.UTF_8));
+        NativeCpu.Sync sy = NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null);
+        check(sy.kind == NativeCpu.SyncKind.IMPORTED && NativeCpu.so(phone).length() == good.length && sy.info.unitCount == 185934, "imported from the game folder");
+        long stamp = NativeCpu.so(phone).lastModified(); Thread.sleep(20);
+        check(NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null).kind == NativeCpu.SyncKind.UNCHANGED && NativeCpu.so(phone).lastModified() == stamp, "not copied again");
+        Files.write(new File(aot, "libbbaot.so").toPath(), other); Files.write(new File(aot, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, other, 1, 1).getBytes(StandardCharsets.UTF_8));
+        check(NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null).kind == NativeCpu.SyncKind.IMPORTED && NativeCpu.so(phone).length() == 120000, "copied again when it changed");
+        Files.write(new File(aot, "libbbaot.so").toPath(), flipped);
+        sy = NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null);
+        check(sy.kind == NativeCpu.SyncKind.FAILED && NativeCpu.so(phone).length() == 120000, "a damaged pair is reported and the installed one stays");
+        Files.write(new File(aot, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 2, 1).getBytes(StandardCharsets.UTF_8));
+        sy = NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null);
+        check(sy.kind == NativeCpu.SyncKind.FAILED && sy.problem.contains("ABI version 2"), "ABI mismatch in the game folder is reported");
 
         System.out.println(checks + " checks, " + failed + " failed");
         if (failed != 0) System.exit(1);

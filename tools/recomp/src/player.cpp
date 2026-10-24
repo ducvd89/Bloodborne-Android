@@ -12,11 +12,16 @@
 #include "game_check.h"
 #include "hash.h"
 #include "io.h"
+#include "pkgs.h"
+#include "proc.h"
+#include "progress.h"
 #include "ps4.h"
 
 #include <llvm/Config/llvm-config.h>
 
 #include <algorithm>
+#include <atomic>
+#include <csignal>
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
@@ -30,10 +35,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>
 #else
-#include <fcntl.h>
 #include <unistd.h>
 #endif
 #if __has_include("variants.h")
@@ -63,22 +68,54 @@ std::string fmtTime(double s) {
   return b;
 }
 
-void step(int n, const char* title) { printf("\n[%d/5] %s\n", n, title); fflush(stdout); }
+bool g_machine = false;           // --machine: "@@..." lines for the GUI (STAGE id|text, PROGRESS done total, ERROR text, DONE folder)
+std::atomic<bool> g_stop {false}; // SIGTERM / SIGINT: stop the PKG step; later stages end the process at once
+std::atomic<bool> g_stoppable {false};
+int g_step = 0, g_steps = 5;
+uint64_t g_lastPct = 101;
+
+void onStopSignal(int) { if (g_stoppable) g_stop = true; else _exit(143); }
+
+void step(const char* id, const char* title) {
+  ++g_step; g_lastPct = 101;
+  if (g_machine) printf("@@STAGE %s|%s\n", id, title);
+  printf("\n[%d/%d] %s\n", g_step, g_steps, title);
+  fflush(stdout);
+}
+void hookStage(const char* id, const char* text) {
+  g_lastPct = 101;
+  if (g_machine) printf("@@STAGE %s|%s\n", id, text); else printf("  %s\n", text);
+  fflush(stdout);
+}
+void hookProgress(uint64_t done, uint64_t total) {
+  if (!total) return;
+  if (g_machine) { printf("@@PROGRESS %" PRIu64 " %" PRIu64 "\n", done, total); fflush(stdout); return; }
+  uint64_t pct = done * 100 / total;
+  if (pct / 10 != g_lastPct / 10 && pct % 10 < 10) { g_lastPct = pct; printf("    %" PRIu64 " %%\n", pct / 10 * 10); fflush(stdout); }
+}
 
 [[noreturn]] void die(const std::string& msg) {
   fflush(stdout);
+  if (g_machine) printf("@@ERROR %s\n", msg.c_str());
   fprintf(stderr, "\nbb-recomp: %s\n", msg.c_str());
+  fflush(stdout);
   exit(1);
 }
 
 void playerUsage() {
-  fputs("bb-recomp player mode: compile the game's code for your phone, from your own game dump.\n"
+  fputs("bb-recomp: builds everything the phone needs for the native CPU from your own copy of Bloodborne.\n"
         "\n"
-        "  bb-recomp --game <game dump folder> [--out <dir>]\n"
+        "  bb-recomp --pkgs <folder with the game's PKG files> --out <output folder>\n"
+        "  bb-recomp --game <extracted game folder> [--out <dir>]     (an already extracted dump: only libbbaot.so and .json are written)\n"
         "\n"
+        "  --pkgs <dir>       a folder holding Bloodborne's base game PKG and its update PKG(s) (1.09). They are unpacked, merged and\n"
+        "                     compiled. The output folder then holds the game folder (CUSA03173, as the app expects it) with aot/ inside\n"
+        "                     and a README.txt: copy it to the phone and choose it as the game folder in the app\n"
         "  --game <dir>       the PS4 dump of Bloodborne with update 1.09 merged in: the folder that holds eboot.bin, sce_module/\n"
         "                     and sce_sys/ (e.g. CUSA03173). Nothing in it is changed\n"
-        "  --out <dir>        where libbbaot.so and libbbaot.json go (default: ./bb-recomp-out)\n"
+        "  --out <dir>        the output folder (default: ./bb-recomp-out)\n"
+        "  --pkg-tool <file>  ps4-pkg-tool (default: next to this program)\n"
+        "  --machine          progress lines for the GUI\n"
         "  --jobs <n>         worker threads (default: the CPU cores minus two, at most 22; fewer when the memory needs it)\n"
         "  --mem-fraction <f> share of the free memory the compile may use (default 0.6)\n"
         "  --variants <dir>   a variant catalog to use instead of the one next to the tool (--no-variants: none)\n"
@@ -177,6 +214,14 @@ std::string readSo(const std::string& path, uint64_t imageSize, SoInfo& out) {
   return "";
 }
 
+// Where libbbaot.so and libbbaot.json go: aot/ inside the game folder made from PKGs (the app imports from there), else the output folder.
+fs::path fromPkgsDir(bool fromPkgs, const fs::path& game, const fs::path& out) { return fromPkgs ? game / "aot" : out; }
+
+std::string exeDirectory() {
+  std::string d = bundleExeDir();
+  return d;
+}
+
 std::string readText(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
   std::stringstream ss; ss << in.rdbuf();
@@ -268,32 +313,73 @@ int runPrepare(const std::string& game, const std::string& data, std::string& er
 } // namespace
 
 int playerMain(int argc, char** argv) {
-  std::string gameArg, outArg = "bb-recomp-out", variantsArg, jobs, memFraction;
+  std::string gameArg, pkgsArg, outArg = "bb-recomp-out", variantsArg, jobs, memFraction, toolArg;
   bool keepWork = false, noVariants = false;
   for (int i = 1; i < argc; ++i) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s); };
     auto arg = [&]() -> std::string { if (i + 1 >= argc) { playerUsage(); exit(2); } return argv[++i]; };
     if (is("--game")) gameArg = arg();
+    else if (is("--pkgs")) pkgsArg = arg();
     else if (is("--out")) outArg = arg();
     else if (is("--jobs")) jobs = arg();
     else if (is("--mem-fraction")) memFraction = arg();
     else if (is("--variants")) variantsArg = arg();
     else if (is("--no-variants")) noVariants = true;
     else if (is("--keep-work")) keepWork = true;
+    else if (is("--pkg-tool")) toolArg = arg();
+    else if (is("--machine")) g_machine = true;
     else if (is("--help-player") || is("--help") || is("-h")) { playerUsage(); return 0; }
-    else { fprintf(stderr, "bb-recomp: unknown option %s in player mode (bb-recomp --help-player)\n", argv[i]); return 2; }
+    else { fprintf(stderr, "bb-recomp: unknown option %s (bb-recomp --help-player)\n", argv[i]); return 2; }
   }
-  if (gameArg.empty()) { playerUsage(); return 2; }
+  if (gameArg.empty() == pkgsArg.empty()) { playerUsage(); return 2; }
+  const bool fromPkgs = !pkgsArg.empty();
+  g_steps = fromPkgs ? 6 : 5;
+  signal(SIGINT, onStopSignal); signal(SIGTERM, onStopSignal);
+  g_progress.stage = hookStage; g_progress.progress = hookProgress;
+  setvbuf(stdout, nullptr, _IOLBF, 0);
 
   const auto t0 = clk::now();
-  printf("bb-recomp %s (LLVM %s): compiles Bloodborne's code for your phone, from your own game dump.\n", BBR_TOOL_VERSION, LLVM_VERSION_STRING);
+  printf("bb-recomp %s (LLVM %s): builds what the phone needs for the native CPU, from your own copy of Bloodborne.\n", BBR_TOOL_VERSION, LLVM_VERSION_STRING);
   printf("The result is derived from your game: keep it for yourself and never share it.\n");
 
-  // ---- [1/5] the game folder ----
-  step(1, "Checking the game folder");
   std::error_code ec;
-  fs::path game = fs::absolute(gameArg, ec);
-  if (!fs::is_directory(game)) die("the game folder " + gameArg + " does not exist.");
+  fs::path out = fs::absolute(outArg, ec);
+  fs::create_directories(out, ec);
+  if (!fs::is_directory(out)) die("cannot create the output folder " + out.string());
+  fs::path work = out / ".bbwork";
+  fs::remove_all(work, ec);
+  fs::create_directories(work, ec);
+  if (!fs::is_directory(work)) die("cannot create the work folder " + work.string());
+  auto cleanup = [&] { if (!keepWork) { std::error_code e2; fs::current_path(out, e2); fs::remove_all(work, e2); } };
+  std::string err;
+
+  fs::path game;
+  if (fromPkgs) {
+    // ---- the PKG files: find, identify, unpack, merge ----
+    step("check", "Checking the PKG files");
+    PkgSet set;
+    if (!findPkgs(fs::absolute(pkgsArg, ec).string(), set, err)) { cleanup(); die(err); }
+    printf("  base game: %s (%s, version %s, %.1f GB)\n", set.base.file.c_str(), set.titleId.c_str(), set.base.appVer.c_str(), set.base.size / 1073741824.0);
+    for (auto& u : set.updates) printf("  update:    %s (version %s, %.1f GB)\n", u.file.c_str(), u.appVer.c_str(), u.size / 1073741824.0);
+    step("extract", "Unpacking the game (this takes a while: the game is tens of GB)");
+    std::string tool = toolArg;
+    if (tool.empty()) {
+      const std::string b = bundleDirDefault();
+      for (const std::string& c : {exeDirectory() + "/ps4-pkg-tool", exeDirectory() + "/ps4-pkg-tool.exe", b.empty() ? std::string() : b + "/../../bin/ps4-pkg-tool"})
+        if (!c.empty() && fs::is_regular_file(c, ec)) { tool = c; break; }
+    }
+    if (const char* e = getenv("BB_PKG_TOOL")) if (toolArg.empty() && *e) tool = e;
+    g_stoppable = true;
+    std::string gameDir;
+    const bool ok = installPkgs(set, tool, out.string(), work.string(), gameDir, err, [](const std::string& l) { printf("  %s\n", l.c_str()); fflush(stdout); }, [] { return g_stop.load(); });
+    g_stoppable = false;
+    if (!ok) { cleanup(); die(err); }
+    game = gameDir;
+  } else {
+    step("check", "Checking the game folder");
+    game = fs::absolute(gameArg, ec);
+    if (!fs::is_directory(game)) { cleanup(); die("the game folder " + gameArg + " does not exist."); }
+  }
   const char* needed[] = {"eboot.bin", "sce_module/libc.prx", "sce_module/libSceFios2.prx", "sce_sys/param.sfo"};
   std::string missing;
   for (const char* n : needed) if (!fs::is_regular_file(game / n)) missing += std::string("  ") + n + "\n";
@@ -301,44 +387,34 @@ int playerMain(int argc, char** argv) {
     std::string hint;
     for (auto& e : fs::directory_iterator(game, ec))
       if (e.is_directory() && fs::is_regular_file(e.path() / "eboot.bin")) hint += "  " + e.path().string() + "\n";
-    die("this does not look like a Bloodborne dump. Missing in " + game.string() + ":\n" + missing +
+    cleanup();
+    die("this does not look like a Bloodborne game folder. Missing in " + game.string() + ":\n" + missing +
         (hint.empty() ? std::string("Pass the folder that contains eboot.bin, sce_module and sce_sys (for example CUSA03173), with the 1.09 update merged in.")
                       : "Did you mean one of these?\n" + hint));
   }
   std::string titleId = "?", version = "?", title = "?", contentId = "?";
   try {
-    MappedFile f = read_file((game / "sce_sys/param.sfo").string());
+    MappedFile f = read_file((game / "sce_sys/param.sfo").generic_string());
     Sfo info = sfo(f.view());
     auto get = [&](const char* k, std::string& dst) { auto it = info.find(k); if (it != info.end()) dst = it->second.str(); };
     get("TITLE_ID", titleId); get("APP_VER", version); get("TITLE", title); get("CONTENT_ID", contentId);
   } catch (PyError& e) {
-    die("sce_sys/param.sfo cannot be read (" + e.kind + (e.msg.empty() ? "" : ": " + e.msg) + "): dump the game again.");
+    cleanup();
+    die("sce_sys/param.sfo cannot be read (" + e.kind + (e.msg.empty() ? "" : ": " + e.msg) + "): the game files are damaged.");
   }
-  printf("  %s (%s), version %s, %s\n", title.c_str(), titleId.c_str(), version.c_str(), game.string().c_str());
+  printf("  %s (%s), version %s, %s\n", title.c_str(), titleId.c_str(), version.c_str(), game.generic_string().c_str());
 
-  fs::path out = fs::absolute(outArg, ec);
-  fs::create_directories(out, ec);
-  if (!fs::is_directory(out)) die("cannot create the output folder " + out.string());
-  fs::path work = out / "work";
-  fs::remove_all(work, ec);
-  fs::create_directories(work, ec);
-  if (!fs::is_directory(work)) die("cannot create the work folder " + work.string());
-  auto cleanup = [&] { if (!keepWork) { std::error_code e2; fs::current_path(out, e2); fs::remove_all(work, e2); } };
-
-  // ---- [2/5] the game image: bb-prepare's code ----
-  step(2, "Building the game image (the same step the app runs on the phone)");
+  // ---- the game image: bb-prepare's code ----
+  step("prepare", "Building the game image (the same step the app runs on the phone)");
   auto tp = clk::now();
-  std::string err;
   fs::path data = work / "data";
-  if (runPrepare(game.string(), data.string(), err, work / "prepare.err") != 0) {
+  if (runPrepare(game.generic_string(), data.generic_string(), err, work / "prepare.err") != 0) {
     cleanup();
     std::string text = err;
     const std::string kCheck = "prepare.GameCheckError: ";
-    if (text.rfind(kCheck, 0) == 0) {
-      die("this game folder is not supported.\n  " + text.substr(kCheck.size()) +
-          "\nbb-recomp compiles Bloodborne with the 1.09 update merged in (the same check the app makes). Nothing was written.");
-    }
-    die("the game files could not be read:\n  " + text + "\nThe dump may be encrypted or damaged: dump the game and the 1.09 update again.");
+    if (text.rfind(kCheck, 0) == 0)
+      die("this game is not supported.\n  " + text.substr(kCheck.size()) + "\nbb-recomp compiles Bloodborne with the 1.09 update merged in (the same check the app makes).");
+    die("the game files could not be read:\n  " + text + "\nThe PKGs or the dump may be damaged: get them again.");
   }
   const fs::path boot = data / "boot-linked.bin";
   uint64_t imageHash = 0, imageSize = 0;
@@ -346,15 +422,15 @@ int playerMain(int argc, char** argv) {
   // The eboot's own ELF (what scripts/prepare.py writes as eboot.elf): the lifter reads its program headers from it.
   fs::path elf = work / "eboot.elf";
   try {
-    MappedFile f = read_file((game / "eboot.bin").string());
+    MappedFile f = read_file((game / "eboot.bin").generic_string());
     SelfInfo s = parse_self(f.view());
     std::ofstream o(elf, std::ios::binary); o.write((const char*)s.elf.data(), (std::streamsize)s.elf.size());
     if (!o) throw PyError{"OSError", "cannot write " + elf.string()};
   } catch (PyError& e) { cleanup(); die("eboot.bin cannot be read: " + e.kind + ": " + e.msg); }
   printf("  image ready: %.1f MB, hash %s, %s\n", imageSize / 1048576.0, hex16(imageHash).c_str(), fmtTime(since(tp)).c_str());
 
-  // ---- [3/5] lift and compile ----
-  step(3, "Lifting and compiling the game's code (a few minutes; the memory plan below fits your RAM)");
+  // ---- lift and compile ----
+  step("analyse", "Analysing and recompiling the game's code (a few minutes; the memory plan below fits your RAM)");
   const auto tc = clk::now();
   std::vector<std::string> args = {"bb-recomp", "--boot", boot.string(), "--elf", elf.string(), "--prx-dir", (game / "sce_module").string(),
                                    "--so", "libbbaot.so", "--stats", (work / "compile.txt").string(), "-O1"};
@@ -393,8 +469,8 @@ int playerMain(int argc, char** argv) {
   if (rc != 0) { cleanup(); die("the compile failed (code " + std::to_string(rc) + "); see the messages above."); }
   const double compileSecs = since(tc);
 
-  // ---- [4/5] verify ----
-  step(4, "Checking the result");
+  // ---- verify ----
+  step("verify", "Checking the result");
   SoInfo so;
   const std::string bad = readSo((work / "libbbaot.so").string(), imageSize, so);
   if (!bad.empty()) { cleanup(); die("the library failed its check: " + bad); }
@@ -408,9 +484,11 @@ int playerMain(int argc, char** argv) {
   if (liftFail > 0) printf("  note: %lld functions could not be lifted; the runtime runs them on its own CPU emulation\n", liftFail);
   if (trapUnits > 0) printf("  note: %lld units use instructions this tool cannot translate yet; the runtime runs those on its own CPU emulation\n", trapUnits);
 
-  // ---- [5/5] write ----
-  step(5, "Writing the result");
-  const fs::path soOut = out / "libbbaot.so", jsonOut = out / "libbbaot.json";
+  // ---- write ----
+  step("finish", "Writing the result");
+  const fs::path aotDir = fromPkgsDir(fromPkgs, game, out);
+  fs::create_directories(aotDir, ec);
+  const fs::path soOut = aotDir / "libbbaot.so", jsonOut = aotDir / "libbbaot.json";
   fs::remove(soOut, ec);
   fs::rename(work / "libbbaot.so", soOut, ec);
   if (ec) { ec.clear(); fs::copy_file(work / "libbbaot.so", soOut, fs::copy_options::overwrite_existing, ec); }
@@ -444,11 +522,36 @@ int playerMain(int argc, char** argv) {
     std::ofstream o(out / "bb-recomp.log", std::ios::binary);
     o << "bb-recomp " << BBR_TOOL_VERSION << " (LLVM " << LLVM_VERSION_STRING << "), " << isoNow() << "\n" << stats;
   }
+  if (fromPkgs) {
+    std::ofstream o(out / "README.txt", std::ios::binary);
+    o << "Bloodborne for Android: the game folder, ready for the app\n"
+         "==========================================================\n\n"
+         "What is in here\n"
+         "  " << game.filename().string() << "/    Bloodborne " << version << " (" << title << "), unpacked from your PKG files, in the layout the app expects\n"
+         "  " << game.filename().string() << "/aot/libbbaot.so and libbbaot.json   the game's code compiled for your phone (the native CPU)\n\n"
+         "What to do\n"
+         "  1. Copy the folder \"" << game.filename().string() << "\" to your phone's storage (internal storage or an SD card), for example into Download.\n"
+         "     (Copying this whole folder, with this README, works too: the app finds the game folder inside.)\n"
+         "  2. In the Bloodborne app, choose that folder as the game folder (Menu > Game folder).\n"
+         "  3. The app copies aot/libbbaot.so into its own files and turns the native CPU on by itself (Menu > Native CPU shows it).\n"
+         "     It only copies again when the files change. Restart the game after the first time.\n\n"
+         "These files are made from your own game and are for you only: do not share or upload them.\n"
+         "Made by bb-recomp " << BBR_TOOL_VERSION << " on " << isoNow() << ".\n";
+  }
   cleanup();
   printf("\nDone in %s (compile %s).\n\n", fmtTime(since(t0)).c_str(), fmtTime(compileSecs).c_str());
-  printf("  %s  (%.1f MB)\n  %s\n\n", soOut.string().c_str(), so.size / 1048576.0, jsonOut.string().c_str());
-  printf("Copy BOTH files to your phone (any folder, for example Downloads), then in the app:\n"
-         "  Menu -> Native CPU (recompiled) -> Import libbbaot.so..., pick libbbaot.so (and libbbaot.json if asked), and switch it on.\n"
-         "Restart the game to apply. These files are derived from your game: do not share them.\n");
+  if (fromPkgs) {
+    printf("  %s\n  %s  (%.1f MB)\n\n", game.generic_string().c_str(), soOut.generic_string().c_str(), so.size / 1048576.0);
+    printf("Copy the folder \"%s\" to your phone's storage and choose it as the game folder in the app (Menu > Game folder).\n"
+           "The app copies the native CPU files in by itself and switches it on; restart the game after the first time.\n"
+           "These files are derived from your game: do not share them.\n", game.filename().string().c_str());
+    if (g_machine) printf("@@DONE %s\n", game.generic_string().c_str());
+  } else {
+    printf("  %s  (%.1f MB)\n  %s\n\n", soOut.generic_string().c_str(), so.size / 1048576.0, jsonOut.generic_string().c_str());
+    printf("Copy BOTH files to your phone, then in the app: Menu -> Native CPU (recompiled) -> Import libbbaot.so..., pick them, and switch it on.\n"
+           "Or put the folder aot/ with both files inside your game folder: the app imports it by itself.\n"
+           "Restart the game to apply. These files are derived from your game: do not share them.\n");
+    if (g_machine) printf("@@DONE %s\n", out.generic_string().c_str());
+  }
   return 0;
 }

@@ -31,6 +31,11 @@ option(BB_RECOMP_BUNDLED "Self-contained bb-recomp: static LLVM + LLD, no NDK or
 set(BB_RECOMP_LLVM_DIR "" CACHE PATH "LLVM's lib/cmake/llvm (default: the system LLVM)")
 set(BB_RECOMP_DEPS_PREFIX "" CACHE PATH "prefix with static zlib and zstd (BB_RECOMP_BUNDLED)")
 set(BB_RECOMP_VERSION "0.1.0" CACHE STRING "tool version written to libbbaot.json")
+# Windows (experimental, cross-compiled on Linux with llvm-mingw): -DBB_RECOMP_TOOLCHAIN_FILE=tools/recomp/windows/toolchain-mingw-x86_64.cmake
+# -DBB_MINGW_ROOT=<llvm-mingw dir>; LLVM_DIR and the deps prefix then name builds for mingw (windows/build.sh).
+set(BB_RECOMP_TOOLCHAIN_FILE "" CACHE FILEPATH "CMake toolchain file for a cross build (Windows: windows/toolchain-mingw-x86_64.cmake)")
+set(BB_MINGW_ROOT "" CACHE PATH "llvm-mingw directory (cross build for Windows)")
+set(BB_RECOMP_LLD_INCLUDE "" CACHE PATH "include directory of LLD's headers when LLVM is a build tree (Windows build)")
 set(BB_RECOMP_JOBS 22 CACHE STRING "Parallel jobs for the inner FEX build (2 of 24 cores stay free)")
 set(BB_RECOMP_MARCH x86-64-v3 CACHE STRING "-march for FEX and bb-recomp on x86 hosts (FEX needs AVX)")
 set(BB_RECOMP_CC clang CACHE STRING "C compiler for FEX (needs Clang)")
@@ -55,8 +60,14 @@ if(NOT EXISTS "${FEX_SOURCE_DIR}/FEXCore/CMakeLists.txt")
   message(FATAL_ERROR "FEX_SOURCE_DIR=${FEX_SOURCE_DIR} has no FEXCore")
 endif()
 
+set(BB_EXE "")
+set(BB_TOOLCHAIN_ARGS -DCMAKE_C_COMPILER=${BB_RECOMP_CC} -DCMAKE_CXX_COMPILER=${BB_RECOMP_CXX})
+if(BB_RECOMP_TOOLCHAIN_FILE)
+  set(BB_EXE ".exe")
+  set(BB_TOOLCHAIN_ARGS "-DCMAKE_TOOLCHAIN_FILE=${BB_RECOMP_TOOLCHAIN_FILE}" "-DBB_MINGW_ROOT=${BB_MINGW_ROOT}")
+endif()
 set(BB_TARGETS bb-recomp)
-set(BB_BUILT_FILES "<BINARY_DIR>/Bin/bb-recomp")
+set(BB_BUILT_FILES "<BINARY_DIR>/Bin/bb-recomp${BB_EXE}")
 if(BB_RECOMP_LLVM AND NOT BB_RECOMP_BUNDLED)
   list(APPEND BB_TARGETS bb-recomp-asmtest bb-recomp-difftest)
   list(APPEND BB_BUILT_FILES "<BINARY_DIR>/Bin/bb-recomp-asmtest" "<BINARY_DIR>/Bin/bb-recomp-difftest")
@@ -70,8 +81,7 @@ ExternalProject_Add(fex
   BINARY_DIR "${CMAKE_BINARY_DIR}/fex"
   CMAKE_GENERATOR "${CMAKE_GENERATOR}"
   CMAKE_ARGS
-    -DCMAKE_C_COMPILER=${BB_RECOMP_CC}
-    -DCMAKE_CXX_COMPILER=${BB_RECOMP_CXX}
+    ${BB_TOOLCHAIN_ARGS}
     -DCMAKE_BUILD_TYPE=Release
     -DENABLE_X86_HOST_DEBUG=ON
     -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_STEAM_SUPPORT=OFF
@@ -81,7 +91,7 @@ ExternalProject_Add(fex
     -DCMAKE_PROJECT_FEX_INCLUDE=${CMAKE_CURRENT_LIST_DIR}/fex_project.cmake
     -DBB_RECOMP_DIR=${CMAKE_CURRENT_LIST_DIR}
     -DBB_RECOMP_PLAYER=${BB_RECOMP_PLAYER} -DBB_RECOMP_BUNDLED=${BB_RECOMP_BUNDLED} -DBB_RECOMP_VERSION=${BB_RECOMP_VERSION}
-    "-DBB_RECOMP_LLVM_DIR=${BB_RECOMP_LLVM_DIR}" "-DBB_RECOMP_DEPS_PREFIX=${BB_RECOMP_DEPS_PREFIX}"
+    "-DBB_RECOMP_LLVM_DIR=${BB_RECOMP_LLVM_DIR}" "-DBB_RECOMP_DEPS_PREFIX=${BB_RECOMP_DEPS_PREFIX}" "-DBB_RECOMP_LLD_INCLUDE=${BB_RECOMP_LLD_INCLUDE}"
     -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH} -DBB_RECOMP_NASM=${BB_RECOMP_NASM}
   BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target ${BB_TARGETS} --parallel ${BB_RECOMP_JOBS}
   INSTALL_COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BB_BUILT_FILES} ${CMAKE_BINARY_DIR}

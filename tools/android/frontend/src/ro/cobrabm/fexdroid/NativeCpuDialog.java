@@ -148,7 +148,9 @@ final class NativeCpuDialog {
         box.removeAllViews();
         box.addView(line("Runs the game's code as ARM64 that was compiled ahead of time, instead of translating it while you play: "
             + "no translation stutter in new areas, and less CPU work.", 13, TEXT, false));
-        TextView help = line("Build it on a PC from your own game dump with bb-recomp. It cannot be downloaded.\n" + NativeCpu.DOCS, 13, GOLD, false);
+        TextView help = line("Build it on a PC from your own game dump with the Rebuild Tool (bb-recomp). It cannot be downloaded.\n" + NativeCpu.DOCS
+            + "\nThe tool's output folder is a game folder with aot/ inside: choose it as the game folder and this is imported by itself. "
+            + "Or import libbbaot.so and libbbaot.json by hand below.", 13, GOLD, false);
         help.setAutoLinkMask(Linkify.WEB_URLS); help.setLinksClickable(true); help.setMovementMethod(LinkMovementMethod.getInstance());
         help.setLinkTextColor(GOLD);
         box.addView(help);
