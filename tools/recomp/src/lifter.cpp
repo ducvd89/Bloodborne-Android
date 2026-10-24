@@ -653,6 +653,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       }
       if (sink) {
         UnitMeta meta;
+        for (auto& c : gu.cover) meta.end = std::max(meta.end, c.second - impl_->img.base);
         for (auto& j : gu.jumps) {
           if (j.targets.empty()) continue;
           SwitchInfo sw {j.pc - impl_->img.base, {}};

@@ -55,6 +55,22 @@ are allowed and undone after each lowered run. Result: `out/recomp/difftest.txt`
 Options: `--host armv8.2|armv8.4|armv9`, `--no-multiblock`, `--no-passes`, `--tso`, `--validate`,
 `--no-gap-units`, `--jobs`, `--every N`. The process renices itself to 19 and uses at most 22 threads.
 
+### The runtime's image: eboot + linked modules, discovery, secondary entries
+
+    bb-recomp --elf out/eboot.elf --boot out/boot-linked.bin [--prx-dir <game>/sce_module] ...
+
+`--boot` lifts the flat memory image the runtime builds (`scripts/link_modules.py`, format BBPROBE5: the eboot, then `libc.prx` at
+image `+0x56e0000` and `libSceFios2.prx` at `+0x57c0000`; the .prx files are plaintext SELFs, so nothing needs decrypting), so
+every unit address is relative to the one image base and the `.so` has one unit table for all three modules. The boot file also
+carries the import names and relocations, which discovery needs. `--elf` then only supplies the eboot's program headers. Without
+`--boot` (plain `eboot.elf`) there are no relocations and no setjmp detection. The module names come from `link.json` next to the
+boot file. Steps before lifting (each prints a line): the non-FDE entries (module starts, PLT stubs), discovery
+(`--no-discovery`), landing pads and setjmp sites (`--no-secondary`). Switch tables are resolved unless `--no-switch-tables`.
+`--resume-entries` adds the resume switch to every unit (docs/RECOMP_ABI.md). `bbr_image_hash` is the FNV-1a of the flat image.
+
+Compile resources: `--plan-only` prints the plan; the shard and worker counts follow the available RAM (`--mem-fraction`, default
+0.6; `BBR_FAKE_MEM_GB=12` pretends a smaller PC). `BBR_DEBUG_JUMPS=1` prints the instructions before every indirect jump.
+
 ### LLVM modes
 
     bb-recomp --elf out/eboot.elf --emit-ll 0x175340 f.ll        # LLVM IR of one function (all its units), before optimisation
@@ -86,7 +102,13 @@ tests, FEX's own disabled and known-failure lists.
 - `elf_image.cpp`: maps the PT_LOAD segments at `base + vaddr` (default base 0x200000000: vaddr 0 cannot be
   mapped). FEX decodes from host memory at the guest RIP, so IR addresses are `base + vaddr`; the lowering
   subtracts the base.
-- `fde_scan.cpp`: `.eh_frame_hdr` table -> 162,959 functions (identical to `ehscan.py`).
+- `fde_scan.cpp`: `.eh_frame_hdr` table of every module -> 162,959 + 2,814 functions (the eboot list is identical to `ehscan.py`);
+  `addNonFdeEntries`: module starts and PLT stubs. `elf_image.cpp`: the ELF loader and the boot-linked image loader.
+- `jumptable.cpp`: recognises `cmp/ja; lea; movsxd; add; jmp` (and variants) in the decoded instructions of a unit and reads the
+  rel32 table. The lifter adds the case targets (and in-function branches the decoder would not follow, > 4 pages ahead) as block
+  entries and decodes again until nothing new appears; the lowering turns the `jmp` into an LLVM `switch`.
+- `discover.cpp`: code without an FDE (relocation pointers, `lea`, branch targets outside every function), to a fixpoint.
+  `eh_frame.cpp`: landing pads from the LSDAs, setjmp call targets from the boot file's imports.
 - `lifter.cpp`: per function, `SetupDecodeInstructionsAtEntry` + `DecodeLoop` (multiblock, bounded to the
   FDE range through the decoder's `SectionMax/MinAddress` and `QueryGuestExecutableRange`), then
   OpDispatchBuilder per instruction, `Finalize`, and the passes. This repeats `ContextImpl::GenerateIR`
@@ -98,20 +120,28 @@ tests, FEX's own disabled and known-failure lists.
 - Failures are caught per function (signals and FEX asserts longjmp back; the unit is rebuilt).
   Release FEX compiles its asserts out, so use `--validate` for IR checks.
 
-## Where things stand (2026-10-24)
+## Where things stand (2026-10-24, step 2c)
 
-- **ASM tests** (x86-64 host, -O1): 1612 pass, 4 fail, 216 not run because an op is still unlowered, 433 skipped:
-  99.8 % of the tests that run pass. Every category except the unlowered-op ones is 100 %: Primary 199/199, PrimaryGroup
+- **ASM tests** (x86-64 host, -O1): unchanged, 1612 pass, 4 fail, 216 not run because an op is still unlowered, 433 skipped:
+  99.8 % of the tests that run pass. `bb-recomp-asmtest --resume-selftest` checks the resume entries (PASS). Every category
+  except the unlowered-op ones is 100 %: Primary 199/199, PrimaryGroup
   152/152, Secondary 72/72, TwoByte 221/221, Atomics 12/12, ConstProp, Flags, REP/REPNE 67/67, OpSize 110/110, SSE4a 4/4,
   VEX 329/332, FEX_bugs 95/95. The 4 failures: `DAZTest` (denormals-are-zero needs FPCR.FIZ, FEAT_AFP) and
   `vcvtps2ph_rd/ru/trunc` (a half-precision conversion with a rounding mode other than nearest: LLVM's x86 `fptrunc`
   ignores MXCSR; on ARM64 the rounding helpers set FPCR). The 216 tests not run need ops the game never uses (AVX2
   gathers and masked moves 105, string compares 39, F80 25, FMA 14, AES/SHA/PCLMUL ~30).
-- **Whole game, all 162,959 functions plus the gap units (202,525 units, 58.7 M IR ops)**: no lift failure, no unit with
-  `bbr_trap`, every module passes the LLVM verifier. Timings are in "Compile time" in `docs/STATIC_RECOMPILE_PLAN.md`.
+- **Whole image (eboot + libc.prx + libSceFios2.prx, 182,663 functions, 184,271 units, 54.0 M IR ops)**: no lift failure; every
+  module passes the LLVM verifier; 118 units (all in libc.prx) contain a `bbr_trap` for an op the eboot never used (x87 80-bit
+  conversions `F80CVT`/`F80CVTTo`, `F64FPREM1`, `F64SCALE`, `NZCVSelectV`). Timings are in "Compile time" in
+  `docs/STATIC_RECOMPILE_PLAN.md`: 67 s, 94 MB `.text`, 13.7 GB peak, and 5.5 GB on a pretended 12 GB PC.
+- **Discovery** (details in the plan, "Discovery"): FDE bytes reached from entries alone 92.00 % -> 98.84 % (the rest is padding and
+  table data); 3,847 of 15,562 indirect jumps are jump tables and resolve (57 table-like ones do not; 8,848 are register tail calls,
+  2,810 vtable tail calls); 692 landing pads, 132 setjmp return sites, 16,890 pseudo-functions (2.8 MB of vtable thunks and static
+  initialisers that only data pointers reach, 816 PLT stubs, 2 module starts); call-return resume entries cost +23 % `.text` and are optional.
 - **Differential test on the game** (`bb-recomp-difftest`, 6 inputs per function, all 162,959 functions, x86-64 host,
-  -O1): 60,796 functions agree on at least one input, 100,426 are skipped (every input faulted or timed out, mostly
-  random arguments that are not valid objects), 1,435 skipped for `rdtsc`, 272 not liftable by the in-process lifter,
+  -O1; re-run after jump tables became LLVM switches, with the same 30 mismatches as before): 60,795 functions agree on at least
+  one input, 100,427 are skipped (every input faulted or timed out, mostly
+  random arguments that are not valid objects), 1,436 skipped for `rdtsc`, 271 not liftable by the in-process lifter,
   **30 mismatch**. None is a lowering bug: 18 use `rcpps`/`rsqrtps` (x86 returns a 12-bit table estimate, the lowering
   computes 1/x; the code refines with a Newton step, so only the last bits differ), 2 differ only in the sign of a
   default NaN (x86 `ffc00000`, ARM `7fc00000`), 10 return host addresses (a tail jump into an import stub that
@@ -123,7 +153,7 @@ tests, FEX's own disabled and known-failure lists.
   ops FEX's tests use. Not lowered: the F80/x87-stack ops (none in the eboot), AES/SHA/PCLMUL, `VPCMP*STRX`, FMA
   (`VFMLA*`), masked loads/stores and gathers, `F64SIN/COS/...`.
 
-## What the census found (CUSA03173 eboot, armv8.4 profile, Multiblock=1, TSO off)
+## What the census found at step 1 (CUSA03173 eboot, armv8.4 profile, Multiblock=1, TSO off; before jump table resolution: see above for the current numbers)
 
 - 162,959 of 162,959 functions lift cleanly; no failures, no crashes, IR validation passes on every unit.
   The whole image takes 0.32 s wall (6 s CPU), 37 M x86 instructions/s.

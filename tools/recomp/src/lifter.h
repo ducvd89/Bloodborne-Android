@@ -79,7 +79,7 @@ struct FuncResult {
 
 // What the lowering needs to know about a unit besides its IR: the resolved jump tables (image vaddrs).
 struct SwitchInfo { uint64_t jmpVaddr; std::vector<uint64_t> targets; };
-struct UnitMeta { std::vector<SwitchInfo> switches; };
+struct UnitMeta { std::vector<SwitchInfo> switches; uint64_t end = 0; /* image vaddr just past the last decoded byte of the unit (0: unknown) */ };
 
 // Receives each lifted unit while its IR is alive (valid only inside the call): entry is the image vaddr,
 // irView a `const FEXCore::IR::IRListView*` (the lowering casts it back).
