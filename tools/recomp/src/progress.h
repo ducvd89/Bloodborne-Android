@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Progress reporting of a compile for the GUI and for `--machine` runs. compile.cpp calls these; player.cpp installs the hooks (the other
 // tools leave them empty).
 #pragma once

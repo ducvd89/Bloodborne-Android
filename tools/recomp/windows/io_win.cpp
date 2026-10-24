@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // tools/android/prepare/io.h on Windows (instead of io.cpp: that one uses mmap, open/O_CLOEXEC, dirent, realpath). The same interface
 // and the same errors (as Python's OSError family), with Win32 file mapping and std::filesystem. Only the file access is here: the
 // image-building logic (ps4.cpp, link.cpp, game_check.cpp, bb_prepare.cpp ...) is the phone's own source, compiled unchanged.

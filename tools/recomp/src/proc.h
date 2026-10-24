@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Runs a child process and reads its output line by line (Linux and Windows): ps4-pkg-tool for the PKG step, and the GUI's own
 // command line run (bb-recomp --pkgs ...), which it watches through the progress lines on stdout.
 #pragma once

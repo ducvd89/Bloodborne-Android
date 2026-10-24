@@ -199,11 +199,19 @@ int recompMain(int argc, char** argv) {
   return runCensus(img, funcs, co);
 }
 
-// Player mode (player.cpp, BB_RECOMP_PLAYER): `bb-recomp --game <dump folder> [--out <dir>]` builds the runtime image and compiles it with recompMain().
+// Player mode (player.cpp, BB_RECOMP_PLAYER): `bb-recomp --pkgs <folder> --out <dir>` (or --game <dump>) builds the runtime image and compiles it with
+// recompMain(). Started without arguments (a double click), or with --gui, the window opens (gui.cpp, BB_RECOMP_GUI); --cli forces the command line.
 #ifdef BB_RECOMP_PLAYER
 int playerMain(int argc, char** argv);
 #endif
+#ifdef BB_RECOMP_GUI
+#include "gui.h"
+#endif
 int main(int argc, char** argv) {
+#ifdef BB_RECOMP_GUI
+  if (argc == 1 || (argc >= 2 && (!strcmp(argv[1], "--gui") || !strcmp(argv[1], "--gui-selftest") || !strcmp(argv[1], "--about")))) return guiMain(argc, argv);
+#endif
+  if (argc >= 2 && !strcmp(argv[1], "--cli")) { --argc; ++argv; argv[0] = const_cast<char*>("bb-recomp"); }
 #ifdef BB_RECOMP_PLAYER
   for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--game") || !strcmp(argv[i], "--pkgs") || !strcmp(argv[i], "--help-player")) return playerMain(argc, argv);
 #endif

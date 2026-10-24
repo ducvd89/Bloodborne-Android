@@ -47,7 +47,10 @@ def main():
 import os, shutil, subprocess, sys
 pkg, staging = sys.argv[1], sys.argv[2]
 data = open(pkg, 'rb').read()
-plan = [l for l in data.split(b'\\n') if l.startswith(b'PLAN ')][0].split(b' ', 2)
+plans = [l for l in data.split(b'\\n') if l.startswith(b'PLAN ')]
+if not plans:   # a real PKG: the real tool (BB_REAL_TOOL), same command line
+    os.execv(os.environ['BB_REAL_TOOL'], [os.environ['BB_REAL_TOOL'], pkg, staging])
+plan = plans[0].split(b' ', 2)
 root = os.path.join(staging, 'CUSA03173')
 print('Progress-bytes: 0 1000', flush=True)
 if plan[1] == b'base':
@@ -63,4 +66,5 @@ print('Progress-bytes: 1000 1000', flush=True)
     open(os.path.join(out, 'game-sfo.bin'), 'wb').write(open(os.path.join(game, 'sce_sys', 'param.sfo'), 'rb').read())
     print(os.path.join(out, 'pkgs'), tool)
 
-main()
+if __name__ == "__main__":
+    main()

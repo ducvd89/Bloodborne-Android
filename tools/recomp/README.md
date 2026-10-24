@@ -1,3 +1,29 @@
+# Bloodborne Android Rebuild Tool (bb-recomp)
+
+`bb-recomp` is a program for players, and the compiler behind it. Players run it (window or command line) on a PC with their own Bloodborne PKG
+files; it unpacks and merges them, builds the game image the way the app's `bb-prepare` does, compiles the game's code to ARM64 and writes one
+folder to copy to the phone: the game folder with `aot/libbbaot.so` and `aot/libbbaot.json` inside (the app imports them by itself). Guide for
+players: `docs/NATIVE_CPU.md`. Free software, GPL-3.0-or-later (`LICENSE`, third-party notices in `NOTICES`); the files outside this folder that the
+build uses are listed in `SPLIT.md`.
+
+    bb-recomp                                   # the window (Dear ImGui + SDL3, src/gui.cpp); it runs the next line as a child process
+    bb-recomp --pkgs <PKG folder> --out <dir>   # the same, on the command line (src/player.cpp, src/pkgs.cpp); --machine adds "@@" progress lines
+    bb-recomp --game <extracted dump> --out <dir>   # an extracted game folder instead of PKGs: only libbbaot.so and .json are written
+
+Releases (both need no LLVM, clang, NDK or lld on the user's machine):
+
+    tools/recomp/package.sh            # out/dist/Bloodborne-Android-Rebuild-Tool-x86_64.AppImage (glibc 2.35+; built against an Ubuntu 22.04 sysroot)
+    tools/recomp/package-windows.sh    # out/dist/bb-recomp-windows-x86_64.zip (cross-compiled with llvm-mingw; static; Windows 10 1903+)
+
+`fetch-deps.sh` downloads and builds the Linux dependencies into `.local-deps` (the LLVM release tarball, an Ubuntu 22.04 sysroot made by
+`fetch-sysroot.py`, zlib, zstd, SDL3, Dear ImGui); `package-windows.sh` builds LLVM and LLD for mingw from source (about 12 minutes on 22 cores at
+nice 19) and the rest of the Windows dependencies. The self-contained build links LLVM statically and runs LLD in the process (`src/bundle.cpp`),
+with the AArch64 x87 helper object, the `libbbcpu.so`/`libm.so` link stubs and the builtins archive in `share/bb-recomp` (made from the NDK when
+the package is built); a developer build without them uses the NDK and the system clang as before. Tests: `tests/recomp-pkgs` (synthetic PKGs
+and a stand-in PKG tool), `tests/android-native-cpu` (the app side).
+
+---
+
 # bb-recomp (PC tool: FEX lifter, IR census, LLVM lowering, ARM64 object/.so, ASM test runner)
 
 Lifts the game's x86-64 code with FEXCore's own front end (decoder, OpcodeDispatcher, IR passes), reports what

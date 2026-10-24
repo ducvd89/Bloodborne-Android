@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
-# Builds the self-contained Linux x86-64 bb-recomp for players: out/dist/bb-recomp-linux-x86_64.tar.gz
-#   tools/recomp/package.sh [--test <game dump folder> [--compare <libbbaot.so of a dev build>]]
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Builds the Linux release of the Bloodborne Android Rebuild Tool: out/dist/Bloodborne-Android-Rebuild-Tool-x86_64.AppImage
+#   tools/recomp/package.sh [--test <folder with the game's PKGs> [--compare <libbbaot.so of a dev build>]]
 #
-# The tool inside needs no LLVM, clang, NDK or lld on the player's machine: LLVM (X86 + AArch64) and LLD are linked in statically
-# (official LLVM release tarball, tools/recomp/fetch-deps.sh), the executable is fully static (no glibc version requirement), the x87
-# helpers are an AArch64 object compiled here, and the two soname stubs and the builtins archive the .so link needs are shipped in
-# share/bb-recomp (bundle.h). The build runs at nice 19 with 22 jobs.
-#
-# Needs: cmake, ninja, git, curl, zstd, tar; a static glibc (libc.a) and libstdc++.a; the Android NDK r29 (BB_NDK or
-# .local-deps/android/sdk/ndk/29.0.14206865 of this or the main checkout) for the AArch64 helper object, the stubs and the builtins.
+# The AppImage holds the program (window and command line in one binary: Dear ImGui + SDL3, LLVM 23 with the X86 and AArch64 code generators
+# and LLD linked in statically), ps4-pkg-tool, the AArch64 x87 helper object and the link stubs. It is built against an Ubuntu 22.04 sysroot,
+# so it needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 ...) and nothing else from the system but what a desktop has (X11 or
+# Wayland, OpenGL, which SDL loads when it starts): no LLVM, clang, NDK or lld. The build runs at nice 19 with 22 jobs.
+# Needs: cmake, ninja, git, curl, zstd, tar, python3 (with Pillow for the icon), ar; the Android NDK r29 (BB_NDK, or .local-deps/android/sdk/ndk/
+# 29.0.14206865 of this or the main checkout) for the AArch64 helper object, the stubs and the builtins.
 # FEX_SOURCE_DIR (a FEX 2609.1 tree with its submodules) is optional: fex_project's default (fetch-fex.sh) makes one under out/.
-# --test runs the package in a clean environment (env -i, no LLVM or NDK on PATH) on the dump and checks the .so; --compare also
-# requires it to be byte-identical to that file.
+# --test runs the AppImage in a clean environment (env -i; no LLVM or NDK on PATH) on the PKGs and checks the result; --compare also requires
+# the .so to match that file (byte-identical, or identical in everything the phone loads: see the end of this script).
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 root=$PWD
-test_game=; compare=
+test_pkgs=; compare=
 while (( $# )); do
     case $1 in
-        --test) test_game=$2; shift 2 ;;
+        --test) test_pkgs=$2; shift 2 ;;
         --compare) compare=$2; shift 2 ;;
-        *) echo "usage: $0 [--test <game dump> [--compare <dev libbbaot.so>]]" >&2; exit 2 ;;
+        *) echo "usage: $0 [--test <PKG folder> [--compare <dev libbbaot.so>]]" >&2; exit 2 ;;
     esac
 done
 J=${BB_JOBS:-22}
 run() { nice -n 19 "$@"; }
 VERSION=${BB_RECOMP_VERSION:-0.1.0}
-name=bb-recomp-linux-x86_64
+APPNAME=Bloodborne-Android-Rebuild-Tool-x86_64.AppImage
 
 # The NDK: this worktree's .local-deps, else the main checkout's (git worktrees share the common dir).
 ndk=${BB_NDK:-}
@@ -41,21 +41,29 @@ nbin=$ndk/toolchains/llvm/prebuilt/linux-x86_64
 builtins=$(ls "$nbin"/lib/clang/*/lib/linux/libclang_rt.builtins-aarch64-android.a | head -n 1)
 
 tools/recomp/fetch-deps.sh
-llvm=$root/.local-deps/llvm/x/LLVM-${BB_LLVM_VERSION:-23.1.3}-Linux-X64
-prefix=$root/.local-deps/deps/prefix
+deps=$root/.local-deps
+llvm=$deps/llvm/x/LLVM-${BB_LLVM_VERSION:-23.1.3}-Linux-X64
+sysroot=$deps/sysroot-jammy
+prefix=$deps/deps/prefix-jammy
+imgui=$(ls -d "$deps"/imgui/imgui-* | head -n 1)
 
-# 1. bb-recomp: static, LLVM 23 from the tarball as the compiler too
+# 1. bb-recomp: window + command line, against the sysroot
 fexargs=()
 [[ -n ${FEX_SOURCE_DIR:-} ]] && fexargs+=(-DFEX_SOURCE_DIR="$FEX_SOURCE_DIR")
-run cmake -S tools/recomp -B out/recomp-bundled -G Ninja "${fexargs[@]}" -DBB_RECOMP_BUNDLED=ON -DBB_RECOMP_VERSION="$VERSION" \
-    -DBB_RECOMP_LLVM_DIR="$llvm/lib/cmake/llvm" -DBB_RECOMP_DEPS_PREFIX="$prefix" -DBB_RECOMP_CC="$llvm/bin/clang" -DBB_RECOMP_CXX="$llvm/bin/clang++" \
-    -DBB_RECOMP_JOBS="$J" > out/recomp-bundled-cfg.log 2>&1 || { tail -20 out/recomp-bundled-cfg.log; exit 1; }
-run cmake --build out/recomp-bundled -j "$J"
+run cmake -S tools/recomp -B out/recomp-linux -G Ninja "${fexargs[@]}" -DBB_RECOMP_BUNDLED=ON -DBB_RECOMP_VERSION="$VERSION" \
+    -DBB_RECOMP_TOOLCHAIN_FILE="$root/tools/recomp/linux-jammy-toolchain.cmake" -DBB_SYSROOT="$sysroot" -DBB_LLVM_ROOT="$llvm" \
+    -DBB_RECOMP_LLVM_DIR="$llvm/lib/cmake/llvm" -DBB_RECOMP_DEPS_PREFIX="$prefix" -DBB_RECOMP_SDL_PREFIX="$deps/sdl/prefix-linux" -DBB_RECOMP_IMGUI_DIR="$imgui" \
+    -DBB_RECOMP_JOBS="$J" > out/recomp-linux-cfg.log 2>&1 || { tail -20 out/recomp-linux-cfg.log; exit 1; }
+run cmake --build out/recomp-linux -j "$J"
 
-# 2. the files the .so link needs, from the NDK: the same commands compile.cpp runs for a developer build
-dist=out/dist/$name
-rm -rf "$dist"; mkdir -p "$dist/bin" "$dist/share/bb-recomp" "$dist/licenses"
-share=$dist/share/bb-recomp
+# 2. ps4-pkg-tool (the app's PKG unpacker), against the same sysroot
+BB_SYSROOT=$sysroot BB_LLVM_ROOT=$llvm BB_ZLIB_PREFIX=$prefix tools/android/build_pkg_tool.sh linux
+
+# 3. the AppDir
+dist=out/dist/AppDir
+rm -rf "$dist"; mkdir -p "$dist/usr/bin" "$dist/usr/share/bb-recomp" "$dist/usr/share/licenses/bb-recomp" "$dist/usr/share/applications" "$dist/usr/share/icons/hicolor/256x256/apps"
+share=$dist/usr/share/bb-recomp
+# the files the .so link needs, from the NDK: the same commands compile.cpp runs for a developer build
 run "$nbin/bin/clang" --target=aarch64-linux-android30 -O2 -fPIC -fvisibility=hidden -fno-stack-protector -ffp-contract=off -c \
     tools/recomp/helpers/bbr_x87_all.c -o "$share/helpers-aarch64.o"
 # libbbcpu.so: a DT_NEEDED entry only (see compile.cpp: the real libbbcpu.so is already loaded when the game starts)
@@ -64,63 +72,81 @@ run "$nbin/bin/clang" --target=aarch64-linux-android30 -shared -nostdlib -Wl,-so
 cp "$nbin/sysroot/usr/lib/aarch64-linux-android/30/libm.so" "$share/libm.so"
 cp "$builtins" "$share/"
 [[ -d tools/recomp/variants ]] && cp -r tools/recomp/variants "$share/variants"
+strip -o "$dist/usr/bin/bb-recomp" out/recomp-linux/bb-recomp
+strip -o "$dist/usr/bin/ps4-pkg-tool" out/linux/pkg-tool/ps4-pkg-tool
+chmod 755 "$dist/usr/bin/"*
+lic=$dist/usr/share/licenses/bb-recomp
+fex=$(sed -n 's/^FEX_SOURCE_DIR:PATH=//p' out/recomp-linux/CMakeCache.txt)
+[[ -f $fex/LICENSE ]] || fex=$(sed -n 's/^FEX_GIT_DIR:PATH=//p' out/recomp-linux/CMakeCache.txt)
+cp "$fex/LICENSE" "$lic/FEX-MIT.txt"
+cp "$deps/llvm/LICENSE.TXT" "$lic/LLVM-Apache-2.0-with-LLVM-exception.txt"
+cp tools/recomp/helpers/NOTICE "$lic/x87-helpers-NOTICE.txt"
+cp tools/recomp/LICENSE "$lic/GPL-3.0.txt"
+cp tools/recomp/NOTICES "$lic/NOTICES.txt"
+cp docs/NATIVE_CPU.md "$dist/usr/share/bb-recomp/NATIVE_CPU.md" 2>/dev/null || true
+echo "$VERSION" > "$dist/usr/share/bb-recomp/VERSION"
+cat > "$dist/AppRun" <<'APPRUN'
+#!/bin/sh
+# Double click: the window. With arguments (--pkgs <dir> --out <dir>, or --cli ...): the command line.
+HERE=$(dirname "$(readlink -f "$0")")
+exec "$HERE/usr/bin/bb-recomp" "$@"
+APPRUN
+chmod 755 "$dist/AppRun"
+cat > "$dist/bb-recomp.desktop" <<'DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Bloodborne Android Rebuild Tool
+Comment=Builds the game folder and the native CPU files for the Bloodborne Android app from your own PKG files
+Exec=bb-recomp
+Icon=bb-recomp
+Categories=Utility;
+Terminal=false
+DESKTOP
+cp "$dist/bb-recomp.desktop" "$dist/usr/share/applications/"
+# A simple generated icon (a chip: gold on dark); no game or console artwork.
+python3 - "$dist/bb-recomp.png" <<'PY'
+import sys
+from PIL import Image, ImageDraw
+S = 256; im = Image.new('RGBA', (S, S), (0, 0, 0, 0)); d = ImageDraw.Draw(im)
+gold, dark = (198, 173, 118, 255), (11, 12, 16, 255)
+d.rounded_rectangle((8, 8, S - 8, S - 8), 40, fill=dark, outline=gold, width=6)
+d.rectangle((68, 68, S - 68, S - 68), fill=(30, 26, 18, 255), outline=gold, width=8)
+for i in range(5):
+    t = 84 + i * 22
+    for (a, b, c, e) in ((t, 36, t + 10, 68), (t, S - 68, t + 10, S - 36), (36, t, 68, t + 10), (S - 68, t, S - 36, t + 10)): d.rectangle((a, b, c, e), fill=gold)
+d.rectangle((100, 100, S - 100, S - 100), fill=gold)
+im.save(sys.argv[1])
+PY
+cp "$dist/bb-recomp.png" "$dist/usr/share/icons/hicolor/256x256/apps/bb-recomp.png"
 
-# 3. the tool, stripped, and the notices
-strip -o "$dist/bin/bb-recomp" out/recomp-bundled/bb-recomp
-fex=$(sed -n 's/^FEX_SOURCE_DIR:PATH=//p' out/recomp-bundled/CMakeCache.txt)
-[[ -f $fex/LICENSE ]] || fex=$(sed -n 's/^FEX_GIT_DIR:PATH=//p' out/recomp-bundled/CMakeCache.txt)
-cp "$fex/LICENSE" "$dist/licenses/FEX-MIT.txt"
-cp .local-deps/llvm/LICENSE.TXT "$dist/licenses/LLVM-Apache-2.0-with-LLVM-exception.txt"
-cp tools/recomp/helpers/NOTICE "$dist/licenses/x87-helpers-NOTICE.txt"
-cp LICENSE "$dist/licenses/bbport-GPL-2.0.txt"
-cat > "$dist/licenses/THIRD_PARTY.txt" <<'NOTICE'
-bb-recomp contains:
-- FEXCore (the x86-64 front end of FEX-Emu 2609.1), MIT license: FEX-MIT.txt
-- LLVM 23.1.3 and LLD (the AArch64 code generator and the linker), Apache License 2.0 with LLVM exceptions: LLVM-Apache-2.0-with-LLVM-exception.txt
-- compiler-rt builtins and the libm.so link stub for AArch64 Android (share/bb-recomp), from the Android NDK r29,
-  Apache License 2.0 with LLVM exceptions / Android Open Source Project licenses
-- the x87 helpers (FEX's fallback handlers over Berkeley SoftFloat 3e, BSD-3-Clause): x87-helpers-NOTICE.txt
-- zlib 1.3.1 (zlib license) and zstd 1.5.7 (BSD-3-Clause, dual licensed with GPL-2.0), linked statically
-- bb-prepare and the rest of the bbport sources, GPL-2.0-or-later: bbport-GPL-2.0.txt
-bb-recomp itself is part of bbport. The libbbaot.so it writes is derived from the player's own game: it is for that player only.
-NOTICE
-cp docs/NATIVE_CPU.md "$dist/NATIVE_CPU.md" 2>/dev/null || true
-cat > "$dist/README.txt" <<'README'
-bb-recomp: compiles Bloodborne's code for your Android phone, from your own game dump.
-
-  ./bin/bb-recomp --game /path/to/CUSA03173 --out ./out
-
-CUSA03173 is the folder with eboot.bin, sce_module and sce_sys (Bloodborne with the 1.09 update merged in). It takes a few minutes and
-about 3 GB of free disk space. It writes out/libbbaot.so and out/libbbaot.json: copy both to the phone and import them in the app
-(Menu -> Native CPU (recompiled)). Full guide: NATIVE_CPU.md.
-
-Nothing here needs LLVM, clang or the Android NDK. Linux x86-64 with AVX2 (Intel Haswell 2013 / AMD Zen or newer) and 8 GB RAM or more.
-On Windows, use WSL2 (NATIVE_CPU.md). The result is derived from your game: do not share it.
-README
-echo "$VERSION" > "$dist/VERSION"
-
-# 4. the tarball (reproducible: sorted, fixed owner and times)
+# 4. the AppImage
+appimagetool=${BB_APPIMAGETOOL:-$deps/appimage/appimagetool-x86_64.AppImage}
+if [[ ! -x $appimagetool ]]; then
+    mkdir -p "$deps/appimage"
+    curl -fL -o "$deps/appimage/appimagetool-x86_64.AppImage" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+    chmod +x "$deps/appimage/appimagetool-x86_64.AppImage"; appimagetool=$deps/appimage/appimagetool-x86_64.AppImage
+fi
 mkdir -p out/dist
-run tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='2026-01-01 00:00:00' -C out/dist -cf - "$name" | gzip -9n > "out/dist/$name.tar.gz"
-ls -l "out/dist/$name.tar.gz"
-du -sh "$dist"
+rm -f "out/dist/$APPNAME"
+ARCH=x86_64 run "$appimagetool" --appimage-extract-and-run --no-appstream "$dist" "out/dist/$APPNAME" > out/appimagetool.log 2>&1 || { tail -20 out/appimagetool.log; exit 1; }
+ls -l "out/dist/$APPNAME"
+echo "needs glibc: $(objdump -T "$dist/usr/bin/bb-recomp" "$dist/usr/bin/ps4-pkg-tool" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1) (or newer)"
 
 # 5. test in a clean environment
-if [[ -n $test_game ]]; then
+if [[ -n $test_pkgs ]]; then
     t=$(mktemp -d /tmp/bb-recomp-clean.XXXXXX)
-    tar -xzf "out/dist/$name.tar.gz" -C "$t"
-    echo "clean-environment test in $t (env -i, PATH=/nonexistent-llvm, HOME=$t)"
-    ( cd "$t" && TIMEFORMAT='wall %R s, user %U s' && time env -i HOME="$t" PATH=/nonexistent-llvm "$t/$name/bin/bb-recomp" --game "$test_game" --out "$t/out" ) 2>&1 | tail -n 45
-    so=$t/out/libbbaot.so
-    [[ -f $so && -f $t/out/libbbaot.json ]] || { echo "TEST FAILED: no libbbaot.so" >&2; exit 1; }
+    echo "clean-environment test in $t (env -i, PATH=/usr/bin:/bin, no LLVM or NDK)"
+    ( cd "$t" && TIMEFORMAT='wall %R s, user %U s' && time env -i HOME="$t" PATH=/usr/bin:/bin DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" BB_PKG_TOOL="${BB_PKG_TOOL:-}" "$root/out/dist/$APPNAME" --appimage-extract-and-run --pkgs "$test_pkgs" --out "$t/out" ) 2>&1 | tail -n 30
+    so=$(ls "$t"/out/*/aot/libbbaot.so)
+    [[ -f $so && -f ${so%.so}.json ]] || { echo "TEST FAILED: no libbbaot.so" >&2; exit 1; }
     if [[ -n $compare ]]; then
         if cmp -s "$so" "$compare"; then echo "TEST OK: byte-identical to $compare"
         else
-            # A developer build links with the NDK's LLD 21, the package with LLD 23: the .comment string differs, which moves the
-            # (unloaded) .symtab. Everything that is loaded must be identical.
+            # A developer build links with the NDK's LLD 21, the AppImage with LLD 23: the .comment string differs, which moves the
+            # (unloaded) .symtab and e_shoff. Everything that is loaded must be identical.
             loadend=0
             while read -r off filesz; do e=$(( off + filesz )); (( e > loadend )) && loadend=$e; done < <(readelf -lW "$so" | awk '$1=="LOAD"{print $2, $5}')
-            # (the ELF header's e_shoff, bytes 41-48 counted from 1 by cmp, moves with the tail)
             if [[ -z $(cmp -l -n "$loadend" "$so" "$compare" | awk '$1<41||$1>48') ]]; then echo "TEST OK: the loaded part ($loadend bytes) is identical to $compare (only e_shoff and the .comment/.symtab tail differ: LLD version)"
             else echo "TEST FAILED: differs from $compare in the loaded part" >&2; exit 1; fi
         fi

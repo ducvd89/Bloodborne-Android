@@ -6,6 +6,10 @@
 #            libc/libm/libdl; build_release_runtime.py bundles it, the app's PKG installs run it from
 #            files/bbport/bionic/bin/; build_bionic.sh builds it)
 #   host  -> out/host/pkg-tool/ps4-pkg-tool   (tests/test_mods_android.py, tests/android-mods)
+#   linux -> out/linux/pkg-tool/ps4-pkg-tool   (the Rebuild Tool's AppImage, tools/recomp: built against an Ubuntu 22.04 sysroot (glibc 2.35) with
+#            the LLVM tarball's clang, static libstdc++; needs BB_SYSROOT, BB_LLVM_ROOT, BB_ZLIB_PREFIX, see tools/recomp/fetch-deps.sh)
+#   windows -> out/windows/pkg-tool/ps4-pkg-tool.exe   (cross-compiled with llvm-mingw, static: the Rebuild Tool for Windows, tools/recomp;
+#            needs BB_MINGW_ROOT (llvm-mingw) and a zlib for mingw in BB_MINGW_ZLIB_PREFIX, see tools/recomp/windows/build.sh)
 # Usage: tools/android/build_pkg_tool.sh [android|host|all]   (default: all)
 # Our patches (tools/android/pkg-tool-patches: byte progress, 64-bit offsets for multi-GB PKGs) are
 # applied to a copy of the source in out/pkg-tool-src; the original is never touched.
@@ -88,9 +92,53 @@ build_host() {
     echo "Built $out/ps4-pkg-tool (host)"
 }
 
+# Linux x86-64 for the AppImage: runs on glibc 2.35 and newer.
+build_linux() {
+    local sysroot=${BB_SYSROOT:-} llvm=${BB_LLVM_ROOT:-} zprefix=${BB_ZLIB_PREFIX:-}
+    [[ -x $llvm/bin/clang && -d $sysroot/usr/include ]] || { echo "Set BB_SYSROOT and BB_LLVM_ROOT (tools/recomp/fetch-deps.sh)" >&2; exit 1; }
+    [[ -f $zprefix/lib/libz.a ]] || { echo "No static zlib: set BB_ZLIB_PREFIX" >&2; exit 1; }
+    local out=$root/out/linux/pkg-tool build=$root/out/linux/pkg-tool-build
+    local object; object=$(shim "$build" "$llvm/bin/clang" --sysroot="$sysroot")
+    sed -i 's|</usr/include/zlib.h>|<zlib.h>|' "$src/src/core/file_format/pkg.cpp"
+    run cmake -S "$src" -B "$build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$root/tools/recomp/linux-jammy-toolchain.cmake" -DBB_SYSROOT="$sysroot" -DBB_LLVM_ROOT="$llvm" \
+        -DBB_RECOMP_DEPS_PREFIX="$zprefix" -DCMAKE_BUILD_TYPE=Release -DBUILD_PKG_QT_GUI=OFF -DCRYPTOPP_BUILD_TESTING=OFF \
+        -DZLIB_LIBRARY="$zprefix/lib/libz.a" -DZLIB_INCLUDE_DIR="$zprefix/include" "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc $object" \
+        >"$build/cmake.log" 2>&1 || { tail -30 "$build/cmake.log" >&2; exit 1; }
+    run ninja -C "$build" -j "$jobs" ps4-pkg-tool >"$build/build.log" 2>&1 || { tail -40 "$build/build.log" >&2; exit 1; }
+    mkdir -p "$out"
+    cp "$build/ps4-pkg-tool" "$out/ps4-pkg-tool"
+    "$llvm/bin/llvm-strip" --strip-all "$out/ps4-pkg-tool"
+    echo "Built $out/ps4-pkg-tool (Linux x86-64, glibc 2.35)"
+}
+
+# Windows (x86-64), cross-compiled with llvm-mingw; everything static, so the .exe needs only the system's own DLLs.
+build_windows() {
+    local mingw=${BB_MINGW_ROOT:-} zprefix=${BB_MINGW_ZLIB_PREFIX:-}
+    [[ -x $mingw/bin/x86_64-w64-mingw32-clang ]] || { echo "No llvm-mingw: set BB_MINGW_ROOT" >&2; exit 1; }
+    [[ -f $zprefix/lib/libzlibstatic.a || -f $zprefix/lib/libz.a ]] || { echo "No zlib for mingw: set BB_MINGW_ZLIB_PREFIX" >&2; exit 1; }
+    local zlib=$zprefix/lib/libzlibstatic.a
+    [[ -f $zlib ]] || zlib=$zprefix/lib/libz.a
+    local out=$root/out/windows/pkg-tool build=$root/out/windows/pkg-tool-build
+    local object; object=$(shim "$build" "$mingw/bin/x86_64-w64-mingw32-clang")
+    sed -i 's|</usr/include/zlib.h>|<zlib.h>|' "$src/src/core/file_format/pkg.cpp"
+    # The manifest that makes UTF-8 the program's code page: PKG paths with non-ASCII characters (a user name with accents).
+    (cd "$root/tools/recomp/windows" && "$mingw/bin/x86_64-w64-mingw32-windres" utf8.rc -O coff -o "$build/utf8.o")
+    run cmake -S "$src" -B "$build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$root/tools/recomp/windows/toolchain-mingw-x86_64.cmake" -DBB_MINGW_ROOT="$mingw" \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_PKG_QT_GUI=OFF -DCRYPTOPP_BUILD_TESTING=OFF \
+        -DZLIB_LIBRARY="$zlib" -DZLIB_INCLUDE_DIR="$zprefix/include" "-DCMAKE_EXE_LINKER_FLAGS=-static $object $build/utf8.o -lbcrypt -ladvapi32 -lws2_32 -luser32 -lshell32 -lole32 -lntdll -lmincore" "-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000006" \
+        >"$build/cmake.log" 2>&1 || { tail -30 "$build/cmake.log" >&2; exit 1; }
+    run ninja -C "$build" -j "$jobs" ps4-pkg-tool >"$build/build.log" 2>&1 || { tail -40 "$build/build.log" >&2; exit 1; }
+    mkdir -p "$out"
+    cp "$build/ps4-pkg-tool.exe" "$out/ps4-pkg-tool.exe" 2>/dev/null || cp "$build/ps4-pkg-tool" "$out/ps4-pkg-tool.exe"
+    "$mingw/bin/llvm-strip" --strip-all "$out/ps4-pkg-tool.exe"
+    echo "Built $out/ps4-pkg-tool.exe (Windows x86-64)"
+}
+
 case $which in
+    linux) build_linux ;;
+    windows) build_windows ;;
     android) build_android ;;
     host) build_host ;;
     all) build_android; build_host ;;
-    *) echo 'usage: build_pkg_tool.sh [android|host|all]' >&2; exit 2 ;;
+    *) echo 'usage: build_pkg_tool.sh [android|host|linux|windows|all]' >&2; exit 2 ;;
 esac

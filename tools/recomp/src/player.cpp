@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Player mode of bb-recomp: `bb-recomp --game <dump folder> [--out <dir>]`.
 //
 // One command, no other inputs. The player's own PS4 dump of Bloodborne (eboot.bin as a decrypted SELF, sce_module/*.prx,

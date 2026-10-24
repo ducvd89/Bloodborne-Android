@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 package ro.cobrabm.fexdroid;
 
 import java.io.ByteArrayInputStream;

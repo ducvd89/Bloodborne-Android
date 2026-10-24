@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // The game as PKG files: find and identify the base game and its update(s) in a folder, unpack them with ps4-pkg-tool (the tool the app's
 // PkgInstaller runs, built by tools/android/build_pkg_tool.sh from its patched shadPS4 source) and merge the updates over the base into
 // one game folder, as PkgInstaller.installGame does (the same checks and messages, the same merge: rename over, case-insensitive names,

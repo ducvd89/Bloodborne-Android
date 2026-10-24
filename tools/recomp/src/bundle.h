@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // The self-contained build of bb-recomp (tools/recomp/package.sh): everything the compile step used to ask the NDK and the
 // system's clang for comes from the tool itself or from its bundle directory (<exe>/../share/bb-recomp):
 //   - ld.lld runs in the process (LLD as a library, BBR_BUNDLED),

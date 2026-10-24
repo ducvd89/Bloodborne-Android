@@ -35,7 +35,15 @@ set(BB_RECOMP_VERSION "0.1.0" CACHE STRING "tool version written to libbbaot.jso
 # -DBB_MINGW_ROOT=<llvm-mingw dir>; LLVM_DIR and the deps prefix then name builds for mingw (windows/build.sh).
 set(BB_RECOMP_TOOLCHAIN_FILE "" CACHE FILEPATH "CMake toolchain file for a cross build (Windows: windows/toolchain-mingw-x86_64.cmake)")
 set(BB_MINGW_ROOT "" CACHE PATH "llvm-mingw directory (cross build for Windows)")
+# Linux release build (AppImage): linux-jammy-toolchain.cmake with an Ubuntu 22.04 sysroot and the LLVM tarball (fetch-deps.sh)
+set(BB_SYSROOT "" CACHE PATH "sysroot for linux-jammy-toolchain.cmake")
+set(BB_LLVM_ROOT "" CACHE PATH "LLVM release tarball directory for linux-jammy-toolchain.cmake")
 set(BB_RECOMP_LLD_INCLUDE "" CACHE PATH "include directory of LLD's headers when LLVM is a build tree (Windows build)")
+# The window (Dear ImGui + SDL3, src/gui.cpp): BB_RECOMP_SDL_PREFIX holds a static SDL3 (lib/cmake/SDL3), BB_RECOMP_IMGUI_DIR the ImGui sources
+# (tools/recomp/fetch-deps.sh fetches both). Without them bb-recomp is the command line tool only.
+set(BB_RECOMP_SDL_PREFIX "" CACHE PATH "prefix of a static SDL3 build (enables the GUI)")
+set(BB_RECOMP_IMGUI_DIR "" CACHE PATH "Dear ImGui source directory (enables the GUI)")
+set(BB_RECOMP_MIMALLOC_DIR "" CACHE PATH "mimalloc source directory: its allocator replaces operator new/delete (Windows build)")
 set(BB_RECOMP_JOBS 22 CACHE STRING "Parallel jobs for the inner FEX build (2 of 24 cores stay free)")
 set(BB_RECOMP_MARCH x86-64-v3 CACHE STRING "-march for FEX and bb-recomp on x86 hosts (FEX needs AVX)")
 set(BB_RECOMP_CC clang CACHE STRING "C compiler for FEX (needs Clang)")
@@ -63,8 +71,10 @@ endif()
 set(BB_EXE "")
 set(BB_TOOLCHAIN_ARGS -DCMAKE_C_COMPILER=${BB_RECOMP_CC} -DCMAKE_CXX_COMPILER=${BB_RECOMP_CXX})
 if(BB_RECOMP_TOOLCHAIN_FILE)
-  set(BB_EXE ".exe")
-  set(BB_TOOLCHAIN_ARGS "-DCMAKE_TOOLCHAIN_FILE=${BB_RECOMP_TOOLCHAIN_FILE}" "-DBB_MINGW_ROOT=${BB_MINGW_ROOT}")
+  if(BB_RECOMP_TOOLCHAIN_FILE MATCHES "mingw")
+    set(BB_EXE ".exe")
+  endif()
+  set(BB_TOOLCHAIN_ARGS "-DCMAKE_TOOLCHAIN_FILE=${BB_RECOMP_TOOLCHAIN_FILE}" "-DBB_MINGW_ROOT=${BB_MINGW_ROOT}" "-DBB_SYSROOT=${BB_SYSROOT}" "-DBB_LLVM_ROOT=${BB_LLVM_ROOT}")
 endif()
 set(BB_TARGETS bb-recomp)
 set(BB_BUILT_FILES "<BINARY_DIR>/Bin/bb-recomp${BB_EXE}")
@@ -91,7 +101,7 @@ ExternalProject_Add(fex
     -DCMAKE_PROJECT_FEX_INCLUDE=${CMAKE_CURRENT_LIST_DIR}/fex_project.cmake
     -DBB_RECOMP_DIR=${CMAKE_CURRENT_LIST_DIR}
     -DBB_RECOMP_PLAYER=${BB_RECOMP_PLAYER} -DBB_RECOMP_BUNDLED=${BB_RECOMP_BUNDLED} -DBB_RECOMP_VERSION=${BB_RECOMP_VERSION}
-    "-DBB_RECOMP_LLVM_DIR=${BB_RECOMP_LLVM_DIR}" "-DBB_RECOMP_DEPS_PREFIX=${BB_RECOMP_DEPS_PREFIX}" "-DBB_RECOMP_LLD_INCLUDE=${BB_RECOMP_LLD_INCLUDE}"
+    "-DBB_RECOMP_LLVM_DIR=${BB_RECOMP_LLVM_DIR}" "-DBB_RECOMP_DEPS_PREFIX=${BB_RECOMP_DEPS_PREFIX}" "-DBB_RECOMP_LLD_INCLUDE=${BB_RECOMP_LLD_INCLUDE}" "-DBB_RECOMP_SDL_PREFIX=${BB_RECOMP_SDL_PREFIX}" "-DBB_RECOMP_IMGUI_DIR=${BB_RECOMP_IMGUI_DIR}" "-DBB_RECOMP_MIMALLOC_DIR=${BB_RECOMP_MIMALLOC_DIR}"
     -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH} -DBB_RECOMP_NASM=${BB_RECOMP_NASM}
   BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target ${BB_TARGETS} --parallel ${BB_RECOMP_JOBS}
   INSTALL_COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BB_BUILT_FILES} ${CMAKE_BINARY_DIR}

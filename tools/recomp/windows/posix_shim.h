@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Force-included (-include) into every bb-recomp source file of the Windows build (llvm-mingw): the few POSIX names the shared sources use.
 // lifter.cpp's crash containment (a signal or a FEX assert while lifting jumps back and marks the function Crashed) is not available
 // on Windows: installCrashHandlers() installs no signal handlers there, so the jumps are never taken. The game's code lifts without a
