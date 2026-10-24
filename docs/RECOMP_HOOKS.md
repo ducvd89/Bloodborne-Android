@@ -117,7 +117,7 @@ With the default Android settings, the common non-default ones (below) and BBSC 
   After the fix: 0 crashes in 60 release runs and 25 ASan runs; ASan + UBSan on a 60,000-function compile with the catalogs and on the ASM tests report nothing;
   UBSan builds of `bb-recomp` (40,000 functions with the catalogs), `bb-recomp-asmtest` (1755/1760, as the release build, all self-tests pass) and `bb-recomp-difftest` (2,000 functions, 0 mismatches)
   report no undefined behaviour. `bb-recomp-difftest` cannot run under ASan: it forks workers from a threaded process, which deadlocks ASan's allocator (with `die_after_fork=0` it runs but every input
-  faults), so its sanitizer run is UBSan; four ASM tests that map fixed addresses inside ASan's shadow gap (`Displacement_Encoding`) differ under ASan only.
+  faults), so its sanitizer run is UBSan; one ASM test that maps a fixed address inside ASan's shadow gap (`Displacement_Encoding`, 1754 of 1760 pass) differs under ASan only.
 
 ### Dirty functions per configuration (phase 4b, `tests/aot_so_check.cpp`, the real x86-64 `.so` and image, the patchers and hook catalogs run against the engine)
 
