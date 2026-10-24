@@ -25,12 +25,13 @@ final class NativeCpu {
     static final String KIND = "bb-recomp-aot", SO = "libbbaot.so", JSON = "libbbaot.json";
     /** The Rebuild Tool (Windows/Linux): its README has the step-by-step guide. */
     static final String TOOL_URL = "https://github.com/ducvd89/Bloodborne-android-rebuild-tool";
-    static final String REQUIRED_TEXT = "This version of the app runs Bloodborne as native code, which you build once on a PC from your own game files "
-        + "with the Bloodborne Android Rebuild Tool (Windows/Linux).";
-    static final String STEPS_TEXT = "1. On a PC, download the Rebuild Tool from its GitHub page (button below) and run it.\n"
-        + "2. Point it at your Bloodborne game folder (with the 1.09 update) and let it build. It takes a few minutes, once.\n"
-        + "3. Copy the folder it makes to your phone and choose it here as the game folder: the native code in its aot/ folder is imported by itself. "
-        + "Or copy libbbaot.so and libbbaot.json and use Import.";
+    /** The links of the "Native code needed" dialog and of the full-screen message: the newest release to download, and the guide. */
+    static final String DOWNLOAD_URL = TOOL_URL + "/releases/latest", GUIDE_URL = TOOL_URL + "#how-to-use-it";
+    /** What the dialog and the full-screen message say (title, then the lead: the reason or NEEDED_MISSING, then NEEDED_TEXT). */
+    static final String NEEDED_TITLE = "Native code needed";
+    static final String NEEDED_MISSING = "This game folder has no native code (aot/libbbaot.so).";
+    static final String NEEDED_TEXT = "Bloodborne on Android 2.0 runs as native ARM64 code that you build once on a PC (Windows or Linux) from your own game files, "
+        + "with the free Bloodborne Android Rebuild Tool. Run the tool on your PKG files, copy the folder it makes to this device, then choose it here.";
 
     /** A reason shown to the player as it is. */
     static final class Problem extends Exception { Problem(String message) { super(message); } }
@@ -332,6 +333,23 @@ final class NativeCpu {
         } catch (Problem p) { result.kind = SyncKind.FAILED; result.problem = "The native CPU files in the game folder were not used: " + p.getMessage(); }
         catch (IOException | RuntimeException e) { result.kind = SyncKind.FAILED; result.problem = "The native CPU files in the game folder could not be read: " + e; }
         return result;
+    }
+
+    /** Whether the "Native code needed" dialog is due for a game folder the app just accepted, and what it leads with; null: do not show it.
+     *  `sync` is what syncFromGame did with the folder (null: not run) and `state` the start state (startState: the checksum checked).
+     *  It is not due when the library that runs fits the game, even when this folder has no aot/ (imported by hand earlier, or from
+     *  another folder). Else the lead is NEEDED_MISSING for a folder without native code, or the specific reason: the folder's files
+     *  were refused (another game build, ABI, checksum), only one of the two is there, or the library kept in the app does not fit. */
+    static String neededLead(File gameDir, Sync sync, State state) {
+        if (gameDir == null || state.ready()) return null;
+        if (sync != null && sync.kind == SyncKind.FAILED && sync.problem != null) return sync.problem;
+        File aot = new File(gameDir, "aot");
+        boolean hasSo = new File(aot, SO).isFile(), hasJson = new File(aot, JSON).isFile();
+        if (hasSo != hasJson)
+            return "The aot/ folder in this game folder has " + (hasSo ? SO + " but no " + JSON : JSON + " but no " + SO) + ": both are needed.";
+        String blocker = state.blocker();
+        if ((hasSo || state.installed) && blocker != null) return blocker;
+        return NEEDED_MISSING;
     }
 
     /** Removes the installed library and its description. */

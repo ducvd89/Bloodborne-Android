@@ -12,14 +12,15 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 /** The full-screen message shown instead of the game when libbbaot.so is missing or does not fit (wrong game, ABI, checksum): this app
- *  runs Bloodborne as native code only, which the player builds once on a PC with the Rebuild Tool. Steps in short, a button to the tool's
- *  GitHub page, and the two ways to bring the result here: the game folder the tool made, or the library itself. Sits above the game
- *  surface and the touch controller, below the menu handle and the drawer. */
+ *  runs Bloodborne as native code only, which the player builds once on a PC with the Rebuild Tool. The same text and links as the
+ *  "Native code needed" dialog (NativeNeededDialog), and the two ways to bring the result here: the game folder the tool made, or the
+ *  library itself. Sits above the game surface and the touch controller, below the menu handle and the drawer. */
 final class NativeRequiredView extends ScrollView {
-    private static final int TEXT = 0xffe8dfc9, GOLD = 0xffc6ad76, WARN = 0xffe5a04b;
+    private static final int TEXT = 0xffe8dfc9, WARN = 0xffe5a04b;
 
     interface Actions {
-        void openTool();
+        void openDownload();
+        void openGuide();
         void chooseGameFolder();
         void importFiles();
     }
@@ -36,18 +37,16 @@ final class NativeRequiredView extends ScrollView {
         box = new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
         int pad = dp(activity, 28);
         box.setPadding(pad, dp(activity, 36), pad, dp(activity, 36));
-        TextView title = text(activity, "Native code needed", 24, TEXT, true);
+        TextView title = text(activity, NativeCpu.NEEDED_TITLE, 24, TEXT, true);
         box.addView(title);
-        TextView message = text(activity, NativeCpu.REQUIRED_TEXT, 16, TEXT, false);
+        TextView message = text(activity, NativeCpu.NEEDED_TEXT, 16, TEXT, false);
         message.setPadding(0, dp(activity, 12), 0, 0);
         box.addView(message);
         reason = text(activity, "", 14, WARN, false);
-        reason.setPadding(0, dp(activity, 10), 0, 0);
+        reason.setPadding(0, dp(activity, 10), 0, dp(activity, 6));
         box.addView(reason);
-        TextView steps = text(activity, NativeCpu.STEPS_TEXT, 14, GOLD, false);
-        steps.setPadding(0, dp(activity, 14), 0, dp(activity, 8));
-        box.addView(steps);
-        box.addView(button(activity, "Open the Rebuild Tool page", actions::openTool));
+        box.addView(button(activity, "Download the Rebuild Tool", actions::openDownload));
+        box.addView(button(activity, "How to use it", actions::openGuide));
         box.addView(button(activity, "Choose game folder", actions::chooseGameFolder));
         box.addView(button(activity, "Import libbbaot.so…", actions::importFiles));
         TextView note = text(activity, "Menu (swipe from the left edge, or the ○ button) has these too, under Native CPU and Game folder.", 12, 0xff8e9097, false);

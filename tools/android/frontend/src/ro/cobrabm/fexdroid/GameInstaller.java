@@ -231,14 +231,10 @@ final class GameInstaller {
     private void finished(PkgInstaller.GameResult o) {
         String where=o.gameDir==null ? "" : o.gameDir;
         if (o.ready && !where.isEmpty()) {
-            if (host.nativeReady()) { closed=true; host.useGame(new File(where)); return; }
-            // The game is in place, but this app runs it as native code only, built once on a PC: say so before the full-screen message.
-            new AlertDialog.Builder(activity).setTitle("Game installed: native code still needed")
-                .setMessage("The game is installed in "+where+".\n\n"+NativeCpu.REQUIRED_TEXT+"\n\n"
-                    +"Easiest: run the Rebuild Tool on a PC with your game PKGs. Its output folder holds the game and the native code "
-                    +"(its aot/ folder) together: copy it to the phone and choose it as the game folder. "+NativeCpu.TOOL_URL)
-                .setCancelable(false)
-                .setPositiveButton("OK",(d,w) -> { closed=true; host.useGame(new File(where)); }).show();
+            // Without native code that fits, the game start shows the "Native code needed" dialog (NativeNeededDialog): it explains the
+            // Rebuild Tool and links to it, so the install says only where the game went.
+            if (!host.nativeReady()) host.toast("Game installed in "+where+".");
+            closed=true; host.useGame(new File(where));
             return;
         }
         // Not ready: the install found an older version (the base game, or an update before 1.09).
