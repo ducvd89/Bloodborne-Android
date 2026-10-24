@@ -3,11 +3,24 @@
 // automatic tests): maps the flat image (out/boot-linked.bin's memory image), applies BBPATCH2 patch parts as the loader does, runs the engine's
 // start-up classification (the .so's tables, unit hashes, variants) and prints what runs as an original, as a variant and on the fallback.
 //   x86-64 .so: bb-recomp --target x86_64 --so out/aot/libbbaot_x86.so --variants tools/recomp/variants ...
-//   c++ -std=c++20 -O1 -g -pthread -Icpu -Isrc tests/aot_so_check.cpp -ldl -rdynamic -o out/aot-so-check
-//   out/aot-so-check libbbaot_x86.so image.bin [patch-part.bin ...]
+//   c++ -std=c++20 -O1 -g -pthread -Icpu -Isrc -Igpu/shim -Igpu/shadps4 tests/aot_so_check.cpp gpu/shim/bbport_frame_rate.cpp gpu/shim/bbport_display.cpp \
+//       gpu/shim/bbport_guest_guards.cpp -ldl -rdynamic -o out/aot-so-check
+//   out/aot-so-check libbbaot_x86.so image.bin [--patchers] [--hooks catalog.txt ...] [patch-part.bin ...]
+// --patchers runs the port's own patchers (frame rate, display, guards, scene size: their environment is the process's: BB_OUTPUT_RES, BB_RENDER_RES ...)
+// against the engine, as bbgpu_patch_image does; --hooks puts a (do-nothing) hook slot at every `hook` line of a catalog, as the online module does.
 #include "../cpu/guest_cpu_aot.cpp"
 
 #include <fcntl.h>
+
+#include <fstream>
+#include <sstream>
+
+#include "bbport_display.h"
+#include "bbport_frame_rate.h"
+#include "bbport_guest_guards.h"
+
+extern "C" int runtime_memory_is_mapped(uintptr_t, uint64_t) { return 0; }
+bool BbSubmitFxInitZero(std::uint64_t, std::uint32_t) { return false; }
 
 extern "C" {
 void bb_fb_init(void* (*)(size_t, int)) {}
@@ -50,7 +63,12 @@ int main(int argc, char** argv) {
     Load(argv[1]);
     if (!E.on) return 1;
     OpenImage(Base, image.size());
-    for (int i = 3; i < argc; ++i) {  // BBPATCH2: magic, base, count, {offset, length, bytes}
+    bool patchers = false;
+    std::vector<const char*> catalogs;
+    for (int i = 3; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--patchers")) { patchers = true; continue; }
+        if (!std::strcmp(argv[i], "--hooks") && i + 1 < argc) { catalogs.push_back(argv[++i]); continue; }
+        // BBPATCH2: magic, base, count, {offset, length, bytes}
         const std::vector<uint8_t> p = ReadFile(argv[i]);
         uint64_t count; std::memcpy(&count, p.data() + 16, 8);
         size_t pos = 24;
@@ -60,6 +78,24 @@ int main(int argc, char** argv) {
             pos += 16 + len;
         }
         std::printf("applied %s\n", argv[i]);
+    }
+    if (patchers) {
+        BbFrameRate::PatchImage(static_cast<unsigned char*>(mem), image.size());
+        BbDisplay::PatchImage(static_cast<unsigned char*>(mem), image.size());
+        BbGuestGuards::PatchImage(static_cast<unsigned char*>(mem), image.size());
+    }
+    for (const char* path : catalogs) {  // a do-nothing slot hook at every site the catalog declares
+        std::ifstream in(path);
+        std::string line;
+        unsigned set = 0, refused = 0;
+        while (std::getline(in, line)) {
+            std::istringstream ls(line);
+            std::string word, addr;
+            if (!(ls >> word >> addr) || word != "hook") continue;
+            const uintptr_t at = Base + std::strtoull(addr.c_str(), nullptr, 16);
+            if (guest_cpu_hook_slot(at, 5, [](void*, GuestRegsEx*) -> uint32_t { return GUEST_HOOK_CONTINUE; }, nullptr)) ++set; else ++refused;
+        }
+        std::printf("hooks %s: %u set, %u refused\n", path, set, refused);
     }
     PrepareImage();
     std::printf("units %llu, dirty %llu (trap units %llu); functions: %llu variant activations, %llu dirty\n", (unsigned long long)E.count,
