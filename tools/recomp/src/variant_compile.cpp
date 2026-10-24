@@ -45,6 +45,15 @@ struct Batch {
   std::unique_ptr<UnitLowerer> ul;
   size_t bytes = 0;
   unsigned index = 0;
+  Batch() = default;
+  Batch(Batch&&) = default;
+  // The lowerer and the module must go before the context they live in (the default assignment would destroy the context first).
+  Batch& operator=(Batch&& o) {
+    ul.reset(); mod.reset(); ctx.reset();
+    ctx = std::move(o.ctx); mod = std::move(o.mod); ul = std::move(o.ul); bytes = o.bytes; index = o.index;
+    return *this;
+  }
+  ~Batch() { ul.reset(); mod.reset(); ctx.reset(); }
 };
 
 // Optimise + codegen on a small pool; at most `depth` modules wait at a time (a module is big in memory).
