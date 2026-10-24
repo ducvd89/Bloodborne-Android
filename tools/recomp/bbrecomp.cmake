@@ -1,13 +1,13 @@
 # bb-recomp target, inside FEX's build. FEXCore's per-target settings (the DEFINES list in
 # FEXCore/Source/CMakeLists.txt) change header layouts, so they are repeated here.
 set(BBR "${BB_RECOMP_DIR}/src")
-set(BBR_COMMON "${BBR}/elf_image.cpp" "${BBR}/fde_scan.cpp" "${BBR}/lifter.cpp" "${BBR}/jumptable.cpp" "${BBR}/eh_frame.cpp" "${BBR}/discover.cpp")
+set(BBR_COMMON "${BBR}/elf_image.cpp" "${BBR}/fde_scan.cpp" "${BBR}/lifter.cpp" "${BBR}/jumptable.cpp" "${BBR}/eh_frame.cpp" "${BBR}/discover.cpp" "${BBR}/variants.cpp")
 set(BBR_JIT "${BBR}/jit_host.cpp")
 set(BBR_HELPERS "${BB_RECOMP_DIR}/helpers")
 # The x87 helpers (plain C, one translation unit) are linked into every tool: the in-process JIT of the test tools calls them
 # directly. The same file is compiled again for the target and linked into the generated .so (compile.cpp).
 set_source_files_properties("${BBR_HELPERS}/bbr_x87_all.c" PROPERTIES LANGUAGE C COMPILE_OPTIONS "-O2;-fvisibility=hidden;-fno-stack-protector;-ffp-contract=off")
-set(BBR_LLVM_SRCS "${BBR}/lower_llvm.cpp" "${BBR}/lower_ops.cpp" "${BBR}/lower_vector.cpp" "${BBR}/codegen.cpp" "${BBR}/compile.cpp")
+set(BBR_LLVM_SRCS "${BBR}/lower_llvm.cpp" "${BBR}/lower_ops.cpp" "${BBR}/lower_vector.cpp" "${BBR}/codegen.cpp" "${BBR}/compile.cpp" "${BBR}/variant_compile.cpp")
 add_executable(bb-recomp "${BBR}/main.cpp" ${BBR_COMMON} "${BBR}/census.cpp")
 target_include_directories(bb-recomp PRIVATE
   "${CMAKE_SOURCE_DIR}/FEXCore/Source" "${CMAKE_SOURCE_DIR}/FEXCore/include" "${CMAKE_BINARY_DIR}/include" "${BBR}" "${BBR_HELPERS}")
@@ -52,4 +52,13 @@ if(BB_RECOMP_LLVM)
   endforeach()
   set(BB_RECOMP_TEST_NASM "${BB_RECOMP_NASM}" CACHE STRING "")
   target_compile_definitions(bb-recomp-asmtest PRIVATE BBR_NASM="${BB_RECOMP_NASM}" BBR_FEX_SRC="${CMAKE_SOURCE_DIR}")
+endif()
+
+if(BB_RECOMP_SANITIZE)
+  foreach(t bb-recomp bb-recomp-asmtest bb-recomp-difftest)
+    if(TARGET ${t})
+      target_compile_options(${t} PRIVATE -fsanitize=${BB_RECOMP_SANITIZE} -fno-sanitize=function -fno-omit-frame-pointer -g)
+      target_link_options(${t} PRIVATE -fsanitize=${BB_RECOMP_SANITIZE})
+    endif()
+  endforeach()
 endif()

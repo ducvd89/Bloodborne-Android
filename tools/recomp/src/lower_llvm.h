@@ -5,11 +5,22 @@
 #include "lifter.h" // UnitMeta
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace llvm { class LLVMContext; class Module; }
+
+// A native hook site (docs/RECOMP_ABI.md, "Hook slots"): at the start of the guest instruction at image vaddr `vaddr` the unit tests
+// bbr_hook_slot[index]; when set it spills the state, calls the slot (GuestState*, index) and acts on the result: 0 = run the instruction as
+// usual, 1 = the callback set rip: continue there (one of `resume`, else through the dispatcher), 2 = the callback made a `ret`.
+struct HookSite {
+  uint64_t vaddr = 0;
+  uint32_t index = 0;
+  std::vector<uint64_t> resume; // addresses the callback may continue at inside the unit (instruction boundaries or block entries)
+};
+using HookSites = std::map<uint64_t, HookSite>; // by vaddr
 
 struct LowerOptions {
   uint64_t liftBase = 0;       // host address the lifter mapped image vaddr 0 at: IR addresses are liftBase + vaddr
@@ -24,6 +35,9 @@ struct LowerOptions {
   bool resumeEntries = false;    // every call-return block is a resume entry of its unit (docs/RECOMP_ABI.md, "Resume entries")
   bool hiddenUnits = true;       // hidden visibility for the unit functions (off for the in-process JIT)
   std::function<bool(uint64_t)> isKnownUnit; // image vaddr -> a unit with that entry exists (direct call)
+  std::function<std::string(uint64_t)> callName; // direct-call symbol of a target (isKnownUnit must be true for it); default unitName(vaddr)
+  std::string defPrefix;                        // prefix of the functions defined here ("bbr_" when empty); variants use "bbrv<k>_"
+  const HookSites* hookSites = nullptr;         // native hook sites (every unit that holds the instruction gets the slot test)
 };
 
 struct LowerResult {
@@ -33,6 +47,8 @@ struct LowerResult {
   uint32_t callExits = 0;               // ExitFunction with the Call hint (of directCalls + dispatchCalls)
   uint32_t irOps = 0;                   // IR ops lowered (all blocks)
   uint32_t resumeCases = 0;             // call-return blocks reachable through the resume switch at the unit entry
+  uint32_t hookSites = 0;               // hook slot tests emitted
+  std::vector<uint32_t> hookIdx;        // ... their site indices
   uint32_t switches = 0, switchCases = 0; // indirect jumps lowered as an LLVM switch over the unit's blocks, and their cases
 };
 
@@ -49,6 +65,9 @@ class UnitLowerer {
   void lower(uint64_t entry, const void* irView, LowerResult* res, const UnitMeta* meta = nullptr);
   // A stub for a unit that could not be lifted: bbr_trap(s, BBR_TRAP_UNLIFTABLE | vaddr).
   void stub(uint64_t entry);
+  // Names for the units lowered from now on (variants share one module): the functions defined get `defPrefix` + hex vaddr, a direct call
+  // goes to the symbol callName(target) (empty: not a direct target: the dispatcher).
+  void reconfigure(const std::string& defPrefix, std::function<std::string(uint64_t)> callName);
 
  private:
   struct Impl;
@@ -56,3 +75,4 @@ class UnitLowerer {
 };
 
 std::string unitName(uint64_t vaddr); // "bbr_<hex>"
+std::string unitNameWith(const std::string& prefix, uint64_t vaddr); // "<prefix><hex>"

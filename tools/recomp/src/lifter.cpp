@@ -308,6 +308,11 @@ struct Lifter::Impl {
   Impl(const ElfImage& i, const LiftOptions& o) : img(i), opt(o) { build(); }
 
   void build() {
+    // FEXCore's config is a process-wide store whose reads convert the stored string in place (Config::MetaLayer::GetConv<bool> emplaces
+    // the variant): two threads creating a context at once free the same string (glibc "free(): invalid pointer", found with ASan:
+    // bad-free in GetConv from the ContextImpl constructor). Every thread of the tool builds its own Lifter, so building is serialised.
+    static std::mutex buildLock;
+    std::lock_guard<std::mutex> guard(buildLock);
     setConfig(opt);
     ctx = static_cast<Context::ContextImpl*>(Context::Context::CreateNewContext(makeHost(opt.host)).release());
     ctx->SetSyscallHandler(&g_handler);
@@ -511,7 +516,7 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
       const bool IsLocked = DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_LOCK;
 
       OD.FlushRegisterCache(true);
-      if (OD.CanHaveSideEffects(TableInfo, DecodedInfo)) OD._GuestOpcode(InstAddress - GuestRIP);
+      if (OD.CanHaveSideEffects(TableInfo, DecodedInfo) || (opt.forceGuestOpcode && opt.forceGuestOpcode->count(InstAddress - img.base))) OD._GuestOpcode(InstAddress - GuestRIP);
 
       if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
         auto Fn = TableInfo->OpcodeDispatcher.OpDispatch;

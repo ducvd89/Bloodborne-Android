@@ -6,6 +6,10 @@
 // instructions and jumps back. With a skip flag (function entries only) the hook may set it to
 // return from the game's function at once.
 //
+// With ahead-of-time recompiled code (BB_AOT, cpu/guest_cpu_aot.cpp) a site the recompiler has a native hook slot for (tools/recomp/variants/
+// hooks-bbsc.txt) is hooked there instead: no trampoline, no code written, the hook is called by the recompiled units (src/guest_cpu.h,
+// guest_cpu_hook_slot); other sites keep the trampoline.
+//
 // The interface is shadPS4's (core/cpu_patches.h of the shadp2p/BBSC forks), so game modules
 // written against it (BBSC's bloodborne_re.cpp) build unchanged.
 //

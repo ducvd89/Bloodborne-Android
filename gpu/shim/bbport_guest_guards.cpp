@@ -32,6 +32,7 @@
 #include "common/types.h"
 #include "bbport_guest_guards.h"
 #include "bbport_guest_code.h"
+#include "bbport_hook_sites.h"
 #include "bbport_patch_notes.h"
 #include "../../src/guest_cpu.h"
 
@@ -88,6 +89,10 @@ void Writable(u64 address, std::size_t size) {
 
 /// `e` onto the stub page: its address, or 0 when it does not fit.
 u64 PlaceStub(const Emitter& e) {
+    if (!stub_page) {
+        stub_page = MapNear();
+        if (!stub_page) std::printf("Guest guards: no memory next to the game's code for a stub\n");
+    }
     if (!stub_page || e.overflow || stub_used + e.size > PageSize) {
         return 0;
     }
@@ -153,6 +158,16 @@ void PS4_SYSV_ABI OnClamp(std::int32_t samples) {
     }
 }
 
+/// The clamp as a native hook slot: below 3 the game's value is told, then edi = 3 (the stub's work; the entry's own instructions run next).
+std::uint32_t ClampSlot(void*, GuestRegsEx* r) {
+    const auto samples = static_cast<std::int32_t>(r->gpr[GUEST_RDI]);
+    if (samples < 3) {
+        OnClamp(samples);
+        r->gpr[GUEST_RDI] = 3; // mov edi, 3
+    }
+    return GUEST_HOOK_CONTINUE;
+}
+
 bool InstallKernelClamp() {
     if (const char* env = std::getenv("BB_KERNEL_SAMPLE_CLAMP"); env && env[0] == '0') {
         std::printf("Guest guards: blur-kernel sample clamp off (BB_KERNEL_SAMPLE_CLAMP=0)\n");
@@ -160,6 +175,9 @@ bool InstallKernelClamp() {
     }
     if (!Expect(KernelSite, KernelEntry.data(), KernelEntry.size(), "blur-kernel sample clamp")) {
         return false;
+    }
+    if (BbHookSites::Available(image_base + KernelSite)) {
+        return BbHookSites::Slot(image_base + KernelSite, image_base, KernelEntry.size(), ClampSlot, nullptr);
     }
     // Below 3: OnClamp told (with the game's value), then edi = 3.
     Emitter clamp;
@@ -191,9 +209,25 @@ void PS4_SYSV_ABI OnNullNode() {
     }
 }
 
+/// The GX node guard as a native hook slot: instead of `mov [r12 + 8], r13`: with a node, the store, then on; without, told, then past the post.
+std::uint32_t GxNodeSlot(void*, GuestRegsEx* r) {
+    if (r->gpr[GUEST_R12]) {
+        std::memcpy(reinterpret_cast<u8*>(r->gpr[GUEST_R12]) + 8, &r->gpr[GUEST_R13], 8);
+        r->rip = image_base + GxNodeSite + 5;
+    } else {
+        OnNullNode();
+        r->rip = image_base + GxNodeSkip;
+    }
+    return GUEST_HOOK_JUMP;
+}
+
 bool InstallGxNodeGuard() {
     if (!Expect(GxNodeSite, GxNodeCode.data(), GxNodeCode.size(), "GX command node guard")) {
         return false;
+    }
+    if (BbHookSites::Available(image_base + GxNodeSite)) {
+        return BbHookSites::Slot(image_base + GxNodeSite, image_base, 5, GxNodeSlot, nullptr,
+                                 {image_base + GxNodeSite + 5, image_base + GxNodeSkip});
     }
     Emitter e;
     e.Bytes({0x4d, 0x85, 0xe4});             // test r12, r12
@@ -277,6 +311,14 @@ void PS4_SYSV_ABI FxInitClear(void* context, void* state, void* texture, const f
     guest_cpu_call(uintptr_t(image_base + FxClearFunction), 4, args);
 }
 
+/// The three calls as native hook slots: instead of `call 0x2168630`, FxInitClear with the call's arguments, then on after the call.
+std::uint32_t FxInitSlot(void*, GuestRegsEx* r) {
+    FxInitClear(reinterpret_cast<void*>(r->gpr[GUEST_RDI]), reinterpret_cast<void*>(r->gpr[GUEST_RSI]),
+                reinterpret_cast<void*>(r->gpr[GUEST_RDX]), reinterpret_cast<const float*>(r->gpr[GUEST_RCX]));
+    r->rip += 5;
+    return GUEST_HOOK_JUMP;
+}
+
 bool InstallFxInitClear() {
     if (const char* env = std::getenv("BB_FX_INIT_CLEAR"); env && env[0] == '0') {
         std::printf("Guest guards: effect initialization as the game does it (BB_FX_INIT_CLEAR=0)\n");
@@ -286,6 +328,14 @@ bool InstallFxInitClear() {
         if (!Expect(site.offset, site.code.data(), site.code.size(), "effect initialization")) {
             return false;
         }
+    }
+    bool all_slots = true;
+    for (const auto& site : FxInitSites) all_slots = all_slots && BbHookSites::Available(image_base + site.offset);
+    if (all_slots) {
+        for (const auto& site : FxInitSites) {
+            if (!BbHookSites::Slot(image_base + site.offset, image_base, 5, FxInitSlot, nullptr, {image_base + site.offset + 5})) return false;
+        }
+        return true;
     }
     Emitter e;
     e.JmpAbs(guest_cpu_host_function(reinterpret_cast<void*>(&FxInitClear)));
@@ -309,22 +359,19 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
     if (size < 0x2200000) {
         return;
     }
-    stub_page = MapNear();
-    if (!stub_page) {
-        std::printf("Guest guards: not installed: no memory next to the game's code\n");
-        return;
-    }
     clamp_on = InstallKernelClamp();
     gx_guard_on = InstallGxNodeGuard();
     fx_clear_on = InstallFxInitClear();
-    if (stub_used == 0) {
+    if (stub_page && stub_used == 0) {
         munmap(stub_page, PageSize);
         stub_page = nullptr;
-        return;
     }
-    // The stub page is guest code (FEXCore translates what the jumps lead to there).
-    guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), PageSize);
-    mprotect(stub_page, PageSize, PROT_READ | PROT_EXEC);
+    if (stub_page) {
+        // The stub page is guest code (FEXCore translates what the jumps lead to there).
+        guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), PageSize);
+        mprotect(stub_page, PageSize, PROT_READ | PROT_EXEC);
+    }
+    if (!clamp_on && !gx_guard_on && !fx_clear_on) return;
     std::printf("Guest guards: blur-kernel sample clamp %s, GX command node guard %s, effect "
                 "initialization by the port %s\n",
                 clamp_on ? "on" : "off", gx_guard_on ? "on" : "off", fx_clear_on ? "on" : "off");

@@ -24,6 +24,7 @@ option(BB_RECOMP_LLVM "Link LLVM for the IR lowering and build bb-recomp-asmtest
 get_filename_component(BB_NASM_DEFAULT "${CMAKE_CURRENT_LIST_DIR}/../../.local-deps/nasm/install/bin/nasm" ABSOLUTE)
 set(BB_RECOMP_NASM "${BB_NASM_DEFAULT}" CACHE FILEPATH "nasm for the ASM test runner (built from source into .local-deps/nasm: see README)")
 set(BB_RECOMP_JOBS 22 CACHE STRING "Parallel jobs for the inner FEX build (2 of 24 cores stay free)")
+set(BB_RECOMP_SANITIZE "" CACHE STRING "sanitizers for bb-recomp and the test tools only, e.g. address,undefined (FEXCore itself is not instrumented)")
 set(BB_RECOMP_MARCH x86-64-v3 CACHE STRING "-march for FEX and bb-recomp on x86 hosts (FEX needs AVX)")
 set(BB_RECOMP_CC clang CACHE STRING "C compiler for FEX (needs Clang)")
 set(BB_RECOMP_CXX clang++ CACHE STRING "C++ compiler for FEX (needs Clang)")
@@ -72,7 +73,7 @@ ExternalProject_Add(fex
     -DTUNE_CPU=none -DTUNE_ARCH=${BB_RECOMP_MARCH} -DOVERRIDE_VERSION=FEX-2609.1 -DOVERRIDE_HASH=9fbdc00bd6401aff3b32d79e78ff98b8a13e4dcf
     -DCMAKE_PROJECT_FEX_INCLUDE=${CMAKE_CURRENT_LIST_DIR}/fex_project.cmake
     -DBB_RECOMP_DIR=${CMAKE_CURRENT_LIST_DIR}
-    -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH} -DBB_RECOMP_NASM=${BB_RECOMP_NASM}
+    -DBB_RECOMP_SANITIZE=${BB_RECOMP_SANITIZE} -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH} -DBB_RECOMP_NASM=${BB_RECOMP_NASM}
   BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target ${BB_TARGETS} --parallel ${BB_RECOMP_JOBS}
   INSTALL_COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BB_BUILT_FILES} ${CMAKE_BINARY_DIR}
   BUILD_ALWAYS ON

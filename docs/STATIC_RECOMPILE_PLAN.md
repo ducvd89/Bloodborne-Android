@@ -301,6 +301,11 @@ nothing new (docs/RECOMP_ABI.md, "x87 helpers"). Measured, same machine and sett
 ASM tests: the reduced-precision x87 suite (`X87_F64`) passes 149 of 150; the tests written for the 80-bit x87 are not part of the totals.
 Differential test on libc.prx: see `tools/recomp/README.md`.
 
+## Phase 4 status (2026-10-24, branch recomp-hooks)
+
+Done on the tool and runtime side, not yet run in the game: variant catalogs (patch parts, BBSC tables, cheats cave) compiled as alternate units selected by byte hash, and native hook slots
+(190 BBSC sites, 6-8 shim sites). Inventory and what is left on the fallback (the frame-rate, guard and display patches write run-time addresses): `docs/RECOMP_HOOKS.md`.
+
 ## Risks
 
 - **On-device compile time and APK size** (the phase 0 gate). The fallback is a downloadable

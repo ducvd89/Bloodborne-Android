@@ -142,7 +142,8 @@ bbr_native_call:
   .size bbr_native_call, .-bbr_native_call
 )");
 
-constexpr uint64_t BufA = 0x500000000ull, BufB = 0x500100000ull, BufSize = 0x2000, StackBase = 0x500200000ull, StackSize = 0x10000;
+uint64_t BufA = 0x500000000ull, BufB = 0x500100000ull, StackBase = 0x500200000ull; // (--high-addresses moves them out of an ASan build's shadow gap)
+constexpr uint64_t BufSize = 0x2000, StackSize = 0x10000;
 constexpr uint64_t Sentinel = 0x7000deadb000ull;
 
 struct Input {
@@ -365,6 +366,7 @@ int main(int argc, char** argv) {
     else if (is("--seed")) seed = atoi(arg());
     else if (is("--jobs")) jobs = std::min(22, std::max(1, atoi(arg())));
     else if (is("--func")) only = strtoull(arg(), nullptr, 16);
+    else if (is("--high-addresses")) { base = 0x200000000000ull; BufA = 0x300000000000ull; BufB = 0x300000100000ull; StackBase = 0x300000200000ull; }
     else if (is("--out")) outFile = arg();
     else if (is("-v")) verbose = true;
     else { fprintf(stderr, "usage: bb-recomp-difftest --elf <eboot.elf> [--limit n] [--every n] [--inputs n] [--seed n] [--func hex] [--jobs n] [--out file] [-v]\n"
