@@ -36,6 +36,7 @@ class Jit {
   Fn find(uint64_t addr);             // the compiled unit entered at addr, or nullptr
   static void dispatch(CPUState* s, uint64_t target);
   static void dispatchTail(CPUState* s);
+  static void unwound(CPUState* s);
 
   // Where a dispatch to `target` may be compiled from: the end of the code range that holds it (0: not compilable).
   std::function<uint64_t(uint64_t)> rangeEnd;

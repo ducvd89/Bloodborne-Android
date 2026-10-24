@@ -446,20 +446,28 @@ void Lower::emitExit(Ref node, const IR::IROp_ExitFunction* op) {
       B.CreateAlignedStore(target, gep(ripOff), Align(8));
       B.CreateCall(m.helper("bbr_dispatch", m.Void, {Ptr, I64}), {S, target});
     }
-    // The callee returns to the pushed address (rip == retaddr) or somewhere else (longjmp, exception).
+    // The callee returns to the pushed address (rip == retaddr) or somewhere else (longjmp, exception). Somewhere else: the
+    // state is all in `s`; bbr_unwound runs the unit at rip if there is one (a setjmp return site, a landing pad) from this
+    // host frame, so the code keeps running as units and its eventual return meets a caller's rip check; else it returns
+    // and the callers unwind (docs/RECOMP_ABI.md).
+    auto unwound = [&] {
+      auto* c = B.CreateCall(m.helper("bbr_unwound", m.Void, {Ptr}), {S});
+      c->setTailCallKind(CallInst::TCK_MustTail);
+      B.CreateRetVoid();
+    };
     Value* rip = B.CreateAlignedLoad(I64, gep(ripOff), Align(8));
     if (!op->CallReturnBlock.IsInvalid()) {
       auto* ok = newBB("retok");
       auto* other = newBB("retother");
       B.CreateCondBr(B.CreateICmpEQ(rip, retAddr), ok, other);
       B.SetInsertPoint(other);
-      B.CreateRetVoid();
+      unwound();
       B.SetInsertPoint(ok);
       fill();
       fd = FlagDesc{};
       B.CreateBr(bbOf[op->CallReturnBlock.ID().Value]);
     } else {
-      B.CreateRetVoid();
+      unwound();
     }
     return;
   }

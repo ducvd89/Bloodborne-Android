@@ -80,6 +80,7 @@ Jit::Jit(const ElfImage& img, const LiftOptions& lo, const TargetSpec& ts) : lif
     sm[jit->mangleAndIntern(n)] = {orc::ExecutorAddr::fromPtr(p), JITSymbolFlags::Exported | JITSymbolFlags::Callable};
   };
   sym("bbr_trap", (void*)&bbr_trap); sym("bbr_dispatch", (void*)&Jit::dispatch); sym("bbr_dispatch_tail", (void*)&Jit::dispatchTail);
+  sym("bbr_unwound", (void*)&Jit::unwound);
   sym("bbr_cpuid", (void*)&bbr_cpuid); sym("bbr_rdtsc", (void*)&bbr_rdtsc); sym("bbr_processor_id", (void*)&bbr_processor_id);
   sym("bbr_set_rounding", (void*)&bbr_set_rounding); sym("bbr_xgetbv", (void*)&bbr_xgetbv); sym("bbr_syscall", (void*)&bbr_syscall);
   sym("bbr_get_rounding", (void*)&bbr_get_rounding); sym("bbr_push_rounding", (void*)&bbr_push_rounding); sym("bbr_pop_rounding", (void*)&bbr_pop_rounding);
@@ -156,3 +157,7 @@ void Jit::dispatch(CPUState* s, uint64_t target) {
   f(s);
 }
 void Jit::dispatchTail(CPUState* s) { dispatch(s, s->rip); }
+// A callee came back to another rip than its return address: run the unit already compiled there, if any (as the runtime).
+void Jit::unwound(CPUState* s) {
+  if (Fn f = g_jit->find(s->rip)) f(s);
+}
