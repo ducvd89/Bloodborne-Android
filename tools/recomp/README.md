@@ -54,6 +54,10 @@ are allowed and undone after each lowered run. Result: `out/recomp/difftest.txt`
 
 Options: `--host armv8.2|armv8.4|armv9`, `--no-multiblock`, `--no-passes`, `--tso`, `--validate`,
 `--no-gap-units`, `--jobs`, `--every N`. The process renices itself to 19 and uses at most 22 threads.
+`--boot out/boot-linked.bin [--prx-dir <sce_module>] --module libc.prx` tests one module of the runtime's image (the functions of
+`libc.prx`; calls may leave it). The native oracle is the real 80-bit x87 unit, while the lowering is FEX's reduced-precision x87: functions
+with x87 code differ by design (status words, `fist` overflow results, extended precision), see "Where things stand".
+`--dump-range <lo> <hi> <file>` writes image bytes for `objdump -D -b binary -mi386:x86-64`.
 
 ### The runtime's image: eboot + linked modules, discovery, secondary entries
 
@@ -94,8 +98,28 @@ GVN and a second round at -O2). `--verify-llvm` runs the LLVM verifier on every 
 
 Each test runs in a forked child (the tests map fixed addresses): nasm assembles it the way FEX's CMake does, the code is
 lifted with the front end, lowered, compiled for the host with LLVM ORC, run on a default `CPUState` until `hlt`, and
-`RegData` is compared. Skipped without trying: x87 (376), MMX/3DNow (28), self-modifying code, 32-bit, SHA/CLZERO/RAND
+`RegData` is compared. Skipped without trying: MMX/3DNow (27), self-modifying code, 32-bit, SHA/CLZERO/RAND
 tests, FEX's own disabled and known-failure lists.
+
+x87: FEX tests it in two modes. `unittests/ASM/X87` and every other x87 test without an `Env` key expect FEX's default x87 (80-bit
+precision, `X87ReducedPrecision=0`); `unittests/ASM/X87_F64` (and the tests with `"Env": {"FEX_X87REDUCEDPRECISION": "1"}`) expect the
+reduced mode, where x87 runs as F64 (`X87F64.cpp`, `x87StackOptimizationPass.cpp`). The game runs reduced (`tools/android/fex-compatible.json`:
+`X87ReducedPrecision=1`, `TSOEnabled=0`, `Multiblock=1`) and the lifter sets exactly that (`lifter.cpp`, `setConfig`), so the reduced
+tests are the ones that apply and are counted in `TOTAL`. The 80-bit ones still run, in the category `x87 80-bit (info)` outside the
+totals: they check extended significands in MM registers, x87 exception flags and 80-bit rounding, which the reduced mode does not
+have by design (the game never needs them).
+
+### x87 helpers (`tools/recomp/helpers`)
+
+Ops with no sensible inline form call `bbr_x87_*` functions: the 80-bit memory conversions of reduced mode (`fld/fstp tbyte`: `F80CVT`,
+`F80CVTTo`), the integer and BCD conversions, and the F64 transcendental and remainder ops (`F64FPREM/FPREM1/SCALE/F2XM1/FYL2X/FYL2XP1/ATAN/TAN/SIN/COS`).
+They are FEX's own fallback handlers (`F80Fallbacks.h`, MIT) over the SoftFloat 3e that FEX bundles (BSD-3; a subset is copied to
+`helpers/softfloat`, see `helpers/NOTICE`), as plain C. `bb-recomp` compiles `helpers/bbr_x87_all.c` for the target with that target's own clang
+(`--ndk` clang with `--target=aarch64-linux-android30`; the system clang for `--target x86_64`), writes it as `<out>.helpers.o`, and
+links it into the `.so` (with libm as `DT_NEEDED`, `--helpers-dir` to use other sources). The runtime provides nothing for them
+(docs/RECOMP_ABI.md, "x87 helpers"). The test tools link the same file and register the symbols with the in-process JIT.
+`helpers/test/test_x87.c` checks the conversions against the host's x87 unit (6.4 M random and edge-case values, 4 rounding modes): 0 mismatches
+(only unnormal 80-bit encodings differ).
 
 ## How it works
 
@@ -122,18 +146,22 @@ tests, FEX's own disabled and known-failure lists.
 
 ## Where things stand (2026-10-24, step 2c)
 
-- **ASM tests** (x86-64 host, -O1): unchanged, 1612 pass, 4 fail, 216 not run because an op is still unlowered, 433 skipped:
-  99.8 % of the tests that run pass. `bb-recomp-asmtest --resume-selftest` checks the resume entries (PASS). Every category
-  except the unlowered-op ones is 100 %: Primary 199/199, PrimaryGroup
-  152/152, Secondary 72/72, TwoByte 221/221, Atomics 12/12, ConstProp, Flags, REP/REPNE 67/67, OpSize 110/110, SSE4a 4/4,
-  VEX 329/332, FEX_bugs 95/95. The 4 failures: `DAZTest` (denormals-are-zero needs FPCR.FIZ, FEAT_AFP) and
-  `vcvtps2ph_rd/ru/trunc` (a half-precision conversion with a rounding mode other than nearest: LLVM's x86 `fptrunc`
-  ignores MXCSR; on ARM64 the rounding helpers set FPCR). The 216 tests not run need ops the game never uses (AVX2
-  gathers and masked moves 105, string compares 39, F80 25, FMA 14, AES/SHA/PCLMUL ~30).
-- **Whole image (eboot + libc.prx + libSceFios2.prx, 182,663 functions, 184,271 units, 54.0 M IR ops)**: no lift failure; every
-  module passes the LLVM verifier; 118 units (all in libc.prx) contain a `bbr_trap` for an op the eboot never used (x87 80-bit
-  conversions `F80CVT`/`F80CVTTo`, `F64FPREM1`, `F64SCALE`, `NZCVSelectV`). Timings are in "Compile time" in
-  `docs/STATIC_RECOMPILE_PLAN.md`: 67 s, 94 MB `.text`, 13.7 GB peak, and 5.5 GB on a pretended 12 GB PC.
+- **ASM tests** (x86-64 host, -O1; step 2d: x87 enabled): 1755 pass, 5 fail, 192 not run because an op is still unlowered, 53 skipped:
+  99.7 % of the tests that run pass. `bb-recomp-asmtest --resume-selftest` checks the resume entries (PASS). Every category
+  except the unlowered-op ones is 100 %, with **X87_F64 149/150** (the reduced-precision x87 suite, 150 tests; the one failure,
+  `D9_F0_02_F64`, expects f2xm1(0.5) = 0x3FDA827999FCEF32 but FEX's own handler is `exp2(x) - 1.0`, which is 0x...34 with every libm
+  we tried: the test was added with an inline JIT sequence that this FEX version does not have, so the helper keeps FEX's handler),
+  Primary 197/197, PrimaryGroup 152/152, Secondary 72/72, TwoByte 220/220, Atomics 12/12, ConstProp, Flags, REP/REPNE 67/67,
+  OpSize 110/110, SSE4a 4/4, VEX 329/332, FEX_bugs 93/93, (top level) 16/17. The other 4 failures: `DAZTest` (denormals-are-zero needs
+  FPCR.FIZ, FEAT_AFP) and `vcvtps2ph_rd/ru/trunc` (a half-precision conversion with a rounding mode other than nearest: LLVM's x86
+  `fptrunc` ignores MXCSR; on ARM64 the rounding helpers set FPCR). The 192 tests not run need ops the game never uses (AVX2
+  gathers and masked moves 105, string compares 39, FMA 14, AES/SHA/PCLMUL ~30). The 80-bit x87 tests (`x87 80-bit (info)`, outside the
+  totals): 85 of 257 pass in reduced mode, `X87/` 56 of 214; of the 158 `X87/` failures 92 have an `X87_F64` sibling that passes (the reduced
+  expectation of the same instruction) and 66 are precision, invalid-operation and status-word tests with no reduced counterpart.
+- **Whole image (eboot + libc.prx + libSceFios2.prx, 182,663 functions, 184,695 units, 54.4 M IR ops)**: no lift failure; every
+  module passes the LLVM verifier; **0 units contain a `bbr_trap`** (step 2c had 118 in libc.prx: `F80CVT` 104, `F80CVTTo` 82, `F64FPREM1` 6,
+  `F64SCALE` 3, `NZCVSelectV` 1, now lowered: x87 helpers above, NZCVSelectV an LLVM select). Timings are in "Compile time" in
+  `docs/STATIC_RECOMPILE_PLAN.md`: 62 s, 102.9 MB `.text`, 123.8 MB `.so`, 14.2 GB peak.
 - **Discovery** (details in the plan, "Discovery"): FDE bytes reached from entries alone 92.00 % -> 98.84 % (the rest is padding and
   table data); 3,847 of 15,562 indirect jumps are jump tables and resolve (57 table-like ones do not; 8,848 are register tail calls,
   2,810 vtable tail calls); 692 landing pads, 132 setjmp return sites, 16,890 pseudo-functions (2.8 MB of vtable thunks and static
@@ -149,9 +177,17 @@ tests, FEX's own disabled and known-failure lists.
   23's x86 `x86-fixup-bw-insts` rewrites `movb 552(%rcx),%cl` to `movzbl` although the upper bits of rcx are live,
   which drops the old upper bits of a byte-merge such as `mov al,[rax+0x228]` (about 26 functions). The x86 host path
   now sets `-fixup-byte-word-insts=0`; the AArch64 backend is not affected.
-- The lowering follows the Arm64 JIT op by op. Lowered: every op the census lists (204 of 424) and the scalar and vector
-  ops FEX's tests use. Not lowered: the F80/x87-stack ops (none in the eboot), AES/SHA/PCLMUL, `VPCMP*STRX`, FMA
-  (`VFMLA*`), masked loads/stores and gathers, `F64SIN/COS/...`.
+- **Differential test on libc.prx** (`bb-recomp-difftest --boot out/boot-linked.bin --module libc.prx --inputs 8`, 2,164 functions): 852 ok,
+  1,272 skipped (every input faulted or timed out), 7 rdtsc, **33 mismatch**, none in non-x87 code except one that stores a host
+  address: 26 contain x87 instructions and 6 more call such functions (`fmod`/`remainder`-style `fprem1` wrappers, `fistp`, `fucomip`
+  chains), where native x86 is the true 80-bit unit (status words 0x7200 against 0x3000, `fist` of NaN or overflow gives the integer indefinite
+  natively and 0 / saturation in the reduced lowering) and the lowering is FEX's reduced x87; the last one is `__setjmp`-style code (`0x5733d76`)
+  that saves its return address, a host address in the native run. An x86-64 run of the reduced x87 against a true oracle is the
+  X87_F64 suite above. The eboot, re-run with `--every 8` (20,370 functions) after the change: 7,490 ok, 3 mismatch (xmm, the known `rcpps`/NaN
+  classes), the harness no longer reports "not liftable" for functions that an earlier call had already compiled (`liftfail`: duplicate symbol).
+- The lowering follows the Arm64 JIT op by op. Lowered: every op the census lists (204 of 424), the scalar and vector ops FEX's tests use,
+  and the x87 ops of the reduced mode. Not lowered: the 80-bit F80 arithmetic ops (`X87ReducedPrecision=0`: the game does not use it), AES/SHA/PCLMUL,
+  `VPCMP*STRX`, FMA (`VFMLA*`), masked loads/stores and gathers.
 
 ## What the census found at step 1 (CUSA03173 eboot, armv8.4 profile, Multiblock=1, TSO off; before jump table resolution: see above for the current numbers)
 

@@ -177,10 +177,40 @@ call (and reloaded after it) for `bbr_dispatch`, `bbr_syscall` and `bbr_trap` of
 | `uint64_t bbr_processor_id(void)` | (node << 12) \| cpu |
 | `void bbr_set_rounding(uint64_t round_mode, uint64_t mxcsr, uint64_t set_daz)` | `ldmxcsr` rounding/flush mode |
 | `uint64_t bbr_get_rounding(void)`, `uint64_t bbr_push_rounding(uint64_t mode)`, `void bbr_pop_rounding(uint64_t saved)` | the host FP environment around rounding-specific conversions (step 2b) |
-| `bbr_x87_*` / `bbr_f80_*` | only if ever needed. The census shows none in the eboot |
+| `bbr_x87_*` | none to provide: the x87 helpers are linked into the `.so` ("x87 helpers" below) |
 
 `__divti3`/`__udivti3` (128-by-64-bit `div`/`idiv`) come from the compiler builtins library, which the link
 step adds (`libclang_rt.builtins-aarch64-android.a`).
+
+## x87 helpers (linked into the `.so`, nothing for the runtime to provide)
+
+The runtime runs x87 as FEX does with `X87ReducedPrecision=1` (`tools/android/fex-compatible.json`): the stack is F64 and most
+instructions lower inline (`fadd`, `fmul`, `fcom`, `fsqrt` ...). A few ops have no inline form and call the helpers below. Unlike the
+`bbr_*` helpers above, these are **defined in the generated `.so`** (hidden visibility, no import): `bb-recomp` compiles
+`tools/recomp/helpers/bbr_x87_all.c` with the target's clang (NDK clang, `aarch64-linux-android30`, for the Android `.so`; the system clang for
+`--target x86_64`) and links the object in. The only new dependency is libm (`DT_NEEDED libm.so`: `sin cos tan atan2 exp2 log2 fmod remainder trunc`,
+which FEX's handlers call too). The helpers are FEX's fallback handlers (`F80Fallbacks.h`, MIT) over its bundled SoftFloat 3e (BSD-3,
+renamed `bbrsf_*`); see `helpers/NOTICE`.
+
+`GuestState* s` is the first argument where the helper needs the x87 state: it reads the control word `FCW` (`CPUState` offset 1200) to build the
+SoftFloat rounding mode, as FEX's `SoftFloatStateFromFCW`, and sets the IE flag (`flags[X87FLAG_IE_LOC]`, offset 1040) when SoftFloat raises the
+invalid-operation flag, as `ScopedSoftFloatState` does. The offsets are `static_assert`ed against `CPUState` in `lower_vector.cpp`. An 80-bit
+value is passed as two `uint64_t` (significand; sign and exponent in the low 16 bits) and returned as `struct {uint64_t sig, top;}`, which both
+the x86-64 SysV and the AArch64 ABI return in two integer registers; in the IR it is the low 10 bytes of a 128-bit FPR (bytes above are zero).
+
+| helper | IR op, FEX handler |
+|---|---|
+| `double bbr_x87_f80_to_f64(s, sig, top)`, `float bbr_x87_f80_to_f32(s, sig, top)` | `F80CVT` size 8 / 4 (`fstp tbyte` path of reduced mode; `OpHandlers<OP_F80CVT>`) |
+| `bbr_f80 bbr_x87_f64_to_f80(s, double)`, `bbr_f80 bbr_x87_f32_to_f80(s, float)` | `F80CVTTo` (`fld tbyte` path; `OP_F80CVTTO`) |
+| `int64_t bbr_x87_f80_to_int(s, sig, top, size, truncate)` | `F80CVTInt` (size 2, 4, 8; 16-bit overflow gives `INT16_MIN`) |
+| `bbr_f80 bbr_x87_int_to_f80(s, int64, size)` | `F80CVTToInt` (size 2, 4) |
+| `bbr_f80 bbr_x87_bcd_load(s, sig, top)`, `bbr_f80 bbr_x87_bcd_store(s, sig, top)` | `F80BCDLoad`, `F80BCDStore` (`fbld`, `fbstp`) |
+| `double bbr_x87_f64_fprem(a, b)`, `_fprem1`, `_scale`, `_f2xm1(a)`, `_fyl2x(x, y)`, `_fyl2xp1(x, y)`, `_atan(y, x)`, `_tan(a)`, `_sin(a)`, `_cos(a)` | `F64FPREM` (`fmod`), `F64FPREM1` (`remainder`), `F64SCALE` (`a == 0 ? a : a * exp2(trunc(b))`), `F64F2XM1` (`exp2(a) - 1`), `F64FYL2X` (`y * log2(x)`), `F64FYL2XP1`, `F64ATAN` (`atan2`), `F64TAN`, `F64SIN`, `F64COS` |
+
+Not provided: the 80-bit arithmetic ops (`F80Add`, `F80Mul`, `F80FPREM` ... used only with `X87ReducedPrecision=0`; the lifter is configured reduced, like
+the game) and `F64SINCOS` (the reduced stack pass emits separate `F64SIN` and `F64COS`). Both would be further `bbr_x87_*` helpers over the same SoftFloat.
+
+`NZCVSelectV` (a floating-point select on the flags, `fcsel`) is plain LLVM: `select` on the condition, the result in lane 0 and the rest zeroed.
 
 ## Test path on the PC
 

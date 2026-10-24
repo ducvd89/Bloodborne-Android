@@ -59,6 +59,7 @@ static void usage() {
         "  --resume-entries     every call-return block is also an entry of its unit (resume flag in the guest state)\n"
         "  --no-callee-saved    reload rbx, rbp, r12-r15 after calls too (default: the SysV callee-saved set is trusted)\n"
         "  --ndk <dir>          Android NDK for --so\n"
+        "  --helpers-dir <dir>  the x87 helper sources (default: tools/recomp/helpers of the build)\n"
         "  --stats <file>       also write the compile summary here\n", stderr);
 }
 
@@ -118,6 +119,7 @@ int main(int argc, char** argv) {
     else if (is("--no-dirty-check")) cc.dirtyCheck = false;
     else if (is("--no-callee-saved")) cc.calleeSaved = false;
     else if (is("--ndk")) cc.ndk = arg();
+    else if (is("--helpers-dir")) cc.helpersDir = arg();
     else if (is("--stats")) cc.statsPath = arg();
     else if (is("--func")) cc.onlyVaddr = strtoll(arg(), nullptr, 16);
 #endif

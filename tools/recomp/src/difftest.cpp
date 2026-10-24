@@ -346,14 +346,19 @@ int main(int argc, char** argv) {
   setpriority(PRIO_PROCESS, 0, 19);
   struct rlimit nocore {0, 0};
   setrlimit(RLIMIT_CORE, &nocore); // the seccomp kill would otherwise dump a 500 MB core (0.5 s)
-  std::string elf = "out/eboot.elf", outFile = "out/recomp/difftest.txt";
+  std::string elf = "out/eboot.elf", outFile = "out/recomp/difftest.txt", bootFile, prxDir = "/home/cid/BloodbornePC/game/CUSA03173/sce_module", moduleName;
   uint64_t base = 0x200000000ull, limit = 0, every = 1, only = ~0ull;
   unsigned inputs = 6, jobs = 22, seed = 1;
+  uint64_t dumpLo = 0, dumpHi = 0; std::string dumpFile; // --dump-range <lo> <hi> <file>: the image bytes of [lo, hi) (for objdump -b binary), then exit
   bool verbose = false;
   for (int i = 1; i < argc; ++i) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s); };
     auto arg = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "missing argument\n"); exit(2); } return argv[++i]; };
     if (is("--elf")) elf = arg();
+    else if (is("--boot")) bootFile = arg();
+    else if (is("--prx-dir")) prxDir = arg();
+    else if (is("--module")) moduleName = arg();
+    else if (is("--dump-range")) { dumpLo = strtoull(arg(), nullptr, 16); dumpHi = strtoull(arg(), nullptr, 16); dumpFile = arg(); }
     else if (is("--limit")) limit = strtoull(arg(), nullptr, 0);
     else if (is("--every")) every = std::max<uint64_t>(1, strtoull(arg(), nullptr, 0));
     else if (is("--inputs")) inputs = atoi(arg());
@@ -362,12 +367,29 @@ int main(int argc, char** argv) {
     else if (is("--func")) only = strtoull(arg(), nullptr, 16);
     else if (is("--out")) outFile = arg();
     else if (is("-v")) verbose = true;
-    else { fprintf(stderr, "usage: bb-recomp-difftest --elf <eboot.elf> [--limit n] [--every n] [--inputs n] [--seed n] [--func hex] [--jobs n] [--out file] [-v]\n"); return 2; }
+    else { fprintf(stderr, "usage: bb-recomp-difftest --elf <eboot.elf> [--limit n] [--every n] [--inputs n] [--seed n] [--func hex] [--jobs n] [--out file] [-v]\n"
+                    "  --boot <boot-linked.bin> [--prx-dir <dir>] [--module <name>]: the runtime's image (eboot + libc.prx + libSceFios2.prx); --module keeps one module's functions\n"); return 2; }
   }
   ElfImage img; std::string err;
-  if (!img.load(elf, base, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  if (bootFile.empty()) {
+    if (!img.load(elf, base, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  } else if (!img.loadBoot(bootFile, elf, prxDir, base, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
   std::vector<Func> funcs;
-  if (!scanFdes(img, funcs, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  if (!(bootFile.empty() ? scanFdes(img, funcs, err) : scanAllFdes(img, funcs, err))) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+  uint64_t modLo = 0, modHi = ~0ull; // --module: only this module's functions are tested (calls may still leave it)
+  if (!moduleName.empty()) {
+    const ModuleInfo* mod = nullptr;
+    for (auto& m : img.modules) if (m.name == moduleName) mod = &m;
+    if (!mod) { fprintf(stderr, "no module '%s' in the image\n", moduleName.c_str()); return 1; }
+    modLo = mod->base; modHi = mod->base + mod->size;
+  }
+  if (!dumpFile.empty()) {
+    FILE* f = fopen(dumpFile.c_str(), "wb");
+    if (!f) { perror(dumpFile.c_str()); return 1; }
+    fwrite((const void*)(base + dumpLo), 1, dumpHi - dumpLo, f);
+    fclose(f);
+    return 0;
+  }
   // read-only image (writes fault), the text segment executable
   for (auto& s : img.loads) {
     const uint64_t a = (base + s.vaddr) & ~0x3fffull, e = (base + s.vaddr + s.memsz + 0x3fff) & ~0x3fffull;
@@ -376,6 +398,7 @@ int main(int argc, char** argv) {
   std::vector<size_t> todo;
   for (size_t i = 0; i < funcs.size(); i += every) {
     if (only != ~0ull && !(only >= funcs[i].start && only < funcs[i].end)) continue;
+    if (funcs[i].start < modLo || funcs[i].start >= modHi) continue;
     if (limit && todo.size() >= limit) break;
     todo.push_back(i);
   }
@@ -427,7 +450,7 @@ int main(int argc, char** argv) {
         if (getenv("DT_DEBUG")) fprintf(stderr, "[w%u] func %llx\n", w, (unsigned long long)f.start);
         const uint64_t fn = base + f.start;
         std::string line;
-        char head[64]; snprintf(head, sizeof head, "%llx ", (unsigned long long)f.start);
+        char head[64]; snprintf(head, sizeof head, "%llx-%llx ", (unsigned long long)f.start, (unsigned long long)f.end);
         // a dispatch (a call, a tail jump, a switch table) compiles the function that holds the target
         jit.rangeEnd = [&](uint64_t t) -> uint64_t {
           if (t < base) return 0;
@@ -436,8 +459,9 @@ int main(int argc, char** argv) {
           --it;
           return t - base < it->end ? base + it->end : 0;
         };
-        if (!jit.compile(fn, base + f.end)) {
-          line = !jit.unsupported.empty() ? "unsupported" : "liftfail";
+        if (!jit.find(fn) && !jit.compile(fn, base + f.end)) { // (already compiled: an earlier function called it)
+          if (!jit.unsupported.empty()) { line = "unsupported"; for (auto& u : jit.unsupported) line += " " + u; }
+          else { line = "liftfail " + jit.liftFailure + jit.err; for (auto& c : line) if (c == '\n') c = ' '; }
         } else if (hasTimestamp((const uint8_t*)fn, f.end - f.start)) {
           line = "skip-rdtsc";
         } else {
@@ -492,7 +516,7 @@ int main(int argc, char** argv) {
       while (!l.empty() && l.back() == '\n') l.pop_back();
       ++done;
       const std::string kind = l.substr(l.find(' ') + 1);
-      std::string key = kind.rfind("ok", 0) == 0 ? "ok" : kind.rfind("MISMATCH", 0) == 0 ? "MISMATCH" : kind.rfind("skip-faults", 0) == 0 ? "skip-faults" : kind;
+      std::string key = kind.rfind("ok", 0) == 0 ? "ok" : kind.rfind("MISMATCH", 0) == 0 ? "MISMATCH" : kind.rfind("skip-faults", 0) == 0 ? "skip-faults" : kind.rfind("liftfail", 0) == 0 ? "liftfail" : kind.rfind("unsupported", 0) == 0 ? "unsupported" : kind;
       ++counts[key];
       if (key == "MISMATCH") bad.push_back(l);
       if (verbose) puts(l.c_str());

@@ -1,0 +1,7 @@
+bbr_x87.c and bbr_x87.h adapt FEX-Emu's x87 fallback handlers (FEX 2609.1, FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+and FEXCore/Source/Common/SoftFloat.h), MIT license, Copyright (c) 2014-2026 the FEX-Emu authors.
+
+softfloat/ is a subset of the SoftFloat 3e that FEX bundles (External/SoftFloat-3e: Berkeley SoftFloat Release 3e by John R. Hauser,
+Copyright 2011-2017 The Regents of the University of California, BSD 3-clause license; the license text is in the header of every
+file). It is copied unchanged except for softfloat/bbr_rename.h (added), which gives its global functions a bbrsf_ prefix so that they
+cannot clash with the SoftFloat linked into FEXCore in the PC tools.
