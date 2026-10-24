@@ -3,6 +3,32 @@
 The game's x86-64 code runs as ahead-of-time units (bb-recomp: FEX front end -> LLVM -> AArch64 `.so`) on the Thor
 (Snapdragon 8 Gen 2), with FEXCore as the fallback on the same CPU state (cpu/guest_cpu_aot.cpp, docs/RECOMP_ABI.md).
 
+## Paused at (2026-10-24, second pause)
+
+**Done since the final report:** nothing merged or released; device back on the **stock 1.2.0 runtime** (`aot_device.sh off`,
+user's `bionic-local.sh` and `bbport.ini` restored, md5 checked).
+
+**In progress: open issue 2 (phase 4b frame-rate patcher in slot mode stops the game, AOT only).** Findings so far:
+- It is not a hang in a wait: the process main thread (which runs the game's main loop) **spins at 100 % CPU** inside units
+  (watchdog dump: in the unit of +0x21b8140, called from +0x2195f7c on the resolution-setup path +0x1d96bf3); the render thread and
+  workers wait for it. Its AOT trace (SIGUSR2 dump, now printed per thread) repeats one cycle of host calls (bb-probe+0x2e07c,
+  +0x2df64, +0x411e8, +0x4946c, +0x44764/+0x44788, +0x40c34..+0x40d1c, +0x48c50..+0x49da4) returning to guest +0x208b166,
+  +0x262d9b2, +0x20368d3, +0x207f41d, +0x207c407, +0x20e4318, +0x2804b43, +0x208400a.., +0x263b374..: the main loop keeps
+  iterating without making progress (symbolize those offsets against out/bionic/bin/bb-probe, unstripped).
+- **Not** the callbacks, the redirects, the Live struct's place, the byte patches or the slots themselves: with
+  `BB_FRAME_SLOT_TEST=63` (pacer/step/fixed-step callbacks do nothing, no redirects, no byte patches, no slots set) and with
+  `BB_FRAME_LIVE_NEAR=1` (Live in its own page) it still hangs; `BB_FRAME_HOOKS=0` hangs too.
+- **Not** a miscompiled unit of the 54 frame-rate functions: with all of them on FEX (`BB_AOT_FALLBACK_RANGES`) it still hangs.
+- The only working combination so far: the patcher in **detour mode** (`BB_AOT_NO_SLOTS=1572a7d`, or the release libbbgpu): it
+  allocates a stub page near the code (`guest_cpu_code`) and its detours put ~32 functions on FEX. So the difference is in what
+  detour mode does besides the patches (memory layout, the stub page registered as guest code, timing), or in another
+  libbbgpu (phase 4b shim) path that slot mode/hooks-off take: compare the shim's guest-code hooks (bbport_guest_code_hooks.cpp)
+  and display slots between the two modes next.
+
+**Next step:** symbolize the main thread's host-call cycle (which runtime calls it loops on: likely a wait/poll the game repeats
+because a condition never becomes true), then diff the shim's behaviour between detour and slot mode. Then open issue 3
+(flip IRQ assertion) by building the branch runtime with the phase 4b shim reverted.
+
 ## Result
 
 - **Title screen, main menu, save loaded (Continue), gameplay**: all in AOT mode. A 13-minute session at the save's spot
