@@ -440,6 +440,18 @@ std::string runHookTest(int opt) {
     if (!(e = expect("6 hook calls in the loop", g_hookCalls, 3)).empty()) return e;
     if (!(e = expect("6 xmm1 edited by the hook", st.gregs[0], 33)).empty()) return e;
   }
+  // 7. A value site: `mov eax, imm32` (the scene size of bbport_display) replaced by a callback that loads rax and goes on after the 5 bytes.
+  //    mov rax, -1 ; H: mov eax, 1280 ; R: mov rbx, rax ; hlt
+  {
+    HookRun hr; hr.code = {0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff,  0xb8, 0x00, 0x05, 0x00, 0x00,  0x48, 0x89, 0xc3,  0xf4};
+    const uint64_t H = CodeBase + 7, R = CodeBase + 12;
+    hr.sites = site(H, {R});
+    g_hookFn = [R](CPUState* s, uint64_t) -> uint64_t { s->gregs[0] = 1707; s->rip = R; return 1; };
+    if (!(e = runHookCase(hr, opt, st, false)).empty()) return "FAIL 7a: " + e;
+    if (!(e = expect("7a without the hook: rbx", st.gregs[3], 1280)).empty()) return e;
+    if (!(e = runHookCase(hr, opt, st, true)).empty()) return "FAIL 7b: " + e;
+    if (!(e = expect("7b value site: rbx", st.gregs[3], 1707)).empty()) return e;
+  }
   return "PASS";
 }
 
@@ -450,24 +462,28 @@ std::string runHookTest(int opt) {
 //   H  0x300: mov eax, 5 ; nop*5 ; add eax, 7 ; ret    group g3 puts `jmp cave` over the nops and writes the cave at 0x2000:
 //   cave 0x2000: add eax, 100 ; jmp H+10        (new code, and a unit inside H that only the variant has)
 //   K  0x400: mov eax, 1 ; mov ebx, 1 ; ret     alternatives g4 / g5 (excl=x) patch the two immediates; g4+g5 is never built
+//   R  0x500: mov eax, [rip + disp] ; ret       the operand redirect: group g6 rewrites the displacement to a fixed data address (the frame rate's `live`)
 std::string runVariantTest(int opt) {
-  constexpr uint64_t Base = 0x300000000ull, Size = 0x10000;
+  constexpr uint64_t Base = 0x200000000000ull, Size = 0x10000; // (high memory: also outside the shadow gap of ASan builds)
   mapFixed(Base, Size);
   mapFixed(0xe8000000 - PageSz, PageSz * 2);
   auto put = [&](uint64_t v, std::initializer_list<uint8_t> b) { size_t i = 0; for (uint8_t x : b) ((uint8_t*)(Base + v))[i++] = x; };
   put(0x100, {0xb8, 1, 0, 0, 0, 0xc3});
   put(0x300, {0xb8, 5, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x05, 7, 0, 0, 0, 0xc3});
   put(0x400, {0xb8, 1, 0, 0, 0, 0xbb, 1, 0, 0, 0, 0xc3});
+  put(0x500, {0x8b, 0x05, 0xfa, 0x00, 0x00, 0x00, 0xc3}); // mov eax, [rip + 0xfa] -> 0x600
+  put(0x600, {7, 0, 0, 0});
+  put(0x700, {99, 0, 0, 0});                              // the redirect's target (live)
   static ElfImage img;
   img.base = Base; img.loads.assign(1, ElfSegment{0, Size, Size, 0, 5}); img.textLo = 0; img.textHi = Size;
   const int32_t toCave = int32_t(0x2000 - (0x305 + 5)), back = int32_t((0x300 + 10) - (0x2005 + 5));
   char cat[1024];
   auto hexle = [](int32_t v) { char b[16]; snprintf(b, sizeof b, "%02x%02x%02x%02x", v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255); return std::string(b); };
-  snprintf(cat, sizeof cat, "group g1\nw 101 02\ngroup g3\nw 305 e9%s\nc 2000 0564000000e9%s\ngroup g4 excl=x\nw 401 02\ngroup g5 excl=x\nw 406 07\n", hexle(toCave).c_str(), hexle(back).c_str());
+  snprintf(cat, sizeof cat, "group g1\nw 101 02\ngroup g3\nw 305 e9%s\nc 2000 0564000000e9%s\ngroup g4 excl=x\nw 401 02\ngroup g5 excl=x\nw 406 07\ngroup g6\nw 502 %s\n", hexle(toCave).c_str(), hexle(back).c_str(), hexle(int32_t(0x700 - 0x506)).c_str());
   Catalog catalog; std::string err;
   if (!parseCatalog(cat, "test", catalog, err)) return "FAIL catalog: " + err;
-  std::vector<Func> funcs = {{0x100, 0x106, 0, 0}, {0x300, 0x310, 0, 0}, {0x400, 0x40b, 0, 0}};
-  std::vector<uint64_t> starts = {0x100, 0x300, 0x400}, traps;
+  std::vector<Func> funcs = {{0x100, 0x106, 0, 0}, {0x300, 0x310, 0, 0}, {0x400, 0x40b, 0, 0}, {0x500, 0x507, 0, 0}};
+  std::vector<uint64_t> starts = {0x100, 0x300, 0x400, 0x500}, traps;
   LiftOptions lo; lo.gapUnits = false; lo.multiblock = true;
   VariantJob vj;
   vj.img = &img; vj.funcs = &funcs; vj.starts = &starts; vj.trapUnits = &traps; vj.catalog = &catalog; vj.lift = lo;
@@ -481,7 +497,7 @@ std::string runVariantTest(int opt) {
   VariantResult vr;
   if (!compileVariants(vj, vr)) return "FAIL compileVariants";
   // F: g1; H: g3 (3 units: H, the cave, the jump-back target inside H); K: g4, g5 (not both): 3 variants
-  if (vr.table.funcs.size() != 4) { std::string n; for (auto& f : vr.table.funcs) n += " " + f.name; return "FAIL expected 4 variants, got " + std::to_string(vr.table.funcs.size()) + ":" + n; }
+  if (vr.table.funcs.size() != 5) { std::string n; for (auto& f : vr.table.funcs) n += " " + f.name; return "FAIL expected 5 variants, got " + std::to_string(vr.table.funcs.size()) + ":" + n; }
   const VFunc* vf = nullptr;
   for (auto& f : vr.table.funcs) if (f.funcStart == 0x300) vf = &f;
   if (!vf || vf->unitCount != 3) return "FAIL the variant of H must have 3 units (H, the cave, the unit inside H)";
@@ -561,6 +577,14 @@ std::string runVariantTest(int opt) {
   Jit::Fn vH = variantFn(0x300, 0x300);
   if (!vH) return "FAIL no variant function for H";
   if (!(e = call(vH, &eax)).empty() || eax != 112) return "FAIL variant of H (through the cave): " + e + " eax " + std::to_string(eax);
+  // The operand redirect: the original reads 7 at 0x600, the variant 99 at 0x700 (a displacement is all that changed), both in the lowered code.
+  revertAll();
+  put(0x500, {0x8b, 0x05, 0xfa, 0x00, 0x00, 0x00, 0xc3});
+  if (!jit.compile(Base + 0x500, Base + 0x507)) return "FAIL compile R: " + jit.err + jit.liftFailure;
+  if (!(e = call(jit.find(Base + 0x500), &eax)).empty() || eax != 7) return "FAIL original R: " + e + " eax " + std::to_string(eax);
+  Jit::Fn vR = variantFn(0x500, 0x500);
+  if (!vR) return "FAIL no variant function for R";
+  if (!(e = call(vR, &eax)).empty() || eax != 99) return "FAIL variant of R (operand redirect): " + e + " eax " + std::to_string(eax);
   alarm(0);
   return "PASS";
 }
