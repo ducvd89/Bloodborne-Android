@@ -493,8 +493,16 @@ u64 AvPlayerSource::CurrentTime() {
 }
 
 bool AvPlayerSource::IsActive() {
+    // bbport: a packet goes from its packet queue to the decoder (m_*_decoding, set before it is taken)
+    // and on to the frame queue (filled before the flag is cleared); read in that order, one of the
+    // three always shows it. Without the decoder's share, the last packets made the player inactive
+    // for a moment while their frames were still being decoded (the game took the frame it had, the
+    // decoder waited for that buffer): Bloodborne then took the opening movie as finished, and its
+    // teardown, finding it active again, skipped stopping the movie's audio thread and destroyed the
+    // mutexes that thread still used (Dantelion2 panic "PthreadMutex.cpp(130) Invalid mutex").
     return !m_is_eof || m_audio_packets.Size() != 0 || m_video_packets.Size() != 0 ||
-           m_video_frames.Size() != 0 || m_audio_frames.Size() != 0;
+           m_audio_decoding || m_video_decoding || m_video_frames.Size() != 0 ||
+           m_audio_frames.Size() != 0;
 }
 
 void AvPlayerSource::ReleaseAVPacket(AVPacket* packet) {
@@ -701,6 +709,17 @@ Frame AvPlayerSource::PrepareVideoFrame(GuestBuffer buffer, const AVFrame& frame
     };
 }
 
+// bbport: marks a decoder thread as holding a packet (AvPlayerSource::IsActive) for one iteration.
+struct DecodingScope {
+    std::atomic_bool& flag;
+    explicit DecodingScope(std::atomic_bool& f) : flag{f} {
+        flag = true;
+    }
+    ~DecodingScope() {
+        flag = false;
+    }
+};
+
 void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
     using namespace std::chrono;
     Common::SetCurrentThreadName("shadPS4:AvVideoDecoder");
@@ -711,6 +730,7 @@ void AvPlayerSource::VideoDecoderThread(std::stop_token stop) {
             !m_video_packets_cv.Wait(stop, [this] { return m_video_packets.Size() != 0; })) {
             continue;
         }
+        const DecodingScope decoding{m_video_decoding};
         const auto packet = m_video_packets.Pop();
         if (!packet.has_value()) {
             continue;
@@ -834,6 +854,7 @@ void AvPlayerSource::AudioDecoderThread(std::stop_token stop) {
             !m_audio_packets_cv.Wait(stop, [this] { return m_audio_packets.Size() != 0; })) {
             continue;
         }
+        const DecodingScope decoding{m_audio_decoding};
         const auto packet = m_audio_packets.Pop();
         if (!packet.has_value()) {
             continue;

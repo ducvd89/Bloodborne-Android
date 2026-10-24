@@ -189,7 +189,12 @@ bool PS4_SYSV_ABI sceAvPlayerIsActive(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return false;
     }
-    return handle->IsActive();
+    const bool active = handle->IsActive();
+    static std::atomic<int> logged{0};
+    if (!active && AvLogOn() && logged.fetch_add(1) < 4) {
+        AVLOG("IsActive(%p) = false\n", (void*)handle);
+    }
+    return active;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerJumpToTime(AvPlayerHandle handle, uint64_t time) {

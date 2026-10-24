@@ -213,6 +213,10 @@ private:
     std::atomic_bool m_is_looping = false;
     std::atomic_bool m_is_paused = false;
     std::atomic_bool m_is_eof = false;
+    /// bbport: a decoder thread holds a packet it took from its queue and has not queued all of its
+    /// frames yet (IsActive: the stream is not over while a packet is between the two queues).
+    std::atomic_bool m_video_decoding = false;
+    std::atomic_bool m_audio_decoding = false;
 
     std::unique_ptr<IDataStreamer> m_up_data_streamer;
 
