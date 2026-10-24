@@ -42,7 +42,7 @@ public final class MainActivity extends Activity {
     private String FILES, BASE;
     /** The game (e.g. CUSA03173, with eboot.bin) in shared storage, chosen by the player. */
     private String gameDir;
-    private static final int REQUEST_FOLDER=1, REQUEST_STORAGE=2, REQUEST_DRIVER=3, REQUEST_SAVES=9, REQUEST_DLL=10; // 4-6: ModsDialog, 7-8: GameInstaller
+    private static final int REQUEST_FOLDER=1, REQUEST_STORAGE=2, REQUEST_DRIVER=3, REQUEST_SAVES=9, REQUEST_DLL=10; // 4-6: ModsDialog, 7-8: GameInstaller, 11: NativeCpuDialog
     private SurfaceHolder pendingHolder;
     private final Handler main=new Handler(Looper.getMainLooper());
     private final ExecutorService worker=Executors.newSingleThreadExecutor();
@@ -90,6 +90,10 @@ public final class MainActivity extends Activity {
     private AtlasScreen atlas;
     private AtlasDialog atlasDialog;
     private LinearLayout atlasItem;
+    /** Native CPU (recompiled game code): its menu, its drawer row, and whether the running game started with it. */
+    private NativeCpuDialog nativeCpu;
+    private LinearLayout nativeCpuItem;
+    private volatile boolean startedNative;
     private AtlasView atlasMini, atlasFull;
     /** The full-screen map over the game is open (opened by holding the mini map): the controller is hidden, the mini map too. */
     private boolean fullMapOpen;
@@ -131,6 +135,7 @@ public final class MainActivity extends Activity {
         online=new OnlineSettings(this);
         GameInstaller.Host host=modsHost();
         mods=new ModsDialog(this,host); installer=new GameInstaller(this,host);
+        nativeCpu=new NativeCpuDialog(this,new SettingsDialog(this,new File(BASE,"bbport.ini"),this::restartGame),nativeCpuHost());
         updater=new AppUpdater(this,new AppUpdater.Host() {
             @Override public void stopGame() { MainActivity.this.stopGame(); }
             @Override public void restartGame() { if (!destroyed && displayReady) MainActivity.this.restartGame(); }
@@ -317,6 +322,7 @@ public final class MainActivity extends Activity {
         modsItem=menuItem("ic_extension","Mods","",() -> { closeDrawer(); mods.show(); });
         atlasItem=menuItem("ic_map","Hunter's Atlas","",() -> { closeDrawer(); showAtlas(); });
         onlineItem=menuItem("ic_online","Online","",() -> { closeDrawer(); showOnline(); });
+        nativeCpuItem=menuItem("ic_cpu","Native CPU (recompiled)","",() -> { closeDrawer(); nativeCpu.show(); });
         menuItem("ic_refresh","Restart game","Unsaved progress is lost",() -> new AlertDialog.Builder(this)
             .setTitle("Restart Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Restart",(dialog,which) -> restartGame()).show());
@@ -475,6 +481,7 @@ public final class MainActivity extends Activity {
         if ("1".equals(setting("cheat_items"))) cheats.add("infinite items");
         setDetail(cheatsItem,online.playingOnline() ? "Off while playing online" : cheats.isEmpty() ? "Off" : String.join(" · ",cheats));
         setDetail(onlineItem,onlineDetail());
+        setDetail(nativeCpuItem,NativeCpu.summary(nativeCpu.quickState()));
         mods.summary(text -> setDetail(modsItem,text));
         setDetail(atlasItem,AtlasDialog.summary(atlas));
         String upscaler="off".equals(setting("upscaler")) ? "No upscaling"
@@ -1080,6 +1087,7 @@ public final class MainActivity extends Activity {
             return;
         }
         if (code==ModsDialog.REQUEST_FOLDER || code==ModsDialog.REQUEST_ARCHIVE) { mods.onResult(code,result,data); return; }
+        if (code==NativeCpuDialog.REQUEST_FILES) { nativeCpu.onResult(result,data); return; }
         if (code==REQUEST_SAVES) {
             if (result==RESULT_OK && data!=null && data.getData()!=null) restoreSaves(folderOf(data.getData()));
             else immersive();
@@ -1309,6 +1317,26 @@ public final class MainActivity extends Activity {
             return DocPath.document(document.getAuthority(),android.provider.DocumentsContract.getDocumentId(document),
                 android.os.Environment.getExternalStorageDirectory());
         } catch (Exception ex) { return null; }
+    }
+    private NativeCpuDialog.Host nativeCpuHost() {
+        return new NativeCpuDialog.Host() {
+            @Override public File base() { return new File(BASE); }
+            @Override public String gameDir() { return gameDir; }
+            @Override public void pick(Intent intent,int code) {
+                try { startActivityForResult(intent,code); }
+                catch (Exception ex) { MainActivity.this.toast("No file picker: "+ex); }
+            }
+            @Override public java.io.InputStream open(android.net.Uri document) throws java.io.IOException {
+                java.io.InputStream in=getContentResolver().openInputStream(document);
+                if (in==null) throw new java.io.IOException("Cannot open the file");
+                return in;
+            }
+            @Override public void toast(String message) { MainActivity.this.toast(message); }
+            @Override public boolean gameRunning() { Process p=game; return p!=null && p.isAlive(); }
+            @Override public boolean startedNative() { return startedNative; }
+            @Override public void restart() { restartGame(); }
+            @Override public void closed() { if (!destroyed) immersive(); }
+        };
     }
     private GameInstaller.Host modsHost() {
         return new GameInstaller.Host() {
@@ -1646,6 +1674,7 @@ public final class MainActivity extends Activity {
     private void startGame() {
         if (destroyed) return;
         hadError=false;
+        startedNative=nativeCpu.quickState().active(); // run-bionic.sh reads native_cpu and finds libbbaot.so now
         releasePause(false);
         playing=false; gameState(true);
         pickRefreshRate();
@@ -1744,7 +1773,7 @@ public final class MainActivity extends Activity {
         if (p!=null) { p.destroyForcibly(); try { p.waitFor(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
     @Override protected void onDestroy() {
-        destroyed=true; if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); audio.stop(); main.removeCallbacksAndMessages(null);
+        destroyed=true; if (nativeCpu!=null) nativeCpu.close(); if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); audio.stop(); main.removeCallbacksAndMessages(null);
         stopGame();
         worker.shutdownNow(); super.onDestroy();
     }
