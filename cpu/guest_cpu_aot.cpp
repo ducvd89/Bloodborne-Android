@@ -1037,10 +1037,55 @@ void PrepareImage() {
             const uint64_t lo = std::strtoull(p, &end, 16);
             if (*end != '-') break;
             const uint64_t hi = std::strtoull(end + 1, &end, 16);
-            if (hi > lo) MarkDirty(E.base + lo, hi - lo);
+            if (hi > lo) {
+                // Pinned: the functions are locked against the variant classifier (which would find their bytes original and run
+                // the units again) and dirty.
+                std::lock_guard<std::mutex> guard(E.lock);
+                for (uint64_t i = 0; i < E.count; ++i) {
+                    if (E.units[i].vaddr >= hi || UnitEnd(i) <= lo) continue;
+                    if (V.enabled) { const int64_t f = FuncOfUnit(i); if (f >= 0) V.locked[f] = 1; }
+                    DirtyUnit(i);
+                }
+            }
             std::printf("AOT: image +%#llx-+%#llx runs on the fallback CPU (BB_AOT_FALLBACK_RANGES)\n", (unsigned long long)lo, (unsigned long long)hi);
             p = *end == ',' ? end + 1 : end;
             if (*end != ',') break;
+        }
+    }
+    // BB_AOT_PROBE_CALL=hex (image offset of a `call *0x58(%rax)`, ff 50 58; the function must run on the fallback, e.g. through
+    // BB_AOT_FALLBACK_RANGES): logs the registers of the first 16 calls there and does the call (diagnostics).
+    if (const char* probe = std::getenv("BB_AOT_PROBE_CALL")) {
+        static uint64_t at;
+        at = E.base + std::strtoull(probe, nullptr, 16);
+        const unsigned char* c = reinterpret_cast<const unsigned char*>(at);
+        if (c[0] == 0xff && c[1] == 0x50) {
+            bb_fb_hook(at, 3, [](GuestRegs* r) {
+                static std::atomic<int> n {0};
+                if (n.fetch_add(1) < 16)
+                    std::fprintf(stderr, "AOT probe +%#llx: rax %#llx rdi %#llx rsi %#llx rdx %#llx rbx %#llx r12 %#llx r13 %#llx r14 %#llx r15 %#llx rsp %#llx\n",
+                                 (unsigned long long)(at - E.base), (unsigned long long)r->gpr[GUEST_RAX], (unsigned long long)r->gpr[GUEST_RDI],
+                                 (unsigned long long)r->gpr[GUEST_RSI], (unsigned long long)r->gpr[GUEST_RDX], (unsigned long long)r->gpr[GUEST_RBX],
+                                 (unsigned long long)r->gpr[GUEST_R12], (unsigned long long)r->gpr[GUEST_R13], (unsigned long long)r->gpr[GUEST_R14],
+                                 (unsigned long long)r->gpr[GUEST_R15], (unsigned long long)r->gpr[GUEST_RSP]);
+                if (n.load() <= 16) {
+                    const uint64_t* st = *reinterpret_cast<uint64_t* const*>(r->gpr[GUEST_RSP] + 0x58);
+                    std::fprintf(stderr, "AOT probe   struct %p: %016llx %016llx %016llx %016llx %016llx %016llx\n", (const void*)st,
+                                 (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2], (unsigned long long)st[3],
+                                 (unsigned long long)st[4], (unsigned long long)st[5]);
+                    uint64_t fp = r->gpr[GUEST_RBP];
+                    for (int d = 0; d < 6 && fp; ++d) {
+                        const uint64_t ret = ReadGuest(fp + 8);
+                        std::fprintf(stderr, "AOT probe   caller %d: +%#llx\n", d, (unsigned long long)(ret - E.base));
+                        fp = ReadGuest(fp);
+                    }
+                }
+                const unsigned char* site = reinterpret_cast<const unsigned char*>(at);
+                const uint64_t target = *reinterpret_cast<const uint64_t*>(r->gpr[GUEST_RAX] + int8_t(site[2]));
+                r->gpr[GUEST_RSP] -= 8;
+                *reinterpret_cast<uint64_t*>(r->gpr[GUEST_RSP]) = at + 3;
+                r->rip = target;
+            });
+            std::printf("AOT: probe at +%#llx\n", (unsigned long long)(at - E.base));
         }
     }
     std::printf("AOT: image checked in %.0f ms: %llu units; %llu differ (patched or hooked), %llu units with their functions' other units "

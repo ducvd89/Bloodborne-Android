@@ -302,7 +302,13 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     return 0;
 }
 static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry entry,void *argument,const char *name) {
-    return create(out,attr,entry,argument,name,0);
+    const int32_t r=create(out,attr,entry,argument,name,0);
+    if (r) { /* diagnostics: a failing create is retried by the game for ever (first failures only) */
+        static _Atomic int logged;
+        if (logged++ < 8) fprintf(stderr,"Runtime: thread_create('%s') failed %#x (out %p, attr %p -> %p, entry %p)\n",name ? name : "?",(unsigned)r,
+                                  (void *)out,(void *)attr,attr ? (void *)*attr : NULL,(void *)entry);
+    }
+    return r;
 }
 static ABI int32_t thread_join(GuestThread *t,void **result) {
     if (!find_thread(t) || t->host_owned) return ERR(3);

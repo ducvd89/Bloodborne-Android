@@ -545,6 +545,10 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
         live = new (image + LiveImageOffset) Live{};
     } else if (slot_mode) {
         data = MapNear(PROT_READ | PROT_WRITE);
+        if (near_env[1] == '2') {  // diagnostics: the stub page detour mode maps, unused, registered as guest code as there
+            stub_page = MapNear(PROT_READ | PROT_WRITE);
+            if (stub_page) guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), StubPageSize);
+        }
         if (!data) {
             release();
             return Disabled("no memory next to the game's code");
