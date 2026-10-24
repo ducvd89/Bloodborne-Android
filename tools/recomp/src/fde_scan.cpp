@@ -1,4 +1,5 @@
 #include "fde_scan.h"
+#include <algorithm>
 #include <cstring>
 
 namespace {
@@ -25,10 +26,21 @@ struct Reader {
 };
 } // namespace
 
-bool scanFdes(const ElfImage& img, std::vector<Func>& out, std::string& err) {
-  if (!img.ehFrameHdrVaddr) { err = "no PT_GNU_EH_FRAME"; return false; }
-  Reader r{img, img.ehFrameHdrVaddr};
-  uint64_t p = img.ehFrameHdrVaddr;
+bool scanFdes(const ElfImage& img, std::vector<Func>& out, std::string& err) { return scanFdesAt(img, img.ehFrameHdrVaddr, out, err); }
+
+bool scanAllFdes(const ElfImage& img, std::vector<Func>& out, std::string& err) {
+  if (img.modules.empty()) return scanFdes(img, out, err);
+  for (auto& m : img.modules) {
+    if (!scanFdesAt(img, m.ehFrameHdrVaddr, out, err)) { err = m.name + ": " + err; return false; }
+  }
+  std::sort(out.begin(), out.end(), [](const Func& a, const Func& b) { return a.start < b.start; });
+  return true;
+}
+
+bool scanFdesAt(const ElfImage& img, uint64_t hdr, std::vector<Func>& out, std::string& err) {
+  if (!hdr) { err = "no PT_GNU_EH_FRAME"; return false; }
+  Reader r{img, hdr};
+  uint64_t p = hdr;
   uint8_t ver = r.get<uint8_t>(p), pe = r.get<uint8_t>(p + 1), fce = r.get<uint8_t>(p + 2), te = r.get<uint8_t>(p + 3);
   if (!r.ok || ver != 1) { err = "bad .eh_frame_hdr"; return false; }
   p += 4;
@@ -41,7 +53,7 @@ bool scanFdes(const ElfImage& img, std::vector<Func>& out, std::string& err) {
     // FDE: u32 length, u32 CIE pointer, pc_begin (4), pc_range (4). PS4's compiler uses sdata4 for both.
     int32_t range = r.get<int32_t>(fde + 12);
     if (!r.ok || range <= 0) { err = "bad FDE #" + std::to_string(i); return false; }
-    out.push_back({(uint64_t)start, (uint64_t)start + range});
+    out.push_back({(uint64_t)start, (uint64_t)start + range, (uint64_t)fde});
   }
   return true;
 }

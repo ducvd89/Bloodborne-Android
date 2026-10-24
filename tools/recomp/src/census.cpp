@@ -18,6 +18,7 @@ struct Agg {
   uint64_t insts = 0, irOps = 0, blocks = 0, bytes = 0, covered = 0, gap = 0, gapInsts = 0, gapPad = 0, gapData = 0, gapInvalid = 0, pastEnd = 0;
   uint64_t realOps = 0, extraUnits = 0, extraFailed = 0, extraInsts = 0, funcsWithExtra = 0, funcsExtraFailed = 0;
   uint64_t instsClean = 0;
+  uint64_t padUnits = 0, setjmpUnits = 0, secondaryFailed = 0, secondaryInsts = 0, padsKnown = 0, padsInUnit = 0;
   uint64_t indJmps = 0, jmpResolved = 0, jmpScanned = 0, jmpMem = 0, jmpMemRip = 0, jmpMemIdx = 0, jmpReg = 0, jmpFailed = 0, tableEntries = 0, tableBytes = 0;
   std::map<std::string, Group> fail, gapFail, jmpFail;
   Agg() : ops(Lifter::numOps()), funcsUsing(Lifter::numOps()) {}
@@ -72,6 +73,7 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
       a.gapInsts += r.gapInsts; a.gapPad += r.gapPad; a.gapData += r.gapData; a.gapInvalid += r.gapInvalid; a.pastEnd += r.spansPastEnd;
       a.extraUnits += r.extraUnits; a.extraFailed += r.extraFailed; a.extraInsts += r.extraInsts; a.funcsWithExtra += r.extraUnits != 0; a.funcsExtraFailed += r.extraFailed != 0;
       a.insts += r.insts; a.irOps += r.irOps; a.blocks += r.blocks;
+      a.padUnits += r.padUnits; a.setjmpUnits += r.setjmpUnits; a.secondaryFailed += r.secondaryFailed; a.secondaryInsts += r.secondaryInsts; a.padsKnown += r.padsKnown; a.padsInUnit += r.padsInUnit;
       a.indJmps += r.indJmps; a.jmpResolved += r.jmpResolved; a.jmpScanned += r.jmpScanned; a.jmpMem += r.jmpMem; a.jmpMemRip += r.jmpMemRip; a.jmpMemIdx += r.jmpMemIdx; a.jmpReg += r.jmpReg; a.jmpFailed += r.jmpFailed; a.tableEntries += r.tableEntries; a.tableBytes += r.tableBytes;
       for (auto& e : r.jmpExamples) { auto& g = a.jmpFail[e.substr(e.find(' ') + 1)]; if (!g.count++) g.example = "jmp at vaddr " + e.substr(0, e.find(' ')) + " in function " + std::to_string(f.start); }
       if (r.status == LiftStatus::Clean) a.instsClean += r.insts;
@@ -99,6 +101,7 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
     t.insts += a.insts; t.irOps += a.irOps; t.blocks += a.blocks; t.bytes += a.bytes; t.covered += a.covered; t.gap += a.gap;
     t.gapInsts += a.gapInsts; t.gapPad += a.gapPad; t.gapData += a.gapData; t.gapInvalid += a.gapInvalid; t.pastEnd += a.pastEnd; t.instsClean += a.instsClean; t.realOps += a.realOps; t.extraUnits += a.extraUnits; t.extraFailed += a.extraFailed; t.extraInsts += a.extraInsts; t.funcsWithExtra += a.funcsWithExtra; t.funcsExtraFailed += a.funcsExtraFailed;
     for (auto& [k, g] : a.fail) { auto& d = t.fail[k]; if (!d.count) { d.example = g.example; d.exampleAddr = g.exampleAddr; } d.count += g.count; }
+    t.padUnits += a.padUnits; t.setjmpUnits += a.setjmpUnits; t.secondaryFailed += a.secondaryFailed; t.secondaryInsts += a.secondaryInsts; t.padsKnown += a.padsKnown; t.padsInUnit += a.padsInUnit;
     t.indJmps += a.indJmps; t.jmpResolved += a.jmpResolved; t.jmpScanned += a.jmpScanned; t.jmpMem += a.jmpMem; t.jmpMemRip += a.jmpMemRip; t.jmpMemIdx += a.jmpMemIdx; t.jmpReg += a.jmpReg; t.jmpFailed += a.jmpFailed; t.tableEntries += a.tableEntries; t.tableBytes += a.tableBytes;
     for (auto& [k, g] : a.jmpFail) { auto& d = t.jmpFail[k]; if (!d.count) { d.example = g.example; d.exampleAddr = g.exampleAddr; } d.count += g.count; }
     for (auto& [k, g] : a.gapFail) { auto& d = t.gapFail[k]; if (!d.count) { d.example = g.example; d.exampleAddr = g.exampleAddr; } d.count += g.count; }
@@ -162,6 +165,8 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
   both("bytes:            %.1f MB in FDEs, %.1f MB covered by lifted blocks (%.2f%%), %.1f MB gap\n", t.bytes / 1e6, t.covered / 1e6, 100.0 * t.covered / t.bytes, t.gap / 1e6);
   both("  gap contents:   %.2f MB padding (int3/nop/ud2), %.2f MB switch table data, %.2f MB other instructions (dead or dropped), %" PRIu64 " undecodable bytes\n", t.gapPad / 1e6, t.gapData / 1e6, t.gapInsts / 1e6, t.gapInvalid);
   both("  units past FDE end: %" PRIu64 "\n", t.pastEnd);
+  both("secondary units: %" PRIu64 " landing pads (of %" PRIu64 " in the functions: %" PRIu64 " were already a unit entry), %" PRIu64 " setjmp return sites; %" PRIu64 " not clean; %" PRIu64 " x86 instructions\n",
+       t.padUnits, t.padsKnown, t.padsInUnit, t.setjmpUnits, t.secondaryFailed, t.secondaryInsts);
   both("indirect jmps:    %" PRIu64 " (jmp reg/mem): %" PRIu64 " jump tables resolved (%" PRIu64 " bounded by cmp/ja or and, %" PRIu64 " scanned without a bound; %" PRIu64 " case entries, %.2f MB of tables),\n"
        "                  %" PRIu64 " jmp [mem] (%" PRIu64 " [rip+x] import stubs, %" PRIu64 " [base+index*scale+x], rest [reg+x] vtable tail calls), %" PRIu64 " jmp reg that is no table (register tail calls), %" PRIu64 " table-like but unresolved\n",
        t.indJmps, t.jmpResolved + t.jmpScanned, t.jmpResolved, t.jmpScanned, t.tableEntries, t.tableBytes / 1e6, t.jmpMem, t.jmpMemRip, t.jmpMemIdx, t.jmpReg, t.jmpFailed);

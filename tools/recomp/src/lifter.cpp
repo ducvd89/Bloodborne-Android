@@ -230,6 +230,11 @@ jt::Ins jtInst(const X86Tables::DecodedInst& d) {
   const char* n = d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "";
   auto is = [&](const char* s) { return !strcmp(n, s); };
   auto starts = [&](const char* s) { return !strncmp(n, s, strlen(s)); };
+  // Group 5 (jmp/call r/m): FEX fills Dest/Src[0] with the opcode extension; the operand is the ModRM r/m
+  auto rmOperand = [&] {
+    if ((d.ModRM >> 6) == 3) { r.src.k = jt::Op::Reg; r.src.reg = (d.ModRM & 7) | ((d.Flags & X86Tables::DecodeFlags::FLAG_REX_XGPR_B) ? 8 : 0); }
+    else r.src = jtOperand(!d.Src[0].IsGPR() ? d.Src[0] : d.Dest);
+  };
   r.dst = jtOperand(d.Dest); r.src = jtOperand(d.Src[0]);
   if (d.Src[1].Type == X86Tables::DecodedOperand::OpType::Literal) r.src = jtOperand(d.Src[1]); // group 1 (83 /7 ib): Src[0] is the opcode extension
   if (d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_XMM_FLAGS)) {
@@ -246,14 +251,16 @@ jt::Ins jtInst(const X86Tables::DecodedInst& d) {
   else if (is("ADD")) r.kind = jt::K::Add;
   else if (is("AND")) r.kind = jt::K::And;
   else if (is("RET")) r.kind = jt::K::Ret;
-  else if (is("CALL")) { r.kind = d.OP == 0xE8 ? jt::K::Call : jt::K::CallInd; r.src = jtOperand(d.Src[0]); }
+  else if (is("CALL")) {
+    r.kind = d.OP == 0xE8 ? jt::K::Call : jt::K::CallInd;
+    if (r.kind == jt::K::CallInd) rmOperand();
+  }
   else if (is("JMP")) {
     if (d.OP == 0xE9 || d.OP == 0xEB) r.kind = jt::K::Jmp;
     else {
       // Group 5 /4: the operand is the ModRM r/m (FEX fills Dest/Src[0] with the opcode extension)
       r.kind = jt::K::JmpInd;
-      if ((d.ModRM >> 6) == 3) { r.src.k = jt::Op::Reg; r.src.reg = (d.ModRM & 7) | ((d.Flags & X86Tables::DecodeFlags::FLAG_REX_XGPR_B) ? 8 : 0); }
-      else r.src = jtOperand(!d.Src[0].IsGPR() ? d.Src[0] : d.Dest);
+      rmOperand();
     }
   }
   else if (n[0] == 'J' && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP)) {
@@ -328,12 +335,14 @@ struct Lifter::Impl {
   struct Gen {
     uint32_t insts = 0; std::string reason; bool dispatchFail = false; std::vector<std::pair<uint64_t, uint64_t>> cover; bool pastEnd = false;
     std::vector<jt::Jump> jumps;    // the indirect jumps of the unit and what became of them
+    std::vector<uint64_t> retSites; // return addresses (image vaddrs) of calls to returns-twice targets (setjmp)
   };
   bool generate(uint64_t rip, uint64_t lo, uint64_t hi, Gen& g);
   void decode(uint64_t rip, uint64_t lo, uint64_t hi, const std::set<uint64_t>& seeds);
-  std::vector<jt::Jump> analyseJumps(uint64_t lo, uint64_t hi);
+  std::vector<jt::Jump> analyseJumps(uint64_t lo, uint64_t hi, Gen* g);
   std::vector<std::pair<uint64_t, uint64_t>> tables; // jump table bytes found so far in this function (host addresses)
   uint64_t imgLo = 0, imgHi = 0;                     // mapped image range (host addresses)
+  bool onlyBounded = false;                          // gap units: only trust tables whose bound was found (the unit may be junk)
   fextl::set<uint64_t> external;                     // branch targets the decoder left out of the multiblock (more than 4 pages ahead, or behind the entry)
   using Step = StepKind;
   Step step(uint64_t pc, uint64_t lo, uint64_t hi, uint64_t end, uint64_t& len, std::string* why);
@@ -354,12 +363,19 @@ void Lifter::Impl::decode(uint64_t rip, uint64_t lo, uint64_t hi, const std::set
 }
 
 // Recognises switch tables among the indirect jumps of the current decode (lo..hi: the unit's range).
-std::vector<jt::Jump> Lifter::Impl::analyseJumps(uint64_t lo, uint64_t hi) {
+std::vector<jt::Jump> Lifter::Impl::analyseJumps(uint64_t lo, uint64_t hi, Gen* g) {
   std::vector<jt::Ins> ins;
   for (auto& b : th->FrontendDecoder->GetDecodedBlockInfo()->Blocks)
     for (uint32_t i = 0; i < b.NumInstructions; ++i) ins.push_back(jtInst(b.DecodedInstructions[i]));
   std::sort(ins.begin(), ins.end(), [](const jt::Ins& a, const jt::Ins& b) { return a.pc < b.pc; });
   ins.erase(std::unique(ins.begin(), ins.end(), [](const jt::Ins& a, const jt::Ins& b) { return a.pc == b.pc; }), ins.end());
+  if (g && opt.retTwiceTargets)
+    for (auto& i : ins) {
+      uint64_t site = 0;
+      if (i.kind == jt::K::Call && i.src.k == jt::Op::Imm && opt.retTwiceTargets->count(i.pc + i.size + i.src.imm - img.base)) site = i.pc + i.size;
+      else if (i.kind == jt::K::CallInd && i.src.k == jt::Op::Mem && i.src.rip && opt.retTwiceSlots && opt.retTwiceSlots->count(i.pc + i.size + i.src.imm - img.base)) site = i.pc + i.size;
+      if (site) g->retSites.push_back(site - img.base);
+    }
   jt::Env env;
   env.lo = lo; env.hi = hi;
   env.readS32 = [this](uint64_t a, int32_t& v) { if (a < imgLo || a + 4 > imgHi) return false; memcpy(&v, (const void*)a, 4); return true; };
@@ -395,8 +411,10 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
     std::set<uint64_t> seeds;
     for (int round = 0;; ++round) {
       decode(GuestRIP, lo, hi, seeds);
-      if (!opt.switchTables) break;
-      g.jumps = analyseJumps(lo, hi);
+      if (!opt.switchTables && !opt.retTwiceTargets) break;
+      g.retSites.clear();
+      g.jumps = analyseJumps(lo, hi, &g);
+      if (!opt.switchTables) { g.jumps.clear(); break; }
       std::set<uint64_t> have;
       for (auto& b : Dec.GetDecodedBlockInfo()->Blocks) have.insert(b.Entry);
       bool more = false;
@@ -405,6 +423,7 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
         if (t >= lo && t < hi && !have.count(t) && seeds.insert(t).second) more = true;
       for (auto& j : g.jumps)
         for (uint64_t t : j.targets)
+          if (!onlyBounded || j.why == jt::Why::Resolved)
           if (!have.count(t) && seeds.insert(t).second) more = true;
       if (!more || round >= 7) break;
       Dec.DelayedDisownBuffer();
@@ -416,6 +435,12 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
   for (auto& b : CodeBlocks) {
     g.cover.push_back({b.Entry, b.Entry + b.Size});
     if (b.Entry + b.Size > hi) g.pastEnd = true;
+  }
+  if (CodeBlocks.empty() || CodeBlocks.front().Entry != GuestRIP) {
+    if (getenv("BBR_DEBUG_JUMPS")) { fprintf(stderr, "entry block missing: %zu blocks, first at %#lx, entry %#lx\n", CodeBlocks.size(), CodeBlocks.empty() ? 0ul : (unsigned long)CodeBlocks.front().Entry, (unsigned long)GuestRIP); }
+    g.reason = "entry block missing after decoding with switch case entries";
+    Dec.DelayedDisownBuffer();
+    return false;
   }
   OD.BeginFunction(GuestRIP, &CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode, false);
   const auto GPRSize = OD.GetGPROpSize();
@@ -584,6 +609,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
   tl_range = {lo, hi};
   tl_log = &log_;
   Impl::Gen g;
+  std::vector<uint64_t> extraEntries, retSites; // gap unit entries (host addresses), setjmp return sites (image vaddrs)
   impl_->tables.clear();
   std::map<uint64_t, jt::Jump> jmps; // distinct indirect jumps of the function (image vaddr -> best outcome over its units)
   auto noteJumps = [&](const Impl::Gen& gu) {
@@ -636,6 +662,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       r.reason = g.reason;
       account(lo, false, g);
       noteJumps(g);
+      retSites.insert(retSites.end(), g.retSites.begin(), g.retSites.end());
       // Code no block of the entry unit reaches (switch case bodies): lift each run as a unit of its own.
       if (impl_->opt.gapUnits) {
         uint64_t from = lo;
@@ -643,7 +670,9 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
           const uint64_t pc = impl_->findEntry(g, lo, hi, from);
           if (!pc) break;
           Impl::Gen g2;
+          impl_->onlyBounded = true;
           const bool ok2 = impl_->generate(pc, pc, hi, g2);
+          impl_->onlyBounded = false;
           ++r.extraUnits;
           g.cover.insert(g.cover.end(), g2.cover.begin(), g2.cover.end());
           if (!ok2 || g2.cover.empty()) {
@@ -654,8 +683,46 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
             if (!g2.reason.empty()) { ++r.extraFailed; if (r.extraReason.empty()) r.extraReason = g2.reason; }
             account(pc, true, g2);
             noteJumps(g2);
+            extraEntries.push_back(pc);
+            retSites.insert(retSites.end(), g2.retSites.begin(), g2.retSites.end());
           }
           from = pc;
+        }
+      }
+    }
+    // Secondary entries: landing pads of the function and the return sites of its setjmp calls become units of their
+    // own (the unwinder and longjmp resume there, which no unit entry covers).
+    if (impl_->opt.landingPads || impl_->opt.retTwiceTargets) {
+      std::set<uint64_t> entries;           // host addresses that already are a unit entry
+      entries.insert(lo);
+      for (auto& e : extraEntries) entries.insert(e);
+      std::vector<std::pair<uint64_t, bool>> want; // (image vaddr, is setjmp site)
+      if (impl_->opt.landingPads) {
+        auto it = impl_->opt.landingPads->find(f.start);
+        if (it != impl_->opt.landingPads->end()) for (uint64_t a : it->second) { want.push_back({a, false}); ++r.padsKnown; }
+      }
+      for (uint64_t a : retSites) want.push_back({a, true});
+      std::sort(want.begin(), want.end());
+      want.erase(std::unique(want.begin(), want.end()), want.end());
+      for (auto [a, isSetjmp] : want) {
+        const uint64_t pc = impl_->img.base + a;
+        if (pc < lo || pc >= hi) continue;
+        if (entries.count(pc)) { if (!isSetjmp) ++r.padsInUnit; continue; }
+        Impl::Gen g3;
+        impl_->onlyBounded = true;
+        const bool ok3 = impl_->generate(pc, pc, hi, g3);
+        impl_->onlyBounded = false;
+        entries.insert(pc);
+        (isSetjmp ? r.setjmpUnits : r.padUnits) += 1;
+        g.cover.insert(g.cover.end(), g3.cover.begin(), g3.cover.end());
+        if (!ok3 || g3.cover.empty()) {
+          ++r.secondaryFailed;
+          if (r.extraReason.empty()) r.extraReason = "secondary entry: " + (g3.reason.empty() ? std::string("no instruction lifted") : g3.reason);
+        } else {
+          r.secondaryInsts += g3.insts;
+          if (!g3.reason.empty()) { ++r.secondaryFailed; if (r.extraReason.empty()) r.extraReason = "secondary entry: " + g3.reason; }
+          account(pc, true, g3);
+          noteJumps(g3);
         }
       }
     }

@@ -5,7 +5,9 @@
 #include "elf_image.h"
 #include "fde_scan.h"
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -19,6 +21,11 @@ struct LiftOptions {
   std::string host = "armv8.4"; // HostFeatures profile of the target: armv8.2 | armv8.4 | armv9
   int64_t injectCrash = -1;   // test hooks (crash containment): fault / FEX assert inside the lift of the function at this vaddr
   int64_t injectAssert = -1;
+  // Secondary entries (image vaddrs; shared, owned by the caller, must outlive the lifters): the unit set also gets a unit at
+  // every landing pad of the function (key: function start) and at the return address of every call to a returns-twice target.
+  const std::map<uint64_t, std::vector<uint64_t>>* landingPads = nullptr;
+  const std::set<uint64_t>* retTwiceTargets = nullptr;  // direct call targets (setjmp, its PLT stubs)
+  const std::set<uint64_t>* retTwiceSlots = nullptr;    // GOT slots of `call [rip+slot]`
   uint64_t maxInst = 0x10000;  // decoder limit per unit (FEX's own buffer limit is 0x10000)
 };
 
@@ -44,6 +51,10 @@ struct FuncResult {
   uint32_t extraUnits = 0;       // extra units lifted for code the entry unit does not reach
   uint32_t extraFailed = 0;      // ... of which cut short or not liftable
   uint32_t extraInsts = 0;       // x86 instructions lifted by extra units (not in `insts`)
+  uint32_t padUnits = 0, setjmpUnits = 0; // secondary entry units lifted for landing pads / setjmp return sites (also counted in extraUnits? no: separate)
+  uint32_t secondaryFailed = 0;  // ... of which cut short or not liftable
+  uint32_t secondaryInsts = 0;   // x86 instructions in them
+  uint32_t padsKnown = 0, padsInUnit = 0; // landing pads of the function, and how many already were a unit entry (no extra unit needed)
   std::string extraReason;       // first extra-unit failure
   bool spansPastEnd = false;     // decoded bytes ran past the FDE end (should not happen: the range is bounded)
   std::string reason;            // first failure, "category: detail"; empty when Clean
