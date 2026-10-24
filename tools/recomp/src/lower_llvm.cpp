@@ -39,8 +39,8 @@ FunctionCallee ModuleCtx::unitFn(uint64_t vaddr) {
 }
 
 // ------------------------------------------------------------------------------------ helpers -------
-Lower::Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry)
-  : m(mc), C(mc.C), M(mc.M), B(mc.C), IR(ir), res(r), entryVaddr(entry) {
+Lower::Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry, const UnitMeta* um)
+  : m(mc), C(mc.C), M(mc.M), B(mc.C), IR(ir), res(r), entryVaddr(entry), meta(um) {
   I1 = m.I1; I8 = m.I8; I16 = m.I16; I32 = m.I32; I64 = m.I64; I128 = m.I128; Ptr = m.Ptr; V128 = m.V128;
   entryRip = IR.GetHeader()->OriginalRIP;
   val.assign(IR.GetSSACount() + 2, nullptr);
@@ -413,7 +413,7 @@ void Lower::emitBreak(const IR::IROp_Break* op) {
   B.CreateRetVoid();
 }
 
-void Lower::emitExit(const IR::IROp_ExitFunction* op) {
+void Lower::emitExit(Ref node, const IR::IROp_ExitFunction* op) {
   const auto hint = op->Hint;
   uint64_t a = 0;
   const bool isConst = addrConst(op->NewRIP, a);
@@ -456,6 +456,20 @@ void Lower::emitExit(const IR::IROp_ExitFunction* op) {
       B.CreateRetVoid();
     }
     return;
+  }
+  // An indirect jump whose jump table the lifter resolved: a switch on the image offset over the unit's blocks.
+  // What is not a case (a stale table, a computed value) goes the ordinary way below.
+  if (!isConst) {
+    auto sw = swCases.find(IR.GetID(node).Value);
+    if (sw != swCases.end() && !sw->second.empty()) {
+      materialize();
+      Value* off = B.CreateSub(target, m.O.fixedImageBase ? (Value*)c64(m.O.imageBase) : ImgBase);
+      auto* def = newBB("swdef");
+      auto* si = B.CreateSwitch(off, def, sw->second.size());
+      for (auto [vaddr, id] : sw->second) si->addCase(cast<ConstantInt>(ConstantInt::get(I64, vaddr)), bbOf[id]);
+      ++res->switches; res->switchCases += sw->second.size();
+      B.SetInsertPoint(def);
+    }
   }
   // Tail call, jmp out of the unit, indirect jump.
   spill(true);
@@ -515,7 +529,7 @@ bool Lower::emitOp(Ref node, IR::IROp_Header* op) {
     B.CreateCondBr(c, bbOf[o->TrueBlock.ID().Value], bbOf[o->FalseBlock.ID().Value]);
     return true;
   }
-  case IR::OP_EXITFUNCTION: emitExit(op->C<IR::IROp_ExitFunction>()); return true;
+  case IR::OP_EXITFUNCTION: emitExit(node, op->C<IR::IROp_ExitFunction>()); return true;
   case IR::OP_BREAK: emitBreak(op->C<IR::IROp_Break>()); return true;
   default: break;
   }
@@ -544,11 +558,35 @@ void Lower::run() {
   struct BlockInfo { Ref node; IR::IROp_Header* hdr; std::vector<uint32_t> succ; };
   std::vector<uint32_t> order;
   std::unordered_map<uint32_t, BlockInfo> blocks;
+  // Guest address (image vaddr) of every block, for the switch cases.
+  std::unordered_map<uint64_t, uint32_t> blockAt;
+  if (meta && !meta->switches.empty())
+    for (auto [BlockNode, BlockHeader] : IR.GetBlocks())
+      blockAt[entryRip - m.O.liftBase + BlockHeader->C<IR::IROp_CodeBlock>()->GuestEntryOffset] = IR.GetID(BlockNode).Value;
   for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
     const uint32_t id = IR.GetID(BlockNode).Value;
     BlockInfo bi{BlockNode, BlockHeader, {}};
+    int64_t lastGuest = -1;
     for (auto [Node, op] : IR.GetCode(BlockNode)) {
-      (void)Node;
+      if (op->Op == IR::OP_GUESTOPCODE) lastGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset;
+      if (op->Op == IR::OP_EXITFUNCTION && lastGuest >= 0 && meta && !meta->switches.empty()) {
+        auto* o = op->C<IR::IROp_ExitFunction>();
+        uint64_t k;
+        if (o->Hint != IR::BranchHint::Call && o->Hint != IR::BranchHint::Return && !addrConst(o->NewRIP, k)) {
+          const uint64_t pc = entryRip - m.O.liftBase + lastGuest;
+          for (auto& sw : meta->switches) {
+            if (sw.jmpVaddr != pc) continue;
+            auto& cases = swCases[IR.GetID(Node).Value];
+            for (uint64_t t : sw.targets) {
+              auto it = blockAt.find(t);
+              if (it == blockAt.end()) continue;
+              cases.push_back({t, it->second});
+              bi.succ.push_back(it->second);
+            }
+            break;
+          }
+        }
+      }
       if (op->Op == IR::OP_JUMP) bi.succ.push_back(op->C<IR::IROp_Jump>()->TargetBlock.ID().Value);
       else if (op->Op == IR::OP_CONDJUMP) {
         auto* o = op->C<IR::IROp_CondJump>();
@@ -599,7 +637,8 @@ void Lower::run() {
         }
         case IR::OP_STOREPF: d |= 1ull << 16; break;
         case IR::OP_STOREAF: d |= 1ull << 17; break;
-        case IR::OP_EXITFUNCTION: case IR::OP_BREAK: case IR::OP_SYSCALL: d = 0; break;
+        case IR::OP_EXITFUNCTION: if (swCases.count(IR.GetID(Node).Value) && !swCases[IR.GetID(Node).Value].empty()) break; d = 0; break; // a switch keeps the registers dirty
+        case IR::OP_BREAK: case IR::OP_SYSCALL: d = 0; break;
         default: break;
         }
       }
@@ -654,9 +693,9 @@ struct UnitLowerer::Impl {
 UnitLowerer::UnitLowerer(LLVMContext& ctx, Module& mod, const LowerOptions& opt) : impl_(new Impl(ctx, mod, opt)) {}
 UnitLowerer::~UnitLowerer() = default;
 
-void UnitLowerer::lower(uint64_t entry, const void* irView, LowerResult* res) {
+void UnitLowerer::lower(uint64_t entry, const void* irView, LowerResult* res, const UnitMeta* meta) {
   const auto& ir = *static_cast<const IR::IRListView*>(irView);
-  Lower l(impl_->m, ir, res, entry);
+  Lower l(impl_->m, ir, res, entry, meta);
   l.run();
 }
 

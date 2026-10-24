@@ -35,6 +35,7 @@ struct ShardStats {
   double liftLower = 0, opt = 0, codegen = 0;
   uint64_t funcs = 0, units = 0, unitsWithTrap = 0, trapSites = 0, irOps = 0, directCalls = 0, dispatchCalls = 0, relocConsts = 0;
   uint64_t liftFailed = 0, objBytes = 0, textBytes = 0;
+  uint64_t switches = 0, switchCases = 0, indJmps = 0, jmpResolved = 0, jmpScanned = 0, jmpMem = 0, jmpReg = 0, jmpFailed = 0, tableBytes = 0;
   std::vector<uint64_t> unitVaddrs;
   std::map<std::string, uint64_t> opUnits; // op name -> units containing a trap for it
 };
@@ -60,12 +61,12 @@ uint64_t textSize(const std::string& obj) {
 struct Sink : UnitSink {
   UnitLowerer& ul; ShardStats& st;
   Sink(UnitLowerer& u, ShardStats& s) : ul(u), st(s) {}
-  void unit(uint64_t entry, bool, const void* ir) override {
+  void unit(uint64_t entry, bool, const void* ir, const UnitMeta& meta) override {
     LowerResult lr;
-    ul.lower(entry, ir, &lr);
+    ul.lower(entry, ir, &lr, &meta);
     ++st.units; st.unitVaddrs.push_back(entry);
     st.trapSites += lr.trapSites; st.irOps += lr.irOps; st.directCalls += lr.directCalls; st.dispatchCalls += lr.dispatchCalls;
-    st.relocConsts += lr.relocConstants;
+    st.relocConsts += lr.relocConstants; st.switches += lr.switches; st.switchCases += lr.switchCases;
     if (!lr.unsupported.empty()) { ++st.unitsWithTrap; for (auto& n : lr.unsupported) ++st.opUnits[n]; }
   }
 };
@@ -184,6 +185,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
         FuncResult fr;
         lifter.lift(f, fr, nullptr, nullptr, nullptr, &sink);
         ++st.funcs;
+        st.indJmps += fr.indJmps; st.jmpResolved += fr.jmpResolved; st.jmpScanned += fr.jmpScanned; st.jmpMem += fr.jmpMem; st.jmpReg += fr.jmpReg; st.jmpFailed += fr.jmpFailed; st.tableBytes += fr.tableBytes;
         if (fr.status == LiftStatus::Failed || fr.status == LiftStatus::Crashed) {
           ++st.liftFailed; ++st.units; st.unitVaddrs.push_back(f.start);
           ul.stub(f.start);
@@ -232,6 +234,8 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     tot.funcs += s.funcs; tot.units += s.units; tot.unitsWithTrap += s.unitsWithTrap; tot.trapSites += s.trapSites; tot.irOps += s.irOps;
     tot.directCalls += s.directCalls; tot.dispatchCalls += s.dispatchCalls; tot.relocConsts += s.relocConsts; tot.liftFailed += s.liftFailed;
     tot.objBytes += s.objBytes; tot.textBytes += s.textBytes;
+    tot.switches += s.switches; tot.switchCases += s.switchCases; tot.indJmps += s.indJmps; tot.jmpResolved += s.jmpResolved; tot.jmpScanned += s.jmpScanned;
+    tot.jmpMem += s.jmpMem; tot.jmpReg += s.jmpReg; tot.jmpFailed += s.jmpFailed; tot.tableBytes += s.tableBytes;
     for (auto& [n, c] : s.opUnits) tot.opUnits[n] += c;
     units.insert(units.end(), s.unitVaddrs.begin(), s.unitVaddrs.end());
   }
@@ -276,6 +280,8 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   say("\n== compile summary (%s, -O%d, %u shards, %u threads) ==\n", opt.target.aarch64 ? "aarch64" : "x86_64", opt.target.opt, nshards, jobs);
   say("functions %" PRIu64 " (%.1f MB), units %" PRIu64 " (lift failures %" PRIu64 "), IR ops lowered %" PRIu64 "\n", tot.funcs, totalBytes / 1e6, tot.units, tot.liftFailed, tot.irOps);
   say("units with bbr_trap (unsupported ops): %" PRIu64 " (%.2f%%), trap sites %" PRIu64 "\n", tot.unitsWithTrap, tot.units ? 100.0 * tot.unitsWithTrap / tot.units : 0.0, tot.trapSites);
+  say("indirect jmps %" PRIu64 ": %" PRIu64 " jump tables (%" PRIu64 " bounded + %" PRIu64 " scanned, %.2f MB of tables), %" PRIu64 " jmp [mem], %" PRIu64 " jmp reg tail calls, %" PRIu64 " table-like unresolved; %" PRIu64 " lowered as switch (%" PRIu64 " cases)\n",
+      tot.indJmps, tot.jmpResolved + tot.jmpScanned, tot.jmpResolved, tot.jmpScanned, tot.tableBytes / 1e6, tot.jmpMem, tot.jmpReg, tot.jmpFailed, tot.switches, tot.switchCases);
   say("direct calls %" PRIu64 ", dispatch calls/jumps %" PRIu64 ", relocated constants %" PRIu64 "\n", tot.directCalls, tot.dispatchCalls, tot.relocConsts);
   if (wantCode) {
     say("CPU time: lift+lower %.1f s, optimise %.1f s, codegen %.1f s (sum over threads); table %.1f s, link %.1f s\n", tot.liftLower, tot.opt, tot.codegen, tableTime, linkTime);

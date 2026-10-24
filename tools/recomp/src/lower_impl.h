@@ -81,7 +81,11 @@ struct Lower {
   uint32_t curGuest = 0;       // offset of the current guest instruction from the entry (GuestOpcode)
   std::set<std::string> unsup; // unsupported op names of this unit
 
-  Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry);
+  const UnitMeta* meta = nullptr;
+  // ExitFunction node id -> (image vaddr, IR block id) of the cases of the switch the jump became
+  std::unordered_map<uint32_t, std::vector<std::pair<uint64_t, uint32_t>>> swCases;
+
+  Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry, const UnitMeta* meta = nullptr);
   void run();
 
   // ---- helpers
@@ -129,7 +133,7 @@ struct Lower {
 
   // ---- control flow
   void emitBlockTerminatorsFix();
-  void emitExit(const IR::IROp_ExitFunction* op);
+  void emitExit(Ref node, const IR::IROp_ExitFunction* op);
   void emitBreak(const IR::IROp_Break* op);
   llvm::BasicBlock* curBB() { return B.GetInsertBlock(); }
   llvm::BasicBlock* newBB(const char* n) { return llvm::BasicBlock::Create(C, n, F); }

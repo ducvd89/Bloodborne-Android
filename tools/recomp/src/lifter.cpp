@@ -42,6 +42,7 @@
 #include <FEXCore/Utils/LogManager.h>
 
 #include "lifter.h"
+#include "jumptable.h"
 
 using namespace FEXCore;
 
@@ -57,6 +58,14 @@ template <SectionPtr M> struct RobMax { friend SectionPtr sectionMax(MaxTag) { r
 template struct RobMin<&Frontend::Decoder::SectionMinAddress>;
 template struct RobMax<&Frontend::Decoder::SectionMaxAddress>;
 void setSection(Frontend::Decoder& d, uint64_t lo, uint64_t hi) { d.*sectionMin(MinTag{}) = lo; d.*sectionMax(MaxTag{}) = hi; }
+
+// The decoder's worklist of block entries: switch case targets are added to it before DecodeLoop, so they
+// become blocks of the same multiblock unit (nothing else in the code branches to them).
+using TodoPtr = fextl::set<uint64_t> Frontend::Decoder::*;
+struct TodoTag { friend TodoPtr blocksToDecode(TodoTag); };
+template <TodoPtr M> struct RobTodo { friend TodoPtr blocksToDecode(TodoTag) { return M; } };
+template struct RobTodo<&Frontend::Decoder::BlocksToDecode>;
+void addEntry(Frontend::Decoder& d, uint64_t pc) { (d.*blocksToDecode(TodoTag{})).insert(pc); }
 } // namespace
 
 const char* statusName(LiftStatus s) {
@@ -192,6 +201,72 @@ bool isPadding(const uint8_t* p, size_t n) {
   return p[i] == 0x0f && i + 1 < n && (p[i + 1] == 0x1f || p[i + 1] == 0x0b);
 }
 
+
+// ---------------------------------------------------------------- jump table analysis input ----
+jt::Op jtOperand(const X86Tables::DecodedOperand& o) {
+  using T = X86Tables::DecodedOperand::OpType;
+  jt::Op r;
+  switch (o.Type) {
+  case T::GPR: r.k = jt::Op::Reg; r.reg = o.Data.GPR.GPR & 15; break;
+  case T::GPRDirect: r.k = jt::Op::Mem; r.base = o.Data.GPR.GPR & 15; break;
+  case T::GPRIndirect: r.k = jt::Op::Mem; r.base = o.Data.GPRIndirect.GPR & 15; r.imm = o.Data.GPRIndirect.Displacement; break;
+  case T::SIB:
+    r.k = jt::Op::Mem; r.imm = o.Data.SIB.Offset; r.scale = o.Data.SIB.Scale;
+    r.base = o.Data.SIB.Base < 16 ? o.Data.SIB.Base : -1; r.index = o.Data.SIB.Index < 16 ? o.Data.SIB.Index : -1; break;
+  case T::RIPRelative: r.k = jt::Op::Mem; r.rip = true; r.imm = o.Data.RIPLiteral.Value; break;
+  case T::Literal: {
+    r.k = jt::Op::Imm; const uint64_t v = o.Data.Literal.Value;
+    switch (o.Data.Literal.Size) { case 1: r.imm = (int8_t)v; break; case 2: r.imm = (int16_t)v; break; case 4: r.imm = (int32_t)v; break; default: r.imm = (int64_t)v; }
+    break;
+  }
+  default: break;
+  }
+  return r;
+}
+
+jt::Ins jtInst(const X86Tables::DecodedInst& d) {
+  jt::Ins r;
+  r.pc = d.PC; r.size = d.InstSize;
+  const char* n = d.TableInfo && d.TableInfo->Name ? d.TableInfo->Name : "";
+  auto is = [&](const char* s) { return !strcmp(n, s); };
+  auto starts = [&](const char* s) { return !strncmp(n, s, strlen(s)); };
+  r.dst = jtOperand(d.Dest); r.src = jtOperand(d.Src[0]);
+  if (d.Src[1].Type == X86Tables::DecodedOperand::OpType::Literal) r.src = jtOperand(d.Src[1]); // group 1 (83 /7 ib): Src[0] is the opcode extension
+  if (d.TableInfo && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_XMM_FLAGS)) {
+    // SSE/AVX/x87: register operands are XMM (or x87) registers unless the table says the destination is a GPR
+    if (!(d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SF_DST_GPR) && r.dst.k == jt::Op::Reg) r.dst = {};
+    if (!(d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SF_SRC_GPR) && r.src.k == jt::Op::Reg) r.src = {};
+  }
+  if (is("CMP")) r.kind = jt::K::Cmp;
+  else if (is("TEST") || is("PUSH") || is("NOP") || starts("PREFETCH")) r.kind = jt::K::NoWrite;
+  else if (is("LEA")) r.kind = jt::K::Lea;
+  else if (is("MOV")) r.kind = jt::K::Mov;
+  else if (is("MOVSXD")) r.kind = jt::K::Movsxd;
+  else if (is("MOVZX")) r.kind = jt::K::Movzx;
+  else if (is("ADD")) r.kind = jt::K::Add;
+  else if (is("AND")) r.kind = jt::K::And;
+  else if (is("RET")) r.kind = jt::K::Ret;
+  else if (is("CALL")) { r.kind = d.OP == 0xE8 ? jt::K::Call : jt::K::CallInd; r.src = jtOperand(d.Src[0]); }
+  else if (is("JMP")) {
+    if (d.OP == 0xE9 || d.OP == 0xEB) r.kind = jt::K::Jmp;
+    else {
+      // Group 5 /4: the operand is the ModRM r/m (FEX fills Dest/Src[0] with the opcode extension)
+      r.kind = jt::K::JmpInd;
+      if ((d.ModRM >> 6) == 3) { r.src.k = jt::Op::Reg; r.src.reg = (d.ModRM & 7) | ((d.Flags & X86Tables::DecodeFlags::FLAG_REX_XGPR_B) ? 8 : 0); }
+      else r.src = jtOperand(!d.Src[0].IsGPR() ? d.Src[0] : d.Dest);
+    }
+  }
+  else if (n[0] == 'J' && (d.TableInfo->Flags & X86Tables::InstFlags::FLAGS_SETS_RIP)) {
+    r.kind = jt::K::Jcc;
+    r.cc = (d.OP >= 0x70 && d.OP <= 0x8f) ? d.OP & 15 : 0xff; // 70-7f: rel8, 0f 80-8f: rel32 (FEX keeps the low byte)
+  }
+  else if (is("MUL") || is("DIV") || is("IDIV") || is("CDQ") || is("CQO") || is("CBW") || is("CWD") || is("CWDE") || is("CDQE") || is("XCHG") ||
+           is("XADD") || starts("CMPXCHG") || is("CPUID") || starts("RDTSC") || is("SYSCALL") || starts("MOVS") || starts("STOS") ||
+           starts("LODS") || starts("SCAS") || starts("CMPS") || is("LEAVE") || is("ENTER") || is("SAHF") || is("LAHF") || is("XLAT"))
+    r.kind = (is("MOVSXD") || starts("MOVSX") || is("MOVSS") || is("MOVSD") || is("MOVSLDUP") || is("MOVSHDUP")) ? jt::K::Other : jt::K::Clobber;
+  return r;
+}
+
 constexpr size_t NumOps = IR::OP_LAST;
 constexpr size_t SizeBuckets = 9; // 0 1 2 4 8 16 32 10(f80) other
 size_t sizeBucket(IR::OpSize s) {
@@ -250,13 +325,64 @@ struct Lifter::Impl {
   }
 
   // Stand-in for ContextImpl::GenerateIR; returns false when no instruction could be lifted.
-  struct Gen { uint32_t insts = 0; std::string reason; bool dispatchFail = false; std::vector<std::pair<uint64_t, uint64_t>> cover; bool pastEnd = false; };
+  struct Gen {
+    uint32_t insts = 0; std::string reason; bool dispatchFail = false; std::vector<std::pair<uint64_t, uint64_t>> cover; bool pastEnd = false;
+    std::vector<jt::Jump> jumps;    // the indirect jumps of the unit and what became of them
+  };
   bool generate(uint64_t rip, uint64_t lo, uint64_t hi, Gen& g);
+  void decode(uint64_t rip, uint64_t lo, uint64_t hi, const std::set<uint64_t>& seeds);
+  std::vector<jt::Jump> analyseJumps(uint64_t lo, uint64_t hi);
+  std::vector<std::pair<uint64_t, uint64_t>> tables; // jump table bytes found so far in this function (host addresses)
+  uint64_t imgLo = 0, imgHi = 0;                     // mapped image range (host addresses)
+  fextl::set<uint64_t> external;                     // branch targets the decoder left out of the multiblock (more than 4 pages ahead, or behind the entry)
   using Step = StepKind;
   Step step(uint64_t pc, uint64_t lo, uint64_t hi, uint64_t end, uint64_t& len, std::string* why);
   uint64_t findEntry(Gen& g, uint64_t lo, uint64_t hi, uint64_t from);
   void gaps(uint64_t lo, uint64_t hi, Gen& g, FuncResult& r);
 };
+
+void Lifter::Impl::decode(uint64_t rip, uint64_t lo, uint64_t hi, const std::set<uint64_t>& seeds) {
+  auto& Dec = *th->FrontendDecoder;
+  Dec.ResetExecutableRangeCache();
+  Dec.SetupDecodeInstructionsAtEntry(th, rip, opt.maxInst);
+  setSection(Dec, lo, hi); // multiblock membership: [entry, function end)
+  for (uint64_t s : seeds) addEntry(Dec, s);
+  external.clear();
+  Dec.SetExternalBranches(&external);
+  Dec.DecodeLoop(reinterpret_cast<const uint8_t*>(rip));
+  Dec.SetExternalBranches(nullptr);
+}
+
+// Recognises switch tables among the indirect jumps of the current decode (lo..hi: the unit's range).
+std::vector<jt::Jump> Lifter::Impl::analyseJumps(uint64_t lo, uint64_t hi) {
+  std::vector<jt::Ins> ins;
+  for (auto& b : th->FrontendDecoder->GetDecodedBlockInfo()->Blocks)
+    for (uint32_t i = 0; i < b.NumInstructions; ++i) ins.push_back(jtInst(b.DecodedInstructions[i]));
+  std::sort(ins.begin(), ins.end(), [](const jt::Ins& a, const jt::Ins& b) { return a.pc < b.pc; });
+  ins.erase(std::unique(ins.begin(), ins.end(), [](const jt::Ins& a, const jt::Ins& b) { return a.pc == b.pc; }), ins.end());
+  jt::Env env;
+  env.lo = lo; env.hi = hi;
+  env.readS32 = [this](uint64_t a, int32_t& v) { if (a < imgLo || a + 4 > imgHi) return false; memcpy(&v, (const void*)a, 4); return true; };
+  auto r = jt::analyze(ins, env);
+  if (getenv("BBR_DEBUG_JUMPS")) {
+    // Debugging aid: the instructions before every indirect jump, as the analysis sees them.
+    std::map<uint64_t, const X86Tables::DecodedInst*> raw;
+    for (auto& b : th->FrontendDecoder->GetDecodedBlockInfo()->Blocks) for (uint32_t i = 0; i < b.NumInstructions; ++i) raw[b.DecodedInstructions[i].PC] = &b.DecodedInstructions[i];
+    auto opText = [](const jt::Op& o) { char b[96]; switch (o.k) { case jt::Op::Reg: snprintf(b, sizeof b, "r%u", o.reg); break; case jt::Op::Imm: snprintf(b, sizeof b, "#%ld", (long)o.imm); break;
+      case jt::Op::Mem: snprintf(b, sizeof b, "[%s b%d i%d*%u %+ld]", o.rip ? "rip" : "", o.base, o.index, o.scale, (long)o.imm); break; default: snprintf(b, sizeof b, "-"); } return std::string(b); };
+    for (auto& j : r) {
+      fprintf(stderr, "jump @%#lx: %s targets=%zu\n", (unsigned long)(j.pc - img.base), jt::whyName(j.why), j.targets.size());
+      auto it = std::lower_bound(ins.begin(), ins.end(), j.pc, [](const jt::Ins& a, uint64_t pc) { return a.pc < pc; });
+      for (size_t k = (size_t)(it - ins.begin()) >= 10 ? (it - ins.begin()) - 10 : 0; k <= (size_t)(it - ins.begin()); ++k) {
+        auto* d = raw[ins[k].pc];
+        fprintf(stderr, "  %#lx %-8s op=%#x modrm=%#x kind=%d dst=%s src=%s\n", (unsigned long)(ins[k].pc - img.base), d && d->TableInfo ? d->TableInfo->Name : "?", d ? d->OP : 0, d ? d->ModRM : 0,
+                (int)ins[k].kind, opText(ins[k].dst).c_str(), opText(ins[k].src).c_str());
+      }
+    }
+  }
+  for (auto& j : r) if (!j.targets.empty()) tables.push_back({j.table, j.table + 4ull * j.entries});
+  return r;
+}
 
 bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g) {
   auto& OD = *th->OpDispatcher;
@@ -264,10 +390,26 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
   if (opt.injectCrash >= 0 && lo == img.base + (uint64_t)opt.injectCrash) *(volatile int*)8 = 1;
   if (opt.injectAssert >= 0 && lo == img.base + (uint64_t)opt.injectAssert) LogMan::Throw::AFmt(false, "injected assert");
   OD.ResetWorkingList();
-  Dec.ResetExecutableRangeCache();
-  Dec.SetupDecodeInstructionsAtEntry(th, GuestRIP, opt.maxInst);
-  setSection(Dec, lo, hi); // multiblock membership: [entry, function end)
-  Dec.DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP));
+  // Decode; every round that finds switch tables adds their case targets as block entries and decodes again.
+  {
+    std::set<uint64_t> seeds;
+    for (int round = 0;; ++round) {
+      decode(GuestRIP, lo, hi, seeds);
+      if (!opt.switchTables) break;
+      g.jumps = analyseJumps(lo, hi);
+      std::set<uint64_t> have;
+      for (auto& b : Dec.GetDecodedBlockInfo()->Blocks) have.insert(b.Entry);
+      bool more = false;
+      // Branches the decoder does not follow (more than 4 pages ahead, ...) but that land inside this function.
+      for (uint64_t t : external)
+        if (t >= lo && t < hi && !have.count(t) && seeds.insert(t).second) more = true;
+      for (auto& j : g.jumps)
+        for (uint64_t t : j.targets)
+          if (!have.count(t) && seeds.insert(t).second) more = true;
+      if (!more || round >= 7) break;
+      Dec.DelayedDisownBuffer();
+    }
+  }
 
   const auto* BlockInfo = Dec.GetDecodedBlockInfo();
   const auto& CodeBlocks = BlockInfo->Blocks;
@@ -349,6 +491,7 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
 // Classifies what starts at pc (hi bounds the executable range, end the gap) and its length.
 Lifter::Impl::Step Lifter::Impl::step(uint64_t pc, uint64_t lo, uint64_t hi, uint64_t end, uint64_t& len, std::string* why) {
   auto& Dec = *th->FrontendDecoder;
+  for (auto [a, b] : tables) if (pc >= a && pc < b) { len = std::min(b, end) - pc; if (len) return Step::Data; }
   if (uint64_t n = dataRun(pc, end, hi)) { len = n; return Step::Data; }
   Dec.ResetExecutableRangeCache();
   Dec.SetupDecodeInstructionsAtEntry(th, pc, 1);
@@ -422,7 +565,13 @@ void Lifter::Impl::gaps(uint64_t lo, uint64_t hi, Gen& g, FuncResult& r) {
   r.coveredBytes = (hi - lo) - gapTotal;
 }
 
-Lifter::Lifter(const ElfImage& img, const LiftOptions& opt) { installCrashHandlers(); impl_ = std::make_unique<Impl>(img, opt); }
+Lifter::Lifter(const ElfImage& img, const LiftOptions& opt) {
+  installCrashHandlers();
+  impl_ = std::make_unique<Impl>(img, opt);
+  uint64_t top = 0;
+  for (auto& sg : img.loads) top = std::max(top, sg.vaddr + sg.memsz);
+  impl_->imgLo = img.base; impl_->imgHi = img.base + top;
+}
 Lifter::~Lifter() = default;
 
 void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts, std::vector<uint64_t>* sizeHist, std::string* irText, UnitSink* sink) {
@@ -435,12 +584,22 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
   tl_range = {lo, hi};
   tl_log = &log_;
   Impl::Gen g;
+  impl_->tables.clear();
+  std::map<uint64_t, jt::Jump> jmps; // distinct indirect jumps of the function (image vaddr -> best outcome over its units)
+  auto noteJumps = [&](const Impl::Gen& gu) {
+    for (auto& j : gu.jumps) {
+      jt::Jump jv = j; jv.pc -= impl_->img.base; jv.table = jv.table ? jv.table - impl_->img.base : 0;
+      for (auto& t : jv.targets) t -= impl_->img.base;
+      auto [it, fresh] = jmps.emplace(jv.pc, jv);
+      if (!fresh && it->second.targets.empty() && !jv.targets.empty()) it->second = jv;
+    }
+  };
   tl_valErr.clear();
   sigjmp_buf jb;
   tl_jmp = &jb;
   if (sigsetjmp(jb, 1) == 0) {
     // Adds the IR of the last generate() to the totals.
-    auto account = [&](uint64_t entry, bool extra) {
+    auto account = [&](uint64_t entry, bool extra, const Impl::Gen& gu) {
       auto IR = impl_->th->OpDispatcher->ViewIR();
       auto count = [&](const IR::IROp_Header* op) {
         ++cnt[op->Op]; ++r.irOps;
@@ -450,7 +609,16 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
         ++r.blocks; count(BlockHeader);
         for (auto [CodeNode, IROp] : IR.GetCode(BlockNode)) count(IROp);
       }
-      if (sink) sink->unit(entry - impl_->img.base, extra, &IR);
+      if (sink) {
+        UnitMeta meta;
+        for (auto& j : gu.jumps) {
+          if (j.targets.empty()) continue;
+          SwitchInfo sw {j.pc - impl_->img.base, {}};
+          for (uint64_t t : j.targets) sw.targets.push_back(t - impl_->img.base);
+          meta.switches.push_back(std::move(sw));
+        }
+        sink->unit(entry - impl_->img.base, extra, &IR, meta);
+      }
       if (irText) {
         fextl::ostringstream out; IR::Dump(&out, &IR);
         char h[96]; snprintf(h, sizeof h, "; ---- %s unit at vaddr %#lx ----\n", extra ? "extra" : "entry", (unsigned long)(entry - impl_->img.base));
@@ -466,7 +634,8 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
     } else {
       r.status = g.reason.empty() ? LiftStatus::Clean : LiftStatus::Partial;
       r.reason = g.reason;
-      account(lo, false);
+      account(lo, false, g);
+      noteJumps(g);
       // Code no block of the entry unit reaches (switch case bodies): lift each run as a unit of its own.
       if (impl_->opt.gapUnits) {
         uint64_t from = lo;
@@ -483,7 +652,8 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
           } else {
             r.extraInsts += g2.insts;
             if (!g2.reason.empty()) { ++r.extraFailed; if (r.extraReason.empty()) r.extraReason = g2.reason; }
-            account(pc, true);
+            account(pc, true, g2);
+            noteJumps(g2);
           }
           from = pc;
         }
@@ -495,6 +665,23 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       if (r.reason.empty()) r.reason = "ir validation: " + e;
     }
     impl_->gaps(lo, hi, g, r);
+    {
+      std::set<uint64_t> seenTables;
+      for (auto& [pc, j] : jmps) {
+        ++r.indJmps;
+        const bool res = !j.targets.empty();
+        if (j.memForm) { ++r.jmpMem; r.jmpMemRip += j.ripMem; r.jmpMemIdx += j.idxMem; }
+        else if (res && j.why == jt::Why::Resolved) ++r.jmpResolved;
+        else if (res) ++r.jmpScanned;
+        else if (j.why == jt::Why::NotTable) ++r.jmpReg;
+        else ++r.jmpFailed;
+        if (res && seenTables.insert(j.table).second) { r.tableEntries += j.entries; r.tableBytes += 4ull * j.entries; }
+        if (!res && !j.memForm && r.jmpExamples.size() < 4) {
+          char b[160]; snprintf(b, sizeof b, "%#lx %s", (unsigned long)pc, jt::whyName(j.why));
+          r.jmpExamples.push_back(b);
+        }
+      }
+    }
     tl_jmp = nullptr;
   } else {
     tl_jmp = nullptr;

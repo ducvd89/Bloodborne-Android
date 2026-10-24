@@ -13,6 +13,7 @@ struct LiftOptions {
   bool multiblock = true;     // whole function as one IR unit (the shipped config, Multiblock=1)
   bool tso = false;           // TSOEnabled; the game runs with it off (fex-compatible.json)
   bool gapUnits = true;       // lift code the entry unit does not reach (switch case bodies) as extra units
+  bool switchTables = true;   // resolve jump tables: case targets become blocks of the unit, the jump a `switch`
   bool validate = false;      // also run FEX's IR validation pass (errors become a failure reason)
   bool passes = true;         // x87 stack optimisation + dead flag calculation elimination
   std::string host = "armv8.4"; // HostFeatures profile of the target: armv8.2 | armv8.4 | armv9
@@ -47,13 +48,28 @@ struct FuncResult {
   bool spansPastEnd = false;     // decoded bytes ran past the FDE end (should not happen: the range is bounded)
   std::string reason;            // first failure, "category: detail"; empty when Clean
   std::vector<std::string> gapReasons; // "category: detail" for undecodable gap bytes
+  // Indirect jumps (`jmp reg`, `jmp [mem]`) of the function, counted once per address over all its units.
+  uint32_t indJmps = 0;          // distinct indirect jmp instructions
+  uint32_t jmpResolved = 0;      // ... resolved as a bounded jump table (cmp/ja or and mask)
+  uint32_t jmpScanned = 0;       // ... resolved by scanning the table to its first non-target entry (no bound found)
+  uint32_t jmpMem = 0;           // ... jmp [mem] (GOT stubs and vtable tail calls): not tables
+  uint32_t jmpMemRip = 0, jmpMemIdx = 0; // ... of which [rip+x] (import stubs) and [base+index*scale+x] (absolute tables)
+  uint32_t jmpReg = 0;           // ... jmp reg that is no table (register tail calls)
+  uint32_t jmpFailed = 0;        // ... table-like but not resolved (reasons in jmpExamples)
+  uint32_t tableEntries = 0;     // case targets read from resolved tables (before de-duplication)
+  uint64_t tableBytes = 0;       // bytes of resolved tables
+  std::vector<std::string> jmpExamples; // "vaddr reason" of unresolved jmp reg / table-like jumps (first few)
 };
+
+// What the lowering needs to know about a unit besides its IR: the resolved jump tables (image vaddrs).
+struct SwitchInfo { uint64_t jmpVaddr; std::vector<uint64_t> targets; };
+struct UnitMeta { std::vector<SwitchInfo> switches; };
 
 // Receives each lifted unit while its IR is alive (valid only inside the call): entry is the image vaddr,
 // irView a `const FEXCore::IR::IRListView*` (the lowering casts it back).
 struct UnitSink {
   virtual ~UnitSink() = default;
-  virtual void unit(uint64_t entryVaddr, bool extra, const void* irView) = 0;
+  virtual void unit(uint64_t entryVaddr, bool extra, const void* irView, const UnitMeta& meta) = 0;
 };
 
 class Lifter {
