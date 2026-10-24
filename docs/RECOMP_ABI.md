@@ -162,6 +162,67 @@ A slot callback may call guest code (`guest_cpu_call`): the nested call starts b
 
 A hook installed in a slot stays set while its function runs on the fallback (a later write made it dirty) but does not fire there: the runtime prints `AOT: the hook at +X is inactive` once per site and the hook works again when the function is native again.
 
+## Granular entries: dynamic jump targets inside functions (additive; `bbr_abi_flags` bit 4)
+
+A jump the lifter cannot resolve (a table-like `jmp reg` whose table or bound it did not find, a table it only scanned) may land on any instruction of its
+function. **Granular functions** answer that without a fallback CPU: every unit of such a function gets, right after its prologue, a switch over every
+instruction boundary it holds (the resume-entry switch of the call-return blocks, with all instruction boundaries as cases).
+
+- **Which functions** (`bb-recomp --granular off|jumps|all`): `jumps` (the default) = functions with an indirect jump the lifter could not resolve for sure (unresolved
+  table-like jumps, and tables resolved only by scanning to the first non-target entry); `all` = every function (an experiment, see the plan's "Granular entries" for the
+  cost); `--granular-funcs <file>` adds the functions holding the addresses in a file (a misses log works). Register tail calls (`jmp reg` to another function) and
+  `jmp [mem]` are not table jumps and do not make a function granular.
+- **Lifting.** The lifter puts a `GuestOpcode` marker at every instruction of a granular function; the lowering splits a block at each instruction that is no block
+  entry (like a hook resume point: the fall-through path joins the new block with its flags in the allocas) and lists every block entry and split in the switch.
+  Entering from the switch loads the flags from the context (flags are live across a jump, unlike after a call: the jumping unit stored them).
+- **Protocol** (the resume flag, `GuestState::_pad1`, offset 0xb8): the dispatcher sets `s->rip = target; s->_pad1 = 1` and calls a unit of the function. A unit that
+  holds the address clears the flag and runs the code from there, as if the jump had gone to it (a `ret` in it returns to the caller of the function: the target was a
+  jump, or a call whose return address is on the stack); a unit that does not returns at once with the flag still set. The dispatcher tries the function's units
+  (`bbr_funcs[]`, entry unit first) until the flag is clear. A dirty unit returns at once (flag set), a patch variant of a granular function has the same switch.
+- **Exports:** `bbr_func_granular[bbr_func_count]` (u8, 1 = granular) and bit 4 of `bbr_abi_flags`.
+- **Runtime:** on a miss (`bbr_dispatch`, `bbr_dispatch_tail`, a return to an address in no unit, `bbr_unwound`) the engine asks `GranularEntry` before anything else.
+  An address no unit and no granular entry covers is a **miss** (below).
+
+## Misses, strict mode and the misses log
+
+A *miss* is guest code about to run at an address no unit starts at, no granular function has as an instruction boundary, and that is not a host-function stub, a PLT
+thunk or an import trap: a jump into the middle of a unit, a call to code the tool did not find, a return after a longjmp to an address no unit holds, an entry of a
+patched function with no variant, an address outside the image.
+
+- **Always:** the first miss at each address is appended to `logs/aot-misses.log` (`BB_AOT_MISS_LOG=<path>` to move it; the working directory of the runtime is
+  `files/bbport`): `miss +0x210ebc0 kind=jump thread=CSChrThread0 tid=1234 rsp=0x... backtrace=+0x2110a20,+0x1c40` (image offsets; kind: call, jump, unwind,
+  patched; `outside 0x...` for an address outside the image; the backtrace is the return address on the guest stack, then the rbp chain), and `# count` lines at exit
+  when an address missed more than once.
+- **`BB_AOT_STRICT=1`** (always on in the `BB_AOT_ONLY` build; the default in phase 7): no FEX for anything. A miss is logged (every time) and the game stops with
+  status 22 and `STOP: AOT: native code is missing an entry at +0x...; please report this, or turn Native CPU off (details: logs/aot-misses.log)`. Strict mode also takes CPUID,
+  XGETBV, the TSC and the unaligned-atomic handler from `cpu/guest_cpu_native.cpp` instead of FEX, in the FEX build too, so it rehearses the native-only runtime.
+- **Without strict mode** (the default for now) the fallback CPU runs the code as before; every miss is logged the same way, so testers' logs find the gaps.
+- **Closing a gap without a code change:** `bb-recomp ... --extra-entries aot-misses.log` makes every logged address a unit entry (an address inside a function becomes an extra unit of
+  it, one outside every function a pseudo-function; addresses that do not decode as code are reported and ignored) and the `.so` is rebuilt. `--check-entries a,b,c` (with
+  `--units-only`) says for each address whether it is a unit entry, a granular entry, a case of a resolved jump table, or not covered (exit status 3).
+- **Import traps.** `src/probe.c` gives unresolved imports 32-byte x86 stubs (`mov rsi,rdi; mov edi,<index>; movabs rax,<handler stub>; jmp rax`) in a code range of
+  their own. The engine recognises exactly that sequence and calls the handler stub's host function with (index, rdi) instead of running it, so no CPU executes it.
+
+## BB_AOT_ONLY: libbbcpu without FEXCore
+
+`cpu/aot_only/CMakeLists.txt` builds `libbbcpu.so` from `guest_cpu_aot.cpp`, `guest_cpu_native.cpp` and `host_call_arm64.S` (`BB_AOT_ONLY=1 tools/android/build_bionic.sh`
+reuses the rest of an `out/bionic` build and relinks bb-probe). Strict mode is always on, `BB_AOT=<libbbaot.so>` is required (the runtime stops at start-up without it), and no
+guest instruction ever runs on a CPU other than the units. What the engine asks of "the fallback" is answered natively there:
+
+| service | FEX build | native-only |
+|---|---|---|
+| thread state | FEX `CPUState` of the thread | the replica `GuestState` (`cpu/guest_state.h`, layout checked against FEX by `tests/guest_state_check.cpp`), allocated per thread |
+| host-function stubs | 16-byte stubs `mov r10,rcx; syscall; ret` executed by FEX | a table of addresses, never executed: the dispatcher recognises them |
+| guest calls (`guest_cpu_call`) | units, FEX for misses | units; sentinel = stub slot 0 |
+| CPUID, XGETBV | FEX's model with the host's features | `cpu/guest_cpu_cpuid.h`: FEX's Skylake model with the host features fixed to the lifter's profile (AVX/AVX2 bits as FEX reports with AVX, AES, PCLMUL, CRC, SHA, SSE4a, no RDRAND); cache sizes and TLB leaves as FEX's constants; the product name is "Unknown ARM CPU" |
+| TSC | `cntvct_el0 << shift`, shift so the rate is at least 1 GHz | the same |
+| unaligned `lock` operations | FEX's non-JIT unaligned handler | `cpu/guest_cpu_atomics.h`: decodes LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN/SWP/CAS/CASP (every width, any acquire/release form), performs them byte-wise under one global lock, advances the pc |
+| faults | FEX handles the call-return stack, the JIT buffer and the unaligned atomics | the unaligned atomics only; everything else is the host crash report |
+| `guest_cpu_hook` / `guest_cpu_invalidate` | patches guest code with a `syscall` trampoline | no code is written: a hook is a native slot or `0` (then the function is patched without a variant: a miss) |
+
+Still FEX-bound (phase 7): `cpu/guest_cpu_fex.cpp` and everything it links (FEXCore, Common, jemalloc, fmt) in the FEX build; `bbr_dirty_entry` of a patched function with no
+variant, the `BB_AOT_FALLBACK_RANGES`, `BB_AOT_TRACE` fallback traces and the free-run/CFI machinery (they only run in non-strict FEX builds); `guest_cpu_call` with BB_AOT off.
+
 ## Guest state
 
 - **`GuestState`** is FEX's `FEXCore::Core::CPUState` layout. Use the offsets from FEX's headers,

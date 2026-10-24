@@ -25,6 +25,28 @@ run() { taskset -c 2-23 nice -n 19 "$@"; }
 [[ -f $prefix/.done-openssl && -x $root/host-tools/bin/protoc && -f $prefix/share/cacert.pem ]] \
     || { echo "No online-module deps (OpenSSL, protobuf, CA bundle) in $prefix (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
 [[ -d $headers/share/cmake/magic_enum ]] || { echo "No header-only packages in $headers" >&2; exit 1; }
+# BB_AOT_ONLY=1: the native-only runtime (no FEXCore in libbbcpu: cpu/aot_only/CMakeLists.txt, docs/RECOMP_ABI.md "Strict mode"). It reuses everything the normal
+# build made (out/bionic: libbbgpu, libbbnet20, ...; they only use guest_cpu.h) and replaces libbbcpu.so and bb-probe's link against it: out/bionic-only.
+if [[ ${BB_AOT_ONLY:-0} == 1 ]]; then
+    [[ -f out/bionic/lib/libbbgpu.so && -f out/bionic/bin/bb-probe ]] || { echo "BB_AOT_ONLY=1 needs the normal build first (out/bionic)" >&2; exit 1; }
+    out=out/bionic-only
+    ndk_cmake=(-DCMAKE_TOOLCHAIN_FILE="$toolchain" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$api -DANDROID_STL=c++_shared)
+    rm -rf "$out/bin" "$out/lib" "$out/share" "$out/licenses"
+    mkdir -p "$out"
+    cp -a --reflink=auto out/bionic/lib out/bionic/share out/bionic/licenses "$out/"
+    cmake -S cpu/aot_only -B "$out/cpu" -G Ninja "${ndk_cmake[@]}" -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
+    run ninja -C "$out/cpu" -j "$J" bbcpu > "$out/cpu-build.log" 2>&1 || { grep -E "error|FAILED" "$out/cpu-build.log" | head -40 >&2; exit 1; }
+    cp -f "$out/cpu/libbbcpu.so" "$out/lib/libbbcpu.so"
+    mkdir -p "$out/bin"
+    cp -a --reflink=auto out/bionic/bin/. "$out/bin/"
+    cc=("$llvm/bin/aarch64-linux-android$api-clang" -fuse-ld=lld)
+    links=(-L"$out/lib" -lbbgpu -lbbcpu -Wl,-rpath,'$ORIGIN/../lib' -rdynamic -pie)
+    "${cc[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I"$prefix/include" -I. -Isrc \
+        src/probe.c src/runtime*.c src/vulkan_smoke.c out/bionic/libatrac9.a -lm "${links[@]}" -o "$out/bin/bb-probe"
+    echo "Built $out/lib/libbbcpu.so (native-only, no FEXCore) and $out/bin/bb-probe"
+    BB_OUT="$out" tools/android/check_bionic_symbols.sh
+    exit 0
+fi
 mkdir -p "$out"
 ndk_cmake=(-DCMAKE_TOOLCHAIN_FILE="$toolchain" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$api -DANDROID_STL=c++_shared)
 # This port's changes to FSR-Vulkan (gpu/patches/fsr-vulkan), applied once, as build.sh does.

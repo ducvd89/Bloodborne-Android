@@ -11,7 +11,7 @@
 # dlopen'ed modules are additionally checked the way Android's linker resolves them (see below).
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
-out=out/bionic
+out=${BB_OUT:-out/bionic}
 ndk=${BB_NDK:-$PWD/.local-deps/android/sdk/ndk/29.0.14206865}
 llvm=$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin
 api=${BB_ANDROID_API:-30}

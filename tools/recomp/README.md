@@ -76,12 +76,34 @@ The catalogs are generated from the sources and checked in (they hold addresses,
     tools/recomp/variants/gen_patchers.py                                                 # patchers.txt + hooks-patchers.txt: runs the frame rate, display and guard patchers (needs the image)
     (each has --check: exit 1 when the catalog is out of date)
 
-Tests: `bb-recomp-asmtest --variant-selftest` (a patched function and a cave compiled as variants, run in the in-process JIT, hashes and alternatives checked),
+Tests: `bb-recomp-asmtest --granular-selftest` (a unit entered at every instruction boundary of a granular function, flags from the context, a non-boundary refused),
+`bb-recomp-asmtest --variant-selftest` (a patched function and a cave compiled as variants, run in the in-process JIT, hashes and alternatives checked),
 `bb-recomp-asmtest --hook-selftest` (a hook callback fires, edits registers, flags survive, resume points in the middle of a block and at block entries, return, dispatcher jump, loops),
 `tests/run_aot_patchers_test.sh` (the patchers' hook slot callbacks against the semantics of the stubs they replace), `tests/run_aot_variants_test.sh` (the runtime's classification of functions, redirects, un-dirtying and hook slots on synthetic tables) and `tests/run_guest_code_hooks_test.sh` (the shim's slot path).
 
 Sanitizers: `cmake ... -DBB_RECOMP_SANITIZE=address,undefined` builds the tool and the test tools with ASan and UBSan (FEXCore itself uncovered). Under ASan the default image base 0x200000000 and the tests'
 low fixed addresses lie in ASan's shadow gap: use `--base 200000000000` (bb-recomp), `--high-addresses` (bb-recomp-difftest) and `ASAN_OPTIONS=detect_leaks=0:protect_shadow_gap=0`.
+
+### Gaps: granular entries, the misses log, `--extra-entries` (phase 6: native only, no FEX fallback)
+
+The runtime logs every guest address no unit covers (`files/bbport/logs/aot-misses.log`) and, with `BB_AOT_STRICT=1` (always in the `BB_AOT_ONLY` runtime), stops there instead of
+running FEX (docs/RECOMP_ABI.md, "Misses, strict mode and the misses log"). The tool closes gaps in two ways:
+
+    --granular off|jumps|all   units of a granular function can be entered at every instruction boundary they hold (dynamic jump targets inside a function). Default `jumps`: the
+                               functions with a table-like indirect jump the lifter could not resolve for sure; --granular-funcs <file> adds more
+    --extra-entries <file>     addresses to make unit entries: a misses log as it is, or one hex address per line
+
+The loop for a tester's report: take the `miss +0x...` lines of `aot-misses.log`, rebuild with them, redeploy the `.so`:
+
+    nice -n 19 out/recomp-build/bb-recomp --elf out/eboot.elf --boot out/boot-linked.bin --prx-dir <game>/sce_module --target aarch64 --so out/aot/libbbaot.so -O1 \
+        --variants tools/recomp/variants --extra-entries aot-misses.log --ndk <ndk>      # prints how many addresses were new units, mid-function units, or rejected
+
+and to check a list without compiling (about 2 s):
+
+    out/recomp-build/bb-recomp --elf out/eboot.elf --boot out/boot-linked.bin --prx-dir <game>/sce_module --units-only --extra-entries aot-misses.log \
+        --check-entries 20,210ebc0,23a9c9c --dump-units out/units.txt     # each address: unit entry | granular entry | case of a resolved jump table | NOT COVERED (exit status 3)
+
+`--dump-units` writes the unit table (`unit <entry> <end> <extra> <function> <granular>`), the granular functions and the weak (unresolved or only scanned) indirect jumps with the reason.
 
 ### The runtime's image: eboot + linked modules, discovery, secondary entries
 

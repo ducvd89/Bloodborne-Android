@@ -13,9 +13,29 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+// Build flavours (cpu/bbcpu.cmake, tools/android/build_bionic.sh):
+//   FEX build (BB_AOT_FEX_STATE): libbbcpu holds FEXCore; the units' GuestState is FEX's thread state, FEX is the fallback CPU.
+//   x86-64 PC build (neither): the host CPU is the fallback; the unit tests and the PC runtime use it.
+//   BB_AOT_ONLY: no FEX, no fallback CPU of any kind (cpu/guest_cpu_native.cpp supplies the few bb_fb_* services the engine needs: stubs, CPUID,
+//   TSC, fault handling). A guest address no unit covers is a bug in the .so, not a slow path: strict mode is always on.
+#if defined(BB_AOT_ONLY) && defined(BB_AOT_FEX_STATE)
+#error "BB_AOT_ONLY and BB_AOT_FEX_STATE exclude each other"
+#endif
+#if defined(__x86_64__) && !defined(BB_AOT_FEX_STATE) && !defined(BB_AOT_ONLY)
+#define BB_AOT_X86_NATIVE 1   // the host CPU runs what the units do not cover
+#endif
+#if defined(BB_AOT_FEX_STATE) || defined(BB_AOT_ONLY)
+#define BB_AOT_FB_EXT 1       // stubs, sentinel, CPUID, XGETBV and the unaligned-atomic handler come from the bb_fb_* services
+#define BB_AOT_ARM 1
+#endif
 #include "guest_cpu_fallback.h"
+#include "guest_cpu_atomics.h"
+#ifdef BB_AOT_ARM
+#include "guest_cpu_native.h"   // strict mode: CPUID, XGETBV, TSC and the unaligned-atomic handler without FEX (every AArch64 build)
+#endif
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -26,12 +46,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__x86_64__)
@@ -93,7 +116,7 @@ struct Thread {
 };
 thread_local Thread* self;
 extern "C" {
-#if defined(__x86_64__) && !defined(BB_AOT_FEX_STATE)
+#if defined(BB_AOT_X86_NATIVE)
 // Read by the asm below (local-exec TLS): the thread's state for the native return path, and the guest rsp of the host
 // function being called (written by the host-function stubs and by call_host).
 __thread GuestState* bbaot_state_ptr;
@@ -142,12 +165,14 @@ struct Engine {
     std::vector<std::pair<uintptr_t, size_t>> ranges;
     bool stats = false;
     bool trace = false;
+    bool strict = false;                  // BB_AOT_STRICT=1 (always in BB_AOT_ONLY builds): a miss stops the game, no fallback CPU
+    const char* miss_log = "logs/aot-misses.log";   // BB_AOT_MISS_LOG overrides
     void* (*low_map)(size_t, int) = nullptr;
     std::atomic<Thread*> threads {nullptr};
     uint64_t sentinel = 0;
 } E;
 
-#if defined(__x86_64__) && !defined(BB_AOT_FEX_STATE)
+#if defined(BB_AOT_X86_NATIVE)
 constexpr bool NativeFallback = true;
 #else
 constexpr bool NativeFallback = false;
@@ -359,7 +384,7 @@ bool BuildTable() {
 
 // ------------------------------------------------------------------------------------ fallback CPU run ----
 
-#if defined(__x86_64__) && !defined(BB_AOT_FEX_STATE)
+#if defined(BB_AOT_X86_NATIVE)
 // Native execution on the host CPU. bbaot_native_enter loads the guest registers from the state, switches to the guest
 // stack and jumps to the target. The guest returns to bbaot_native_ret_a (the return address we put on its stack, so the
 // callee returns to us) or bbaot_native_ret_s (the sentinel at the bottom of the guest stack: it unwound past us, by a
@@ -630,6 +655,14 @@ static_assert(offsetof(HostResult, v) == 16);
 thread_local uint64_t guest_rsp_at_host_call;
 
 uint64_t Sentinel() { return bb_fb_sentinel(); }
+#ifdef BB_AOT_ONLY
+// No fallback CPU in this build. Strict mode (always on here) stops at the first miss before it gets here; this is the backstop.
+[[noreturn]] void NoFallback(uint64_t target) {
+    Fatal("native code is missing an entry and this build has no fallback CPU (offset)", target - E.base);
+}
+void FallbackRun(GuestState*, uint64_t target, bool, Thread*) { NoFallback(target); }
+bool FallbackRunUntil(GuestState*, uint64_t target, uint64_t, Thread*) { NoFallback(target); }
+#else
 void FallbackRun(GuestState* s, uint64_t target, bool call, Thread* t) {
     if (!E.stats) { bb_fb_run(s, target, call); return; }
     if (!call) ++t->free_runs;
@@ -645,6 +678,7 @@ bool FallbackRunUntil(GuestState* s, uint64_t target, uint64_t slot, Thread* t) 
     if (outer) { t->fb_ticks += Ticks() - t->fb_start; t->fb_running = false; }
     return here;
 }
+#endif
 void CallHostFn(GuestState* s, void* fn) {
     HostArgs a;
     a.x[0] = s->gregs[RDI]; a.x[1] = s->gregs[RSI]; a.x[2] = s->gregs[RDX];
@@ -677,7 +711,9 @@ Thread* Current() {
     if (!t->s) Fatal("cannot allocate a guest state");
     new (t->s) GuestState();
     ResetGuestState(*t->s);
+#if defined(BB_AOT_X86_NATIVE)
     bbaot_state_ptr = t->s;
+#endif
 #endif
     t->tid = pid_t(syscall(SYS_gettid));
     if (E.stats) RegisterThread(t);
@@ -710,8 +746,164 @@ void* StubFunction(uint64_t target) {
     return nullptr;
 }
 
+
+// -------------------------------------------------------------------------- granular entries, misses, strict mode ----
+// Granular entries (docs/RECOMP_ABI.md): the units of a function marked in bbr_func_granular[] can be entered at any instruction boundary they
+// hold: a unit called with the resume flag set (GuestState::_pad1 = 1) and rip at the wanted address continues there and clears the flag, or
+// returns at once with the flag still set when the address is not one of its boundaries. The dispatcher asks the function's units one by one.
+struct GranRec { uint32_t start, end, first, count; };   // bbr_funcs[] (the same record guest_cpu_aot_hooks.inc calls FuncRec)
+struct Gran {
+    const GranRec* funcs = nullptr;
+    uint64_t nfuncs = 0;
+    const uint8_t* flags = nullptr;    // bbr_func_granular[]
+    std::atomic<uint64_t> entries {0}, rejected {0};
+} G;
+
+bool GranularEntry(GuestState* s, uint64_t target, Thread* t) {
+    if (!G.flags) return false;
+    const uint64_t offset = target - E.base;
+    if (offset >= E.size) return false;
+    const GranRec* end = G.funcs + G.nfuncs;
+    const GranRec* f = std::upper_bound(G.funcs, end, offset, [](uint64_t v, const GranRec& r) { return v < r.start; });
+    if (f == G.funcs) return false;
+    --f;
+    if (offset >= f->end || !G.flags[f - G.funcs]) return false;
+    for (uint32_t u = f->first; u < f->first + f->count; ++u) {
+        UnitFn fn = __atomic_load_n(&E.fns[u], __ATOMIC_ACQUIRE);
+        s->rip = target;
+        s->_pad1 = 1;
+        fn(s);
+        if (s->_pad1 == 0) {                      // the unit took it and ran the code from there
+            if (E.stats) { ++t->unit_dispatch; G.entries.fetch_add(1, std::memory_order_relaxed); }
+            return true;
+        }
+    }
+    s->_pad1 = 0;
+    G.rejected.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+enum class MissKind { Call, Jump, Unwind, Patched, Outside };
+const char* const MissKindNames[] = {"call", "jump", "unwind", "patched", "outside"};
+
+struct MissLog {
+    std::mutex lock;
+    int fd = -1;
+    bool tried = false;
+    std::unordered_map<uint64_t, uint64_t> seen;     // address -> times
+    bool atexit_set = false;
+} ML;
+
+void MissLogWrite(const char* text, size_t n) {   // ML.lock held
+    if (!ML.tried) {
+        ML.tried = true;
+        ML.fd = open(E.miss_log, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (ML.fd < 0) std::fprintf(stderr, "AOT: cannot open the misses log %s: %s\n", E.miss_log, std::strerror(errno));
+        else {
+            char head[256];
+            const int m = std::snprintf(head, sizeof head, "# bb aot misses (image offsets; feed this file to bb-recomp --extra-entries), pid %d, image base %#llx, %s\n", int(getpid()),
+                                        (unsigned long long)E.base, E.strict ? "strict" : "fallback on");
+            if (write(ML.fd, head, size_t(m)) < 0) {}
+        }
+    }
+    if (ML.fd >= 0 && write(ML.fd, text, n) < 0) {}
+}
+
+// The guest return addresses on the stack: [rsp], then the rbp chain (the game's code keeps frame pointers).
+std::string GuestBacktrace(const GuestState* s) {
+    std::string out;
+    char b[32];
+    auto add = [&](uint64_t a) {
+        if (a - E.base >= E.size) return false;
+        std::snprintf(b, sizeof b, "%s+%#llx", out.empty() ? "" : ",", (unsigned long long)(a - E.base));
+        out += b;
+        return true;
+    };
+    add(ReadGuest(s->gregs[RSP]));
+    uint64_t rbp = s->gregs[RBP];
+    for (unsigned i = 0; i < 24 && rbp && !(rbp & 7); ++i) {
+        const uint64_t ret = ReadGuest(rbp + 8), next = ReadGuest(rbp);
+        if (!ret || !add(ret)) break;
+        if (next <= rbp) break;
+        rbp = next;
+    }
+    return out;
+}
+
+void MissLogTotals() {
+    std::lock_guard<std::mutex> g(ML.lock);
+    for (auto& [a, n] : ML.seen) {
+        if (n < 2) continue;
+        char line[96];
+        const int m = std::snprintf(line, sizeof line, "# count +%#llx %llu\n", (unsigned long long)a, (unsigned long long)n);
+        MissLogWrite(line, size_t(m));
+    }
+}
+
+// Every miss (a guest address no unit and no granular entry covers) is logged once per address to the misses log, with the thread and a backtrace of
+// guest return addresses, so that testers' reports find the gaps (docs/RECOMP_ABI.md, "Strict mode"; bb-recomp --extra-entries turns the log into entries).
+// Strict mode then stops the game.
+[[gnu::noinline]] void NoteMiss(GuestState* s, uint64_t target, Thread* t, MissKind kind) {
+    (void)t;
+    const bool inside = target - E.base < E.size;
+    char name[32] = "?";
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    bool first;
+    {
+        std::lock_guard<std::mutex> g(ML.lock);
+        first = ++ML.seen[target] == 1;
+        if (first || E.strict) {
+            char line[1024];
+            const std::string bt = GuestBacktrace(s);
+            int m;
+            if (inside)
+                m = std::snprintf(line, sizeof line, "miss +%#llx kind=%s thread=%s tid=%d rsp=%#llx backtrace=%s\n", (unsigned long long)(target - E.base), MissKindNames[int(kind)], name,
+                                  int(syscall(SYS_gettid)), (unsigned long long)s->gregs[RSP], bt.c_str());
+            else
+                m = std::snprintf(line, sizeof line, "outside %#llx kind=%s thread=%s tid=%d rsp=%#llx backtrace=%s\n", (unsigned long long)target, MissKindNames[int(kind)], name,
+                                  int(syscall(SYS_gettid)), (unsigned long long)s->gregs[RSP], bt.c_str());
+            MissLogWrite(line, size_t(m));
+            if (!ML.atexit_set && !E.strict) { ML.atexit_set = true; std::atexit(MissLogTotals); }
+        }
+    }
+    if (first && !E.strict)
+        std::fprintf(stderr, "AOT: miss at %s (%s): the fallback CPU runs it; logged in %s\n", inside ? "an image address" : "an address outside the image", MissKindNames[int(kind)], E.miss_log);
+    if (!E.strict) return;
+    if (inside && kind != MissKind::Patched)
+        std::fprintf(stderr, "STOP: AOT: native code is missing an entry at +%#llx; please report this, or turn Native CPU off (details: %s)\n", (unsigned long long)(target - E.base), E.miss_log);
+    else if (inside)
+        std::fprintf(stderr, "STOP: AOT: native code for a patched or hooked function has no variant at +%#llx; please report this, or turn Native CPU off (details: %s)\n",
+                     (unsigned long long)(target - E.base), E.miss_log);
+    else
+        std::fprintf(stderr, "STOP: AOT: guest code ran at %#llx, outside the image, which native code cannot run; please report this, or turn Native CPU off (details: %s)\n",
+                     (unsigned long long)target, E.miss_log);
+    std::fflush(nullptr);
+    _exit(22);
+}
+
+// The game's import traps for imports nothing resolves (src/probe.c): `mov rsi,rdi; mov edi,<index>; movabs rax,<handler stub>; jmp rax`, 32 bytes each,
+// in a code range of their own. Recognised here instead of run: the handler (the host function `unresolved`) then gets (index, rdi) as it would.
+uint64_t TrapHandler(GuestState* s, uint64_t target) {
+    if (E.ranges.size() < 2) return 0;
+    for (size_t i = 1; i < E.ranges.size(); ++i) {
+        const auto [base, size] = E.ranges[i];
+        if (target - base >= size || (target - base) % 32 || target - E.stub_base < E.stub_bytes) continue;
+        const unsigned char* t = reinterpret_cast<const unsigned char*>(target);
+        if (t[0] != 0x48 || t[1] != 0x89 || t[2] != 0xfe || t[3] != 0xbf || t[8] != 0x48 || t[9] != 0xb8 || t[18] != 0xff || t[19] != 0xe0) return 0;
+        uint32_t index;
+        uint64_t handler;
+        std::memcpy(&index, t + 4, 4);
+        std::memcpy(&handler, t + 10, 8);
+        s->gregs[RSI] = s->gregs[RDI];
+        s->gregs[RDI] = index;
+        return handler;
+    }
+    return 0;
+}
+
 // A call or jump to an address that is not a unit entry: a host function (import), or code for the fallback CPU.
 void Miss(GuestState* s, uint64_t target, Thread* t, bool dirty_unit) {
+    NoteMiss(s, target, t, dirty_unit ? MissKind::Patched : (target - E.base < E.size ? MissKind::Call : MissKind::Outside));
     Trace(t, dirty_unit ? EvDirty : EvMiss, target, s->gregs[RSP], *reinterpret_cast<uint64_t*>(s->gregs[RSP]));
     if (E.stats) {
         ++t->misses;
@@ -886,6 +1078,7 @@ uint64_t ReturnSlot(const GuestState* s, uint64_t target) {
 // address is on the guest stack (the frame is mid-function), so it cannot return to the unit: it runs to the end of the
 // guest stack, which makes everything above it native too. Counted in the statistics (mid-unit jumps).
 [[gnu::noinline]] void MidUnitJump(GuestState* s, uint64_t target, Thread* t) {
+    NoteMiss(s, target, t, MissKind::Jump);
     mid_unit_jumps.fetch_add(1, std::memory_order_relaxed);
     if (E.stats) { ++t->misses; CountMiss(target, false); }
     Trace(t, EvFree, target, s->gregs[RSP]);
@@ -928,9 +1121,18 @@ uint64_t ReturnSlot(const GuestState* s, uint64_t target) {
                 plt_hops.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+        } else if (hops < 8) {
+            // An import trap of src/probe.c (an import nothing resolves): its handler is a host function stub.
+            if (const uint64_t handler = TrapHandler(s, target)) {
+                target = handler;
+                s->rip = target;
+                continue;
+            }
         }
         break;
     }
+    // An instruction boundary inside a function with granular entries (a computed jump the lifter could not resolve, a jump into the middle of a function).
+    if (GranularEntry(s, target, t)) return;
     if (tail && target - E.base < E.text_end && !IsUnitEntry(target - E.base)) {
         MidUnitJump(s, target, t);
         return;
@@ -1008,7 +1210,12 @@ uint64_t Fnv(const unsigned char* p, uint64_t n) {
 // Once, before the first guest call (every patch and hook of the start-up is in the image by then): compare each unit's
 // bytes with what the .so was built from.
 void PrepareImage() {
-    if (!E.base) { E.on = false; std::fprintf(stderr, "AOT: no guest image was registered: the fallback CPU only\n"); return; }
+    if (!E.base) {
+        E.on = false;
+        std::fprintf(stderr, "AOT: no guest image was registered: the fallback CPU only\n");
+        if (E.strict) Fatal("no guest image was registered; native code cannot run (strict mode: no fallback CPU)");
+        return;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t bad = 0;
     std::vector<uint64_t> bad_units;
@@ -1024,6 +1231,7 @@ void PrepareImage() {
         E.on = false;
         std::fprintf(stderr, "AOT: %llu of %llu units differ from the image: this .so was built from another image; the fallback CPU only\n",
                      (unsigned long long)bad, (unsigned long long)E.count);
+        if (E.strict) Fatal("the unit library was built from another image; native code cannot run (strict mode: no fallback CPU)", bad, E.count);
         return;
     }
     {
@@ -1107,6 +1315,13 @@ void Load(const char* path) {
     if (abi_flags && (*abi_flags & 2)) E.dirty_flags = static_cast<uint8_t*>(dlsym(so, "bbr_dirty"));
     if (abi_flags && (*abi_flags & 1))
         std::fprintf(stderr, "AOT: %s has resume entries (bbr_abi_flags bit 0); this runtime does not use them\n", path);
+    if (abi_flags && (*abi_flags & 16)) {   // granular entries: bbr_func_granular[] says which functions of bbr_funcs[] have them
+        G.funcs = static_cast<const GranRec*>(dlsym(so, "bbr_funcs"));
+        const auto* nf = static_cast<const uint64_t*>(dlsym(so, "bbr_func_count"));
+        G.flags = static_cast<const uint8_t*>(dlsym(so, "bbr_func_granular"));
+        G.nfuncs = nf ? *nf : 0;
+        if (!G.funcs || !G.flags || !G.nfuncs) { G.flags = nullptr; std::fprintf(stderr, "AOT: %s: granular entries declared but their tables are missing\n", path); }
+    }
     E.stats = std::getenv("BB_AOT_STATS") != nullptr;
     E.trace = std::getenv("BB_AOT_TRACE") != nullptr;
     if (const char* c = std::getenv("BB_AOT_CFI")) E.cfi = std::strcmp(c, "0") != 0;
@@ -1151,7 +1366,14 @@ BBR_EXPORT void bbr_unwound(GuestState* s) {
     Thread* t = Current();
     if (t->unwound_depth >= 16) return;
     const UnitFn fn = Lookup(offset);
-    if (!fn) return;
+    if (!fn) {
+        // (a granular function's instruction boundary: run from here, nested like the unit case)
+        ++t->unwound_depth;
+        const bool ran = GranularEntry(s, s->rip, t);
+        --t->unwound_depth;
+        if (ran) unwound_runs.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     unwound_runs.fetch_add(1, std::memory_order_relaxed);
     ++t->unwound_depth;
     fn(s);
@@ -1182,6 +1404,7 @@ BBR_EXPORT void bbr_dirty_entry(GuestState* s, uint64_t vaddr) {
     const UnitEntry* end = E.units + E.count;
     const UnitEntry* at = std::lower_bound(E.units, end, vaddr, [](const UnitEntry& u, uint64_t v) { return u.vaddr < v; });
     if (at != end && at->vaddr == vaddr && E.extra[at - E.units]) {
+        NoteMiss(s, target, t, MissKind::Patched);
         if (E.stats) { ++t->misses; ++t->dirty_runs; CountMiss(target, true); }
         Trace(t, EvFree, target, s->gregs[RSP]);
         if (const uint64_t slot = ReturnSlot(s, target)) {
@@ -1213,19 +1436,23 @@ BBR_EXPORT void bbr_syscall(GuestState* s) {
 struct CpuidResult { uint64_t lo, hi; };
 BBR_EXPORT CpuidResult bbr_cpuid(GuestState*, uint64_t leaf, uint64_t subleaf) {
     uint32_t r[4];
-#if defined(BB_AOT_FEX_STATE)
-    bb_fb_cpuid(leaf, subleaf, r);   // FEX's own CPUID model: the values the game sees today
+#if defined(BB_AOT_FB_EXT)
+    if (E.strict) bbnative::Cpuid(leaf, subleaf, r);   // strict mode: no FEX, FEX's CPUID model with the host features fixed (cpu/guest_cpu_cpuid.h)
+    else bb_fb_cpuid(leaf, subleaf, r);                // FEX's own CPUID model: the values the game sees today
 #else
     __cpuid_count(uint32_t(leaf), uint32_t(subleaf), r[0], r[1], r[2], r[3]);  // as the native PC build runs it
 #endif
     return {uint64_t(r[0]) | uint64_t(r[1]) << 32, uint64_t(r[2]) | uint64_t(r[3]) << 32};
 }
 BBR_EXPORT uint64_t bbr_rdtsc(void) {
+#ifdef BB_AOT_ARM
+    if (E.strict) return bbnative::Tsc();
+#endif
     return bb_fb_tsc();
 }
 BBR_EXPORT uint64_t bbr_xgetbv(uint64_t function) {
-#if defined(BB_AOT_FEX_STATE)
-    return bb_fb_xgetbv(function);
+#if defined(BB_AOT_FB_EXT)
+    return E.strict ? bbnative::Xgetbv(function) : bb_fb_xgetbv(function);
 #else
     uint32_t eax, edx;
     __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(uint32_t(function)));
@@ -1289,7 +1516,7 @@ BBR_EXPORT void bbr_pop_rounding(uint64_t saved) {
 // ============================================================================================ guest_cpu.h ====
 namespace {
 // Host functions get a stub on x86-64 hosts when AOT is on (they are plain function pointers without it).
-#if defined(__x86_64__) && !defined(BB_AOT_FEX_STATE)
+#if defined(BB_AOT_X86_NATIVE)
 constexpr size_t StubBytesTotal = 1 << 20;
 constexpr size_t StubSize = 32;
 void* x86_stub_fns[StubBytesTotal / StubSize];
@@ -1342,10 +1569,24 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     bb_fb_init(map);
     E.low_map = map;
     const char* path = std::getenv("BB_AOT");
+#ifdef BB_AOT_ONLY
+    E.strict = true;   // nothing else to fall back to
+    if (!path || !*path || std::strcmp(path, "0") == 0)
+        Fatal("this runtime has no FEX: BB_AOT=<libbbaot.so> is required (Native CPU off needs the runtime with FEX)");
+#else
     if (!path || !*path || std::strcmp(path, "0") == 0) return;  // BB_AOT=0: off (FEX alone)
+    if (const char* st = std::getenv("BB_AOT_STRICT")) E.strict = *st && std::strcmp(st, "0") != 0;   // no FEX for anything: a miss logs and stops the game
+#endif
+    if (const char* ml = std::getenv("BB_AOT_MISS_LOG")) E.miss_log = ml;
+#ifdef BB_AOT_ARM
+    if (E.strict) bbnative::Init();
+#endif
     Load(path);
+#ifdef BB_AOT_ONLY
+    if (!E.on) Fatal("the unit library could not be loaded (see the lines above); this runtime has no fallback CPU");
+#endif
     if (!E.on) return;
-#if defined(BB_AOT_FEX_STATE)
+#if defined(BB_AOT_FB_EXT)
     E.stub_fns = bb_fb_stubs(&E.stub_base, &E.stub_bytes);
     E.stub_stride = 16;
 #elif defined(__x86_64__)
@@ -1365,7 +1606,7 @@ void guest_cpu_code(uintptr_t base, size_t size) {
 }
 
 uintptr_t guest_cpu_host_function(void* fn) {
-#if defined(__x86_64__) && !defined(BB_AOT_FEX_STATE)
+#if defined(BB_AOT_X86_NATIVE)
     if (E.on) return MakeStub(fn);
 #endif
     return bb_fb_host_function(fn);
@@ -1426,7 +1667,9 @@ uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t* args) {
         UnitFn unit = offset < E.size ? Lookup(offset) : nullptr;
         if (unit) unit(&s);
         else if (void* host = StubFunction(rip)) HostCall(&s, host, t);
+        else if (GranularEntry(&s, rip, t)) {}
         else {
+            NoteMiss(&s, rip, t, MissKind::Unwind);
             if (E.stats) { ++t->misses; CountMiss(rip, false); }
             Trace(t, EvFree, rip, s.gregs[RSP]);
             if (const uint64_t slot = ReturnSlot(&s, rip)) {
@@ -1476,12 +1719,14 @@ void guest_cpu_thread_end(void) {
     Thread* t = self;
     if (E.on && t) {
         self = nullptr;
-        if (NativeFallback) {
+#if !defined(BB_AOT_FEX_STATE)
+        {   // (the state is ours unless FEX owns it)
             std::free(t->s);
             if (t->own_stack) munmap(reinterpret_cast<void*>(t->own_stack - t->own_stack_size), t->own_stack_size);
             for (uintptr_t top : t->nested) munmap(reinterpret_cast<void*>(top - NestedStack), NestedStack);
             t->s = nullptr;
         }
+#endif
         if (!E.stats) delete t;  // with statistics the thread stays on the list
     }
     bb_fb_thread_end();
@@ -1551,12 +1796,12 @@ __attribute__((visibility("default"))) void bbaot_crash_report(const void* ucont
 
 uintptr_t guest_cpu_host_pc(const void* ucontext) { return bb_fb_host_pc(ucontext); }
 int guest_cpu_handle_fault(int sig, siginfo_t* info, void* ucontext) {
-#if defined(BB_AOT_FEX_STATE)
+#if defined(BB_AOT_FB_EXT)
     // x86 `lock` operations may be unaligned; the units' LSE atomics fault when they cross 16 bytes: emulated, and the unit
     // goes on after the instruction.
     if (E.on && sig == SIGBUS && info->si_code == BUS_ADRALN) {
         const uintptr_t pc = bb_fb_host_pc(ucontext);
-        if (pc >= E.so_lo && pc < E.so_hi && bb_fb_handle_unaligned(ucontext)) {
+        if (pc >= E.so_lo && pc < E.so_hi && (E.strict ? bbnative::HandleUnalignedAtomic(ucontext) : bb_fb_handle_unaligned(ucontext) != 0)) {
             unaligned_atomics.fetch_add(1, std::memory_order_relaxed);
             return 1;
         }
@@ -1595,6 +1840,16 @@ void guest_cpu_invalidate(uintptr_t address, size_t size) {
     MarkDirty(address, size);
     bb_fb_invalidate(address, size);
 }
-uint64_t guest_cpu_tsc(void) { return bb_fb_tsc(); }
-uint64_t guest_cpu_tsc_frequency(void) { return bb_fb_tsc_frequency(); }
+uint64_t guest_cpu_tsc(void) {
+#ifdef BB_AOT_ARM
+    if (E.on && E.strict) return bbnative::Tsc();
+#endif
+    return bb_fb_tsc();
+}
+uint64_t guest_cpu_tsc_frequency(void) {
+#ifdef BB_AOT_ARM
+    if (E.on && E.strict) return bbnative::TscFrequency();
+#endif
+    return bb_fb_tsc_frequency();
+}
 }  // extern "C"
