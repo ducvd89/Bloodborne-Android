@@ -561,7 +561,7 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
             release();
             return Disabled("no memory next to the game's code");
         }
-        // The stub page is guest code (FEXCore translates what the jumps lead to there).
+        // The stub page is guest code (registered with guest_cpu_code).
         guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), StubPageSize);
         live = new (data) Live{};
     }

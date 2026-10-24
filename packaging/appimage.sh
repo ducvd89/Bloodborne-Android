@@ -12,8 +12,8 @@ cd -- "$(dirname -- "$0")/.."
 arch=$(uname -m)
 libs=(out/bb-probe out/gpu/libbbgpu.so)
 if [[ $arch == aarch64 ]]; then
-    [[ -f out/fex/libbbcpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
-    libs+=(out/fex/libbbcpu.so)
+    [[ -f out/cpu/libbbcpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+    libs+=(out/cpu/libbbcpu.so)
 fi
 # NIX: the nix command (default nix; e.g. "nix-portable nix" without a system Nix).
 # BB_NIXPKGS: the nixpkgs the build's nix-shell used (-I nixpkgs=...), when not <nixpkgs>.

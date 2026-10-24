@@ -7,8 +7,8 @@
 // function may have changed (the start-up check, guest_cpu_invalidate) the function is classified again, by hashing its units:
 //   0 original: every unit hashes as built; the units run (their dirty bytes are cleared again: a patch that was undone, a toggle switched off)
 //   1 variant:  the bytes match a variant: the units' dirty bytes stay set, and each unit's entry (bbr_dirty_entry), and the dispatch table, go
-//               to the variant's unit of the same address; units the variant lacks run on the fallback
-//   2 dirty:    anything else: the whole function runs on the fallback, as before
+//               to the variant's unit of the same address; units the variant lacks stop the game when entered
+//   2 dirty:    anything else: the function has no native code, and the game stops when it is entered (strict mode)
 // A direct unit-to-unit call reaches the variant through the original unit's dirty entry: the dirty byte is set, bbr_dirty_entry finds the
 // redirect pointer of the unit. The .so's text is never written.
 //
@@ -96,7 +96,7 @@ int64_t FuncOfAddress(uint64_t vaddr) {
     return vaddr < it->end ? it - V.funcs : -1;
 }
 
-void SetUnitsBack(uint64_t f) {  // E.lock held: the original units run again (or the fallback runs them: the caller sets the dirty bytes)
+void SetUnitsBack(uint64_t f) {  // E.lock held: the original units run again (or they stay out: the caller sets the dirty bytes)
     const FuncRec& fr = V.funcs[f];
     for (uint32_t u = fr.first; u < fr.first + fr.count; ++u) {
         __atomic_store_n(&V.redirect[u], UnitFn(nullptr), __ATOMIC_RELEASE);
@@ -118,13 +118,13 @@ void SetOriginal(uint64_t f) {  // E.lock held
     V.state[f] = 0;
 }
 
-void NoteHooksInactive(uint64_t f) {  // slot hooks in a function that now runs on the fallback do not fire: say so, once per site
+void NoteHooksInactive(uint64_t f) {  // slot hooks in a function that now has no native code do not fire: say so, once per site
     const FuncRec& fr = V.funcs[f];
     for (uint64_t k = 0; k < V.nsites; ++k) {
         if (V.sites[k].vaddr < fr.start || V.sites[k].vaddr >= fr.end || !V.recs[k].load()) continue;
         static std::atomic<uint64_t> told {0};
         if (told.fetch_add(1) < 16)
-            std::fprintf(stderr, "AOT: the hook at +%#llx is inactive: its function was patched and runs on the fallback CPU\n", (unsigned long long)V.sites[k].vaddr);
+            std::fprintf(stderr, "AOT: the hook at +%#llx is inactive: its function was patched and has no native variant\n", (unsigned long long)V.sites[k].vaddr);
     }
 }
 
@@ -192,11 +192,11 @@ void ResolveUnits(const std::vector<uint64_t>& units) {  // E.lock held
     NewResolveEpoch();
     for (uint64_t i : units) ResolveUnit(i);
     if (V.enabled)
-        std::printf("AOT: %llu functions run as patch variants, %llu on the fallback CPU (patched without a variant)\n",
+        std::printf("AOT: %llu functions run as patch variants, %llu patched without a variant (the game stops if one is entered)\n",
                     (unsigned long long)V.to_variant.load(), (unsigned long long)V.to_dirty.load());
 }
 
-// bbr_dirty_entry: the variant unit of a dirty unit, or null (the fallback runs it).
+// bbr_dirty_entry: the variant unit of a dirty unit, or null (a miss).
 inline UnitFn VariantRedirect(uint64_t vaddr) {
     if (!V.enabled) return nullptr;
     const int64_t i = TableIndex(vaddr);
@@ -220,12 +220,6 @@ void LoadVariantTables(void* so, uint64_t abi_flags) {
             if (E.dirty[u]) { const int64_t f = FuncOfUnit(u); if (f >= 0) V.locked[f] = 1; }
         V.enabled = true;
     }
-    // BB_AOT_VARIANTS=0 / BB_AOT_HOOK_SLOTS=0: without patch variants / native hook slots (A/B tests: patched functions and hooked
-    // sites then run on the fallback CPU as before phase 4).
-    const char* ev = std::getenv("BB_AOT_VARIANTS");
-    const char* eh = std::getenv("BB_AOT_HOOK_SLOTS");
-    if (ev && std::strcmp(ev, "0") == 0) abi_flags &= ~uint64_t(4);
-    if (eh && std::strcmp(eh, "0") == 0) abi_flags &= ~uint64_t(8);
     if ((abi_flags & 4) && V.enabled) {
         const auto* vfuncs = static_cast<const VFuncRec*>(dlsym(so, "bbr_vfuncs"));
         const auto* nv = static_cast<const uint64_t*>(dlsym(so, "bbr_vfunc_count"));
@@ -301,7 +295,7 @@ uint64_t RunSlot(GuestState* s, uint64_t k) {
         std::memcpy(x.ymm[i] + 16, s->avx_high[i], 16);
     }
     // The callback may call guest code (guest_cpu_call): the call starts below this frame's red zone (guest_cpu_call uses the state's rsp, which the
-    // unit stored before the call); the native fallback's host stack bookkeeping is told the guest rsp as for a host function.
+    // unit stored before the call); the host-call bookkeeping is told the guest rsp as for a host function.
     const uint64_t saved_host_rsp = GuestRspAtHostCall();
     NoteGuestRsp(s->gregs[RSP]);
     const uint32_t act = r->ex(r->context, &x);
@@ -334,7 +328,7 @@ int64_t SiteIndex(uintptr_t address) {
     return it - V.sites;
 }
 
-// Is the code at the site run by the units (not the fallback)? E.lock held; classifies the function first.
+// Is the code at the site run by the units (the function is original or has a variant)? E.lock held; classifies the function first.
 bool SiteRunsNatively(int64_t k) {
     const int64_t f = FuncOfAddress(V.sites[k].vaddr);
     if (f < 0 || V.locked[f]) return false;
@@ -343,23 +337,7 @@ bool SiteRunsNatively(int64_t k) {
     return V.state[f] != 2;
 }
 
-// BB_AOT_NO_SLOTS=hex[,hex...] (image offsets) or "all": those hooks take the old way (A/B tests of single sites).
-bool NoSlotByEnv(uintptr_t address) {
-    const char* no = std::getenv("BB_AOT_NO_SLOTS");
-    if (!no) return false;
-    if (std::strcmp(no, "all") == 0) return true;
-    for (const char* p = no; *p;) {
-        char* end;
-        const uint64_t off = std::strtoull(p, &end, 16);
-        if (end == p) break;
-        if (off == address - E.base) return true;
-        p = *end == ',' ? end + 1 : end;
-    }
-    return false;
-}
-
 int InstallSlot(uintptr_t address, GuestHook regs, GuestHookEx ex, void* context) {
-    if (NoSlotByEnv(address)) return 0;
     if (!E.on || !V.nsites) return 0;
     const int64_t k = SiteIndex(address);
     if (k < 0) return 0;

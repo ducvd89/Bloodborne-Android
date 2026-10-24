@@ -8,7 +8,7 @@
 }:
 let
   lib = pkgs.lib;
-  # aarch64 hosts: the game's x86-64 code runs in FEXCore (out/fex/libbbcpu.so, build.sh).
+  # aarch64 hosts: the game's x86-64 code runs as native recompiled units (out/cpu/libbbcpu.so, build.sh).
   arm = pkgs.stdenv.hostPlatform.isAarch64;
   root = ./..;
   # FSR 4.1.1 models are extracted from AMD's DLLs: never in a public package. BB_PACKAGE_FSR411=1
@@ -19,7 +19,7 @@ let
   # Only what the package needs (the tree also holds builds, profiles and captures).
   wanted = [
     "run.sh" "out" "out/bb-probe" "out/bb-gpu-capabilities" "out/gpu" "out/gpu/libbbgpu.so" "tools"
-  ] ++ lib.optionals arm [ "out/fex" "out/fex/libbbcpu.so" ] ++ assetDirs;
+  ] ++ lib.optionals arm [ "out/cpu" "out/cpu/libbbcpu.so" ] ++ assetDirs;
   src = builtins.path {
     name = "bbport-src";
     path = root;
@@ -177,7 +177,7 @@ pkgs.stdenv.mkDerivation {
     install -m755 out/bb-probe $d/bin/bb-probe
     install -m755 out/bb-gpu-capabilities $d/bin/bb-gpu-capabilities
     install -Dm755 out/gpu/libbbgpu.so $d/bin/gpu/libbbgpu.so
-    ${lib.optionalString arm "install -Dm755 out/fex/libbbcpu.so $d/bin/cpu/libbbcpu.so"}
+    ${lib.optionalString arm "install -Dm755 out/cpu/libbbcpu.so $d/bin/cpu/libbbcpu.so"}
     ${lib.optionalString (mangohudSrc != "") ''
       if [ -f ${mangohud.src}/MangoHud/MangoHud.conf ]; then
         install -Dm644 ${mangohud.src}/MangoHud/MangoHud.conf $d/mangohud/MangoHud.conf

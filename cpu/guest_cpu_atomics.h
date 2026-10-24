@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Unaligned x86 `lock` operations in ahead-of-time code, without FEX (BB_AOT_ONLY).
+// Unaligned x86 `lock` operations in ahead-of-time code (the runtime has no JIT or interpreter to do it).
 //
 // x86 `lock add [mem]`, `lock cmpxchg`, `xchg [mem]`, `lock cmpxchg16b` accept any alignment. The units use AArch64 LSE atomics
 // (LDADDAL, LDCLRAL, LDSETAL, LDEORAL, SWPAL, CASAL, CASPAL ...), which fault with SIGBUS when the access crosses a 16-byte granule
 // (FEAT_LSE2 only covers an access inside one). The fault handler decodes the faulting instruction with EmulateAtomic, performs it
 // byte-wise under one global lock (atomic against the other emulated accesses, not against aligned atomics on the same bytes: the
-// same guarantee FEX's own non-JIT handler gives), writes the result registers and advances the pc.
+// same guarantee as any emulation can give), writes the result registers and advances the pc.
 //
 // Pure C++ without architecture-specific code: tests/test_aot_atomics.cpp runs it on the x86-64 PC against encoded instruction words.
 #ifndef BB_GUEST_CPU_ATOMICS_H

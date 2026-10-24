@@ -12,25 +12,7 @@
 #if !defined(__x86_64__)
 int main() { std::puts("aot strict test: x86-64 only"); return 0; }
 #else
-extern "C" {
-void bb_fb_init(void* (*)(size_t, int)) {}
-void bb_fb_code(uintptr_t, size_t) {}
-uintptr_t bb_fb_host_function(void* fn) { return uintptr_t(fn); }
-uint64_t bb_fb_call(uintptr_t, unsigned, const uint64_t*) { return 0; }
-void bb_fb_thread_stack(void*, size_t) {}
-void bb_fb_set_gs(void*) {}
-void bb_fb_abandon(void) {}
-void bb_fb_thread_end(void) {}
-uintptr_t bb_fb_return_address(uintptr_t n) { return n; }
-uintptr_t bb_fb_stack_pointer(void) { return 0; }
-int bb_fb_signal_regs(const void*, GuestRegs*) { return 0; }
-uintptr_t bb_fb_host_pc(const void*) { return 0; }
-int bb_fb_handle_fault(int, siginfo_t*, void*) { return 0; }
-int bb_fb_hook(uintptr_t, size_t, GuestHook) { return 0; }
-void bb_fb_invalidate(uintptr_t, size_t) {}
-uint64_t bb_fb_tsc(void) { return 0; }
-uint64_t bb_fb_tsc_frequency(void) { return 1; }
-}
+#include "aot_test_services.h"
 
 namespace {
 constexpr uint64_t ImageSize = 0x1000;
@@ -141,29 +123,12 @@ int main() {
         assert(TrapHandler(&s, reinterpret_cast<uint64_t>(t) + 8) == 0);   // not a 32-byte record start
     }
 
-    // ---- Non-strict: the miss is logged once per address, the program goes on ----
-    {
-        GuestState s;
-        uint64_t stack[4] = {E.base + 0x110, 0, 0, 0};
-        s.gregs[RSP] = reinterpret_cast<uint64_t>(stack);
-        assert(!E.strict);
-        NoteMiss(&s, E.base + 0x3f0, Current(), MissKind::Jump);
-        NoteMiss(&s, E.base + 0x3f0, Current(), MissKind::Jump);
-        NoteMiss(&s, E.base + 0x3f8, Current(), MissKind::Call);
-        const std::string log = ReadFile(logpath);
-        assert(log.find("miss +0x3f0 kind=jump thread=") != std::string::npos);
-        assert(log.find("backtrace=+0x110") != std::string::npos);
-        assert(log.find("miss +0x3f8 kind=call") != std::string::npos);
-        assert(log.find("miss +0x3f0", log.find("miss +0x3f0") + 1) == std::string::npos);   // the second miss at +0x3f0 was not logged again
-    }
-
-    // ---- Strict: message, status 22, the log line with the backtrace ----
+    // ---- A miss: message, status 22, the log line with the backtrace ----
     {
         std::remove(logpath);
-        ML.tried = false; ML.seen.clear();
+        ML.tried = false;
         std::string err;
         const int rc = InChild([&] {
-            E.strict = true;
             uint64_t frame[2] = {0, E.base + 0x150};            // rbp chain: [rbp] = next (0), [rbp+8] = a return address
             uint64_t stack[2] = {E.base + 0x110, 0};
             GuestState s;
@@ -173,17 +138,17 @@ int main() {
             bbr_dispatch(&s, E.base + 0x3f0);                   // no unit, not in a granular function: a miss
         }, err);
         assert(rc == 22);
-        assert(err.find("native code is missing an entry at +0x3f0; please report this, or turn Native CPU off") != std::string::npos);
+        assert(err.find("native code is missing an entry at +0x3f0; please report this") != std::string::npos);
         const std::string log = ReadFile(logpath);
         assert(log.find("miss +0x3f0 kind=call") != std::string::npos && log.find("backtrace=+0x110,+0x150") != std::string::npos);
         assert(log.find("# bb aot misses") != std::string::npos);
         // A tail jump into the middle of a unit; a patched function; an address outside the image.
         std::string e2, e3, e4;
-        assert(InChild([&] { E.strict = true; GuestState s; uint64_t st[2] = {0, 0}; s.gregs[RSP] = reinterpret_cast<uint64_t>(st); s.rip = E.base + 0x230; bbr_dispatch_tail(&s); }, e2) == 22);
+        assert(InChild([&] { GuestState s; uint64_t st[2] = {0, 0}; s.gregs[RSP] = reinterpret_cast<uint64_t>(st); s.rip = E.base + 0x230; bbr_dispatch_tail(&s); }, e2) == 22);
         assert(e2.find("missing an entry at +0x230") != std::string::npos && ReadFile(logpath).find("miss +0x230 kind=jump") != std::string::npos);
-        assert(InChild([&] { E.strict = true; GuestState s; uint64_t st[2] = {0, 0}; s.gregs[RSP] = reinterpret_cast<uint64_t>(st); Miss(&s, E.base + 0x200, Current(), true); }, e3) == 22);
+        assert(InChild([&] { GuestState s; uint64_t st[2] = {0, 0}; s.gregs[RSP] = reinterpret_cast<uint64_t>(st); Miss(&s, E.base + 0x200, Current(), true); }, e3) == 22);
         assert(e3.find("patched or hooked function has no variant at +0x200") != std::string::npos);
-        assert(InChild([&] { E.strict = true; GuestState s; uint64_t st[2] = {0, 0}; s.gregs[RSP] = reinterpret_cast<uint64_t>(st); bbr_dispatch(&s, 0x1000); }, e4) == 22);
+        assert(InChild([&] { GuestState s; uint64_t st[2] = {0, 0}; s.gregs[RSP] = reinterpret_cast<uint64_t>(st); bbr_dispatch(&s, 0x1000); }, e4) == 22);
         assert(e4.find("outside the image") != std::string::npos);
     }
     std::remove(logpath);

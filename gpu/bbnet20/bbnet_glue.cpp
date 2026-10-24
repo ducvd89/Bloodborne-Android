@@ -698,7 +698,7 @@ BBNET_EXPORT void bbnet_image_ready(uint64_t base, uint64_t size) {
     }
     std::printf("BBSC: seamless co-op hooks for the image at %#llx (%u code mappings writable)\n",
                 static_cast<unsigned long long>(base), writable);
-    // The pages stay read, write and execute (FEXCore here has no page tracking of the game's code: every write
+    // The pages stay read, write and execute (every write
     // of it is followed by guest_cpu_invalidate, Core::GuestCodeWritten); a refused hook says who changed its site.
     Core::KeepGuestCodeWritable();
     Core::SetGuestCodeMismatchExplainer(&ExplainCodeMismatch);

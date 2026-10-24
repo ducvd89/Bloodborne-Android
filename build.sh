@@ -31,9 +31,8 @@ fi
 mkdir -p pgo
 # Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
 # to FSR-Vulkan (gpu/patches/fsr-vulkan), applied to its working tree once.
-if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ||
-      ( $(uname -m) == aarch64 && ! -f third_party/FEX/External/vixl/CMakeLists.txt ) ]]; then
-    git submodule update --init --recursive
+if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
+    git submodule update --init gpu/third_party/fsr-vulkan gpu/third_party/imgui third_party/LibAtrac9
 fi
 # Issue #124: a checkout updated from an earlier version keeps that version's patch applied, and
 # the new one applies neither way ("patch does not apply"): the submodule's tree holds nothing but
@@ -72,31 +71,17 @@ if [[ -n ${DLSS_SDK_ROOT:-} ]]; then
 fi
 # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
 gpu=(-Lout/gpu -lbbgpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
-# Hosts other than x86-64: the game's code runs in FEXCore's JIT, linked into out/fex/libbbcpu.so
-# (cpu/: FEX's CMake project builds it, cpu/fex_project.cmake adds the target). FEX needs Clang.
+# Hosts other than x86-64 (AArch64): the game's code runs as ahead-of-time recompiled native code (BB_AOT=<libbbaot.so>, built on a PC with the
+# Bloodborne Android Rebuild Tool): out/cpu/libbbcpu.so, cpu/CMakeLists.txt. x86-64 hosts run the game's code on the CPU itself (src/runtime_cpu.c).
 cpu=()
 if [[ $(uname -m) == aarch64 ]]; then
-    if [[ ! -f out/fex/build.ninja ]]; then
-        CC=${FEX_CC:-clang} CXX=${FEX_CXX:-clang++} cmake -S third_party/FEX -B out/fex -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PROJECT_FEX_INCLUDE="$PWD/cpu/fex_project.cmake" \
-            -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_STEAM_SUPPORT=OFF \
-            -DBUILD_FEX_LINUX_TESTS=OFF -DENABLE_ZYDIS=OFF -DTUNE_ARCH=armv8.2-a -DTUNE_CPU=generic >/dev/null
+    cmake -S cpu -B out/cpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
+    if ! ninja -C out/cpu bbcpu > out/cpu-build.log 2>&1; then
+        grep -v '^\[' out/cpu-build.log | tail -40 >&2
+        echo 'Guest CPU library build failed (full log: out/cpu-build.log)' >&2; exit 1
     fi
-    if ! ninja -C out/fex bbcpu > out/fex-build.log 2>&1; then
-        grep -v '^\[' out/fex-build.log | tail -40 >&2
-        echo 'Guest CPU library build failed (full log: out/fex-build.log)' >&2; exit 1
-    fi
-    echo 'Guest CPU: FEXCore (out/fex/libbbcpu.so)'
-    cpu=(-Lout/fex -lbbcpu -Wl,-rpath,'$ORIGIN/cpu' -Wl,-rpath,"$PWD/out/fex")
-fi
-# x86-64 hosts: cpu/guest_cpu_aot.cpp runs ahead-of-time units (BB_AOT=<bb-recomp .so>, docs/RECOMP_ABI.md) and sends
-# what they do not cover to src/runtime_cpu.c's native execution (BB_AOT_FALLBACK renames that file's functions).
-aot=()
-aot_defs=()
-if [[ $(uname -m) == x86_64 ]]; then
-    "${CXX:-c++}" -std=c++20 -O2 -g -Wall -Wextra -Werror -pthread -Icpu -Isrc -c cpu/guest_cpu_aot.cpp -o out/guest_cpu_aot.o
-    aot=(out/guest_cpu_aot.o -lstdc++ -ldl)
-    aot_defs=(-DBB_AOT_FALLBACK)
+    echo 'Guest CPU: native units only (out/cpu/libbbcpu.so)'
+    cpu=(-Lout/cpu -lbbcpu -Wl,-rpath,'$ORIGIN/cpu' -Wl,-rpath,"$PWD/out/cpu")
 fi
 runtime=(src/runtime*.c)
 # Third-party decoders: compiled once, without this project's -Werror policy.
@@ -106,7 +91,7 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
     for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${aot_defs[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c "${aot[@]}" out/libatrac9.a -lm "${gpu[@]}" "${cpu[@]}" "${libraries[@]}" -o out/bb-probe
+"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${cpu[@]}" "${libraries[@]}" -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities

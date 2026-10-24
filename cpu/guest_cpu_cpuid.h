@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// CPUID and XGETBV for ahead-of-time code without FEX (BB_AOT_ONLY and strict mode): exactly the values FEXCore's CPUID model gives the game on the Thor
+// CPUID and XGETBV for ahead-of-time code: exactly the values the FEX-Emu CPUID model gave the game on the Thor (the values the game was verified with)
 // (FEXCore/Source/Interface/Core/CPUID.cpp, the Intel/Skylake identity, FEX 2609.1, default configuration: HideHybrid on, hypervisor bit shown, no atomic
 // memcpy TSO), with the host features of the Thor build: AVX through FEX's AVX128 path, AES, PMULL, CRC32, SHA, 3DNow, no RNG, no SVE256, no WFxT; SSE4a
 // is NOT reported (FEX's HostFeatures never sets it on ARM hosts) and CLZERO is (DC ZVA block of 64 bytes, set from DCZID_EL0). Every leaf FEX answers is
@@ -7,7 +7,8 @@
 // 0x80000000..4, 0x80000006..8 and 0x80000019. Everything else answers zeros, as in FEX: leaf 0x1A (hybrid cores are hidden), and the AMD-only leaves
 // 0x80000005 and 0x8000001D (FEX is built with the Intel identity: CPUID_AMD is not defined).
 // The brand string (0x80000002..4) is the product name FEX derives from the MIDR of core 0 (HideHybrid makes every core report core 0's name); the name
-// table below is FEX's. tests/test_aot_native.cpp pins all of it. Pure C++, no host calls.
+// table below is ported from FEX-Emu (MIT licence, Copyright (c) 2019 Ryan Houdek; notice in the app's THIRD_PARTY_LICENSES.txt). tests/test_aot_native.cpp pins all of it.
+// Pure C++, no host calls.
 #ifndef BB_GUEST_CPU_CPUID_H
 #define BB_GUEST_CPU_CPUID_H
 #include <algorithm>

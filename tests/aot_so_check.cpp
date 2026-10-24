@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Dev check of a real bb-recomp .so against the real image, without running the game (needs the game's prepared files, so it is not part of the
 // automatic tests): maps the flat image (out/boot-linked.bin's memory image), applies BBPATCH2 patch parts as the loader does, runs the engine's
-// start-up classification (the .so's tables, unit hashes, variants) and prints what runs as an original, as a variant and on the fallback.
+// start-up classification (the .so's tables, unit hashes, variants) and prints what runs as an original, as a variant and what has no native code.
 //   x86-64 .so: bb-recomp --target x86_64 --so out/aot/libbbaot_x86.so --variants tools/recomp/variants ...
 //   c++ -std=c++20 -O1 -g -pthread -Icpu -Isrc -Igpu/shim -Igpu/shadps4 tests/aot_so_check.cpp gpu/shim/bbport_frame_rate.cpp gpu/shim/bbport_display.cpp \
 //       gpu/shim/bbport_guest_guards.cpp -ldl -rdynamic -o out/aot-so-check
@@ -22,25 +22,7 @@
 extern "C" int runtime_memory_is_mapped(uintptr_t, uint64_t) { return 0; }
 bool BbSubmitFxInitZero(std::uint64_t, std::uint32_t) { return false; }
 
-extern "C" {
-void bb_fb_init(void* (*)(size_t, int)) {}
-void bb_fb_code(uintptr_t, size_t) {}
-uintptr_t bb_fb_host_function(void* fn) { return uintptr_t(fn); }
-uint64_t bb_fb_call(uintptr_t, unsigned, const uint64_t*) { return 0; }
-void bb_fb_thread_stack(void*, size_t) {}
-void bb_fb_set_gs(void*) {}
-void bb_fb_abandon(void) {}
-void bb_fb_thread_end(void) {}
-uintptr_t bb_fb_return_address(uintptr_t n) { return n; }
-uintptr_t bb_fb_stack_pointer(void) { return 0; }
-int bb_fb_signal_regs(const void*, GuestRegs*) { return 0; }
-uintptr_t bb_fb_host_pc(const void*) { return 0; }
-int bb_fb_handle_fault(int, siginfo_t*, void*) { return 0; }
-int bb_fb_hook(uintptr_t, size_t, GuestHook) { return 0; }
-void bb_fb_invalidate(uintptr_t, size_t) {}
-uint64_t bb_fb_tsc(void) { return 0; }
-uint64_t bb_fb_tsc_frequency(void) { return 1; }
-}
+#include "../tests/aot_test_services.h"
 
 static std::vector<uint8_t> ReadFile(const char* path) {
     FILE* f = std::fopen(path, "rb");

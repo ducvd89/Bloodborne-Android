@@ -94,4 +94,13 @@ exported=$("$llvm/llvm-nm" -D --defined-only "$out/lib/libbloodframe.so" | awk '
 for name in bb_lsfg_init bb_lsfg_create_context bb_lsfg_present bb_lsfg_wait bb_lsfg_destroy_context bb_lsfg_shutdown bb_lsfg_precision bb_lsfg_diagnostics; do
     grep -qx "$name" <<<"$exported" || { echo "== libbloodframe.so does not export $name"; fail=1; }
 done
+# No FEX anywhere: the game runs as ahead-of-time native code (libbbaot.so), the runtime has no FEXCore. No symbol (dynamic or, when not stripped, static)
+# and no string of an output may name FEX, except the two constants the CPUID model presents to the game (the hypervisor vendor "FEXIFEXIEMU" and its
+# version leaf "FEX-2609.1": cpu/guest_cpu_cpuid.h, pinned by tests/test_aot_native.cpp).
+for f in "$out/bin/bb-probe" "$out/bin/bb-prepare" "$out/bin/ps4-pkg-tool" "$out/lib/libbbgpu.so" "$out/lib/libbbcpu.so" "$out/lib/libbloodframe.so" "$out/lib/libbbnet20.so"; do
+    hits=$({ "$llvm/llvm-nm" "$f" 2>/dev/null | awk '{print $NF}'; "$llvm/llvm-nm" -D "$f" 2>/dev/null | awk '{print $NF}'; strings -a "$f"; } \
+        | grep -E 'FEX|fextl|[Jj]emalloc' | grep -E 'FEXCore|FEX-Emu|FEXInterpreter|fextl|FEX::|FEX_|[Jj]emalloc' | grep -vxE 'FEXIFEXIEMU|FEX-2609\.1' | sort -u | head -5 || true)
+    if [[ -n $hits ]]; then echo "== $f names FEX/jemalloc:"; echo "$hits" | sed 's/^/    /'; fail=1; fi
+done
+[[ $fail == 0 ]] && echo "== no FEX symbols or strings in the outputs (but the two CPUID constants)"
 exit $fail

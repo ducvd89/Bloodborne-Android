@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds and runs tests/test_guest_code_hooks.cpp on an x86-64 PC: the guest-code hook trampoline
 # (gpu/shim/bbport_guest_code_hooks.cpp) executed against fake game functions, with the hook called
-# directly and through the host-function thunk the FEXCore build uses. Zydis: the system's when installed,
+# directly (the x86-64 runtime's call path). Zydis: the system's when installed,
 # else built from the Android dependency sources (build_bionic_deps.sh fetches them) into out/host/zydis.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/.."
@@ -24,8 +24,6 @@ else
              -DZYDIS_STATIC_BUILD -DZYCORE_STATIC_BUILD)
     libs=(out/host/zydis/libZydis.a out/host/zydis/zycore/libZycore.a)
 fi
-for thunk in 0 1; do
-    run clang++ -std=c++20 -O1 -g -Wall -Wextra -Werror -DBB_GUEST_HOOK_THUNK=$thunk -I src -I gpu/shim "${include[@]}" \
-        tests/test_guest_code_hooks.cpp gpu/shim/bbport_guest_code_hooks.cpp "${libs[@]}" -o "$out/test-$thunk"
-    "$out/test-$thunk"
-done
+run clang++ -std=c++20 -O1 -g -Wall -Wextra -Werror -I src -I gpu/shim "${include[@]}" \
+    tests/test_guest_code_hooks.cpp gpu/shim/bbport_guest_code_hooks.cpp "${libs[@]}" -o "$out/test"
+"$out/test"

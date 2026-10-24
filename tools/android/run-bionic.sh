@@ -17,12 +17,7 @@ export FXD_FILES="$files"
 export PATH=/system/bin
 export HOME="$files/home/bbport"
 export TMPDIR="$files/tmp" XDG_RUNTIME_DIR="$files/tmp"
-# FEXCore (libbbcpu) reads its Config.json from here (it runs only the guest's code: no x86 rootfs,
-# loader or syscalls of its own).
-export FEX_APP_CONFIG_LOCATION="$HOME/.fex-emu/"
-export FEX_APP_DATA_LOCATION="$HOME/.fex-emu/"
-export FEX_APP_CACHE_LOCATION="$HOME/.cache/fex-emu/"
-mkdir -p "$HOME/.fex-emu" "$HOME/.cache/fex-emu" "$TMPDIR" "$base/user" "$base/logs" "$base/logs/failed-shaders"
+mkdir -p "$HOME" "$TMPDIR" "$base/user" "$base/logs" "$base/logs/failed-shaders"
 
 # ---- Settings: bbport.ini (the app's settings screen writes it) turned into BB_* variables ----
 export BB_CONFIG="$base/bbport.ini"
@@ -309,7 +304,6 @@ export BB_PRESENT_SOCKET="$files/bbpresent.sock"
 export BB_SCREEN_W="${BB_SCREEN_W:-1280}" BB_SCREEN_H="${BB_SCREEN_H:-720}"
 # libbbgpu: SPIR-V of pipelines the driver rejects is written here (vk_shader_util.cpp).
 export BB_FAILED_SHADER_DIR="$base/logs/failed-shaders"
-cp "$base/fex-compatible.json" "$HOME/.fex-emu/Config.json"
 # ---- Debug options (Debug options in the app menu; bbport.ini debug_* keys, a missing key is its default) ----
 # Write-fault tracking: how the game's writes to GPU memory are tracked. Only the non-default values are
 # exported; bionic-local.sh (below) and the environment can still override them.
@@ -466,19 +460,21 @@ if [ "${1:-game}" = game ]; then
     fi
 fi
 
-# Ahead-of-time recompiled game code (docs/STATIC_RECOMPILE_PLAN.md): bb-recomp's .so, copied to aot/libbbaot.so in the
-# runtime's directory (bbport/aot, or bbport/bionic/aot), is run by libbbcpu in front of FEX (BB_AOT=<path> by hand wins).
-# Whatever it does not cover, and units whose code differs from the image, still run on FEX. BB_AOT_STATS=1: counts.
-# BB_AOT=0 (environment or bionic-local.sh): off, FEX alone, even with the .so in place.
-# The app's Native CPU menu (NativeCpuDialog.java) imports the .so and has the On/Off switch: native_cpu=0 in bbport.ini is Off, a missing
-# key or native_cpu=1 is On (when the .so is there). A BB_AOT set by hand (environment, bionic-local.sh) wins over the switch.
-if [ -z "${BB_AOT:-}" ] && [ "$(setting native_cpu)" = 0 ]; then export BB_AOT=0; fi
-if [ -z "${BB_AOT:-}" ]; then
+# The game's code runs as ahead-of-time recompiled native code and nothing else (docs/STATIC_RECOMPILE_PLAN.md): the Bloodborne Android
+# Rebuild Tool's libbbaot.so, copied to aot/libbbaot.so in the runtime's directory (bbport/aot, or bbport/bionic/aot) by the app (NativeCpu.java).
+# BB_AOT=<path> by hand wins (bionic-local.sh, environment). Without the library the game cannot start: the app shows how to get it, and this script
+# stops here with the same message. A native-code miss is written to logs/aot-misses.log and stops the game (BB_AOT_STATS=1: counters).
+if [ "${BB_AOT:-0}" = 0 ]; then
+    unset BB_AOT
     for aot in "$base/aot/libbbaot.so" "$bionic/aot/libbbaot.so"; do
         if [ -f "$aot" ]; then export BB_AOT="$aot"; break; fi
     done
 fi
-if [ "${BB_AOT:-0}" = 0 ]; then unset BB_AOT; echo "AOT: off (FEX JIT only)"; else export BB_AOT; echo "AOT: $BB_AOT"; fi
+if [ -z "${BB_AOT:-}" ]; then
+    echo "STOP: AOT: libbbaot.so is missing: this version of the app runs Bloodborne as native code, which is built once on a PC from your own game files with the Bloodborne Android Rebuild Tool (https://github.com/ducvd89/Bloodborne-android-rebuild-tool)"
+    exit 3
+fi
+export BB_AOT; echo "AOT: $BB_AOT"
 
 # The Bionic libraries only: the app's own environment has no library path.
 LD_LIBRARY_PATH="$bionic/lib"; export LD_LIBRARY_PATH

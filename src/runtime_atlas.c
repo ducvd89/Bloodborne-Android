@@ -8,7 +8,7 @@
  * BB_ATLAS_FLAGS_FILE: the app's request, "gen <N>" then one decimal flag id per line.
  * Nothing is written to the game and no game function is called. Every read of the game's memory is
  * safe: a write() of the range into a pipe (an unmapped range gives EFAULT, never a fault). No
- * signal handler is touched: FEX owns this process's signals.
+ * signal handler is touched: the runtime owns this process's signals.
  *
  * File layout (little endian):
  *    0 u32 magic 0x54414242 ("BBAT")      4 u32 version = 1

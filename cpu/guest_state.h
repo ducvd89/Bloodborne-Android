@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// GuestState: the register file ahead-of-time recompiled code (bb-recomp units) runs on. It is FEXCore's
-// CPUState layout (docs/RECOMP_ABI.md), so the offsets the lowering uses (tools/recomp/src/lower_llvm.cpp) apply
-// unchanged, and on ARM64 hosts the very state of FEX's thread, which the fallback CPU shares.
-//
-// FEX builds (BB_AOT_FEX_STATE) alias the real type. Other hosts (the x86-64 PC, where FEX is not part of the
-// runtime) use a replica; tests/guest_state_check.cpp compares the two against FEX's headers.
+// GuestState: the register file ahead-of-time recompiled code (bb-recomp units) runs on. Its layout is the contract with the Rebuild Tool
+// (docs/RECOMP_ABI.md): the units are compiled against these offsets (the tool lowers the x86-64 front end's IR to loads and stores of this
+// struct). The static_asserts below pin the ones the tool and the runtime's assembly rely on; tools/check_recomp_abi.sh compares them with
+// the tool's own list when the tools/recomp submodule is checked out.
 #ifndef BB_GUEST_STATE_H
 #define BB_GUEST_STATE_H
 #include <cstddef>
 #include <cstdint>
 
-#ifdef BB_AOT_FEX_STATE
-#include <FEXCore/Core/CoreState.h>
-using GuestState = FEXCore::Core::CPUState;
-#else
 struct alignas(64) GuestState {
     union XMMRegs {
         struct AVX { uint64_t data[16][4]; } avx;
@@ -60,14 +54,20 @@ struct alignas(64) GuestState {
     uint8_t _pad2[5] {};
     gdt_segment private_gdt[32] {};
 };
-#endif
 
-// x86 register numbers in gregs[] and the flag layout (FEXCore/Core/X86Enums.h).
+static_assert(offsetof(GuestState, InlineJITBlockHeader) == 0 && offsetof(GuestState, rip) == 24 && offsetof(GuestState, gregs) == 32 &&
+              offsetof(GuestState, L1Pointer) == 160 && offsetof(GuestState, _pad1) == 184 && offsetof(GuestState, avx_high) == 192 &&
+              offsetof(GuestState, xmm) == 448 && offsetof(GuestState, mxcsr) == 972 && offsetof(GuestState, gs_cached) == 992 &&
+              offsetof(GuestState, flags) == 1008 && offsetof(GuestState, mm) == 1056 && offsetof(GuestState, FCW) == 1200 &&
+              sizeof(GuestState) == 1472 && alignof(GuestState) == 64,
+              "GuestState layout: docs/RECOMP_ABI.md");
+
+// x86 register numbers in gregs[] and the flag layout.
 namespace bbaot {
 enum : unsigned { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
 // NZCV word in flags[]: N<<31 | Z<<30 | C<<29 | V<<28 (bytes 24..27), DF raw at 10, reserved at 1, IF at 9.
 constexpr unsigned FlagNZCV = 24;
-// The reset state FEX gives a thread (CPUState constructor, which the replica does not have).
+// The reset state of a thread's registers (x86-64 power-on values the lowering assumes).
 inline void ResetGuestState(GuestState& s) {
     s.flags[1] = 1;      // RFLAG_RESERVED_LOC
     s.flags[9] = 1;      // RFLAG_IF_LOC

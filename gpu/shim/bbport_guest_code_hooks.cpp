@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: observers in a game's own code (bbport_guest_code_hooks.h). The trampoline follows
-// shadPS4's InstallGuestCodeHook (core/cpu_patches.cpp of the shadp2p/BBSC forks, GPL-2.0+) and the
-// port's own upstream version of it (Xbyak); the machine code is emitted here byte by byte (no code
-// generator library), so the Android build, where FEXCore runs the game's code, needs nothing more
-// than Zydis (the check that a span is whole position-independent instructions).
+// bbport: observers in a game's own code (bbport_guest_code_hooks.h).
 //
-// What differs from a native x86-64 host: the game's code is not run by the host CPU, so the
-// trampoline cannot `call` the hook (arm64 code). It calls the guest-callable stub of one host
-// function (guest_cpu_host_function) with the hook as a third argument; that function calls the
-// hook. FEXCore has no page tracking of the game's code here, so every write of code is followed by
-// guest_cpu_invalidate of the range (GuestCodeWritten).
+// Android (the ahead-of-time native build): a hook goes into a native hook slot of the recompiled units (guest_cpu_hook_slot) and nowhere else.
+// The game's code is never rewritten there, so a site the library has no slot for is refused with a log line.
+//
+// x86-64 hosts (the PC build, where the host CPU runs the game): a trampoline, as shadPS4's InstallGuestCodeHook (core/cpu_patches.cpp of the
+// shadp2p/BBSC forks, GPL-2.0+) and the port's own upstream version of it (Xbyak) do it; the machine code is emitted here byte by byte (no code
+// generator library), with Zydis for the check that a span is whole position-independent instructions.
 #include "bbport_guest_code_hooks.h"
 
 #include <algorithm>
@@ -28,18 +25,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include <Zydis/Zydis.h>
-
 #include "../../src/guest_cpu.h"
 
-// Whether the trampoline reaches the hook through a guest-callable host function stub: always where
-// the guest CPU is FEXCore; a test on an x86-64 host builds it both ways.
-#ifndef BB_GUEST_HOOK_THUNK
+// Trampolines (and the guest stub of CallGuestWithFloats) exist where the host CPU runs the game's code.
 #ifdef GUEST_CPU_NATIVE
-#define BB_GUEST_HOOK_THUNK 0
-#else
-#define BB_GUEST_HOOK_THUNK 1
-#endif
+#define BB_GUEST_TRAMPOLINES 1
+#include <Zydis/Zydis.h>
 #endif
 
 namespace Core {
@@ -49,11 +40,13 @@ using u8 = std::uint8_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
-constexpr std::size_t NearJumpBytes = 5;
+constexpr std::size_t NearJumpBytes = 5;                // (the length of the near jump a trampoline hook writes; the shortest span a hook replaces)
+constexpr std::size_t MaxSpan = 64;               // the longest run of instructions a hook replaces
+
+#ifdef BB_GUEST_TRAMPOLINES
 constexpr std::size_t GuestRedZoneBytes = 128;
 constexpr std::size_t AreaSize = 512u << 10;      // trampolines (~0.9 KiB each)
 constexpr std::int64_t JumpReach = 0x7000'0000;   // inside a rel32 jump's 2 GiB
-constexpr std::size_t MaxSpan = 64;               // the longest run of instructions a hook replaces
 
 // The frame the trampoline builds below the guest's stack pointer: past the red zone, the
 // snapshot (16-aligned), then the guest's r11 and flags (they are needed before the snapshot's
@@ -121,12 +114,15 @@ private:
     }
 };
 
+#endif // BB_GUEST_TRAMPOLINES
+
 std::mutex hook_mutex;
 std::map<std::uintptr_t, std::uintptr_t> hooked_sites; // [first byte, end) of installed hooks
 unsigned installed_count = 0;
 unsigned refused_count = 0;
 GuestCodeMismatchExplainer explainer = nullptr;
 
+#ifdef BB_GUEST_TRAMPOLINES
 /// An executable area within reach of its code, mapped on first use.
 struct Area {
     std::uintptr_t start = 0;
@@ -173,6 +169,8 @@ Area* AreaFor(std::uintptr_t code, std::size_t size) {
     return &areas.back();
 }
 
+#endif // BB_GUEST_TRAMPOLINES
+
 std::string Hex(const u8* data, std::size_t size) {
     std::string text;
     char two[4];
@@ -189,6 +187,7 @@ std::string Hex(const u8* data, std::size_t size) {
     return text;
 }
 
+#ifdef BB_GUEST_TRAMPOLINES
 /// Whole instructions, none addressing relative to the instruction pointer (they move to the
 /// trampoline).
 bool WholeAndAbsolute(const u8* code, std::size_t size, const char** why) {
@@ -226,6 +225,8 @@ bool WholeAndAbsolute(const u8* code, std::size_t size, const char** why) {
     }
     return true;
 }
+
+#endif // BB_GUEST_TRAMPOLINES
 
 std::atomic<bool> code_writable{false};
 
@@ -340,6 +341,7 @@ struct SlotContext {
     return GUEST_HOOK_CONTINUE;
 }
 
+#ifdef BB_GUEST_TRAMPOLINES
 /// The trampoline for the site at `site` whose `expected` bytes it runs after the hook.
 Code BuildTrampoline(std::uintptr_t site, std::span<const u8> expected, u64 tag, GuestCodeHook hook,
                      const u8* skip_flag, std::uintptr_t at, SiteStats* stats) {
@@ -383,16 +385,8 @@ Code BuildTrampoline(std::uintptr_t site, std::span<const u8> expected, u64 tag,
     t.MovImm(RDI, tag);                                 // mov rdi, tag
     t.Bytes({0x4c, 0x89, 0xe6});                        // mov rsi, r12 (+ SnapshotOffset = 0)
     static_assert(SnapshotOffset == 0);
-#if BB_GUEST_HOOK_THUNK
-    // The hook is host code the guest cannot call: its guest-callable stub gets it as a third argument (and the
-    // site's counters, or 0, as a fourth) and calls it.
-    t.MovImm(RDX, reinterpret_cast<u64>(hook));
-    t.MovImm(RCX, reinterpret_cast<u64>(stats));
-    t.MovImm(RAX, u64(guest_cpu_host_function(reinterpret_cast<void*>(&HookDispatch))));
-#else
     (void)stats;
     t.MovImm(RAX, reinterpret_cast<u64>(hook));
-#endif
     t.Bytes({0xff, 0xd0});                              // call rax
     t.Bytes({0x4c, 0x89, 0xe4});                        // mov rsp, r12
     for (int i = 0; i < 16; ++i) {
@@ -498,11 +492,20 @@ std::uintptr_t FloatCallStub() {
     }();
     return stub;
 }
+#endif // BB_GUEST_TRAMPOLINES
 
 } // namespace
 
 std::uint64_t CallGuestWithFloats(std::uintptr_t fn, std::span<const std::uint64_t> ints,
                                   std::span<const float> floats) {
+#ifndef BB_GUEST_TRAMPOLINES
+    // The native build runs no guest stub: the engine puts the floats in the vector registers itself.
+    if (ints.size() > 8 || floats.size() > 8) {
+        std::fprintf(stderr, "STOP: CallGuestWithFloats(%#llx): too many arguments\n", static_cast<unsigned long long>(fn));
+        std::abort();
+    }
+    return guest_cpu_call_floats(fn, static_cast<unsigned>(ints.size()), ints.data(), static_cast<unsigned>(floats.size()), floats.data());
+#else
     const std::uintptr_t stub = FloatCallStub();
     if (!stub || ints.size() > 8 || floats.size() > 8) {
         std::fprintf(stderr, "STOP: CallGuestWithFloats(%#llx): %s\n", static_cast<unsigned long long>(fn),
@@ -517,6 +520,7 @@ std::uint64_t CallGuestWithFloats(std::uintptr_t fn, std::span<const std::uint64
     std::memcpy(&block[9], floats.data(), floats.size() * sizeof(float));
     const u64 argument = reinterpret_cast<u64>(block.data());
     return guest_cpu_call(stub, 1, &argument);
+#endif
 }
 
 int GuestCodeProtection() {
@@ -576,10 +580,12 @@ bool InstallGuestCodeHook(void* address, std::span<const std::uint8_t> expected,
         }
         return refuse("the code differs (another build of the game, or a port patch there)", detail);
     }
+#ifdef BB_GUEST_TRAMPOLINES
     const char* why = nullptr;
     if (!WholeAndAbsolute(code, expected.size(), &why)) {
         return refuse(why);
     }
+#endif
     const auto begin = reinterpret_cast<std::uintptr_t>(code);
     const auto end = begin + expected.size();
     // A hook before the first one that ends after `begin`.
@@ -611,6 +617,10 @@ bool InstallGuestCodeHook(void* address, std::span<const std::uint8_t> expected,
         delete context;
         delete slot_stats;
     }
+#ifndef BB_GUEST_TRAMPOLINES
+    // No trampolines in the native build: the game's code is never rewritten.
+    return refuse("the native build has no hook slot at this site (hooks there are disabled; the site's function is original code of the library)");
+#else
     // Room for the trampoline: at most ~1.1 KiB.
     Area* area = AreaFor(begin, 1280);
     if (!area) {
@@ -644,6 +654,7 @@ bool InstallGuestCodeHook(void* address, std::span<const std::uint8_t> expected,
     }
     ++installed_count;
     return true;
+#endif
 }
 
 } // namespace Core

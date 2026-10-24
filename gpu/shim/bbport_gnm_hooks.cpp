@@ -515,11 +515,12 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
     const char* observe_env = std::getenv("BB_GNM_OBSERVE");
     observe = observe_env && observe_env[0] == '1';
 #if !defined(__x86_64__)
-    // The observing stubs call host functions from guest code: only possible on an x86-64 host.
-    if (observe) {
-        std::fprintf(stderr, "Gnm observe: BB_GNM_OBSERVE needs an x86-64 host, ignored\n");
-        observe = false;
+    // The counting and observing stubs are x86 code written into the game's functions: the native (ahead-of-time) build never rewrites the game's
+    // code (a rewritten function has no native code and would stop the game), so both are off here.
+    if (observe || (env && env[0] == '1')) {
+        std::fprintf(stderr, "Gnm census/observe: disabled in the native build (BB_GNM_CENSUS and BB_GNM_OBSERVE write stubs into the game's code); ignored\n");
     }
+    return;
 #endif
     if (!observe && (!env || env[0] != '1')) {
         return;

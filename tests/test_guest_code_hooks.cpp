@@ -2,9 +2,7 @@
 // gpu/shim/bbport_guest_code_hooks.cpp on an x86-64 host: the trampoline is emitted next to a copy
 // of small fake "game" functions and RUN, so the context it builds (every register, flags, MXCSR,
 // YMM), what a hook's changes do, the displaced instructions, the skip flag, the refusals and the
-// invalidation calls are all checked. Built twice: the hook called directly (the x86-64 runtime)
-// and through a host-function thunk (-DBB_GUEST_HOOK_THUNK=1, the FEXCore build's call path, here
-// with a guest_cpu_host_function that is the identity, as on an x86-64 host).
+// invalidation calls are all checked. (x86-64 hosts only: the Android build has no trampolines, its hooks are native slots.)
 //   clang++ -std=c++20 -O1 -g -I src -I gpu/shim tests/test_guest_code_hooks.cpp \
 //       gpu/shim/bbport_guest_code_hooks.cpp -lZydis -lZycore -o out/guest-code-hooks-test
 #undef NDEBUG
@@ -320,7 +318,7 @@ bool Refused(const u8* before, const u8* after, std::size_t size) {
 
 int main() {
     using namespace Core;
-    std::printf("guest code hooks test: hook %s\n", BB_GUEST_HOOK_THUNK ? "through the host-function thunk"
+    std::printf("guest code hooks test: hook %s\n", 0 ? "through the host-function thunk"
                                                                        : "called directly");
     assert(GuestCodeProtection() == (PROT_READ | PROT_EXEC));
 
@@ -384,7 +382,7 @@ int main() {
         }
         assert(site_seen);
         assert(g_code.size() == 1); // the trampoline area is registered as guest code
-        assert(BB_GUEST_HOOK_THUNK ? g_thunks == 1 : g_thunks == 0);
+        assert(g_thunks == 0);
     }
     assert(site[0] == 0xe9);
     CheckTrampolineDecodes(site, 7, false);

@@ -686,7 +686,7 @@ void PatchImage(unsigned char* image, std::uint64_t) {
         std::printf("Display: aspect ratio %.3f: no memory next to the game's code, not installed\n", double(aspect));
         return;
     }
-    // The stub page is guest code (FEXCore translates what the jumps lead to there).
+    // The stub page is guest code (registered with guest_cpu_code).
     if (stub_page) guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), PageSize);
     data = new (data_page) Data{};
     Counts counts;

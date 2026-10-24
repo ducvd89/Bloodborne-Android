@@ -1,8 +1,5 @@
 /* guest_cpu.h on x86-64 hosts: the game's code runs on the host CPU, so crossings are plain calls. */
 #define _GNU_SOURCE
-#ifdef BB_AOT_FALLBACK /* cpu/guest_cpu_aot.cpp exports guest_cpu.h and runs this CPU for the code the AOT units do not cover */
-#include "../cpu/guest_cpu_rename.h"
-#endif
 #include "guest_cpu.h"
 #if defined(GUEST_CPU_NATIVE)
 #include "runtime.h"
@@ -17,9 +14,7 @@
 #include <asm/prctl.h>
 #endif
 
-#ifndef BB_AOT_FALLBACK
 int guest_cpu_is_native(void) { return 1; }
-#endif
 void guest_cpu_init(void *(*map)(size_t size, int prot)) { (void)map; }
 void guest_cpu_code(uintptr_t base, size_t size) { (void)base; (void)size; }
 uintptr_t guest_cpu_host_function(void *fn) { return (uintptr_t)fn; }
@@ -37,11 +32,9 @@ uintptr_t guest_cpu_return_address(uintptr_t native) { return native; }
 uintptr_t guest_cpu_stack_pointer(void) { return (uintptr_t)__builtin_frame_address(0); }
 void guest_cpu_invalidate(uintptr_t address, size_t size) { (void)address; (void)size; }
 int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook) { (void)address; (void)size; (void)hook; return 0; }
-#ifndef BB_AOT_FALLBACK /* (cpu/guest_cpu_aot.cpp has the native hook slots) */
 int guest_cpu_hook_slot(uintptr_t address, size_t size, GuestHookEx hook, void *context) { (void)address; (void)size; (void)hook; (void)context; return 0; }
 int guest_cpu_has_hook_slot(uintptr_t address) { (void)address; return 0; }
 void guest_cpu_hook_slot_clear(uintptr_t address) { (void)address; }
-#endif
 uint64_t guest_cpu_tsc(void) { return __rdtsc(); }
 #ifndef _WIN32
 void guest_cpu_set_gs(void *base) {

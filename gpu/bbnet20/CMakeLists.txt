@@ -62,7 +62,7 @@ if (ANDROID)
     # the library's own DT_NEEDED closure only: bb-probe's NEEDED libbbcpu.so is not visible to it, so guest_cpu_call
     # would fail the dlopen ("cannot locate symbol"). libbbnet20.so therefore has NEEDED libbbcpu.so itself
     # (BB_CPU_LIB: the libbbcpu.so build_bionic.sh built; check_bionic_symbols.sh verifies every symbol resolves).
-    set(BB_CPU_LIB "" CACHE FILEPATH "libbbcpu.so (FEXCore) the online module is linked against on Android")
+    set(BB_CPU_LIB "" CACHE FILEPATH "libbbcpu.so the online module is linked against on Android")
     if (NOT BB_CPU_LIB OR NOT EXISTS "${BB_CPU_LIB}")
         message(FATAL_ERROR "bbnet20: BB_CPU_LIB (libbbcpu.so) is required on Android (tools/android/build_bionic.sh passes it)")
     endif()

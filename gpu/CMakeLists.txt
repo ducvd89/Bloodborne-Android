@@ -240,18 +240,12 @@ add_executable(settings-test EXCLUDE_FROM_ALL ../tests/test_settings.cpp shim/bb
 target_compile_options(settings-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(settings-test PRIVATE .. shim)
 
-# The game-code hooks' trampoline, run on an x86-64 host against fake game functions (tests/test_guest_code_hooks.cpp):
-# once with the hook called directly (the x86-64 runtime), once through a host-function thunk (the FEXCore build's
-# call path; the guest CPU is the host's here). ninja -C out/gpu guest-code-hooks-test guest-code-hooks-thunk-test.
-foreach(variant "" "-thunk")
-    add_executable(guest-code-hooks${variant}-test EXCLUDE_FROM_ALL ../tests/test_guest_code_hooks.cpp
-        shim/bbport_guest_code_hooks.cpp)
-    target_compile_options(guest-code-hooks${variant}-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
-    target_include_directories(guest-code-hooks${variant}-test PRIVATE ../src shim)
-    target_link_libraries(guest-code-hooks${variant}-test PRIVATE Zydis::Zydis)
-endforeach()
-target_compile_definitions(guest-code-hooks-thunk-test PRIVATE BB_GUEST_HOOK_THUNK=1)
-target_compile_definitions(guest-code-hooks-test PRIVATE BB_GUEST_HOOK_THUNK=0)
+# The game-code hooks' trampoline, run on an x86-64 host against fake game functions (tests/test_guest_code_hooks.cpp).
+# ninja -C out/gpu guest-code-hooks-test.
+add_executable(guest-code-hooks-test EXCLUDE_FROM_ALL ../tests/test_guest_code_hooks.cpp shim/bbport_guest_code_hooks.cpp)
+target_compile_options(guest-code-hooks-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(guest-code-hooks-test PRIVATE ../src shim)
+target_link_libraries(guest-code-hooks-test PRIVATE Zydis::Zydis)
 
 add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_include_directories(scene-resolution-test PRIVATE shim shadps4 third_party/gcn/include)

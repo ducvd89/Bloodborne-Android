@@ -1,5 +1,5 @@
-/* The CPU that runs the game's x86-64 code: the host CPU on x86-64 (src/runtime_cpu.c), FEXCore's
- * JIT elsewhere (cpu/, libbbcpu.so). Guest and host share one address space either way; what
+/* The CPU that runs the game's x86-64 code: the host CPU on x86-64 (src/runtime_cpu.c), ahead-of-time
+ * recompiled native code elsewhere (cpu/, libbbcpu.so: the units of libbbaot.so, nothing else). Guest and host share one address space either way; what
  * differs is how control crosses between them, which goes through these calls:
  *  - host functions handed to the guest (imports) are wrapped by guest_cpu_host_function;
  *  - guest functions called by the host (thread entries, callbacks) go through guest_cpu_call;
@@ -37,6 +37,9 @@ uintptr_t guest_cpu_host_function(void *fn);
  * guest stack when the host was called by guest code, else on the stack set by
  * guest_cpu_thread_stack (or one allocated for the thread). */
 uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t *args);
+/* guest_cpu_call with floating-point arguments too: `floats` (at most 8) go to xmm0-7 as single-precision scalars, `count` integers
+ * (at most 8: six in registers, two on the stack) as for guest_cpu_call. The native (AArch64) build only. */
+uint64_t guest_cpu_call_floats(uintptr_t fn, unsigned count, const uint64_t *args, unsigned nfloats, const float *floats);
 /* The guest stack of this host thread for calls not nested in guest code: [top - size, top). */
 void guest_cpu_thread_stack(void *top, size_t size);
 /* Guest GS base (the TCB) of this host thread. */
@@ -58,15 +61,14 @@ enum { GUEST_CPU_IN_GUEST=1, GUEST_CPU_IN_HOST_CALL=2 };
 int guest_cpu_signal_regs(const void *ucontext, GuestRegs *regs);
 /* The host program counter at a signal. */
 uintptr_t guest_cpu_host_pc(const void *ucontext);
-/* Faults raised by the guest CPU itself (JIT bookkeeping): handled and to be resumed when 1. */
+/* Faults raised by the guest CPU itself (an unaligned x86 `lock` operation of the recompiled code): handled and to be resumed when 1. */
 int guest_cpu_handle_fault(int sig, siginfo_t *info, void *ucontext);
-/* Replaces the guest instruction at `address` (at least `size` >= 2 bytes) with a call of
- * `hook`, which sees and edits the registers and must set rip. RCX and R11 hold garbage when the
- * hook runs, so the original code must not read them there. Not available on x86-64 hosts
- * (bbport_guest_hooks.cpp uses int3 there): returns 0. */
+/* Hooks the guest instruction at `address` with a call of `hook`, which sees and edits the registers
+ * and must set rip. Only where the native library has a hook slot (guest_cpu_hook_slot, below): no
+ * code is ever rewritten, so anywhere else the hook is refused (logged) and 0 is returned.
+ * Not available on x86-64 hosts (bbport_guest_hooks.cpp uses int3 there): returns 0. */
 typedef void (*GuestHook)(GuestRegs *regs);
 int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook);
-/* (hooks at a site the ahead-of-time library has a slot for are set there: see guest_cpu_hook_slot below) */
 /* Native hook slots (ahead-of-time recompiled code only, cpu/guest_cpu_aot.cpp; docs/RECOMP_ABI.md, "Hook slots"). The recompiled units
  * have a slot test at the hook sites the .so was built with (tools/recomp/variants/hooks-*.txt): installing a hook there writes no
  * code, the units call it. The callback sees the registers at the start of the instruction at `address` (rip = address) and returns
@@ -74,8 +76,8 @@ int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook);
  * declares as a resume point is a jump inside the function, any other a jump through the dispatcher), GUEST_HOOK_RETURN: the callback
  * made a `ret` itself (rip = the popped return address, rsp past it). rflags is a constant (the callback cannot change the flags, which
  * survive the call), mxcsr is not written back, ymm is. The callback must leave rbx, rbp and r12-r15 alone when it returns.
- * Returns 1 when the hook was set (no guest_cpu_invalidate needed), 0 when there is no slot at `address` or the code there runs on the
- * fallback CPU (a patched function without a variant): the caller then hooks the old way. guest_cpu_hook (below) tries the slot first. */
+ * Returns 1 when the hook was set (no guest_cpu_invalidate needed), 0 (logged) when there is no slot at `address` or the function there
+ * has no native code (a patched function without a variant). guest_cpu_hook (above) is the same for a GuestHook. */
 typedef struct {
     uint64_t gpr[GUEST_GPRS];
     uint64_t rip;
@@ -90,12 +92,12 @@ int guest_cpu_hook_slot(uintptr_t address, size_t size, GuestHookEx hook, void *
 int guest_cpu_has_hook_slot(uintptr_t address);
 /* The hook set by guest_cpu_hook_slot / guest_cpu_hook at `address` is removed (the slot test then runs the instruction as usual). */
 void guest_cpu_hook_slot_clear(uintptr_t address);
-/* The host wrote guest code in [address, address + size) (a byte patch made while the game runs, a hook
- * installed): what the guest CPU translated of it is dropped, on every thread, and translated again from
- * the new bytes when next run. A no-op on x86-64 hosts. The JIT has no page tracking here, so every write
- * of code that may already have run needs this call after it. */
+/* The host wrote guest code in [address, address + size) (a byte patch made while the game runs): the
+ * native functions that contain it are re-checked against the library's variants, and one with no
+ * variant for the new bytes has no native code (the game stops if it is entered). A no-op on x86-64
+ * hosts. Every write of code that may already have run needs this call after it. */
 void guest_cpu_invalidate(uintptr_t address, size_t size);
-/* 1 when the guest code runs on the host CPU and the thread's own stack (x86-64 hosts without BB_AOT): the main thread
+/* 1 when the guest code runs on the host CPU and the thread's own stack (x86-64 hosts): the main thread
  * then enters the game by calling its entry point on a stack of its own; otherwise it enters through guest_cpu_call. */
 int guest_cpu_is_native(void);
 /* The guest's time stamp counter (RDTSC) and its frequency in Hz. */

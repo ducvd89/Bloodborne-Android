@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bionic (Android NDK) build of the native game process, the Android app's only runtime: libbbcpu.so
-# (FEXCore), libbbgpu.so (GPU/HLE), libbbnet20.so (online play: shadNet / The Hunter's Dream, loaded only with
+# (the ahead-of-time unit engine: the game runs as native code from libbbaot.so, no FEXCore, no JIT), libbbgpu.so (GPU/HLE), libbbnet20.so (online play: shadNet / The Hunter's Dream, loaded only with
 # BB_ONLINE=1), libbloodframe.so (Lossless Scaling frame generation, build_bloodframe.sh),
 # bb-probe (runtime executable), kgsl-chip-id, bb-prepare (game preparation) and ps4-pkg-tool (PKG
 # installs). Output: out/bionic/{bin,lib,licenses}; build_release_runtime.py packages them.
@@ -25,28 +25,6 @@ run() { taskset -c 2-23 nice -n 19 "$@"; }
 [[ -f $prefix/.done-openssl && -x $root/host-tools/bin/protoc && -f $prefix/share/cacert.pem ]] \
     || { echo "No online-module deps (OpenSSL, protobuf, CA bundle) in $prefix (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
 [[ -d $headers/share/cmake/magic_enum ]] || { echo "No header-only packages in $headers" >&2; exit 1; }
-# BB_AOT_ONLY=1: the native-only runtime (no FEXCore in libbbcpu: cpu/aot_only/CMakeLists.txt, docs/RECOMP_ABI.md "Strict mode"). It reuses everything the normal
-# build made (out/bionic: libbbgpu, libbbnet20, ...; they only use guest_cpu.h) and replaces libbbcpu.so and bb-probe's link against it: out/bionic-only.
-if [[ ${BB_AOT_ONLY:-0} == 1 ]]; then
-    [[ -f out/bionic/lib/libbbgpu.so && -f out/bionic/bin/bb-probe ]] || { echo "BB_AOT_ONLY=1 needs the normal build first (out/bionic)" >&2; exit 1; }
-    out=out/bionic-only
-    ndk_cmake=(-DCMAKE_TOOLCHAIN_FILE="$toolchain" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$api -DANDROID_STL=c++_shared)
-    rm -rf "$out/bin" "$out/lib" "$out/share" "$out/licenses"
-    mkdir -p "$out"
-    cp -a --reflink=auto out/bionic/lib out/bionic/share out/bionic/licenses "$out/"
-    cmake -S cpu/aot_only -B "$out/cpu" -G Ninja "${ndk_cmake[@]}" -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
-    run ninja -C "$out/cpu" -j "$J" bbcpu > "$out/cpu-build.log" 2>&1 || { grep -E "error|FAILED" "$out/cpu-build.log" | head -40 >&2; exit 1; }
-    cp -f "$out/cpu/libbbcpu.so" "$out/lib/libbbcpu.so"
-    mkdir -p "$out/bin"
-    cp -a --reflink=auto out/bionic/bin/. "$out/bin/"
-    cc=("$llvm/bin/aarch64-linux-android$api-clang" -fuse-ld=lld)
-    links=(-L"$out/lib" -lbbgpu -lbbcpu -Wl,-rpath,'$ORIGIN/../lib' -rdynamic -pie)
-    "${cc[@]}" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I"$prefix/include" -I. -Isrc \
-        src/probe.c src/runtime*.c src/vulkan_smoke.c out/bionic/libatrac9.a -lm "${links[@]}" -o "$out/bin/bb-probe"
-    echo "Built $out/lib/libbbcpu.so (native-only, no FEXCore) and $out/bin/bb-probe"
-    BB_OUT="$out" tools/android/check_bionic_symbols.sh
-    exit 0
-fi
 mkdir -p "$out"
 ndk_cmake=(-DCMAKE_TOOLCHAIN_FILE="$toolchain" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$api -DANDROID_STL=c++_shared)
 # This port's changes to FSR-Vulkan (gpu/patches/fsr-vulkan), applied once, as build.sh does.
@@ -56,15 +34,12 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
     fi
 done
 
-# FEX: no glibc jemalloc hook (glibc-only; it exists for thunks, which this build does not use).
-if [[ ! -f $out/fex/build.ninja ]]; then
-    cmake -S third_party/FEX -B "$out/fex" -G Ninja "${ndk_cmake[@]}" \
-        -DCMAKE_BUILD_TYPE=Release -DCMAKE_PROJECT_FEX_INCLUDE="$PWD/cpu/fex_project.cmake" \
-        -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_STEAM_SUPPORT=OFF \
-        -DBUILD_FEX_LINUX_TESTS=OFF -DENABLE_ZYDIS=OFF -DTUNE_ARCH=armv8.2-a -DTUNE_CPU=generic \
-        -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF >/dev/null
+# Guest CPU: libbbcpu.so is the ahead-of-time unit engine and its platform services (cpu/CMakeLists.txt): no FEXCore, nothing but libc/libdl.
+# Built first: libbbnet20 is linked against it.
+if [[ ! -f $out/cpu/build.ninja ]]; then
+    cmake -S cpu -B "$out/cpu" -G Ninja "${ndk_cmake[@]}" -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
 fi
-run ninja -C "$out/fex" -j "$J" bbcpu > "$out/fex-build.log" 2>&1 || { grep -E "error|FAILED" "$out/fex-build.log" | head -40 >&2; exit 1; }
+run ninja -C "$out/cpu" -j "$J" bbcpu > "$out/cpu-build.log" 2>&1 || { grep -E "error|FAILED" "$out/cpu-build.log" | head -40 >&2; exit 1; }
 
 # GPU library: no libvulkan (gpu/shim/vk_driver_loader.cpp dlopens the driver), no X11. glslang
 # (host program) compiles the host shaders.
@@ -86,12 +61,12 @@ fi
 # the prefix, and the protoc that generates the shadNet protocol runs on this PC (the same version as the library).
 # BB_NET_BBSC: BBSC (seamless co-op, BB_BBSC=1 at run time) is part of the module; an old build directory has the
 # option cached as OFF.
-cmake -S gpu -B "$out/gpu" -DBB_NET=ON -DBB_NET_BBSC=ON "-DBB_HOST_PROTOC=$root/host-tools/bin/protoc" "-DBB_CPU_LIB=$PWD/$out/fex/libbbcpu.so" >/dev/null
+cmake -S gpu -B "$out/gpu" -DBB_NET=ON -DBB_NET_BBSC=ON "-DBB_HOST_PROTOC=$root/host-tools/bin/protoc" "-DBB_CPU_LIB=$PWD/$out/cpu/libbbcpu.so" >/dev/null
 run ninja -C "$out/gpu" -j "$J" bbgpu bbnet20 > "$out/gpu-build.log" 2>&1 || { grep -v '^\[' "$out/gpu-build.log" | tail -40 >&2; exit 1; }
 
 # bin/ and lib/ side by side, executables find lib/ through $ORIGIN.
 mkdir -p "$out/bin" "$out/lib"
-cp -f "$out/fex/libbbcpu.so" "$out/gpu/libbbgpu.so" "$out/gpu/libbbnet20.so" "$out/lib/"
+cp -f "$out/cpu/libbbcpu.so" "$out/gpu/libbbgpu.so" "$out/gpu/libbbnet20.so" "$out/lib/"
 # Mozilla's CA bundle (build_bionic_deps.sh): the online module's TLS trust (BB_CA_BUNDLE overrides the default
 # path, <runtime>/share/cacert.pem beside lib/); MPL-2.0, which the bundle's own header names.
 mkdir -p "$out/share" "$out/licenses"

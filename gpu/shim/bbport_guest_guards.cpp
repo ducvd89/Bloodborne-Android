@@ -367,7 +367,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         stub_page = nullptr;
     }
     if (stub_page) {
-        // The stub page is guest code (FEXCore translates what the jumps lead to there).
+        // The stub page is guest code (registered with guest_cpu_code).
         guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), PageSize);
         mprotect(stub_page, PageSize, PROT_READ | PROT_EXEC);
     }

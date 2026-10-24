@@ -13,27 +13,7 @@
 int main() { std::puts("aot variants test: x86-64 only"); return 0; }
 #else
 
-// The fallback CPU, as far as the engine reaches it here: nothing runs on it.
-extern "C" {
-void bb_fb_init(void* (*)(size_t, int)) {}
-void bb_fb_code(uintptr_t, size_t) {}
-uintptr_t bb_fb_host_function(void* fn) { return uintptr_t(fn); }
-uint64_t bb_fb_call(uintptr_t, unsigned, const uint64_t*) { return 0; }
-void bb_fb_thread_stack(void*, size_t) {}
-void bb_fb_set_gs(void*) {}
-void bb_fb_abandon(void) {}
-void bb_fb_thread_end(void) {}
-uintptr_t bb_fb_return_address(uintptr_t n) { return n; }
-uintptr_t bb_fb_stack_pointer(void) { return 0; }
-int bb_fb_signal_regs(const void*, GuestRegs*) { return 0; }
-uintptr_t bb_fb_host_pc(const void*) { return 0; }
-int bb_fb_handle_fault(int, siginfo_t*, void*) { return 0; }
-static int g_fb_hooks = 0;
-int bb_fb_hook(uintptr_t, size_t, GuestHook) { ++g_fb_hooks; return 0; }
-void bb_fb_invalidate(uintptr_t, size_t) {}
-uint64_t bb_fb_tsc(void) { return 0; }
-uint64_t bb_fb_tsc_frequency(void) { return 1; }
-}
+#include "aot_test_services.h"
 
 namespace {
 constexpr uint64_t ImageSize = 0x1000;
@@ -156,7 +136,7 @@ int main() {
     Changed(0x104, 0x92);
     assert(V.state[0] == 1 && V.active[0] == 1);
     assert(Run(0x100) == 120);
-    assert(E.fns[1] == units[1].fn && E.dirty_flags[1]);       // the variant lacks unit 0x108: it runs on the fallback (dirty, no redirect)
+    assert(E.fns[1] == units[1].fn && E.dirty_flags[1]);       // the variant lacks unit 0x108: it has no native code (dirty, no redirect)
     assert(VariantRedirect(0x108) == nullptr);
 
     // A patch nobody built a variant for: the whole function is dirty.
@@ -212,17 +192,15 @@ int main() {
     }
     // guest_cpu_hook (a GuestHook that replaces the instruction): the slot is set, no code written, rip set by the hook means a jump.
     {
-        const int fb = g_fb_hooks;
-        assert(guest_cpu_hook(E.base + 0x200, 2, RegsHook) == 1 && g_fb_hooks == fb);
+        assert(guest_cpu_hook(E.base + 0x200, 2, RegsHook) == 1);
         GuestState s;
         assert(RunSlot(&s, 1) == GUEST_HOOK_JUMP && s.rip == E.base + 0x10c && s.gregs[RDX] == 99);
     }
-    // A hook at a site that is no slot goes the old way (the fallback hook, then the function is classified from its bytes).
+    // A hook at a site that is no slot is refused (logged): the game's code is never rewritten.
     {
-        const int fb = g_fb_hooks;
-        assert(guest_cpu_hook(E.base + 0x204, 2, RegsHook) == 0 && g_fb_hooks == fb + 1);
+        assert(guest_cpu_hook(E.base + 0x204, 2, RegsHook) == 0);
     }
-    // A function that runs on the fallback refuses a slot; when its code is a variant or original again the slot works (and was kept).
+    // A function without native code refuses a slot; when its code is a variant or original again the slot works (and was kept).
     guest_cpu_hook_slot_clear(E.base + 0x108);
     Changed(0x104, 0x55);
     assert(V.state[0] == 2 && !guest_cpu_has_hook_slot(E.base + 0x108));

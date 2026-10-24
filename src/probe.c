@@ -1,5 +1,5 @@
 /* Minimal x86-64 loader experiment (the game's code runs natively on x86-64 hosts, through
- * FEXCore elsewhere: guest_cpu.h). Not a PS4 emulator or game port. */
+ * ahead-of-time recompiled native code elsewhere: guest_cpu.h). Not a PS4 emulator or game port. */
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
@@ -107,7 +107,7 @@ static void check_cpu(void) {
     exit(1);
 }
 #else
-/* Other hosts: FEXCore provides these instructions to the game. */
+/* Other hosts: the recompiled code does not use the host's x86 features. */
 static void check_cpu(void) {}
 #endif
 static uint64_t read64(FILE *f) {
@@ -173,7 +173,7 @@ static ABI void guest_exit(void) { puts("Runtime: process finalizer callback rea
 /* ---- Fault entry (bb_fault_entry): faults the kernel would otherwise kill silently ----
  * A SIGSEGV/SIGBUS the kernel cannot deliver kills the process with no output (exit 139, no
  * tombstone: this handler replaced debuggerd's): one raised while the handler runs with the
- * signal blocked (a fault inside the chain below: FEX, promotion wait, GPU page tracking, the
+ * signal blocked (a fault inside the chain below: the guest CPU, promotion wait, GPU page tracking, the
  * crash report itself), or one whose handler frame does not fit on the stack (an overflow).
  * - SA_NODEFER: a fault inside the handler re-enters bb_fault_entry, which sees this thread's
  *   depth and reports both faults with async-signal-safe writes (dladdr: acceptable when dying),
@@ -188,7 +188,7 @@ static ABI void guest_exit(void) { puts("Runtime: process finalizer callback rea
 enum { FAULT_STAGE_ENTRY = 1, FAULT_STAGE_GUEST_CPU, FAULT_STAGE_PROMOTION, FAULT_STAGE_GPU,
        FAULT_STAGE_RECOVER, FAULT_STAGE_REPORT };
 static const char *const fault_stage_names[] = {
-    "?", "entry", "guest CPU (FEX)", "granule promotion wait", "GPU page tracking (bbgpu_handle_fault)",
+    "?", "entry", "guest CPU", "granule promotion wait", "GPU page tracking (bbgpu_handle_fault)",
     "recovery point", "crash report"};
 static __thread int fault_depth; /* 1 while this thread runs the handler, 2 while it reports a nested fault */
 static __thread int fault_stage, fault_outer_sig;
@@ -411,7 +411,7 @@ void bb_fault_entry(int sig, siginfo_t *info, void *context) {
     errno = saved_errno;
 }
 static void fault(int sig, siginfo_t *info, void *context) {
-    /* The guest CPU's own faults (FEXCore's JIT), then GPU page tracking (write-protected guest pages). */
+    /* The guest CPU's own faults (unaligned atomics), then GPU page tracking (write-protected guest pages). */
     fault_stage = FAULT_STAGE_GUEST_CPU;
     if (guest_cpu_handle_fault(sig, info, context)) return;
     /* bbport UMA: a page a granule promotion froze: wait for it, the access is retried. */
