@@ -765,7 +765,7 @@ int main(int argc, char** argv) {
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
   }
 #else
-  (void)cpuidDiff;
+  if (cpuidDiff) { fprintf(stderr, "--cpuid-diff needs the Bloodborne-Android tree (cpu/guest_cpu_cpuid.h next to tools/recomp); this build does not have it\n"); return 2; }
 #endif
   if (granularTest) {
     const pid_t pid = fork();
