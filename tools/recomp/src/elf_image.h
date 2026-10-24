@@ -21,6 +21,7 @@ struct ModuleInfo {
   std::string name;
   uint64_t base = 0, size = 0;                      // image-relative
   uint64_t ehFrameHdrVaddr = 0, ehFrameHdrSize = 0; // image-relative (PT_GNU_EH_FRAME of the module)
+  uint64_t init = 0;                                // image-relative entry the runtime starts the module at (boot mode; 0: none)
 };
 
 // Imports and relocations of a boot-linked image: which GOT slot belongs to which import, and the native

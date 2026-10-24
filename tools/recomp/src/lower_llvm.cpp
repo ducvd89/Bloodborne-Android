@@ -363,6 +363,11 @@ void Lower::prologue() {
     B.CreateStore(B.CreateAlignedLoad(V128, gep(offsetof(Core::CPUState, xmm.sse.data) + 16 * i), Align(16)), xmm[i]);
   }
   fN = newAlloca(I1, "N"); fZ = newAlloca(I1, "Z"); fC = newAlloca(I1, "C"); fV = newAlloca(I1, "V");
+}
+
+// The flags at unit entry: from the context (when the unit reads them) or the x86 reset values. Not done on the resume path: the
+// flags are dead after a call, so a call-return block does not care what they were.
+void Lower::flagsInit() {
   if (flagsRead) {
     Value* w = B.CreateAlignedLoad(I32, gep(offsetof(Core::CPUState, flags) + X86State::RFLAG_NZCV_LOC), Align(1));
     auto bit = [&](unsigned sh) { return B.CreateTrunc(B.CreateLShr(w, sh), I1); };
@@ -569,6 +574,12 @@ void Lower::run() {
     int64_t lastGuest = -1;
     for (auto [Node, op] : IR.GetCode(BlockNode)) {
       if (op->Op == IR::OP_GUESTOPCODE) lastGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset;
+      if (op->Op == IR::OP_EXITFUNCTION && m.O.resumeEntries) {
+        auto* o = op->C<IR::IROp_ExitFunction>();
+        uint64_t ra;
+        if (o->Hint == IR::BranchHint::Call && !o->CallReturnBlock.IsInvalid() && addrConst(o->CallReturnAddress, ra))
+          retBlocks.push_back({ra - m.O.liftBase, o->CallReturnBlock.ID().Value});
+      }
       if (op->Op == IR::OP_EXITFUNCTION && lastGuest >= 0 && meta && !meta->switches.empty()) {
         auto* o = op->C<IR::IROp_ExitFunction>();
         uint64_t k;
@@ -601,7 +612,7 @@ void Lower::run() {
     blocks.emplace(id, std::move(bi));
   }
   if (order.empty()) { B.CreateUnreachable(); return; }
-  B.CreateBr(bbOf[order[0]]);
+  auto* proEnd = B.GetInsertBlock(); // the prologue block: its terminator is emitted after the blocks (resume switch)
 
   // Reverse post-order from the entry: a block's dominators are emitted first, so every operand exists
   // when it is used (the IR list order does not guarantee that).
@@ -668,6 +679,36 @@ void Lower::run() {
       materialize();
       B.CreateUnreachable();
     }
+  }
+  // Prologue exit: into the unit's entry block, or (resume entries) into the switch that re-enters at a call-return block when
+  // the dispatcher asks for it with the resume flag in the guest state (docs/RECOMP_ABI.md).
+  B.SetInsertPoint(proEnd);
+  std::vector<std::pair<uint64_t, uint32_t>> cases;
+  for (auto& rb : retBlocks) if (emitted.count(rb.second)) cases.push_back(rb);
+  std::sort(cases.begin(), cases.end());
+  cases.erase(std::unique(cases.begin(), cases.end(), [](auto& a, auto& b) { return a.first == b.first; }), cases.end());
+  if (m.O.resumeEntries && !cases.empty()) {
+    auto* rsw = newBB("resume");
+    auto* fi = newBB("flags");
+    auto* flag = B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, _pad1)), Align(8));
+    B.CreateCondBr(B.CreateICmpNE(flag, c64(0)), rsw, fi);
+    B.SetInsertPoint(fi);
+    flagsInit();
+    B.CreateBr(bbOf[order[0]]);
+    B.SetInsertPoint(rsw);
+    B.CreateAlignedStore(c64(0), gep(offsetof(Core::CPUState, _pad1)), Align(8));
+    Value* rip = B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, rip)), Align(8));
+    Value* off = B.CreateSub(rip, m.O.fixedImageBase ? (Value*)c64(m.O.imageBase) : ImgBase);
+    auto* miss = newBB("resume_miss");
+    auto* si = B.CreateSwitch(off, miss, cases.size());
+    for (auto [vaddr, id] : cases) si->addCase(cast<ConstantInt>(ConstantInt::get(I64, vaddr)), bbOf[id]);
+    B.SetInsertPoint(miss);
+    B.CreateAlignedStore(c64(1), gep(offsetof(Core::CPUState, _pad1)), Align(8)); // not here: the dispatcher tries the next unit
+    B.CreateRetVoid();
+    res->resumeCases = cases.size();
+  } else {
+    flagsInit();
+    B.CreateBr(bbOf[order[0]]);
   }
   for (uint32_t id : order)
     if (!emitted.count(id)) bbOf[id]->eraseFromParent();

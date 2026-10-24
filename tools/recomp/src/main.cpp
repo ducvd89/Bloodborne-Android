@@ -28,7 +28,7 @@ static void usage() {
         "  --scan               list function count and range statistics only\n"
         "  --funcs <file>       compare the FDE list with a 'start end' hex list (ehscan.py output)\n"
         "  --out <dir>          census output directory (default out/recomp)\n"
-        "  --jobs <n>           worker threads (default: cores - 2, at most 22)\n"
+        "  --jobs <n>           worker threads (default: cores - 2, at most 22; fewer when the memory budget needs it)\n"
         "  --limit <n>, --every <n>   census only the first n functions / every nth function\n"
         "  --base <hex>         host address of image vaddr 0 (default 0x200000000)\n"
         "  --host <profile>     target features: armv8.2 | armv8.4 (default) | armv9\n"
@@ -47,9 +47,13 @@ static void usage() {
         "  --obj <file>         compile to object files (<file> for 1 shard, else <base>.NNN.o + <base>.table.o)\n"
         "  --so <file>          compile and link an Android ARM64 shared object (needs --target aarch64)\n"
         "  --target aarch64|x86_64   (default aarch64)     -O0 | -O1 (default) | -O2\n"
-        "  --shards <n>         modules compiled in parallel (default 64; 1 for --emit-ll)\n"
+        "  --shards <n>         modules compiled in parallel (default 64 or more: the memory plan makes the shards smaller, then the\n"
+        "                       worker count lower, until the peak fits in 60% of the available RAM; 1 for --emit-ll)\n"
+        "  --plan-only          print the memory plan (jobs, shards, estimated peak) and stop\n"
+        "  --mem-fraction <f>   share of the available memory the compile may use (default 0.6)\n"
         "  --verify-llvm        run the LLVM verifier on every module\n"
         "  --flags-at-calls     also store NZCV before calls and returns (x86 flags are dead there; off by default)\n"
+        "  --resume-entries     every call-return block is also an entry of its unit (resume flag in the guest state)\n"
         "  --no-callee-saved    reload rbx, rbp, r12-r15 after calls too (default: the SysV callee-saved set is trusted)\n"
         "  --ndk <dir>          Android NDK for --so\n"
         "  --stats <file>       also write the compile summary here\n", stderr);
@@ -62,7 +66,7 @@ int main(int argc, char** argv) {
   CensusOptions co;
 #ifdef BB_RECOMP_LLVM
   CompileOptions cc;
-  bool shardsSet = false;
+  bool shardsSet = false, jobsSet = false;
   cc.statsPath = "out/recomp/compile.txt";
 #endif
   unsigned hw = std::thread::hardware_concurrency();
@@ -77,7 +81,7 @@ int main(int argc, char** argv) {
     else if (is("--scan")) scanOnly = true;
     else if (is("--funcs")) funcsFile = arg();
     else if (is("--out")) co.outDir = arg();
-    else if (is("--jobs")) co.jobs = std::max(1, atoi(arg()));
+    else if (is("--jobs")) { co.jobs = std::max(1, atoi(arg())); jobsSet = true; }
     else if (is("--limit")) co.limit = strtoull(arg(), nullptr, 0);
     else if (is("--every")) co.every = std::max<uint64_t>(1, strtoull(arg(), nullptr, 0));
     else if (is("--base")) base = strtoull(arg(), nullptr, 16);
@@ -103,7 +107,10 @@ int main(int argc, char** argv) {
     else if (is("-O2")) cc.target.opt = 2;
     else if (is("--shards")) { cc.shards = std::max(1, atoi(arg())); shardsSet = true; }
     else if (is("--verify-llvm")) cc.verify = true;
+    else if (is("--plan-only")) cc.planOnly = true;
+    else if (is("--mem-fraction")) cc.memFraction = std::max(0.05, atof(arg()));
     else if (is("--flags-at-calls")) cc.storeFlagsAtCalls = true;
+    else if (is("--resume-entries")) cc.resumeEntries = true;
     else if (is("--no-callee-saved")) cc.calleeSaved = false;
     else if (is("--ndk")) cc.ndk = arg();
     else if (is("--stats")) cc.statsPath = arg();
@@ -143,6 +150,11 @@ int main(int argc, char** argv) {
     printf("compared with %s: %zu entries, %zu differ%s\n", funcsFile.c_str(), n, bad, n != funcs.size() ? " (count differs)" : "");
     if (bad || n != funcs.size()) return 1;
   }
+  {
+    const size_t nFde = funcs.size();
+    const NonFde nf = addNonFdeEntries(img, funcs);
+    if (nf.entries || nf.stubs) printf("non-FDE code the runtime enters: %zu start entries (eboot entry, module starts), %zu PLT stubs (%zu pseudo-functions added to the %zu FDE functions)\n", nf.entries, nf.stubs, funcs.size() - nFde, nFde);
+  }
   static EhScan eh;
   static ReturnsTwice rt;
   if (!noSecondary && !scanOnly) {
@@ -159,8 +171,8 @@ int main(int argc, char** argv) {
   if (scanOnly) return 0;
   if (dump) return dumpFunction(img, funcs, strtoull(dumpArg.c_str(), nullptr, 16), co.lift);
 #ifdef BB_RECOMP_LLVM
-  if (!cc.llPath.empty() || !cc.objPath.empty() || !cc.soPath.empty()) {
-    cc.lift = co.lift; cc.jobs = co.jobs; cc.limit = co.limit;
+  if (!cc.llPath.empty() || !cc.objPath.empty() || !cc.soPath.empty() || cc.planOnly) {
+    cc.lift = co.lift; cc.jobs = co.jobs; cc.limit = co.limit; cc.jobsFixed = jobsSet; cc.shardsFixed = shardsSet;
     if (!shardsSet && !cc.llPath.empty() && cc.objPath.empty() && cc.soPath.empty()) cc.shards = 1;
     return runCompile(img, funcs, cc);
   }

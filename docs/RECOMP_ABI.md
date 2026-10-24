@@ -5,22 +5,54 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
 
 ## Units
 
-- **One unit per FEX IR multiblock.** That is one FDE function, plus the extra (gap) units the
-  census found. Each unit becomes one LLVM function:
-  `void bbr_<vaddr hex>(GuestState *s)`, with external linkage and the C calling convention.
+- **One unit per FEX IR multiblock.** That is one FDE function (the *entry unit*), plus extra units for code the entry unit does
+  not reach: gap units (leftovers of unresolved jump tables, dead code) and *secondary entries* (below). Each unit becomes one
+  LLVM function: `void bbr_<vaddr hex>(GuestState *s)`, with external linkage and the C calling convention.
+- **One image.** The `.so` covers the eboot and the linked system modules (`libc.prx`, `libSceFios2.prx`) in the layout the
+  runtime builds (`scripts/link_modules.py`, `out/boot-linked.bin`): a module sits at its own image offset (`image +0x56e0000` for
+  libc.prx, `+0x57c0000` for libSceFios2.prx) and every unit address, in the table and in the code, is relative to the one image
+  base. `bb-recomp --boot out/boot-linked.bin` lifts that flat image (so the bytes are the ones the runtime maps, `mov rax, fs:[0]`
+  already rewritten to `gs:` by the linker); `--elf` only supplies the eboot's program headers.
 - **Guest addresses** in the IR are image vaddr + the lift base. The lowering emits *image-relative*
   addresses (vaddr) plus a runtime image base, a global `bbr_image_base` that the loader sets. The
   `.so` is then position independent, and the runtime may map the image anywhere (on Android
   today: 0x800000000).
 - **Unit table.** The `.so` exports `bbr_units[]`, a sorted array of `{ uint64_t vaddr; void (*fn)(GuestState*); }`
-  with one entry per unit entry (every FDE start plus every gap unit). It also exports `bbr_unit_count`,
-  `bbr_image_hash` (FNV-1a 64 of the patched image file the `.so` was built from), `bbr_abi_version` (1) and
-  the writable `bbr_image_base`. The unit functions themselves have hidden visibility: the table is the only
-  way in.
-  *Change from the first draft:* call-return blocks are **not** table entries. Re-entering the middle of a
-  unit would need an entry stub per call site (about 1.6 M in the game) and a resume switch in every unit.
-  Only a longjmp/exception resume lands there, and the rare case goes to the fallback CPU through the
-  `bbr_dispatch` miss path, like any other address that is not a unit entry.
+  with one entry per unit: every FDE start of every module, every gap unit and every secondary entry. It also exports
+  `bbr_unit_count`, `bbr_image_hash` (FNV-1a 64 of the image the `.so` was built from: the flat boot image, or the ELF file for a
+  plain `--elf` build), `bbr_abi_version` (1) and the writable `bbr_image_base`. The unit functions themselves have hidden
+  visibility: the table is the only way in.
+- **Function table** (additive, ABI version still 1). `bbr_funcs[]`, `bbr_func_count`: `{ uint32_t start, end, first_unit, unit_count; }`
+  per FDE function in address order, where `first_unit .. first_unit+unit_count` is the run of `bbr_units[]` entries that lie in
+  `[start, end)` (entry unit first). A dispatcher that has to resume in the middle of a function (below) finds the function by
+  binary search and tries those units. `bbr_abi_flags` (u64): bit 0 = the units have resume entries.
+- **Secondary entries.** Addresses the runtime can enter without a function start get units of their own, bounded to their FDE
+  (a multiblock lifted from that address; the code that follows is duplicated from the entry unit, which costs little because
+  there are few):
+  - *C++ landing pads*: the call-site tables of every FDE's LSDA (`.eh_frame` CIE/FDE augmentation, `gcc_except_table`).
+    The unwinder (`_Unwind_*` in libc.prx, `__Ux86_64_setcontext`) resumes there with a register restore and a jump.
+  - *setjmp return sites*: the return address of every `call` to `setjmp`, found by the import name (`gNQ1V2vfXDE`, the NID of
+    `setjmp`, in the boot file's import table; the binding gives libc.prx's export, the relocations give the GOT slot and
+    the PLT stub in the eboot). `longjmp` ends in a jump to the saved return address, which lands in the middle of the caller.
+  Case counts are in `docs/STATIC_RECOMPILE_PLAN.md` ("Discovery").
+- **Resume entries (every call-return block; optional, `--resume-entries`).** When a guest `ret` or `jmp` lands on a call-return
+  address (the address after a `call`) that is not an entry above, for instance after a stack switch (a fiber or coroutine
+  restores another guest stack and `ret`s into a caller that has no host frame), the dispatcher can enter the unit that holds
+  the address instead of falling back to the slow path. Design: **no per-site table and no per-site stub.** Each unit that
+  contains calls gets a resume switch right after its prologue (which already loads every register it uses from `s`):
+
+      if (s->resume != 0) {            // GuestState offset 0xb8: FEX's `_pad1`, unused by the lowering
+          s->resume = 0;
+          switch (s->rip - image_base) { case <return address k>: goto the call-return block k; ... }
+          s->resume = 1; return;       // not a call-return block of this unit: the dispatcher tries the next unit
+      }
+
+  The call-return block is the IR block after the call; entering it from the prologue is valid because the state is exactly what
+  the ordinary path has there (all registers in `s`, flags dead). The dispatcher (`bbr_dispatch`/`bbr_dispatch_tail` on a miss in
+  `bbr_units[]`): binary-search `bbr_funcs[]` for the function containing `s->rip`, then for each of its units in order set
+  `s->resume = 1` and call it; when it returns with `s->resume` still 1 try the next unit; when none takes it, use the fallback
+  CPU. Cost (measured on a 20,000-function sample at -O1, then the whole game): see the plan, "Resume entries". It is **off by
+  default**; `bbr_abi_flags` bit 0 tells the runtime whether the `.so` has it.
 
 ## Guest state
 
@@ -81,8 +113,13 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
   - With a constant, known target: `musttail call bbr_<target>(s)`.
   - Otherwise store the target to `s->rip` and `musttail call bbr_dispatch_tail(s)`. *Change:* the target is
     in `s->rip`, not an argument: `musttail` needs the caller's prototype `void(GuestState*)`.
-  - Indirect jumps inside the unit (switch tables), once resolved, become an LLVM `switch` over block
-    addresses, with dispatch as the default.
+  - **Switch tables.** The lifter recognises the compiler's jump table pattern (`cmp idx, N; ja default; lea base, [rip+T];
+    movsxd off, [base+idx*4]; add off, base; jmp off`, also `jbe/jb` into the table code, an `and idx, mask` bound, the
+    base kept in another register or set before a loop) and reads the rel32 table from `.text`. The case targets are added as
+    block entries of the same multiblock unit, and that `jmp` becomes an LLVM `switch` on `target - image_base` over the case
+    blocks, with `bbr_dispatch_tail` (the code above) as the default: an address that is not a case (a table the
+    recogniser got wrong, or a computed target) still works, only slower. Registers and flags are not spilled on the switch
+    edges (the case blocks are blocks of the same unit); the default edge spills as for any tail jump.
 - **`bbr_image_base`** is a `uint64_t` the loader sets after `dlopen`; every unit loads it once at entry
   (`!invariant.load`) and adds it to each image-relative address. Constants that are image addresses are
   recognised by value: `EntrypointOffset`, `InlineEntrypointOffset`, and a `Constant` inside the image

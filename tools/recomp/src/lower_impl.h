@@ -82,6 +82,7 @@ struct Lower {
   std::set<std::string> unsup; // unsupported op names of this unit
 
   const UnitMeta* meta = nullptr;
+  std::vector<std::pair<uint64_t, uint32_t>> retBlocks; // (image vaddr of the return address, IR block id) of every call with a return block
   // ExitFunction node id -> (image vaddr, IR block id) of the cases of the switch the jump became
   std::unordered_map<uint32_t, std::vector<std::pair<uint64_t, uint32_t>>> swCases;
 
@@ -127,6 +128,7 @@ struct Lower {
   // ---- state
   void scan();
   void prologue();
+  void flagsInit();
   void spill(bool flags);                 // store the dirty registers (and the flags when asked)
   void fill();
   Value* loadRegValue(unsigned cls, unsigned reg);

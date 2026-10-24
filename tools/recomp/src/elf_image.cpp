@@ -71,7 +71,7 @@ bool ElfImage::load(const std::string& path, uint64_t baseAddr, std::string& err
     }
   }
   if (loads.empty()) { err = "no PT_LOAD"; return false; }
-  modules.assign(1, ModuleInfo {"eboot", 0, top, ehFrameHdrVaddr, ehFrameHdrSize});
+  modules.assign(1, ModuleInfo {"eboot", 0, top, ehFrameHdrVaddr, ehFrameHdrSize, entry});
   for (auto& s : loads) {
     if (s.flags & 1) { textLo = s.vaddr; textHi = s.vaddr + s.memsz; }
     uint64_t a = (baseAddr + s.vaddr) & ~(Page - 1), e = (baseAddr + s.vaddr + s.memsz + Page - 1) & ~(Page - 1);
@@ -144,13 +144,14 @@ bool ElfImage::loadBoot(const std::string& bootPath, const std::string& ebootElf
   if (!readFile(ebootElf, eb)) { err = "cannot read " + ebootElf; return false; }
   if (!programHeaders(eb, ph, err)) { err = ebootElf + ": " + err; return false; }
   modules.clear();
-  ModuleInfo main {"eboot", 0, 0, 0, 0};
+  ModuleInfo main {"eboot", 0, 0, 0, 0, 0};
+  main.init = entryOff;
   for (auto& p : ph) if (p.type == PT_GNU_EH_FRAME_) { main.ehFrameHdrVaddr = p.vaddr; main.ehFrameHdrSize = p.filesz; }
   main.size = mods[0].base; // the eboot ends where the first module starts (the module table is in link order)
   ehFrameHdrVaddr = main.ehFrameHdrVaddr; ehFrameHdrSize = main.ehFrameHdrSize;
   modules.push_back(main);
   for (size_t m = 0; m < mods.size(); ++m) {
-    ModuleInfo mi; mi.base = mods[m].base; mi.size = mods[m].size;
+    ModuleInfo mi; mi.base = mods[m].base; mi.size = mods[m].size; mi.init = mods[m].init;
     mi.name = m < names.size() ? names[m] : (m == 0 ? "libc.prx" : "libSceFios2.prx");
     std::vector<uint8_t> f; std::vector<Phdr> mp;
     if (!readFile(prxDir + "/" + mi.name, f)) { err = "cannot read " + prxDir + "/" + mi.name; return false; }
