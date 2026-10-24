@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Compile-time and start-up check that cpu/guest_state.h's replica of FEX's CPUState has the same layout:
+// Compile-time and start-up check that cpu/guest_state.h's GuestState has the layout of the x86-64 front end's CPUState, which the Rebuild Tool
+// (tools/recomp) compiles the units against. The runtime itself contains no FEX code: this check needs a FEX source tree (the tool's, which
+// fetches it: tools/recomp/fetch-fex.sh) and is run by tools/check_recomp_abi.sh when BB_FEX_DIR points at one:
 //   clang++ -std=c++20 -I<FEX>/FEXCore/include -I<FEX> -I<FEX>/External/fmt/include ... tests/guest_state_check.cpp
 #include <FEXCore/Core/CoreState.h>
 #include <cstdio>
