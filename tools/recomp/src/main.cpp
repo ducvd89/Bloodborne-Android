@@ -31,7 +31,7 @@ static void usage() {
         "  --out <dir>          census output directory (default out/recomp)\n"
         "  --jobs <n>           worker threads (default: cores - 2, at most 22; fewer when the memory budget needs it)\n"
         "  --limit <n>, --every <n>   census only the first n functions / every nth function\n"
-        "  --base <hex>         host address of image vaddr 0 (default 0x200000000)\n"
+        "  --base <hex>         host address of image vaddr 0 (default 0x3a7700000000: no plain constant of the game falls in it)\n"
         "  --host <profile>     target features: armv8.2 | armv8.4 (default) | armv9\n"
         "  --no-multiblock      one basic block per unit (FEX default is multiblock; the game ships Multiblock=1)\n"
         "  --tso                lift with x86 TSO memory ordering (the game runs with it off)\n"
@@ -67,7 +67,11 @@ static void usage() {
 
 int main(int argc, char** argv) {
   std::string elf = "out/eboot.elf", funcsFile, dumpArg, bootFile, prxDir;
-  uint64_t base = 0x200000000ull;
+  // The lift base. The lowering takes a 64-bit IR constant inside [base, base + image size) for an image address (FEX folds
+  // rip-relative arithmetic into such constants) and relocates it to the runtime's image base. With the old base 0x200000000
+  // two packed 32-bit integers such as `movabs rax, 0x200000002` (2 and 2) became image + 2 on the Thor (a count of
+  // 0x104002 -> a 1 GB allocation -> null). Nothing but rip-derived values lands in this high, odd window.
+  uint64_t base = 0x3a7700000000ull;
   bool scanOnly = false, nice = true, dump = false, noSecondary = false, noDiscovery = false;
   CensusOptions co;
 #ifdef BB_RECOMP_LLVM
