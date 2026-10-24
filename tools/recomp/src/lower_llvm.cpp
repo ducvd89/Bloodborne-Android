@@ -10,11 +10,12 @@
 
 using namespace llvm;
 
-std::string unitName(uint64_t vaddr) {
-  char b[40];
-  snprintf(b, sizeof b, "bbr_%llx", (unsigned long long)vaddr);
-  return b;
+std::string unitNameWith(const std::string& prefix, uint64_t vaddr) {
+  char b[24];
+  snprintf(b, sizeof b, "%llx", (unsigned long long)vaddr);
+  return prefix + b;
 }
+std::string unitName(uint64_t vaddr) { return unitNameWith("bbr_", vaddr); }
 
 namespace bbr {
 
@@ -29,15 +30,16 @@ FunctionCallee ModuleCtx::helper(const char* name, Type* ret, ArrayRef<Type*> ar
   return M.getOrInsertFunction(name, FunctionType::get(ret, args, false));
 }
 
-FunctionCallee ModuleCtx::unitFn(uint64_t vaddr) {
-  std::string n = unitName(vaddr);
-  if (auto* f = M.getFunction(n)) return f;
-  auto* f = Function::Create(FunctionType::get(Void, {Ptr}, false), GlobalValue::ExternalLinkage, n, &M);
-  if (O.hiddenUnits) f->setVisibility(GlobalValue::HiddenVisibility);
+static FunctionCallee unitFnNamed(ModuleCtx& m, const std::string& n) {
+  if (auto* f = m.M.getFunction(n)) return f;
+  auto* f = Function::Create(FunctionType::get(m.Void, {m.Ptr}, false), GlobalValue::ExternalLinkage, n, &m.M);
+  if (m.O.hiddenUnits) f->setVisibility(GlobalValue::HiddenVisibility);
   f->addFnAttr(Attribute::NoUnwind);
   f->addParamAttr(0, Attribute::NoAlias);
   return f;
 }
+FunctionCallee ModuleCtx::unitFn(uint64_t vaddr) { return unitFnNamed(*this, O.callName ? O.callName(vaddr) : unitName(vaddr)); }
+FunctionCallee ModuleCtx::defFn(uint64_t vaddr) { return unitFnNamed(*this, O.defPrefix.empty() ? unitName(vaddr) : unitNameWith(O.defPrefix, vaddr)); }
 
 // ------------------------------------------------------------------------------------ helpers -------
 Lower::Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry, const UnitMeta* um)
@@ -409,6 +411,73 @@ void Lower::fill() {
     if (xmmUsed[i]) B.CreateStore(B.CreateAlignedLoad(V128, gep(offsetof(Core::CPUState, xmm.sse.data) + 16 * i), Align(16)), xmm[i]);
 }
 
+// Every used register from the context (after a hook callback, which may have changed any of them, callee-saved ones included).
+void Lower::fillAll() {
+  for (unsigned i = 0; i < NumStaticGPR; ++i) {
+    if (!gprUsed[i]) continue;
+    if (i < 16) B.CreateStore(B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, gregs) + 8 * i), Align(8)), gpr[i]);
+    else B.CreateStore(B.CreateZExt(B.CreateAlignedLoad(I32, gep(i == 16 ? offsetof(Core::CPUState, pf_raw) : offsetof(Core::CPUState, af_raw)), Align(4)), I64), gpr[i]);
+  }
+  for (unsigned i = 0; i < NumStaticFPR; ++i)
+    if (xmmUsed[i]) B.CreateStore(B.CreateAlignedLoad(V128, gep(offsetof(Core::CPUState, xmm.sse.data) + 16 * i), Align(16)), xmm[i]);
+}
+
+// A native hook site (docs/RECOMP_ABI.md, "Hook slots"), at the start of the guest instruction at hs.vaddr:
+//   if (bbr_hook_slot[k]) { spill; rip = site; act = slot(s, k); reload;
+//                           act 0: run this instruction;  act 2: return (rip and rsp set by the slot);
+//                           else: continue at s->rip: a case of hs.resume (a block of this unit), else the dispatcher }
+// Flags stay as they were (the callback cannot change them): they are put into the allocas before the test, so the jump path
+// continues from there, while the fall-through path goes on with the lazy flag descriptor.
+void Lower::emitHookSite(const HookSite& hs) {
+  materialize();
+  auto* slotAddr = B.CreateConstInBoundsGEP1_64(Ptr, m.hookSlotVar, hs.index);
+  auto* slot = B.CreateAlignedLoad(Ptr, slotAddr, Align(8), "hslot");
+  slot->setAtomic(AtomicOrdering::Monotonic);
+  auto* hookBB = newBB("hook");
+  auto* contBB = newBB("hcont");
+  auto* br = B.CreateCondBr(B.CreateICmpNE(slot, ConstantPointerNull::get(cast<PointerType>(Ptr))), hookBB, contBB);
+  br->setMetadata(LLVMContext::MD_prof, MDBuilder(C).createBranchWeights(1, 4000));
+  B.SetInsertPoint(hookBB);
+  const uint64_t savedDirty = dirty;
+  spill(true);
+  B.CreateAlignedStore(reloc(m.O.liftBase + hs.vaddr), gep(offsetof(Core::CPUState, rip)), Align(8));
+  Value* act = B.CreateCall(FunctionType::get(I64, {Ptr, I64}, false), slot, {S, c64(hs.index)});
+  fillAll();
+  dirty = 0;
+  auto* retBB = newBB("hret");
+  auto* jmpBB = newBB("hjump");
+  auto* sw = B.CreateSwitch(act, jmpBB, 2);
+  sw->addCase(cast<ConstantInt>(ConstantInt::get(I64, 0)), contBB);
+  sw->addCase(cast<ConstantInt>(ConstantInt::get(I64, 2)), retBB);
+  B.SetInsertPoint(retBB);
+  B.CreateRetVoid();
+  B.SetInsertPoint(jmpBB);
+  Value* rip = B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, rip)), Align(8));
+  std::vector<std::pair<uint64_t, BasicBlock*>> cases;
+  for (uint64_t r : hs.resume) {
+    auto sp = hookSplit.find(r);
+    if (sp != hookSplit.end()) { cases.push_back({r, sp->second}); continue; }
+    auto bi = hookBlockAt.find(r);
+    if (bi != hookBlockAt.end() && hookReachable.count(bi->second)) cases.push_back({r, bbOf[bi->second]});
+  }
+  auto* miss = newBB("hmiss");
+  if (cases.empty()) {
+    B.CreateBr(miss);
+  } else {
+    Value* off = B.CreateSub(rip, m.O.fixedImageBase ? (Value*)c64(m.O.imageBase) : ImgBase);
+    auto* si = B.CreateSwitch(off, miss, cases.size());
+    for (auto [vaddr, bb] : cases) si->addCase(cast<ConstantInt>(ConstantInt::get(I64, vaddr)), bb);
+  }
+  B.SetInsertPoint(miss);
+  auto* c = B.CreateCall(m.helper("bbr_dispatch_tail", m.Void, {Ptr}), {S});
+  c->setTailCallKind(CallInst::TCK_MustTail);
+  B.CreateRetVoid();
+  B.SetInsertPoint(contBB);
+  dirty = savedDirty;
+  ++res->hookSites;
+  res->hookIdx.push_back(hs.index);
+}
+
 // ----------------------------------------------------------------------------------- control flow ----
 void Lower::emitBreak(const IR::IROp_Break* op) {
   const uint64_t kind = (uint64_t)op->Reason.Signal | ((uint64_t)op->Reason.TrapNumber << 8) | ((uint64_t)op->Reason.si_code << 16) |
@@ -507,7 +576,24 @@ bool Lower::emitOp(Ref node, IR::IROp_Header* op) {
   case IR::OP_BEGINBLOCK: case IR::OP_ENDBLOCK: case IR::OP_CODEBLOCK: case IR::OP_IRHEADER: case IR::OP_DUMMY:
   case IR::OP_INVALIDATEFLAGS: case IR::OP_INLINECONSTANT: case IR::OP_INLINEENTRYPOINTOFFSET:
     return true;
-  case IR::OP_GUESTOPCODE: curGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset; return true;
+  case IR::OP_GUESTOPCODE: {
+    curGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset;
+    if (m.O.hookSites) {
+      const uint64_t vaddr = entryRip - m.O.liftBase + curGuest;
+      // A point a hook callback may continue at, in the middle of a block: the block starts here (the fall-through path comes in
+      // with its flags in the allocas), the callback's jump path joins it.
+      auto sp = hookSplit.find(vaddr);
+      if (sp != hookSplit.end() && !terminated()) {
+        materialize();
+        fd = FlagDesc{};
+        B.CreateBr(sp->second);
+        B.SetInsertPoint(sp->second);
+      }
+      auto hs = m.O.hookSites->find(vaddr);
+      if (hs != m.O.hookSites->end()) emitHookSite(hs->second);
+    }
+    return true;
+  }
   case IR::OP_JUMP: {
     materialize();
     B.CreateBr(bbOf[op->C<IR::IROp_Jump>()->TargetBlock.ID().Value]);
@@ -549,7 +635,7 @@ bool Lower::emitOp(Ref node, IR::IROp_Header* op) {
 void Lower::run() {
   scan();
   const std::string name = unitName(entryVaddr);
-  F = cast<Function>(m.unitFn(entryVaddr).getCallee());
+  F = cast<Function>(m.defFn(entryVaddr).getCallee());
   F->setDoesNotThrow();
   if (!F->empty()) { fprintf(stderr, "bb-recomp: unit %s lowered twice\n", name.c_str()); return; }
   S = F->getArg(0);
@@ -597,12 +683,17 @@ void Lower::run() {
   if (meta && !meta->switches.empty())
     for (auto [BlockNode, BlockHeader] : IR.GetBlocks())
       blockAt[entryRip - m.O.liftBase + BlockHeader->C<IR::IROp_CodeBlock>()->GuestEntryOffset] = IR.GetID(BlockNode).Value;
+  std::set<uint64_t> guestAt; // image vaddr of every GuestOpcode of the unit (hook sites)
   for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
     const uint32_t id = IR.GetID(BlockNode).Value;
     BlockInfo bi{BlockNode, BlockHeader, {}};
     int64_t lastGuest = -1;
+    if (m.O.hookSites) hookBlockAt[entryRip - m.O.liftBase + BlockHeader->C<IR::IROp_CodeBlock>()->GuestEntryOffset] = id;
     for (auto [Node, op] : IR.GetCode(BlockNode)) {
-      if (op->Op == IR::OP_GUESTOPCODE) lastGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset;
+      if (op->Op == IR::OP_GUESTOPCODE) {
+        lastGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset;
+        if (m.O.hookSites) guestAt.insert(entryRip - m.O.liftBase + lastGuest);
+      }
       if (op->Op == IR::OP_EXITFUNCTION && m.O.resumeEntries) {
         auto* o = op->C<IR::IROp_ExitFunction>();
         uint64_t ra;
@@ -642,6 +733,14 @@ void Lower::run() {
   }
   if (order.empty()) { B.CreateUnreachable(); return; }
   auto* proEnd = B.GetInsertBlock(); // the prologue block: its terminator is emitted after the blocks (resume switch)
+  if (m.O.hookSites) {
+    // Resume points of the hook sites that are instructions inside a block (no block entry): the block gets a split there.
+    for (auto& [vaddr, hs] : *m.O.hookSites) {
+      if (!guestAt.count(vaddr)) continue;
+      for (uint64_t r : hs.resume)
+        if (!hookBlockAt.count(r) && guestAt.count(r) && !hookSplit.count(r)) hookSplit[r] = newBB("hsplit");
+    }
+  }
 
   // Reverse post-order from the entry: a block's dominators are emitted first, so every operand exists
   // when it is used (the IR list order does not guarantee that).
@@ -660,6 +759,7 @@ void Lower::run() {
     }
   }
   std::reverse(post.begin(), post.end());
+  hookReachable.insert(post.begin(), post.end());
 
   // Which static registers may differ from the context at each block start: a register is dirty from its
   // StoreRegister until the next spill (exit, call, syscall); a call's return block starts clean.
@@ -741,6 +841,8 @@ void Lower::run() {
   }
   for (uint32_t id : order)
     if (!emitted.count(id)) bbOf[id]->eraseFromParent();
+  for (auto& [v, bb] : hookSplit)
+    if (bb->empty()) { IRBuilder<> ub(bb); ub.CreateUnreachable(); } // a resume point whose instruction was never reached: nothing jumps here
 
   for (auto& s : unsup) res->unsupported.push_back(s);
 }
@@ -761,6 +863,10 @@ struct UnitLowerer::Impl {
       m.dirtyVar = new GlobalVariable(mod, m.I8, false, GlobalValue::ExternalLinkage, nullptr, "bbr_dirty");
       m.dirtyVar->setDSOLocal(true);
     }
+    if (o.hookSites) {
+      m.hookSlotVar = new GlobalVariable(mod, m.Ptr, false, GlobalValue::ExternalLinkage, nullptr, "bbr_hook_slot");
+      m.hookSlotVar->setDSOLocal(true);
+    }
   }
 };
 
@@ -773,9 +879,16 @@ void UnitLowerer::lower(uint64_t entry, const void* irView, LowerResult* res, co
   l.run();
 }
 
+void UnitLowerer::reconfigure(const std::string& defPrefix, std::function<std::string(uint64_t)> callName) {
+  auto& o = impl_->m.O;
+  o.defPrefix = defPrefix;
+  o.callName = callName;
+  o.isKnownUnit = [callName](uint64_t v) { return !callName(v).empty(); };
+}
+
 void UnitLowerer::stub(uint64_t entry) {
   auto& m = impl_->m;
-  auto* f = cast<Function>(m.unitFn(entry).getCallee());
+  auto* f = cast<Function>(m.defFn(entry).getCallee());
   auto* bb = BasicBlock::Create(m.C, "entry", f);
   IRBuilder<> b(bb);
   b.CreateCall(m.helper("bbr_trap", m.Void, {m.Ptr, m.I64}), {f->getArg(0), ConstantInt::get(m.I64, BBR_TRAP_UNLIFTABLE | entry)});

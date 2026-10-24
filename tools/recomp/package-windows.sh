@@ -104,7 +104,7 @@ run "$nbin/bin/clang" --target=aarch64-linux-android30 -O2 -fPIC -fvisibility=hi
 run "$nbin/bin/clang" --target=aarch64-linux-android30 -shared -nostdlib -Wl,-soname,libbbcpu.so -x c /dev/null -o "$d/share/bb-recomp/libbbcpu-stub.so"
 cp "$nbin/sysroot/usr/lib/aarch64-linux-android/30/libm.so" "$d/share/bb-recomp/libm.so"
 cp "$builtins" "$d/share/bb-recomp/"
-[[ -d tools/recomp/variants ]] && cp -r tools/recomp/variants "$d/share/bb-recomp/variants"
+mkdir -p "$d/share/bb-recomp/variants" && cp tools/recomp/variants/*.txt "$d/share/bb-recomp/variants/"   # the catalogs only (the generators stay in the source tree)
 "$mingw/bin/llvm-strip" -o "$d/bb-recomp.exe" out/recomp-win/bb-recomp.exe
 cp out/windows/pkg-tool/ps4-pkg-tool.exe "$d/"
 fex=$(sed -n 's/^FEX_SOURCE_DIR:PATH=//p' out/recomp-win/CMakeCache.txt)

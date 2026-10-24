@@ -59,6 +59,8 @@ static void usage() {
         "  --flags-at-calls     also store NZCV before calls and returns (x86 flags are dead there; off by default)\n"
         "  --no-dirty-check     no `if (bbr_dirty[unit]) bbr_dirty_entry()` at the start of every unit (default: on)\n"
         "  --resume-entries     every call-return block is also an entry of its unit (resume flag in the guest state)\n"
+        "  --variants <file|dir>   a variant catalog (tools/recomp/variants/*.txt; repeatable): patch groups compiled as variants, native hook sites\n"
+        "  --variant-report     list every variant and hook site in the summary\n"
         "  --no-callee-saved    reload rbx, rbp, r12-r15 after calls too (default: the SysV callee-saved set is trusted)\n"
         "  --ndk <dir>          Android NDK for --so\n"
         "  --bundle-dir <dir>   self-contained build: the bundle directory (default: <exe>/../share/bb-recomp, if present)\n"
@@ -122,6 +124,8 @@ int recompMain(int argc, char** argv) {
     else if (is("--resume-entries")) cc.resumeEntries = true;
     else if (is("--no-dirty-check")) cc.dirtyCheck = false;
     else if (is("--no-callee-saved")) cc.calleeSaved = false;
+    else if (is("--variants")) cc.variantPaths.push_back(arg());
+    else if (is("--variant-report")) cc.variantReport = true;
     else if (is("--ndk")) cc.ndk = arg();
     else if (is("--bundle-dir")) cc.bundleDir = arg();
     else if (is("--helpers-dir")) cc.helpersDir = arg();

@@ -37,7 +37,7 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
   with the table lookup skipped (the unit does not set `s->rip`: the runtime sets it to `image_base + vaddr`): run the guest code at that address on the fallback CPU until the guest returns to the address on top
   of the stack (a call) or leaves (a jump). With resume entries on, a dirty unit entered with the resume flag set returns at
   once with the flag still set (it is not the place to resume). Direct calls and tail jumps between units go straight to the
-  target unit, which tests its own byte, so no stale unit runs. `bbr_abi_flags` bit 1 = the check is present. The runtime
+  target unit, which tests its own byte, so no stale unit runs. `bbr_abi_flags` bit 1 = the check is present (bits 2 and 3: variants and hook slots, below). The runtime
   marks a function dirty by setting the bytes of all its units (`bbr_funcs[]`). Cost: about 6 MB of code for 184 k units (see the plan).
 - **Direct jumps and calls to any unit.** A constant call or jump target that is the entry of any unit (not only a function
   start) is a direct call (`musttail` for jumps), and every in-function target that another unit jumps or calls into, or that
@@ -83,6 +83,84 @@ See STATIC_RECOMPILE_PLAN.md for the plan.
   `s->resume = 1` and call it; when it returns with `s->resume` still 1 try the next unit; when none takes it, use the fallback
   CPU. Cost (measured on a 20,000-function sample at -O1, then the whole game): see the plan, "Resume entries". It is **off by
   default**; `bbr_abi_flags` bit 0 tells the runtime whether the `.so` has it.
+
+## Variants: precompiled patched code (additive, ABI version still 1; `bbr_abi_flags` bit 2)
+
+The runtime patches the game's code at start-up (patch parts, the port's own hooks) and while the game runs (BBSC's toggled patches). Patches whose bytes are known
+at build time are described to `bb-recomp` in a **variant catalog** (`tools/recomp/variants/*.txt`, docs/RECOMP_HOOKS.md: a list of *groups*, each a set of writes `vaddr + bytes`
+that the runtime applies together, plus `excl=` sets for alternatives and `c` lines for new code such as the cheats' cave). `bb-recomp --variants <file|dir>`:
+
+- finds the functions each group writes into (a write outside every function is a *cave piece*: new code, a pseudo-function of its own);
+- for every function and every consistent non-empty subset S of the groups that touch it (alternatives of one `excl` set never together; a function with more than six groups gets single
+  groups and the full set only) applies the writes of S to the image, lifts the function again, follows the jumps into cave pieces and back into the middle of the function (a unit
+  fixpoint like the discovery's, so the cave's jump back lands on a unit), lowers the result as **alternate units** `bbrv<k>_<vaddr>` (`k` unique per variant, hidden visibility, no dirty check), and undoes the writes;
+- does not build a variant for a function that holds a unit with unsupported ops (it runs on the fallback), and skips (and reports) a variant that fails to lift or lowers an unsupported op.
+
+Exports (all read-only data except where noted):
+
+| symbol | meaning |
+|---|---|
+| `bbr_vfuncs[]`, `bbr_vfunc_count` | per variant `{ u64 func_start; u32 first_unit, unit_count, name_offset, 0; }`, sorted by `func_start`; the variants of one function are adjacent. `first_unit ..+unit_count` index `bbr_vunits[]` (sorted by vaddr) |
+| `bbr_vunits[]`, `bbr_vunit_count` | per variant unit `{ u64 vaddr, end, ehash; void (*fn)(GuestState*); i64 orig; }`: the unit's code range in the *patched* image, the FNV-1a of those bytes (byte 0x65 hashed as 0x64, as `bbr_unit_ehash`), the function, and the index of the original unit with that entry in `bbr_units[]` (-1: only the variant has this unit: a cave piece, or an entry the patch made necessary) |
+| `bbr_vnames` | NUL-separated variant names (`<func>+<group>+<group>`), for diagnostics |
+
+**What the runtime does** (`cpu/guest_cpu_aot_hooks.inc`). A function is *classified* from the bytes in memory each time they may have changed: at the start-up check (every unit whose hash differs) and
+at every `guest_cpu_invalidate` / `guest_cpu_hook` that overlaps the function (the call must come after the write). The classification hashes every unit of the function (`bbr_funcs[]` gives its units):
+
+1. every unit hashes as built: **original**. The units run. Their dirty bytes are cleared if a patch was undone, and the redirects dropped;
+2. otherwise a variant of the function (`bbr_vfuncs` by function start) whose every unit hashes as the current bytes: **variant**. The dirty byte of every original unit of the function is set and a *redirect pointer* is stored
+   per original unit (`V.redirect[i]`: the variant unit with the same address, or null for a unit the variant lacks). The dispatch table entry (`E.fns[i]`) is replaced by the variant's function, so indirect calls and
+   tail jumps through `bbr_dispatch` skip the original;
+3. otherwise **dirty**: all units dirty, no redirects, the fallback CPU runs the function (as before phase 4).
+
+Direct unit-to-unit calls and tail jumps keep calling `bbr_<vaddr>` of the *original* unit. That unit tests its dirty byte, which is set, and tail-calls `bbr_dirty_entry(s, vaddr)`. `bbr_dirty_entry` now first looks up the unit
+(the dispatch hash table, O(1)) and, if it has a redirect pointer, calls the variant's unit with the same state (`variant(s)`): the extra hop costs a few instructions per call and only on patched functions. Calls inside a variant to a unit
+of its own variant (including its cave pieces and entries it added) go to `bbrv<k>_<vaddr>` directly; calls to any other unit go to `bbr_<vaddr>` and so reach *that* function's variant the same way. The `.so`'s text is never written and
+nothing about the lowering of ordinary units changed (the per-unit dirty test is the redirect's switch).
+
+A function that holds a unit the tool started dirty (unsupported ops) is never classified: it stays on the fallback. Without `bbr_funcs`, exact unit hashes or the dirty byte (an older tool's `.so`, `bbr_abi_flags` bit 1 clear) the
+old behaviour applies: a changed unit leaves the table or goes dirty for good.
+
+Transient states are visible: a group whose sites are written one at a time (`guest_cpu_invalidate` after each) is dirty, then a variant once the last site is in, and the original again when the originals are written back.
+
+## Hook slots: native hook sites (additive; `bbr_abi_flags` bit 3)
+
+A catalog `hook <vaddr> <len> <snap|regs> [skip] [resume=a,b,...]` line declares an instruction the runtime may hook. `bb-recomp` then:
+
+- forces a `GuestOpcode` marker at the site and at every resume address (FEX only emits one for instructions with side effects), so each is an instruction boundary in the IR;
+- at the start of the guest instruction at the site, in **every unit that contains it** (the entry unit, secondary-entry copies, variants), emits
+
+      if (bbr_hook_slot[k] != null) {                  // relaxed atomic load of a pointer, branch weights 1:4000
+          spill registers and flags to the state; s->rip = site;
+          act = bbr_hook_slot[k](s, k);                // uint64_t (*)(GuestState*, uint64_t)
+          reload every register (the callback may have changed any of them);
+          switch (act) { case 0: run the instruction;
+                         case 2: return;               // the callback made a `ret`: rip, rsp set; Return semantic of ExitFunction
+                         default: switch (s->rip - image_base) { case <resume address>: continue there; default: tail dispatch } }
+      }
+
+  The flags are put into the state's per-unit flag cells before the test and are not touched by the callback: the fall-through path continues with the lazy flag descriptor, the jump path from the cells.
+  A resume address that is no block entry gets a block of its own (the block is split there). A jump to an address that is not a resume point of the site goes through `bbr_dispatch_tail` (a jump
+  into the middle of another unit's code then runs on the fallback). Resume addresses of a site that are not in the unit are ignored.
+- exports `bbr_hook_sites[]`, `bbr_hook_count`: `{ u64 vaddr; u32 len, flags, resume_first, resume_count; }` sorted by vaddr (flags: 1 the site was compiled into at least one unit, 2 `skip`, 4 kind `regs`),
+  `bbr_hook_resume[]` (u64), and the writable `bbr_hook_slot[]` (all null at load; the runtime stores a function pointer).
+
+The runtime (`cpu/guest_cpu_aot_hooks.inc`) sets every slot to one function, `RunSlot(s, k)`, and keeps a record per site (`src/guest_cpu.h`):
+
+- `guest_cpu_hook(address, size, GuestHook)`: in AOT mode first tries the slot (same call, same `GuestHook`: the callback edits `GuestRegs` and must set rip; rip as set becomes a jump, rip unchanged runs the instruction); otherwise the old path;
+- `guest_cpu_hook_slot(address, size, GuestHookEx, context)`: `GuestRegsEx` has rflags (a constant 0x202; the flags survive the call), mxcsr (not written back) and ymm (written back); the result is `GUEST_HOOK_CONTINUE`, `_JUMP` or `_RETURN`
+  (the runtime then does the `ret`: rip = [rsp], rsp += 8);
+- `guest_cpu_has_hook_slot(address)`, `guest_cpu_hook_slot_clear(address)`.
+
+A slot is only set when the site's function is currently native (original or variant); if it is dirty the call returns 0 and the caller hooks the old way. `InstallGuestCodeHook` (`gpu/shim/bbport_guest_code_hooks.cpp`) asks first: with a slot it
+writes no trampoline and no code, `SlotAdapter` converts `GuestRegsEx` to the `GuestRegisterSnapshot` the hooks know (registers, rflags, mxcsr, ymm), calls `HookDispatch`, converts back and returns `GUEST_HOOK_RETURN` when the skip flag was set (and clears it,
+as the trampoline did). Differences from the x86 trampoline: the callback runs on the host stack (not the guest stack), registers are the callback's to change but rbx, rbp, r12-r15 must be the original values on a `GUEST_HOOK_RETURN`
+(a return from a function must preserve them anyway), and rflags in the snapshot is not the guest's.
+
+A slot callback may call guest code (`guest_cpu_call`): the nested call starts below the red zone of the rsp the unit stored before the slot call. The port's patchers use the slot mechanism too
+(`gpu/shim/bbport_hook_sites.h`: `Slot(address, image_base, length, callback, context, {resume addresses})` installs, and in the generator's build prints the catalog line).
+
+A hook installed in a slot stays set while its function runs on the fallback (a later write made it dirty) but does not fire there: the runtime prints `AOT: the hook at +X is inactive` once per site and the hook works again when the function is native again.
 
 ## Guest state
 

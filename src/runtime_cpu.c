@@ -37,6 +37,11 @@ uintptr_t guest_cpu_return_address(uintptr_t native) { return native; }
 uintptr_t guest_cpu_stack_pointer(void) { return (uintptr_t)__builtin_frame_address(0); }
 void guest_cpu_invalidate(uintptr_t address, size_t size) { (void)address; (void)size; }
 int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook) { (void)address; (void)size; (void)hook; return 0; }
+#ifndef BB_AOT_FALLBACK /* (cpu/guest_cpu_aot.cpp has the native hook slots) */
+int guest_cpu_hook_slot(uintptr_t address, size_t size, GuestHookEx hook, void *context) { (void)address; (void)size; (void)hook; (void)context; return 0; }
+int guest_cpu_has_hook_slot(uintptr_t address) { (void)address; return 0; }
+void guest_cpu_hook_slot_clear(uintptr_t address) { (void)address; }
+#endif
 uint64_t guest_cpu_tsc(void) { return __rdtsc(); }
 #ifndef _WIN32
 void guest_cpu_set_gs(void *base) {

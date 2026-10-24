@@ -71,7 +71,7 @@ run "$nbin/bin/clang" --target=aarch64-linux-android30 -shared -nostdlib -Wl,-so
 # libm.so: the NDK's own link stub (no code), so that the .so gets libm's DT_NEEDED and symbol versions exactly as a developer build
 cp "$nbin/sysroot/usr/lib/aarch64-linux-android/30/libm.so" "$share/libm.so"
 cp "$builtins" "$share/"
-[[ -d tools/recomp/variants ]] && cp -r tools/recomp/variants "$share/variants"
+mkdir -p "$share/variants" && cp tools/recomp/variants/*.txt "$share/variants/"   # the catalogs only (the generators stay in the source tree)
 strip -o "$dist/usr/bin/bb-recomp" out/recomp-linux/bb-recomp
 strip -o "$dist/usr/bin/ps4-pkg-tool" out/linux/pkg-tool/ps4-pkg-tool
 chmod 755 "$dist/usr/bin/"*

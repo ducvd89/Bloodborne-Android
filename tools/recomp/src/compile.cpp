@@ -2,6 +2,7 @@
 #include "bundle.h"
 #include "progress.h"
 #include "lower_llvm.h"
+#include "variant_compile.h"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -43,6 +45,7 @@ struct ShardStats {
   uint64_t liftFailed = 0, objBytes = 0, textBytes = 0;
   uint64_t resumeCases = 0, switches = 0, switchCases = 0, indJmps = 0, jmpResolved = 0, jmpScanned = 0, jmpMem = 0, jmpReg = 0, jmpFailed = 0, tableBytes = 0;
   std::vector<uint64_t> unitVaddrs;
+  std::vector<uint32_t> hookSeen;   // hook site indices that got a slot test in this shard
   std::vector<uint64_t> trapVaddrs; // units with an unsupported-op trap: bbr_dirty starts at 1 for them (the fallback CPU runs them)
   std::map<std::string, uint64_t> opUnits; // op name -> units containing a trap for it
 };
@@ -74,6 +77,7 @@ struct Sink : UnitSink {
     ++st.units; st.unitVaddrs.push_back(entry);
     st.trapSites += lr.trapSites; st.irOps += lr.irOps; st.directCalls += lr.directCalls; st.dispatchCalls += lr.dispatchCalls;
     st.relocConsts += lr.relocConstants; st.switches += lr.switches; st.switchCases += lr.switchCases; st.resumeCases += lr.resumeCases;
+    for (uint32_t i : lr.hookIdx) st.hookSeen.push_back(i);
     if (!lr.unsupported.empty()) { ++st.unitsWithTrap; st.trapVaddrs.push_back(entry); for (auto& n : lr.unsupported) ++st.opUnits[n]; }
   }
 };
@@ -117,8 +121,10 @@ std::vector<uint64_t> unitHashes(const ElfImage& img, const std::vector<uint64_t
 
 // bbr_units[] (sorted), bbr_unit_count, bbr_unit_end[], bbr_unit_hash[], bbr_unit_extra[], bbr_text_end, bbr_dirty[], bbr_funcs[],
 // bbr_func_count, bbr_abi_flags, bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
+struct HookTable { const HookSites* sites = nullptr; const std::vector<HookDecl>* decls = nullptr; std::vector<uint8_t> compiled; };
 bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends, const std::vector<uint64_t>& hashes, const std::vector<uint64_t>& ehashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
-               const std::vector<uint8_t>& dirtyInit, const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
+               const std::vector<uint8_t>& dirtyInit, const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path,
+               const VariantTable* vt, const HookTable* ht) {
   LLVMContext ctx;
   Module m("bbr_table", ctx);
   setModuleTarget(m, tm);
@@ -179,7 +185,6 @@ bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>&
     new GlobalVariable(m, faty, true, GlobalValue::ExternalLinkage, ConstantArray::get(faty, fs), "bbr_funcs");
     new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, fs.size()), "bbr_func_count");
   }
-  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, (opt.resumeEntries ? 1 : 0) | (opt.dirtyCheck ? 2 : 0)), "bbr_abi_flags");
   {
     // bbr_eh_frame_hdr[3 * n]: per module {base, size, .eh_frame_hdr vaddr}, image-relative; bbr_eh_frame_hdr_count = n. The
     // runtime reads the CFI of a function it enters in the middle (a jump the units do not cover) to find the function's
@@ -190,6 +195,56 @@ bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>&
     new GlobalVariable(m, t, true, GlobalValue::ExternalLinkage, ConstantArray::get(t, xs), "bbr_eh_frame_hdr");
     new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, ehHdrs.size() / 3), "bbr_eh_frame_hdr_count");
   }
+  // Variants (docs/RECOMP_ABI.md): bbr_vfuncs[] {func start, first unit, unit count, name offset}, bbr_vunits[] {vaddr, end, ehash, fn, original unit index},
+  // bbr_vnames (the names, NUL separated).
+  const bool haveVariants = vt && !vt->funcs.empty();
+  if (haveVariants) {
+    auto* vfty = FunctionType::get(Type::getVoidTy(ctx), {ptr}, false);
+    auto* vfent = StructType::get(ctx, {i64, i32, i32, i32, i32});
+    auto* vuent = StructType::get(ctx, {i64, i64, i64, ptr, i64});
+    std::string names;
+    std::vector<Constant*> fs;
+    for (auto& f : vt->funcs) {
+      fs.push_back(ConstantStruct::get(vfent, {ConstantInt::get(i64, f.funcStart), ConstantInt::get(i32, f.firstUnit), ConstantInt::get(i32, f.unitCount), ConstantInt::get(i32, names.size()), ConstantInt::get(i32, 0)}));
+      names += f.name; names.push_back(0);
+    }
+    std::vector<Constant*> us;
+    for (auto& u : vt->units) {
+      auto* fn = Function::Create(vfty, GlobalValue::ExternalLinkage, u.symbol, &m);
+      fn->setVisibility(GlobalValue::HiddenVisibility);
+      us.push_back(ConstantStruct::get(vuent, {ConstantInt::get(i64, u.vaddr), ConstantInt::get(i64, u.end), ConstantInt::get(i64, u.ehash), fn, ConstantInt::get(i64, (uint64_t)u.orig)}));
+    }
+    auto* fa = ArrayType::get(vfent, fs.size());
+    new GlobalVariable(m, fa, true, GlobalValue::ExternalLinkage, ConstantArray::get(fa, fs), "bbr_vfuncs");
+    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, fs.size()), "bbr_vfunc_count");
+    auto* ua = ArrayType::get(vuent, us.size());
+    new GlobalVariable(m, ua, true, GlobalValue::ExternalLinkage, ConstantArray::get(ua, us), "bbr_vunits");
+    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, us.size()), "bbr_vunit_count");
+    auto* na = ArrayType::get(i8, names.size());
+    new GlobalVariable(m, na, true, GlobalValue::ExternalLinkage, ConstantDataArray::getString(ctx, names, false), "bbr_vnames");
+  }
+  // Hook slots: bbr_hook_sites[] {vaddr, len, flags, resume first, resume count}, bbr_hook_resume[], and the writable bbr_hook_slot[]
+  // the units test (flags: 1 compiled into at least one unit, 2 skip allowed, 4 kind regs).
+  const bool haveHooks = ht && ht->decls && !ht->decls->empty();
+  if (haveHooks) {
+    auto* hent = StructType::get(ctx, {i64, i32, i32, i32, i32});
+    std::vector<Constant*> hs, rs;
+    for (size_t i = 0; i < ht->decls->size(); ++i) {
+      const HookDecl& d = (*ht->decls)[i];
+      const uint32_t flags = (ht->compiled[i] ? 1 : 0) | (d.skip ? 2 : 0) | (d.regs ? 4 : 0);
+      hs.push_back(ConstantStruct::get(hent, {ConstantInt::get(i64, d.vaddr), ConstantInt::get(i32, d.len), ConstantInt::get(i32, flags), ConstantInt::get(i32, rs.size()), ConstantInt::get(i32, d.resume.size())}));
+      for (uint64_t r : d.resume) rs.push_back(ConstantInt::get(i64, r));
+    }
+    auto* ha = ArrayType::get(hent, hs.size());
+    new GlobalVariable(m, ha, true, GlobalValue::ExternalLinkage, ConstantArray::get(ha, hs), "bbr_hook_sites");
+    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, hs.size()), "bbr_hook_count");
+    auto* ra = ArrayType::get(i64, std::max<size_t>(1, rs.size()));
+    if (rs.empty()) rs.push_back(ConstantInt::get(i64, 0));
+    new GlobalVariable(m, ra, true, GlobalValue::ExternalLinkage, ConstantArray::get(ra, rs), "bbr_hook_resume");
+    auto* sa = ArrayType::get(ptr, hs.size());
+    new GlobalVariable(m, sa, false, GlobalValue::ExternalLinkage, ConstantAggregateZero::get(sa), "bbr_hook_slot");
+  }
+  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, (opt.resumeEntries ? 1 : 0) | (opt.dirtyCheck ? 2 : 0) | (haveVariants ? 4 : 0) | (haveHooks ? 8 : 0)), "bbr_abi_flags");
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, imageHash), "bbr_image_hash");
   new GlobalVariable(m, i32, true, GlobalValue::ExternalLinkage, ConstantInt::get(i32, 1), "bbr_abi_version");
   new GlobalVariable(m, i64, false, GlobalValue::ExternalLinkage, ConstantInt::get(i64, 0), "bbr_image_base");
@@ -277,6 +332,24 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   initLlvmTargets();
   if (!opt.statsPath.empty()) g_sf = fopen(opt.statsPath.c_str(), "w");
 
+  // Variant catalogs: patch groups (alternate units) and native hook sites (docs/RECOMP_ABI.md).
+  Catalog catalog;
+  HookSites hookSites;
+  std::set<uint64_t> forceOp;
+  if (!opt.variantPaths.empty()) {
+    std::string err;
+    if (!loadCatalogs(opt.variantPaths, catalog, err)) { fprintf(stderr, "bb-recomp: %s\n", err.c_str()); return 1; }
+    uint32_t idx = 0;
+    for (auto& h : catalog.hooks) {
+      HookSite hs; hs.vaddr = h.vaddr; hs.index = idx++; hs.resume = h.resume;
+      hookSites[h.vaddr] = hs;
+      forceOp.insert(h.vaddr);
+      for (uint64_t r : h.resume) forceOp.insert(r);
+    }
+  }
+  LiftOptions liftOpt = opt.lift;
+  if (!forceOp.empty()) liftOpt.forceGuestOpcode = &forceOp;
+
   // Functions to compile.
   std::vector<size_t> todo;
   if (opt.onlyVaddr >= 0) {
@@ -317,7 +390,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     std::vector<std::vector<UnitInfo>> part(std::max(1u, plan.jobs));
     std::atomic<size_t> nextF {0};
     auto w = [&](unsigned id) {
-      Lifter lifter(img, opt.lift);
+      Lifter lifter(img, liftOpt);
       RecordSink rs(part[id]);
       for (;;) {
         const size_t j = nextF++;
@@ -350,6 +423,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   lo.resumeEntries = opt.resumeEntries;
   lo.isKnownUnit = [&starts](uint64_t v) { return std::binary_search(starts.begin(), starts.end(), v); };
   lo.dirtyCheck = opt.dirtyCheck;
+  if (!hookSites.empty()) lo.hookSites = &hookSites;
   lo.unitIndex = [&starts](uint64_t v) -> int64_t { auto it = std::lower_bound(starts.begin(), starts.end(), v); return it != starts.end() && *it == v ? it - starts.begin() : -1; };
 
   bbrStage("compile", "Recompiling");
@@ -361,7 +435,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   std::mutex errMu;
 
   auto worker = [&] {
-    Lifter lifter(img, opt.lift);
+    Lifter lifter(img, liftOpt);
     auto tm = makeTargetMachine(opt.target);
     if (!tm) { failed = true; return; }
     for (;;) {
@@ -439,6 +513,36 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   std::sort(units.begin(), units.end());
   units.erase(std::unique(units.begin(), units.end()), units.end());
 
+  // Hook sites that got a slot test in at least one unit.
+  std::vector<uint8_t> hookCompiled(catalog.hooks.size(), 0);
+  for (auto& st : stats) for (uint32_t i : st.hookSeen) if (i < hookCompiled.size()) hookCompiled[i] = 1;
+
+  // Variants: the functions the catalog's patch groups touch, compiled again from the patched bytes.
+  VariantResult vres;
+  bool haveVariantCode = false;
+  if (wantCode && opt.table && !catalog.groups.empty()) {
+    VariantJob vj;
+    vj.img = &img; vj.starts = &starts; vj.catalog = &catalog; vj.lift = liftOpt; vj.lower = lo; vj.target = opt.target;
+    vj.jobs = jobs; vj.verify = opt.verify;
+    vj.objBase = opt.objPath.empty() ? opt.soPath : opt.objPath;
+    { const size_t d = vj.objBase.rfind('.'); if (d != std::string::npos && d > vj.objBase.rfind('/') + 1) vj.objBase.resize(d); }
+    std::vector<Func> compiledF;
+    for (size_t i : todo) compiledF.push_back(funcs[i]);
+    vj.funcs = &compiledF;
+    // `trapUnits` is only known after the totals below: units with unsupported ops of the main compile
+    std::vector<uint64_t> trapSorted;
+    for (auto& s2 : stats) trapSorted.insert(trapSorted.end(), s2.trapVaddrs.begin(), s2.trapVaddrs.end());
+    std::sort(trapSorted.begin(), trapSorted.end());
+    vj.trapUnits = &trapSorted;
+    for (auto& s2 : stats) for (uint32_t i : s2.hookSeen) (void)i;
+    if (!compileVariants(vj, vres)) { fprintf(stderr, "bb-recomp: compiling the variants failed\n"); return 1; }
+    for (auto& s2 : vres.notes) fprintf(stderr, "bb-recomp: variants: %s\n", s2.c_str());
+    haveVariantCode = !vres.table.funcs.empty();
+    for (uint32_t i = 0; i < vres.table.units.size(); ++i) (void)i;
+    // hook sites in variant units count too: the variant lowering ran with the same sites, but their indices are not collected: a site
+    // is "compiled" when the original units have it (variants are copies of original functions), or when it lies in new code only
+  }
+
   double tableTime = 0, helperTime = 0;
   std::string tablePath;
   if (wantCode && opt.table) {
@@ -463,7 +567,9 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     std::vector<uint64_t> ehHdrs;
     for (auto& md : img.modules) if (md.ehFrameHdrVaddr) { ehHdrs.push_back(md.base); ehHdrs.push_back(md.size); ehHdrs.push_back(md.ehFrameHdrVaddr); }
     if (ehHdrs.empty() && img.ehFrameHdrVaddr) { ehHdrs.push_back(0); ehHdrs.push_back(img.textHi); ehHdrs.push_back(img.ehFrameHdrVaddr); }
-    if (!emitTable(ehHdrs, units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, dirtyInit, compiled, fnv1a(img.file), opt, *tm, tablePath)) return 1;
+    HookTable ht; ht.sites = &hookSites; ht.decls = &catalog.hooks; ht.compiled = hookCompiled;
+    if (!emitTable(ehHdrs, units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, dirtyInit, compiled, fnv1a(img.file), opt, *tm, tablePath,
+                   haveVariantCode ? &vres.table : nullptr, catalog.hooks.empty() ? nullptr : &ht)) return 1;
     tableTime = since(t);
   }
 
@@ -498,6 +604,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       cmd = "nice -n 19 " + bin + "/bin/ld.lld -shared -m aarch64linux --hash-style=gnu -z noexecstack -z max-page-size=16384 -Bsymbolic --build-id=none "
             "-soname " + opt.soPath.substr(opt.soPath.rfind('/') + 1) + " -o " + opt.soPath;
       for (auto& o : objFiles) cmd += " " + o;
+      for (auto& o : vres.objFiles) cmd += " " + o;
       if (!tablePath.empty()) cmd += " " + tablePath;
       cmd += " " + helperObj;
       cmd += " -L" + bin + "/sysroot/usr/lib/aarch64-linux-android/30 -lm"; // the helpers call libm (sin, exp2, fmod ...)
@@ -515,6 +622,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       // (__divti3, __udivti3). The bbr_* helpers stay undefined here: the executable provides them.
       cmd = "nice -n 19 clang -shared -fuse-ld=lld -Wl,-Bsymbolic -Wl,-z,noexecstack -Wl,--build-id=none -o " + opt.soPath;
       for (auto& o : objFiles) cmd += " " + o;
+      for (auto& o : vres.objFiles) cmd += " " + o;
       if (!tablePath.empty()) cmd += " " + tablePath;
       cmd += " " + helperObj + " -lm";
     }
@@ -539,6 +647,16 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   say("indirect jmps %" PRIu64 ": %" PRIu64 " jump tables (%" PRIu64 " bounded + %" PRIu64 " scanned, %.2f MB of tables), %" PRIu64 " jmp [mem], %" PRIu64 " jmp reg tail calls, %" PRIu64 " table-like unresolved; %" PRIu64 " lowered as switch (%" PRIu64 " cases)\n",
       tot.indJmps, tot.jmpResolved + tot.jmpScanned, tot.jmpResolved, tot.jmpScanned, tot.tableBytes / 1e6, tot.jmpMem, tot.jmpReg, tot.jmpFailed, tot.switches, tot.switchCases);
   if (opt.resumeEntries) say("resume entries: %" PRIu64 " call-return blocks reachable through the unit-entry resume switch\n", tot.resumeCases);
+  if (!catalog.groups.empty() || !catalog.hooks.empty()) {
+    size_t hc = 0; for (uint8_t c : hookCompiled) hc += c;
+    say("variants: %zu groups in the catalogs (%" PRIu64 " touch code), %" PRIu64 " variants planned, %" PRIu64 " built (%" PRIu64 " units, %" PRIu64 " only in the variant), %" PRIu64 " skipped, %" PRIu64 " writes outside any function, %" PRIu64 " cave pieces, %.2f MB of code, %.1f s\n",
+        catalog.groups.size(), vres.groupsUsed, vres.variantsPlanned, vres.variantsBuilt, vres.unitsBuilt, vres.unitsNew, vres.variantsSkipped, vres.dataWrites, vres.cavePieces, vres.codeBytes / 1048576.0, vres.seconds);
+    say("hook slots: %zu sites declared, %zu compiled into units\n", catalog.hooks.size(), hc);
+    if (opt.variantReport) {
+      for (auto& f : vres.table.funcs) say("  variant %s: %u units\n", f.name.c_str(), f.unitCount);
+      for (size_t i = 0; i < catalog.hooks.size(); ++i) if (!hookCompiled[i]) say("  hook site %#" PRIx64 " is in no unit\n", catalog.hooks[i].vaddr);
+    }
+  }
   say("direct calls %" PRIu64 ", dispatch calls/jumps %" PRIu64 ", relocated constants %" PRIu64 "\n", tot.directCalls, tot.dispatchCalls, tot.relocConsts);
   if (wantCode) {
     say("CPU time: lift+lower %.1f s, optimise %.1f s, codegen %.1f s (sum over threads); table %.1f s, x87 helpers %.1f s, link %.1f s\n", tot.liftLower, tot.opt, tot.codegen, tableTime, helperTime, linkTime);

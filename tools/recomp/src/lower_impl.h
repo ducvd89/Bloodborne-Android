@@ -47,9 +47,11 @@ struct ModuleCtx {
   llvm::Type *I1, *I8, *I16, *I32, *I64, *I128, *Ptr, *V128, *Void;
   llvm::GlobalVariable* imageBaseVar = nullptr;
   llvm::GlobalVariable* dirtyVar = nullptr; // bbr_dirty[]
+  llvm::GlobalVariable* hookSlotVar = nullptr; // bbr_hook_slot[]
   ModuleCtx(llvm::LLVMContext& c, llvm::Module& m, const LowerOptions& o);
   llvm::FunctionCallee helper(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> args);
-  llvm::FunctionCallee unitFn(uint64_t vaddr); // declaration of bbr_<vaddr>
+  llvm::FunctionCallee unitFn(uint64_t vaddr); // declaration of the direct-call target for vaddr (bbr_<vaddr>, or O.callName)
+  llvm::FunctionCallee defFn(uint64_t vaddr);  // the function this unit defines (O.defPrefix + <vaddr>)
 };
 
 struct Lower {
@@ -86,6 +88,10 @@ struct Lower {
   std::vector<std::pair<uint64_t, uint32_t>> retBlocks; // (image vaddr of the return address, IR block id) of every call with a return block
   // ExitFunction node id -> (image vaddr, IR block id) of the cases of the switch the jump became
   std::unordered_map<uint32_t, std::vector<std::pair<uint64_t, uint32_t>>> swCases;
+  // Hook sites of this unit: image vaddr -> the first block of ...; resume points that are no block entry get a block of their own.
+  std::unordered_map<uint64_t, llvm::BasicBlock*> hookSplit;   // resume vaddr (an instruction inside a block) -> its block, created up front
+ std::set<uint32_t> hookReachable;                            // IR block ids that get emitted
+  std::unordered_map<uint64_t, uint32_t> hookBlockAt;          // image vaddr of every block entry of the unit -> IR block id (hook resume targets)
 
   Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry, const UnitMeta* meta = nullptr);
   void run();
@@ -138,6 +144,8 @@ struct Lower {
   void emitBlockTerminatorsFix();
   void emitExit(Ref node, const IR::IROp_ExitFunction* op);
   void emitBreak(const IR::IROp_Break* op);
+  void emitHookSite(const HookSite& hs);
+  void fillAll();                         // every used register from the context (after a hook: any of them may have changed)
   llvm::BasicBlock* curBB() { return B.GetInsertBlock(); }
   llvm::BasicBlock* newBB(const char* n) { return llvm::BasicBlock::Create(C, n, F); }
   bool terminated() { return curBB()->hasTerminator(); }

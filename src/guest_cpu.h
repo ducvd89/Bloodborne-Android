@@ -66,6 +66,30 @@ int guest_cpu_handle_fault(int sig, siginfo_t *info, void *ucontext);
  * (bbport_guest_hooks.cpp uses int3 there): returns 0. */
 typedef void (*GuestHook)(GuestRegs *regs);
 int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook);
+/* (hooks at a site the ahead-of-time library has a slot for are set there: see guest_cpu_hook_slot below) */
+/* Native hook slots (ahead-of-time recompiled code only, cpu/guest_cpu_aot.cpp; docs/RECOMP_ABI.md, "Hook slots"). The recompiled units
+ * have a slot test at the hook sites the .so was built with (tools/recomp/variants/hooks-*.txt): installing a hook there writes no
+ * code, the units call it. The callback sees the registers at the start of the instruction at `address` (rip = address) and returns
+ * what the unit does next: GUEST_HOOK_CONTINUE runs the instruction, GUEST_HOOK_JUMP continues at regs->rip (an address the site
+ * declares as a resume point is a jump inside the function, any other a jump through the dispatcher), GUEST_HOOK_RETURN: the callback
+ * made a `ret` itself (rip = the popped return address, rsp past it). rflags is a constant (the callback cannot change the flags, which
+ * survive the call), mxcsr is not written back, ymm is. The callback must leave rbx, rbp and r12-r15 alone when it returns.
+ * Returns 1 when the hook was set (no guest_cpu_invalidate needed), 0 when there is no slot at `address` or the code there runs on the
+ * fallback CPU (a patched function without a variant): the caller then hooks the old way. guest_cpu_hook (below) tries the slot first. */
+typedef struct {
+    uint64_t gpr[GUEST_GPRS];
+    uint64_t rip;
+    uint64_t rflags;
+    uint32_t mxcsr, reserved;
+    uint8_t ymm[16][32];
+} GuestRegsEx;
+enum { GUEST_HOOK_CONTINUE = 0, GUEST_HOOK_JUMP = 1, GUEST_HOOK_RETURN = 2 };
+typedef uint32_t (*GuestHookEx)(void *context, GuestRegsEx *regs);
+int guest_cpu_hook_slot(uintptr_t address, size_t size, GuestHookEx hook, void *context);
+/* 1 when guest_cpu_hook_slot / guest_cpu_hook at `address` would use a slot now. */
+int guest_cpu_has_hook_slot(uintptr_t address);
+/* The hook set by guest_cpu_hook_slot / guest_cpu_hook at `address` is removed (the slot test then runs the instruction as usual). */
+void guest_cpu_hook_slot_clear(uintptr_t address);
 /* The host wrote guest code in [address, address + size) (a byte patch made while the game runs, a hook
  * installed): what the guest CPU translated of it is dropped, on every thread, and translated again from
  * the new bytes when next run. A no-op on x86-64 hosts. The JIT has no page tracking here, so every write

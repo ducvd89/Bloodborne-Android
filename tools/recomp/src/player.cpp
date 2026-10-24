@@ -44,9 +44,7 @@
 #else
 #include <unistd.h>
 #endif
-#if __has_include("variants.h")
-#define BBR_HAVE_VARIANTS 1 // the recomp-hooks build: recompMain() knows --variants
-#endif
+#define BBR_HAVE_VARIANTS 1 // recompMain() knows --variants (variant catalogs, native hook sites)
 
 #ifndef BBR_TOOL_VERSION
 #define BBR_TOOL_VERSION "0.1.0"

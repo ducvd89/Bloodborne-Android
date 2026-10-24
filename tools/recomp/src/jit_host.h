@@ -42,6 +42,7 @@ class Jit {
   uint64_t liftBase = 0, imageSize = 0; // lifter base of the guest addresses; image span (constants inside are addresses)
   uint32_t callExits = 0;               // call exits (ExitFunction/Call) in the units of the last compile
   bool resumeEntries = false;           // lower with resume entries (call-return blocks re-enterable with the resume flag)
+  const HookSites* hookSites = nullptr; // native hook sites of the units compiled from now on (the lifter must have been given forceGuestOpcode for them)
   bool calleeSaved = false;             // false: reload everything after calls (exact); true: the game's setting
 
   Lifter lifter;
@@ -54,4 +55,5 @@ class Jit {
   std::string liftFailure;
 };
 extern Jit* g_jit;
+extern void* g_hookSlot[64];       // bbr_hook_slot[] of the in-process JIT (docs/RECOMP_ABI.md, "Hook slots"): the tests set the slots they hook
 extern bool g_allowSyscalls;       // false: bbr_syscall ends the run instead of calling the kernel

@@ -36,6 +36,8 @@ extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, 
 extern "C" void guest_cpu_code(uintptr_t, size_t) {}
 extern "C" uintptr_t guest_cpu_host_function(void* fn) { return uintptr_t(fn); }
 extern "C" void guest_cpu_invalidate(uintptr_t, size_t) {}
+extern "C" int guest_cpu_has_hook_slot(uintptr_t) { return 0; }  // (the real trampolines: this tool lists what the installer accepts)
+extern "C" int guest_cpu_hook_slot(uintptr_t, size_t, void*, void*) { return 0; }
 extern "C" uint64_t guest_cpu_call(uintptr_t, unsigned, const uint64_t*) { return 0; }
 namespace BbNet { void EnsureGuestThread() {} }
 namespace Core::Debugger { int GetCurrentPid() { return 1; } }

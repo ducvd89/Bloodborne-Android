@@ -15,6 +15,7 @@
 #include "common/types.h"
 #include "bbport_display.h"
 #include "bbport_guest_code.h"
+#include "bbport_hook_sites.h"
 #include "bbport_patch_notes.h"
 #include "../../src/guest_cpu.h"
 
@@ -465,6 +466,131 @@ bool InstallAll(Counts& c, std::string& what, float aspect) {
     return true;
 }
 
+
+// ---- Native hook slots (the game's code runs as ahead-of-time recompiled units, docs/RECOMP_HOOKS.md) ----
+// Every stub above as a C++ callback of a hook slot: nothing is written into the game's code, no stub page. What a callback does is what its stub did,
+// with the registers the hook gives it (the stubs saved and restored flags and registers; the callbacks leave them alone).
+
+/// The camera stub: the game's store, the output's aspect ratio into +0x54, and the widened field of view (x87 in the stub, in double precision here: the
+/// reduced x87 FEX and the recompiled code run is double precision too). The context is the store: 0 `vmovss [rbx + 0x5c], xmm0`, 1 `vmovups [rbx + 0x50], xmm1`.
+std::uint32_t CameraSlot(void* store, GuestRegsEx* r) {
+    u8* camera = reinterpret_cast<u8*>(r->gpr[GUEST_RBX]);
+    if (store == nullptr) std::memcpy(camera + 0x5c, r->ymm[0], 4);
+    else std::memcpy(camera + 0x50, r->ymm[1], 16);
+    if (data->camera_aspect_bits) std::memcpy(camera + 0x54, &data->camera_aspect_bits, 4);
+    if (data->fov_factor_bits) {
+        float fov, factor;
+        std::memcpy(&fov, camera + 0x50, 4);
+        std::memcpy(&factor, &data->fov_factor_bits, 4);
+        double t = std::tan(double(fov) * double(data->half)); // fld fov; fmul [half]; fptan; fstp st0
+        t = t * double(factor);                                 // fmul [factor]
+        const double angle = std::atan2(t, 1.0);                // fld1; fpatan
+        const float widened = float(angle + angle);             // fadd st0, st0; fstp dword
+        std::memcpy(camera + 0x50, &widened, 4);
+    }
+    r->rip += 5;
+    return GUEST_HOOK_JUMP;
+}
+
+/// A marker's `vmulps xmm0, xmm0, [scale]; vaddps xmm0, xmm0, [bias]` with the port's vector for the scale (the context is the marker's index).
+std::uint32_t MarkerSlot(void* index, GuestRegsEx* r) {
+    const std::size_t i = reinterpret_cast<std::uintptr_t>(index);
+    float x[4], bias[4], y[4];
+    std::memcpy(x, r->ymm[0], 16);
+    std::memcpy(bias, reinterpret_cast<const void*>(image_base + MarkerSites[i].bias), 16);
+    for (int k = 0; k < 4; ++k) {
+        const float product = x[k] * data->markers[i].now[k];
+        y[k] = product + bias[k];
+    }
+    std::memcpy(r->ymm[0], y, 16);
+    std::memset(r->ymm[0] + 16, 0, 16); // (VEX.128 clears the upper half)
+    r->rip += 16;
+    return GUEST_HOOK_JUMP;
+}
+
+/// SetViewport's stub: the pixel aspect into the full-screen movies' viewport (the context holds the float's bits).
+std::uint32_t ViewportSlot(void* bits, GuestRegsEx* r) {
+    u8* viewport = reinterpret_cast<u8*>(r->gpr[GUEST_RSI]);
+    u32 v[6];
+    std::memcpy(v, viewport, sizeof(v));
+    if (v[0] == 1920 && v[1] == 1080 && v[2] == 0 && v[3] == 0 && v[4] == 1920 && v[5] == 1080) {
+        const u32 aspect = u32(reinterpret_cast<std::uintptr_t>(bits));
+        std::memcpy(viewport + 0x30, &aspect, 4);
+    }
+    return GUEST_HOOK_CONTINUE;
+}
+
+std::uint32_t HudSlot(void*, GuestRegsEx* r) {
+    HudFrame(r->gpr[GUEST_RDI]);
+    return GUEST_HOOK_CONTINUE;
+}
+
+/// All the hooks as slots, in one pass as InstallAll: a required site that is not the expected code, or has no slot, fails.
+bool InstallAllSlots(Counts& c, std::string& what, float aspect) {
+    c = {};
+    claimed.clear();
+    float kx = 1.0f, ky = 1.0f;
+    float fov = 0.0f;
+    if (aspect < GameAspect) {
+        ky = GameAspect / aspect;
+        fov = ky;
+    } else {
+        kx = aspect / GameAspect;
+    }
+    if (committing) {
+        std::memcpy(&data->camera_aspect_bits, &aspect, 4);
+        std::memcpy(&data->fov_factor_bits, &fov, 4);
+        hud_dx = 960.0f * (kx - 1.0f);
+        hud_dy = 540.0f * (ky - 1.0f);
+        if (const char* env = std::getenv("BB_HUD_DX"); env && *env) hud_dx = std::strtof(env, nullptr); // diagnostics
+    }
+    const auto slot = [&](u64 site, const u8* expected, std::size_t length, GuestHookEx fn, void* context,
+                          std::initializer_list<u64> resume) {
+        if (std::memcmp(reinterpret_cast<const u8*>(image_base + site), expected, length) != 0) return false;
+        if (!committing) return Claim(image_base + site, length) && BbHookSites::Available(image_base + site);
+        return BbHookSites::Slot(image_base + site, image_base, length, fn, context, resume);
+    };
+    for (const ParamStore& site : CameraParamStores) {
+        if (!slot(site.offset, site.code.data(), site.code.size(), CameraSlot, site.code[1] == 0xfa ? nullptr : reinterpret_cast<void*>(1),
+                  {image_base + site.offset + site.code.size()})) {
+            char text[80];
+            std::snprintf(text, sizeof(text), "the camera's parameters (%#llx) are not the expected code", (unsigned long long)site.offset);
+            what = text;
+            return false;
+        }
+        ++c.camera;
+    }
+    {
+        float pixel_aspect = aspect / GameAspect;
+        u32 bits;
+        std::memcpy(&bits, &pixel_aspect, 4);
+        c.viewport = slot(SetViewportSite, FunctionEntry, sizeof(FunctionEntry), ViewportSlot, reinterpret_cast<void*>(std::uintptr_t(bits)), {});
+        if (!c.viewport) {
+            what = "the UI's viewport (0x1f510) is not the expected code";
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < MarkerSites.size(); ++i) {
+        const MarkerSite& site = MarkerSites[i];
+        if (!MarkerCodeAt(site)) continue;
+        Data::Marker& m = data->markers[i];
+        std::memcpy(m.game, reinterpret_cast<const void*>(image_base + site.scale), sizeof(m.game));
+        const float now[4] = {m.game[0] * kx, m.game[1] * ky, m.game[2], m.game[3]};
+        if (committing) std::memcpy(m.now, now, sizeof(now));
+        u8 expected[16];
+        std::memcpy(expected, reinterpret_cast<const void*>(image_base + site.offset), 16);
+        c.markers += slot(site.offset, expected, 16, MarkerSlot, reinterpret_cast<void*>(i), {image_base + site.offset + 16});
+    }
+    if (hud_anchor_on) c.hud = slot(HudFrameSite, FunctionEntry, sizeof(FunctionEntry), HudSlot, nullptr, {});
+    return true;
+}
+
+std::uint32_t SceneImmediateSlot(void* imm, GuestRegsEx* r) {
+    r->gpr[GUEST_RAX] = u32(reinterpret_cast<std::uintptr_t>(imm));
+    r->rip += 5;
+    return GUEST_HOOK_JUMP;
+}
+
 /// The scene size (BB_RENDER_RES) into the resolution patch's four immediates... the scene's two (the UI's
 /// stay 1920x1080): `mov eax, imm24` (0xb8 and the low three bytes of the 32-bit immediate) at the patch's
 /// SCENE_WIDTH / SCENE_HEIGHT (scripts/patches.py). The patch file (res-scene.bin) has the 1280x720 template
@@ -491,6 +617,18 @@ void PatchSceneSize(unsigned char* image) {
         }
     }
     if (w >= 1u << 24 || h >= 1u << 24) return;
+    if (BbHookSites::Available(image_base + immediates[0].offset) && BbHookSites::Available(image_base + immediates[1].offset)) {
+        // Native hook slots: the instructions stay as the resolution patch left them, the callback loads eax with the size (what the new
+        // immediate would have done: `mov eax, imm32` clears the upper half of rax and leaves the flags).
+        for (const Immediate& im : immediates) {
+            const u8* code = image + im.offset;
+            const u32 imm = u32(im.value) | u32(code[4]) << 24;
+            BbHookSites::Slot(image_base + im.offset, image_base, 5, SceneImmediateSlot, reinterpret_cast<void*>(std::uintptr_t(imm)),
+                              {image_base + im.offset + 5});
+        }
+        std::printf("Display: the game's scene size %ux%u (native hook slots at the resolution patch's immediates)\n", w, h);
+        return;
+    }
     for (const Immediate& im : immediates) {
         u8* code = image + im.offset;
         code[1] = u8(im.value);
@@ -534,38 +672,41 @@ void PatchImage(unsigned char* image, std::uint64_t) {
     const float aspect = Aspect();
     if (const char* env = std::getenv("BB_HUD_ANCHOR"); env && env[0] == '0') hud_anchor_on = false;
     u8* data_page = MapNear();
-    stub_page = MapNear();
+    bool slot_mode = BbHookSites::Available(image_base + SetViewportSite);
+    for (const ParamStore& site : CameraParamStores) slot_mode = slot_mode && BbHookSites::Available(image_base + site.offset);
+    if (!slot_mode) stub_page = MapNear(); // (the stubs' page: not needed with hook slots; the data page is below 1 TiB for the HUD's strings and values)
     const auto release = [&] {
         if (data_page) munmap(data_page, PageSize);
         if (stub_page) munmap(stub_page, PageSize);
         data_page = stub_page = nullptr;
         data = nullptr;
     };
-    if (!data_page || !stub_page) {
+    if (!data_page || (!slot_mode && !stub_page)) {
         release();
         std::printf("Display: aspect ratio %.3f: no memory next to the game's code, not installed\n", double(aspect));
         return;
     }
     // The stub page is guest code (FEXCore translates what the jumps lead to there).
-    guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), PageSize);
+    if (stub_page) guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), PageSize);
     data = new (data_page) Data{};
     Counts counts;
     std::string what;
     committing = false;
-    if (!InstallAll(counts, what, aspect)) {
+    const auto install = [&] { return slot_mode ? InstallAllSlots(counts, what, aspect) : InstallAll(counts, what, aspect); };
+    if (!install()) {
         release();
         std::printf("Display: aspect ratio %.3f not installed: %s\n", double(aspect), what.c_str());
         return;
     }
     committing = true;
-    if (!InstallAll(counts, what, aspect)) {
+    if (!install()) {
         std::fprintf(stderr, "STOP: Display: %s after the check\n", what.c_str());
         std::abort();
     }
-    mprotect(stub_page, PageSize, PROT_READ | PROT_EXEC);
-    std::printf("Display: aspect ratio %.3f (%s): camera at %d of %zu places, the UI's viewport, HUD markers at "
+    if (stub_page) mprotect(stub_page, PageSize, PROT_READ | PROT_EXEC);
+    std::printf("Display: aspect ratio %.3f (%s%s): camera at %d of %zu places, the UI's viewport, HUD markers at "
                 "%d of %zu, HUD groups %s\n", double(aspect),
-                aspect > GameAspect ? "wider than 16:9" : "taller than 16:9", counts.camera,
+                aspect > GameAspect ? "wider than 16:9" : "taller than 16:9", slot_mode ? ", native hook slots" : "", counts.camera,
                 CameraParamStores.size(), counts.markers, MarkerSites.size(),
                 counts.hud ? "at the output's edges" : "in the 16:9 middle");
 }

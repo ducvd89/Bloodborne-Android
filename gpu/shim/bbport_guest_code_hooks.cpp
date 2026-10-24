@@ -305,6 +305,41 @@ void ReportStats() {
     }
 }
 
+/// A hook set in a native hook slot (the ahead-of-time recompiled build, src/guest_cpu.h guest_cpu_hook_slot): what the guest CPU gives the
+/// callback instead of a trampoline. The units call SlotAdapter with the registers at the start of the hooked instruction; it makes the
+/// snapshot, calls the hook and hands the (possibly changed) registers back; with the skip flag set it makes the function return.
+struct SlotContext {
+    u64 tag;
+    GuestCodeHook hook;
+    const u8* skip_flag;
+    SiteStats* stats;
+};
+
+[[maybe_unused]] std::uint32_t SlotAdapter(void* context, GuestRegsEx* r) {
+    const auto* c = static_cast<const SlotContext*>(context);
+    alignas(16) GuestRegisterSnapshot snapshot;
+    snapshot.rax = r->gpr[GUEST_RAX]; snapshot.rbx = r->gpr[GUEST_RBX]; snapshot.rcx = r->gpr[GUEST_RCX]; snapshot.rdx = r->gpr[GUEST_RDX];
+    snapshot.rsi = r->gpr[GUEST_RSI]; snapshot.rdi = r->gpr[GUEST_RDI]; snapshot.rbp = r->gpr[GUEST_RBP]; snapshot.rsp = r->gpr[GUEST_RSP];
+    snapshot.r8 = r->gpr[GUEST_R8]; snapshot.r9 = r->gpr[GUEST_R9]; snapshot.r10 = r->gpr[GUEST_R10]; snapshot.r11 = r->gpr[GUEST_R11];
+    snapshot.r12 = r->gpr[GUEST_R12]; snapshot.r13 = r->gpr[GUEST_R13]; snapshot.r14 = r->gpr[GUEST_R14]; snapshot.r15 = r->gpr[GUEST_R15];
+    snapshot.rflags = r->rflags;
+    snapshot.mxcsr = r->mxcsr;
+    static_assert(sizeof(snapshot.ymm) == sizeof(r->ymm));
+    std::memcpy(snapshot.ymm.data(), r->ymm, sizeof(r->ymm));
+    HookDispatch(c->tag, &snapshot, c->hook, c->stats);
+    r->gpr[GUEST_RAX] = snapshot.rax; r->gpr[GUEST_RBX] = snapshot.rbx; r->gpr[GUEST_RCX] = snapshot.rcx; r->gpr[GUEST_RDX] = snapshot.rdx;
+    r->gpr[GUEST_RSI] = snapshot.rsi; r->gpr[GUEST_RDI] = snapshot.rdi; r->gpr[GUEST_RBP] = snapshot.rbp; r->gpr[GUEST_RSP] = snapshot.rsp;
+    r->gpr[GUEST_R8] = snapshot.r8; r->gpr[GUEST_R9] = snapshot.r9; r->gpr[GUEST_R10] = snapshot.r10; r->gpr[GUEST_R11] = snapshot.r11;
+    r->gpr[GUEST_R12] = snapshot.r12; r->gpr[GUEST_R13] = snapshot.r13; r->gpr[GUEST_R14] = snapshot.r14; r->gpr[GUEST_R15] = snapshot.r15;
+    std::memcpy(r->ymm, snapshot.ymm.data(), sizeof(r->ymm));
+    if (c->skip_flag != nullptr && *c->skip_flag != 0) {
+        // Function entries only, as in the trampoline: a set flag (cleared here) returns from the game's function at once.
+        *const_cast<u8*>(c->skip_flag) = 0;
+        return GUEST_HOOK_RETURN;
+    }
+    return GUEST_HOOK_CONTINUE;
+}
+
 /// The trampoline for the site at `site` whose `expected` bytes it runs after the hook.
 Code BuildTrampoline(std::uintptr_t site, std::span<const u8> expected, u64 tag, GuestCodeHook hook,
                      const u8* skip_flag, std::uintptr_t at, SiteStats* stats) {
@@ -554,6 +589,27 @@ bool InstallGuestCodeHook(void* address, std::span<const std::uint8_t> expected,
     }
     if (it != hooked_sites.end() && it->first < end) {
         return refuse("it overlaps another hook");
+    }
+    // A native hook slot (the ahead-of-time recompiled build has a slot test at this instruction): the hook is set there, no trampoline is
+    // built and no code is written, so the units around the site stay native.
+    if (guest_cpu_has_hook_slot(begin)) {
+        SiteStats* slot_stats = nullptr;
+        if (StatsEnabled()) {
+            slot_stats = new SiteStats{};
+            slot_stats->site = begin;
+            slot_stats->tag = tag;
+        }
+        auto* context = new SlotContext{tag, hook, skip_flag, slot_stats};
+        if (guest_cpu_hook_slot(begin, expected.size(), &SlotAdapter, context)) {
+            hooked_sites.emplace(begin, end);
+            if (slot_stats) {
+                all_stats.push_back(slot_stats);
+            }
+            ++installed_count;
+            return true;
+        }
+        delete context;
+        delete slot_stats;
     }
     // Room for the trampoline: at most ~1.1 KiB.
     Area* area = AreaFor(begin, 1280);

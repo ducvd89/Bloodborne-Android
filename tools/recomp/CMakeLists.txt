@@ -45,6 +45,7 @@ set(BB_RECOMP_SDL_PREFIX "" CACHE PATH "prefix of a static SDL3 build (enables t
 set(BB_RECOMP_IMGUI_DIR "" CACHE PATH "Dear ImGui source directory (enables the GUI)")
 set(BB_RECOMP_MIMALLOC_DIR "" CACHE PATH "mimalloc source directory: its allocator replaces operator new/delete (Windows build)")
 set(BB_RECOMP_JOBS 22 CACHE STRING "Parallel jobs for the inner FEX build (2 of 24 cores stay free)")
+set(BB_RECOMP_SANITIZE "" CACHE STRING "sanitizers for bb-recomp and the test tools only, e.g. address,undefined (FEXCore itself is not instrumented)")
 set(BB_RECOMP_MARCH x86-64-v3 CACHE STRING "-march for FEX and bb-recomp on x86 hosts (FEX needs AVX)")
 set(BB_RECOMP_CC clang CACHE STRING "C compiler for FEX (needs Clang)")
 set(BB_RECOMP_CXX clang++ CACHE STRING "C++ compiler for FEX (needs Clang)")
@@ -102,7 +103,7 @@ ExternalProject_Add(fex
     -DBB_RECOMP_DIR=${CMAKE_CURRENT_LIST_DIR}
     -DBB_RECOMP_PLAYER=${BB_RECOMP_PLAYER} -DBB_RECOMP_BUNDLED=${BB_RECOMP_BUNDLED} -DBB_RECOMP_VERSION=${BB_RECOMP_VERSION}
     "-DBB_RECOMP_LLVM_DIR=${BB_RECOMP_LLVM_DIR}" "-DBB_RECOMP_DEPS_PREFIX=${BB_RECOMP_DEPS_PREFIX}" "-DBB_RECOMP_LLD_INCLUDE=${BB_RECOMP_LLD_INCLUDE}" "-DBB_RECOMP_SDL_PREFIX=${BB_RECOMP_SDL_PREFIX}" "-DBB_RECOMP_IMGUI_DIR=${BB_RECOMP_IMGUI_DIR}" "-DBB_RECOMP_MIMALLOC_DIR=${BB_RECOMP_MIMALLOC_DIR}"
-    -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH} -DBB_RECOMP_NASM=${BB_RECOMP_NASM}
+    -DBB_RECOMP_SANITIZE=${BB_RECOMP_SANITIZE} -DBB_RECOMP_LLVM=${BB_RECOMP_LLVM} -DBB_RECOMP_MARCH=${BB_RECOMP_MARCH} -DBB_RECOMP_NASM=${BB_RECOMP_NASM}
   BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target ${BB_TARGETS} --parallel ${BB_RECOMP_JOBS}
   INSTALL_COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BB_BUILT_FILES} ${CMAKE_BINARY_DIR}
   BUILD_ALWAYS ON
