@@ -537,7 +537,12 @@ static void dump_frames(ucontext_t *uc) {
         rbp=frame[0]; rip=frame[1];
     }
 }
-static void thread_dump(int sig, siginfo_t *info, void *context) { (void)sig; (void)info; dump_frames(context); }
+static void thread_dump(int sig, siginfo_t *info, void *context) {
+    (void)sig; (void)info;
+    dump_frames(context);
+    /* AOT (BB_AOT_TRACE): the thread's last transitions between units, the fallback and host functions. */
+    if (bbaot_crash_report) bbaot_crash_report(context);
+}
 static void watchdog(int sig, siginfo_t *info, void *context) {
     (void)info;
     const char head[]="STOP: watchdog timeout; thread stacks:\n";

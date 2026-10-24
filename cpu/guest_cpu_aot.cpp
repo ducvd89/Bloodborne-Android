@@ -1540,10 +1540,17 @@ __attribute__((visibility("default"))) void bbaot_crash_report(const void* ucont
     if (E.trace) {
         static const char* names[] = {"?", "miss", "fallback returned", "host call", "dirty unit", "free run", "unwind"};
         const unsigned n = t->trace_n, first = n > Thread::TraceSize ? n - Thread::TraceSize : 0;
+        std::fprintf(stderr, "AOT: tid %d, last %u transitions:\n", int(syscall(SYS_gettid)), n - first);
         for (unsigned i = first; i < n; ++i) {
             const auto& e = t->trace[i % Thread::TraceSize];
-            std::fprintf(stderr, "AOT:   %-18s a=%#llx b=%#llx c=%#llx (image offsets: %#llx %#llx)\n", names[e.kind], (unsigned long long)e.a, (unsigned long long)e.b,
-                         (unsigned long long)e.c, (unsigned long long)(e.a - E.base), (unsigned long long)(e.c - E.base));
+            // host functions as module+offset (symbolize on the PC against the unstripped library)
+            Dl_info info {};
+            const bool host = e.kind == EvHost && dladdr(reinterpret_cast<void*>(e.a), &info) && info.dli_fname;
+            const char* mod = host ? std::strrchr(info.dli_fname, '/') : nullptr;
+            std::fprintf(stderr, "AOT:   %-18s a=%#llx b=%#llx c=%#llx (image offsets: %#llx %#llx)%s%s%s%#llx\n", names[e.kind], (unsigned long long)e.a,
+                         (unsigned long long)e.b, (unsigned long long)e.c, (unsigned long long)(e.a - E.base), (unsigned long long)(e.c - E.base),
+                         host ? " " : "", host ? (mod ? mod + 1 : info.dli_fname) : "", host ? "+" : "",
+                         host ? (unsigned long long)(e.a - reinterpret_cast<uintptr_t>(info.dli_fbase)) : 0ull);
         }
     }
     std::fflush(stderr);

@@ -397,9 +397,16 @@ bool InstallAll(Counts& c, std::string& what) {
 constexpr u64 LiveImageOffset = 0x56d3f40; // data segment end 0x56d30f4, its page ends at 0x56d4000; the cheats' flags are at 0x56d3f00
 static_assert(sizeof(Live) <= 0xc0);
 bool slot_mode = false;
+/// BB_FRAME_SLOT_TEST (diagnostics, bits): 1 the pacer's mode slot, 2 the step slot, 4 the fixed-step slots do nothing (the
+/// game's own instruction runs); 8 no redirects; 16 no byte patches (pacer's late frame, run's wall check); 32 no slots set.
+const unsigned slot_test = [] {
+    const char* env = std::getenv("BB_FRAME_SLOT_TEST");
+    return env ? unsigned(std::strtoul(env, nullptr, 0)) : 0u;
+}();
 
 /// The pacer's mode (0x203493d, before `lea r15, [r12 + 0x268]`).
 std::uint32_t PacerModeSlot(void*, GuestRegsEx* r) {
+    if (slot_test & 1) return GUEST_HOOK_CONTINUE;
     u8* pacer = reinterpret_cast<u8*>(r->gpr[GUEST_R12]);
     const std::uint32_t one = 1, shortest = *reinterpret_cast<const std::uint32_t*>(&live->shortest);
     std::memcpy(pacer + 0x10, &one, 4);
@@ -411,6 +418,7 @@ std::uint32_t PacerModeSlot(void*, GuestRegsEx* r) {
 }
 /// The main loop's step (0x2018e36, instead of `mov dword [rbp - 0x38], 1/30`; rbx the pacer).
 std::uint32_t StepSlot(void*, GuestRegsEx* r) {
+    if (slot_test & 2) return GUEST_HOOK_CONTINUE;
     FrameStep(r->gpr[GUEST_RBX]);
     std::memcpy(reinterpret_cast<u8*>(r->gpr[GUEST_RBP]) - 0x38, &live->dt, 4);
     r->rip += 7;
@@ -418,6 +426,7 @@ std::uint32_t StepSlot(void*, GuestRegsEx* r) {
 }
 /// A subsystem stepped by a fixed 1/30 s (`mov dword [rbp + offset], 1/30`, the offset is the context).
 std::uint32_t FixedStepSlot(void* offset, GuestRegsEx* r) {
+    if (slot_test & 4) return GUEST_HOOK_CONTINUE;
     std::memcpy(reinterpret_cast<u8*>(r->gpr[GUEST_RBP]) + std::int64_t(reinterpret_cast<std::intptr_t>(offset)), &live->dt, 4);
     r->rip += 7;
     return GUEST_HOOK_JUMP;
@@ -448,6 +457,7 @@ bool InstallAllSlots(Counts& c, std::string& what) {
                           std::initializer_list<u64> resume) {
         if (std::memcmp(reinterpret_cast<const u8*>(image_base + site), expected, length) != 0) return false;
         if (!committing) return Claim(image_base + site, length) && BbHookSites::Available(image_base + site);
+        if (slot_test & 32) return true;  // diagnostics: the slot is not set
         return BbHookSites::Slot(image_base + site, image_base, length, fn, context, resume);
     };
     {
@@ -458,7 +468,7 @@ bool InstallAllSlots(Counts& c, std::string& what) {
         // test dl, dl; je +5; mov eax, [r12 + 0x10]: the stub ran the mov always: the `je` becomes two nops.
         constexpr u8 code[] = {0x84, 0xd2, 0x74, 0x05, 0x41, 0x8b, 0x44, 0x24, 0x10};
         constexpr u8 patched[] = {0x84, 0xd2, 0x90, 0x90, 0x41, 0x8b, 0x44, 0x24, 0x10};
-        if (!PatchBytes(0x2034d96, code, patched, sizeof(code))) return fail("the pacer's late frame", 0x2034d96);
+        if (!(slot_test & 16) && !PatchBytes(0x2034d96, code, patched, sizeof(code))) return fail("the pacer's late frame", 0x2034d96);
     }
     {
         constexpr u8 code[] = {0xc7, 0x45, 0xc8, 0x89, 0x88, 0x08, 0x3d};
@@ -487,12 +497,13 @@ bool InstallAllSlots(Counts& c, std::string& what) {
             }
             u8 expected[8];
             std::memcpy(expected, code, 8);
-            if (!PatchBytes(site, expected, patched, 8)) return fail("the run's wall check", site);
+            if (!(slot_test & 16) && !PatchBytes(site, expected, patched, 8)) return fail("the run's wall check", site);
             c.run = 1;
         }
     }
     c.detours += c.run == 1;
     for (const Redirect& r : Redirects) {
+        if (slot_test & 8) break;
         if (!RedirectOperand(r)) return fail("a per-frame value", r.site);
         ++c.redirects;
     }
@@ -529,8 +540,16 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
         data = stub_page = nullptr;
         live = nullptr;
     };
-    if (slot_mode) {
+    const char* near_env = std::getenv("BB_FRAME_LIVE_NEAR"); // diagnostics: Live in its own page in slot mode too
+    if (slot_mode && !(near_env && near_env[0] == '1')) {
         live = new (image + LiveImageOffset) Live{};
+    } else if (slot_mode) {
+        data = MapNear(PROT_READ | PROT_WRITE);
+        if (!data) {
+            release();
+            return Disabled("no memory next to the game's code");
+        }
+        live = new (data) Live{};
     } else {
         data = MapNear(PROT_READ | PROT_WRITE);
         stub_page = MapNear(PROT_READ | PROT_WRITE);
