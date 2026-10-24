@@ -122,6 +122,8 @@ void playerUsage() {
         "  --jobs <n>         worker threads (default: the CPU cores minus two, at most 22; fewer when the memory needs it)\n"
         "  --mem-fraction <f> share of the free memory the compile may use (default 0.6)\n"
         "  --variants <dir>   a variant catalog to use instead of the one next to the tool (--no-variants: none)\n"
+        "  --extra-entries <file>  addresses the app reported as missing native entries: the misses log of the phone (logs/aot-misses.log) as it is.\n"
+        "                     Each becomes an entry of the library; rebuild with this when the app says a native entry is missing\n"
         "  --keep-work        keep the work folder (<out>/work: the game image and the object files)\n"
         "\n"
         "It takes a few minutes and needs about 3 GB of free disk space while it works. Then copy libbbaot.so and libbbaot.json to\n"
@@ -316,7 +318,7 @@ int runPrepare(const std::string& game, const std::string& data, std::string& er
 } // namespace
 
 int playerMain(int argc, char** argv) {
-  std::string gameArg, pkgsArg, outArg = "bb-recomp-out", variantsArg, jobs, memFraction, toolArg;
+  std::string gameArg, pkgsArg, outArg = "bb-recomp-out", variantsArg, jobs, memFraction, toolArg, extraArg;
   bool keepWork = false, noVariants = false;
   std::string checkOnly;
   for (int i = 1; i < argc; ++i) {
@@ -328,6 +330,7 @@ int playerMain(int argc, char** argv) {
     else if (is("--jobs")) jobs = arg();
     else if (is("--mem-fraction")) memFraction = arg();
     else if (is("--variants")) variantsArg = arg();
+    else if (is("--extra-entries")) extraArg = arg();
     else if (is("--no-variants")) noVariants = true;
     else if (is("--keep-work")) keepWork = true;
     else if (is("--pkg-tool")) toolArg = arg();
@@ -459,6 +462,12 @@ int playerMain(int argc, char** argv) {
                                    "--so", "libbbaot.so", "--stats", (work / "compile.txt").string(), "-O1"};
   if (!jobs.empty()) { args.push_back("--jobs"); args.push_back(jobs); }
   if (!memFraction.empty()) { args.push_back("--mem-fraction"); args.push_back(memFraction); }
+  if (!extraArg.empty()) {  // the compile runs inside the work folder: an absolute path, checked now
+    std::error_code xec;
+    const fs::path extra = fs::absolute(extraArg, xec);
+    if (xec || !fs::is_regular_file(extra, xec)) { cleanup(); die("--extra-entries: cannot read " + extraArg); }
+    args.push_back("--extra-entries"); args.push_back(extra.string());
+  }
   std::string variantNote = "none (this build has no variant support)";
 #ifdef BBR_HAVE_VARIANTS
   {

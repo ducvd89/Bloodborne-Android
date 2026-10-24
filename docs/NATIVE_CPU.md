@@ -168,6 +168,10 @@ right game folder.
 **The menu says "Set by bionic-local.sh"** - the file `bionic-local.sh` in the app's folder sets `BB_AOT` by hand; that wins over the switch.
 Remove that line to use the switch.
 
+**The app reports a missing native entry** ("native code is missing an entry at +0x..."; the details are in `logs/aot-misses.log` in the app's folder) - the
+library does not cover a place the game jumped to. Copy `aot-misses.log` to the PC and rebuild with it: `bb-recomp --pkgs <PKG folder> --out <folder> --extra-entries aot-misses.log`
+(or `--game <dump> ...` the same way). Every address in the log becomes an entry of the new library. Please also send the log with a report.
+
 **The game hangs or crashes with it on** - turn it off (Menu > Native CPU), and send a report (Menu > Report a problem). The game runs as
 before without it.
 
