@@ -70,9 +70,9 @@ if(BB_RECOMP_LLVM)
     # ld.lld in the process (bundle.cpp): LLD's ELF driver as a static library, and a fully static executable (no glibc or
     # libstdc++ version needed on the player's machine). The libraries are linked by path: LLD's CMake target would pull in every
     # LLVM target, which the ELF driver does not need without LTO.
-    llvm_map_components_to_libnames(BB_LLD_DEPS option targetparser binaryformat demangle lto transformutils profiledata bitwriter bitreader mc debuginfodwarf)
+    llvm_map_components_to_libnames(BB_LLD_DEPS option targetparser binaryformat demangle lto dtlto transformutils profiledata bitwriter bitreader mc debuginfodwarf aarch64asmparser x86asmparser aarch64codegen x86codegen passes object)
     target_compile_definitions(bb-recomp PRIVATE BBR_BUNDLED=1)
-    target_link_libraries(bb-recomp PRIVATE "${LLVM_LIBRARY_DIR}/liblldELF.a" "${LLVM_LIBRARY_DIR}/liblldCommon.a" ${BB_LLD_DEPS})
+    target_link_libraries(bb-recomp PRIVATE -Wl,--start-group "${LLVM_LIBRARY_DIR}/liblldELF.a" "${LLVM_LIBRARY_DIR}/liblldCommon.a" ${BB_LLD_DEPS} -Wl,--end-group)
     target_link_options(bb-recomp PRIVATE -static)
   endif()
 endif()

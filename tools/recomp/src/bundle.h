@@ -2,7 +2,7 @@
 // system's clang for comes from the tool itself or from its bundle directory (<exe>/../share/bb-recomp):
 //   - ld.lld runs in the process (LLD as a library, BBR_BUNDLED),
 //   - the x87 helpers are an AArch64 object compiled when the package was made (helpers-aarch64.o),
-//   - libbbcpu.so and libm.so are empty soname stubs (the .so only needs the DT_NEEDED entries),
+//   - libbbcpu.so is an empty soname stub and libm.so the NDK's own link stub (53 KB: no code, only the symbol list with its LIBC versions),
 //   - libclang_rt.builtins-aarch64-android.a (__divti3 and friends) is the NDK's own file.
 // compile.cpp runs its external commands through bbrSystem(): without a bundle directory that is system(); with one, the
 // three aarch64 commands (compile the helpers, make the stub, link) are replaced as above and every other command is run.
