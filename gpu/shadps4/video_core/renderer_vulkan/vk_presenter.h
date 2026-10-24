@@ -6,6 +6,7 @@
 #include <atomic>
 #include <deque>
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 
@@ -184,6 +185,8 @@ private:
     BbLsfgState::State lsfg_requested; ///< what the state file last asked for
     BbLsfgState::Watcher lsfg_watch;
     std::unique_ptr<Lsfg> lsfg; ///< null: off, or it could not start / failed
+    bool lsfg_paused = false; ///< bbport: frame generation paused while a movie plays (PollLsfgState)
+    std::chrono::steady_clock::time_point lsfg_movie_seen{}; ///< when a movie last played (PollLsfgState)
 #endif
     Swapchain swapchain;
     Runtime runtime;

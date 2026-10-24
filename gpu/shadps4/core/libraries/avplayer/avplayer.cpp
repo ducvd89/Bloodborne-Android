@@ -12,7 +12,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <mutex>
 #include <unistd.h>
+#include <vector>
 
 // bbport BB_AVPLAYER_LOG=1: the game's AvPlayer calls (crash at the opening movie).
 static bool AvLogOn() {
@@ -26,6 +29,28 @@ namespace Libraries::AvPlayer {
 // bbport: frames handed to the game, and when playing started (the pacing line at sceAvPlayerClose).
 static std::atomic<u64> video_frames_shown{0};
 static std::chrono::steady_clock::time_point started_at{};
+
+// bbport: the players started and not stopped or closed (PlayingCount). Close removes a player before
+// deleting it, under the same lock, so PlayingCount may ask the ones listed whether they are active.
+static std::mutex playing_mutex;
+static std::vector<AvPlayerHandle> playing;
+
+static void SetPlaying(AvPlayerHandle handle, bool on) {
+    std::scoped_lock lock{playing_mutex};
+    const auto it = std::find(playing.begin(), playing.end(), handle);
+    if (on && it == playing.end()) {
+        playing.push_back(handle);
+    } else if (!on && it != playing.end()) {
+        playing.erase(it);
+    }
+}
+
+u32 PlayingCount() {
+    std::scoped_lock lock{playing_mutex};
+    // A player at the end of its stream that the game keeps (no Stop) counts no more.
+    std::erase_if(playing, [](AvPlayerHandle handle) { return !handle->IsActive(); });
+    return u32(playing.size());
+}
 
 s32 PS4_SYSV_ABI sceAvPlayerAddSource(AvPlayerHandle handle, const char* filename) {
     AVLOG("AddSource(%p, %s)\n", (void*)handle, filename ? filename : "(null)");
@@ -62,6 +87,7 @@ s32 PS4_SYSV_ABI sceAvPlayerClose(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    SetPlaying(handle, false);
     delete handle;
     return ORBIS_OK;
 }
@@ -277,6 +303,7 @@ s32 PS4_SYSV_ABI sceAvPlayerStart(AvPlayerHandle handle) {
     }
     const s32 result = handle->Start();
     if (result == ORBIS_OK) {
+        SetPlaying(handle, true);
         video_frames_shown = 0;
         started_at = std::chrono::steady_clock::now();
     }
@@ -289,6 +316,7 @@ s32 PS4_SYSV_ABI sceAvPlayerStop(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    SetPlaying(handle, false);
     return handle->Stop();
 }
 

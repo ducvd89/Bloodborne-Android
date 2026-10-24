@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_frame_latency.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "core/libraries/avplayer/avplayer.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -695,7 +696,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // bbport: Lossless Scaling frame generation (vk_lsfg.h): the generated frames, then this one. Only
     // for frames of the size the output wants (the first frames, made before the output was known, are
     // not: the frame generation context is made once, for the right size).
-    if (lsfg && is_game_frame && !is_reusing_frame) {
+    if (lsfg && !lsfg_paused && is_game_frame && !is_reusing_frame) {
         const vk::Extent2D extent = swapchain.GetExtent();
         SetExpectedGameSize(s32(extent.width), s32(extent.height));
         if (frame->width == expected_frame_width && frame->height == expected_frame_height &&
@@ -937,6 +938,32 @@ bool Presenter::SendToApp() {
 
 #ifdef __ANDROID__
 void Presenter::PollLsfgState() {
+    // bbport: frame generation pauses while a movie plays (an AvPlayer started and active). With it the GPU
+    // command thread is held at each flip until the paced hand-over has freed a frame (frames_cap): the GPU
+    // stays busy for a display interval and a game submission waits for it (the submission lock, ~32 ms at x2
+    // and 60 Hz). Bloodborne's movie step draws into the render thread's command buffer 20 ms after handing it
+    // a frame, trusting it to be done by then, so the render thread, held in the middle of its frame, and the
+    // movie step wrote one command buffer at once (docs/CRASH_NEWGAME_CUTSCENE.md). Paused, frames go out as
+    // with frame generation off (no frame cap); the framegen context, its buffers and the swapchain stay as
+    // they are, so pausing and resuming cost nothing. A 30 fps video gains nothing from generated frames.
+    if (lsfg) {
+        // It resumes a while after the player is stopped: the game takes the movie down meanwhile (its audio
+        // thread and the movie step), and that, too, is timed by sleeps.
+        using Clock = std::chrono::steady_clock;
+        static constexpr auto ResumeAfter = std::chrono::milliseconds(1500);
+        bool movie = Libraries::AvPlayer::PlayingCount() > 0;
+        if (movie) {
+            lsfg_movie_seen = Clock::now();
+        } else if (lsfg_paused && Clock::now() - lsfg_movie_seen < ResumeAfter) {
+            movie = true;
+        }
+        if (movie != lsfg_paused) {
+            lsfg_paused = movie;
+            ApplyFramesCap();
+            std::printf(movie ? "LSFG: paused while a movie plays\n" : "LSFG: resumed (the movie ended)\n");
+            std::fflush(stdout);
+        }
+    }
     BbLsfgState::State next;
     if (!lsfg_watch.Poll(next)) {
         return;
@@ -986,7 +1013,7 @@ void Presenter::ApplyLsfgOutputMode() {
 void Presenter::ApplyFramesCap() {
     {
         std::scoped_lock lock{free_mutex};
-        frames_cap.store(lsfg ? lsfg->FramesCap() : 0, std::memory_order_relaxed);
+        frames_cap.store(lsfg && !lsfg_paused ? lsfg->FramesCap() : 0, std::memory_order_relaxed);
     }
     free_cv.notify_all();
 }

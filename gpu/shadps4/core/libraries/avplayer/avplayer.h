@@ -292,4 +292,9 @@ using AvPlayerLogCallback = int PS4_SYSV_ABI (*)(void* p, const char* format, va
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 
+/// bbport: how many players are playing (sceAvPlayerStart, until sceAvPlayerStop or sceAvPlayerClose, or
+/// until the player is no longer active: the end of its stream). Any thread; the presenter pauses frame
+/// generation while it is non-zero (docs/CRASH_NEWGAME_CUTSCENE.md).
+u32 PlayingCount();
+
 } // namespace Libraries::AvPlayer
