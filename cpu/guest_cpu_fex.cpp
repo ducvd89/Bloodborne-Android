@@ -619,5 +619,21 @@ uint64_t bb_fb_xgetbv(uint64_t function) {
     const auto r = ctx->RunXCRFunction(uint32_t(function));
     return uint64_t(r.eax) | uint64_t(r.edx) << 32;
 }
+
+int bb_fb_handle_unaligned(void* ucontext) {
+    // An unaligned atomic (CASAL, CASPAL, LDADD..., LDAXR/STLXR) in ahead-of-time code: x86 `lock` allows any alignment, the
+    // host's atomics only within 16 bytes (LSE2). FEX's handler emulates the access without patching the code (not JIT code).
+    GuestThread* t = self;
+    if (!t) {
+        return 0;
+    }
+    auto& m = static_cast<ucontext_t*>(ucontext)->uc_mcontext;
+    if (const auto skip = FEXCore::ArchHelpers::Arm64::HandleUnalignedAccess(t->thread, unaligned_type, m.pc, reinterpret_cast<uint64_t*>(m.regs),
+                                                                               false)) {
+        m.pc += *skip;
+        return 1;
+    }
+    return 0;
+}
 } // extern "C"
 #endif

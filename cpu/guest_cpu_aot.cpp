@@ -154,6 +154,7 @@ MissSlot miss_table[MissSlots];
 std::atomic<uint64_t> miss_dropped {0};
 std::atomic<uint64_t> mid_unit_jumps {0};
 std::atomic<uint64_t> plt_hops {0};
+std::atomic<uint64_t> unaligned_atomics {0};
 
 void CountMiss(uint64_t address, bool dirty_unit) {
     const uint64_t key = address | 1ull << 63;  // address 0 stays distinguishable
@@ -179,8 +180,9 @@ void Report(const char* why) {
     for (Thread* t = E.threads.load(); t; t = t->next_registered) {
         unit += t->unit_dispatch; host += t->host_calls; misses += t->misses; dirty_runs += t->dirty_runs; cycles += t->fb_cycles;
     }
-    std::fprintf(stderr, "AOT stats (%s): %llu PLT thunks followed; %llu mid-unit jumps run to the end of the stack on the fallback\n", why,
-                 (unsigned long long)plt_hops.load(), (unsigned long long)mid_unit_jumps.load());
+    std::fprintf(stderr, "AOT stats (%s): %llu PLT thunks followed; %llu mid-unit jumps run to the end of the stack on the fallback; "
+                 "%llu unaligned atomics emulated\n", why,
+                 (unsigned long long)plt_hops.load(), (unsigned long long)mid_unit_jumps.load(), (unsigned long long)unaligned_atomics.load());
     std::fprintf(stderr, "AOT stats (%s): %llu units, %llu dirty (%llu entries patched, %llu not patchable)\n"
                  "  via the dispatcher (indirect calls, tail jumps; direct unit-to-unit calls are not counted): %llu unit entries, "
                  "%llu host function calls\n"
@@ -989,7 +991,7 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     bb_fb_init(map);
     E.low_map = map;
     const char* path = std::getenv("BB_AOT");
-    if (!path || !*path) return;
+    if (!path || !*path || std::strcmp(path, "0") == 0) return;  // BB_AOT=0: off (FEX alone)
     Load(path);
     if (!E.on) return;
 #if defined(BB_AOT_FEX_STATE)
@@ -1186,7 +1188,20 @@ __attribute__((visibility("default"))) void bbaot_crash_report(const void* ucont
 }
 
 uintptr_t guest_cpu_host_pc(const void* ucontext) { return bb_fb_host_pc(ucontext); }
-int guest_cpu_handle_fault(int sig, siginfo_t* info, void* ucontext) { return bb_fb_handle_fault(sig, info, ucontext); }
+int guest_cpu_handle_fault(int sig, siginfo_t* info, void* ucontext) {
+#if defined(BB_AOT_FEX_STATE)
+    // x86 `lock` operations may be unaligned; the units' LSE atomics fault when they cross 16 bytes: emulated, and the unit
+    // goes on after the instruction.
+    if (E.on && sig == SIGBUS && info->si_code == BUS_ADRALN) {
+        const uintptr_t pc = bb_fb_host_pc(ucontext);
+        if (pc >= E.so_lo && pc < E.so_hi && bb_fb_handle_unaligned(ucontext)) {
+            unaligned_atomics.fetch_add(1, std::memory_order_relaxed);
+            return 1;
+        }
+    }
+#endif
+    return bb_fb_handle_fault(sig, info, ucontext);
+}
 
 int guest_cpu_is_native(void) { return NativeFallback && !E.on; }
 

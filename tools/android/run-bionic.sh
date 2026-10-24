@@ -459,12 +459,13 @@ fi
 # Ahead-of-time recompiled game code (docs/STATIC_RECOMPILE_PLAN.md): bb-recomp's .so, copied to aot/libbbaot.so in the
 # runtime's directory (bbport/aot, or bbport/bionic/aot), is run by libbbcpu in front of FEX (BB_AOT=<path> by hand wins).
 # Whatever it does not cover, and units whose code differs from the image, still run on FEX. BB_AOT_STATS=1: counts.
+# BB_AOT=0 (environment or bionic-local.sh): off, FEX alone, even with the .so in place.
 if [ -z "${BB_AOT:-}" ]; then
     for aot in "$base/aot/libbbaot.so" "$bionic/aot/libbbaot.so"; do
         if [ -f "$aot" ]; then export BB_AOT="$aot"; break; fi
     done
 fi
-[ -n "${BB_AOT:-}" ] && echo "AOT: $BB_AOT"
+if [ "${BB_AOT:-0}" = 0 ]; then unset BB_AOT; echo "AOT: off (FEX JIT only)"; else export BB_AOT; echo "AOT: $BB_AOT"; fi
 
 # The Bionic libraries only: the app's own environment has no library path.
 LD_LIBRARY_PATH="$bionic/lib"; export LD_LIBRARY_PATH

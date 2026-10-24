@@ -41,6 +41,8 @@ uint64_t bb_fb_sentinel(void);
 void *const *bb_fb_stubs(uintptr_t *base, size_t *bytes);
 void bb_fb_cpuid(uint64_t function, uint64_t leaf, uint32_t out[4]);
 uint64_t bb_fb_xgetbv(uint64_t function);
+/* SIGBUS BUS_ADRALN at an atomic instruction of ahead-of-time code: emulated (the signal's pc is advanced); 0: not handled. */
+int bb_fb_handle_unaligned(void *ucontext);
 #endif
 #ifdef __cplusplus
 }
