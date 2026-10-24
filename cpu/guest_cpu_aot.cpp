@@ -1631,6 +1631,33 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     if (!E.on) Fatal("the unit library could not be loaded (see the lines above); this runtime has no fallback CPU");
 #endif
     if (!E.on) return;
+    if (E.strict) std::printf("AOT: strict mode: no fallback CPU (a miss is logged to %s and stops the game)\n", E.miss_log);
+#ifdef BB_AOT_ARM
+    // BB_AOT_CPUID_LOG=1: the CPUID leaves and XGETBV(0) the game can read, from FEX's model (FEX builds) and from the native
+    // model strict mode and BB_AOT_ONLY use (cpu/guest_cpu_cpuid.h), side by side.
+    if (const char* cl = std::getenv("BB_AOT_CPUID_LOG"); cl && cl[0] == '1') {
+        if (!E.strict) bbnative::Init();
+        static const uint32_t leaves[][2] = {{0, 0}, {1, 0}, {6, 0}, {7, 0}, {7, 1}, {0xd, 0}, {0xd, 1}, {0x80000000u, 0}, {0x80000001u, 0},
+                                             {0x80000002u, 0}, {0x80000003u, 0}, {0x80000004u, 0}, {0x80000007u, 0}, {0x80000008u, 0}};
+        for (const auto& l : leaves) {
+            uint32_t nat[4];
+            bbnative::Cpuid(l[0], l[1], nat);
+#if defined(BB_AOT_FB_EXT)
+            uint32_t fex[4];
+            bb_fb_cpuid(l[0], l[1], fex);
+            std::printf("AOT cpuid %08x.%u: fex %08x %08x %08x %08x  native %08x %08x %08x %08x%s\n", l[0], l[1], fex[0], fex[1], fex[2], fex[3],
+                        nat[0], nat[1], nat[2], nat[3], std::memcmp(fex, nat, sizeof(nat)) ? "  DIFFERS" : "");
+#else
+            std::printf("AOT cpuid %08x.%u: native %08x %08x %08x %08x\n", l[0], l[1], nat[0], nat[1], nat[2], nat[3]);
+#endif
+        }
+#if defined(BB_AOT_FB_EXT)
+        std::printf("AOT xgetbv(0): fex %#llx native %#llx\n", (unsigned long long)bb_fb_xgetbv(0), (unsigned long long)bbnative::Xgetbv(0));
+#else
+        std::printf("AOT xgetbv(0): native %#llx\n", (unsigned long long)bbnative::Xgetbv(0));
+#endif
+    }
+#endif
 #if defined(BB_AOT_FB_EXT)
     E.stub_fns = bb_fb_stubs(&E.stub_base, &E.stub_bytes);
     E.stub_stride = 16;
