@@ -267,7 +267,10 @@ uint64_t RunSlot(GuestState* s, uint64_t k) {
         GuestRegs regs;
         std::memcpy(regs.gpr, s->gregs, sizeof(regs.gpr));
         regs.rip = site;
+        const uint64_t saved_rsp = GuestRspAtHostCall();
+        NoteGuestRsp(s->gregs[RSP]);
         r->regs(&regs);
+        NoteGuestRsp(saved_rsp);
         std::memcpy(s->gregs, regs.gpr, sizeof(regs.gpr));
         s->rip = regs.rip;
         return regs.rip == site ? uint64_t(GUEST_HOOK_CONTINUE) : uint64_t(GUEST_HOOK_JUMP);
@@ -282,7 +285,12 @@ uint64_t RunSlot(GuestState* s, uint64_t k) {
         std::memcpy(x.ymm[i], s->xmm.sse.data[i], 16);
         std::memcpy(x.ymm[i] + 16, s->avx_high[i], 16);
     }
+    // The callback may call guest code (guest_cpu_call): the call starts below this frame's red zone (guest_cpu_call uses the state's rsp, which the
+    // unit stored before the call); the native fallback's host stack bookkeeping is told the guest rsp as for a host function.
+    const uint64_t saved_host_rsp = GuestRspAtHostCall();
+    NoteGuestRsp(s->gregs[RSP]);
     const uint32_t act = r->ex(r->context, &x);
+    NoteGuestRsp(saved_host_rsp);
     std::memcpy(s->gregs, x.gpr, sizeof(x.gpr));
     for (unsigned i = 0; i < 16; ++i) {
         std::memcpy(s->xmm.sse.data[i], x.ymm[i], 16);

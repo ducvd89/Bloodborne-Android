@@ -26,6 +26,7 @@
 #include "common/types.h"
 #include "bbport_frame_rate.h"
 #include "bbport_guest_code.h"
+#include "bbport_hook_sites.h"
 #include "bbport_patch_notes.h"
 #include "../../src/guest_cpu.h"
 
@@ -387,12 +388,123 @@ bool InstallAll(Counts& c, std::string& what) {
     return true;
 }
 
+
+// ---- Native hook slots (the game's code runs as ahead-of-time recompiled units, docs/RECOMP_HOOKS.md) ----
+// The detours become C++ callbacks of hook slots: no stub page, no jump written. `live` moves to the unused end of the image's data segment's last
+// page (as the cheats' flags do, tools/android/build_patch_parts.py), so that the operand redirects' displacements are the same bytes in every run and
+// the recompiler can build the redirected functions ahead of time (tools/recomp/variants/gen_patchers.cpp reads them from this code). Every callback
+// does what its stub did.
+constexpr u64 LiveImageOffset = 0x56d3f40; // data segment end 0x56d30f4, its page ends at 0x56d4000; the cheats' flags are at 0x56d3f00
+static_assert(sizeof(Live) <= 0xc0);
+bool slot_mode = false;
+
+/// The pacer's mode (0x203493d, before `lea r15, [r12 + 0x268]`).
+std::uint32_t PacerModeSlot(void*, GuestRegsEx* r) {
+    u8* pacer = reinterpret_cast<u8*>(r->gpr[GUEST_R12]);
+    const std::uint32_t one = 1, shortest = *reinterpret_cast<const std::uint32_t*>(&live->shortest);
+    std::memcpy(pacer + 0x10, &one, 4);
+    pacer[0x14] = 0;
+    std::memcpy(pacer + 0x18, &shortest, 4);
+    const u64 zero = 0;
+    std::memcpy(pacer + 0x268, &zero, 8);
+    return GUEST_HOOK_CONTINUE; // the game's `lea` runs
+}
+/// The main loop's step (0x2018e36, instead of `mov dword [rbp - 0x38], 1/30`; rbx the pacer).
+std::uint32_t StepSlot(void*, GuestRegsEx* r) {
+    FrameStep(r->gpr[GUEST_RBX]);
+    std::memcpy(reinterpret_cast<u8*>(r->gpr[GUEST_RBP]) - 0x38, &live->dt, 4);
+    r->rip += 7;
+    return GUEST_HOOK_JUMP;
+}
+/// A subsystem stepped by a fixed 1/30 s (`mov dword [rbp + offset], 1/30`, the offset is the context).
+std::uint32_t FixedStepSlot(void* offset, GuestRegsEx* r) {
+    std::memcpy(reinterpret_cast<u8*>(r->gpr[GUEST_RBP]) + std::int64_t(reinterpret_cast<std::intptr_t>(offset)), &live->dt, 4);
+    r->rip += 7;
+    return GUEST_HOOK_JUMP;
+}
+
+/// `size` bytes at `site` are `expected`: they become `bytes` (checked in the first pass, written in the second).
+bool PatchBytes(u64 site, const u8* expected, const u8* bytes, std::size_t size) {
+    u8* code = reinterpret_cast<u8*>(image_base + site);
+    if (std::memcmp(code, expected, size) != 0) return false;
+    if (!committing) return Claim(image_base + site, size);
+    Writable(reinterpret_cast<u64>(code), size);
+    std::memcpy(code, bytes, size);
+    return true;
+}
+
+/// The hooks as slots (every site checked first, as InstallAll). The detours that only drop or replace instructions are byte patches instead
+/// (the pacer's late-frame `je`, the run's wall check): variants of the functions, the same bytes in every run.
+bool InstallAllSlots(Counts& c, std::string& what) {
+    c = {};
+    claimed.clear();
+    char text[96];
+    const auto fail = [&](const char* name, u64 site) {
+        std::snprintf(text, sizeof(text), "%s (%#llx) is not the expected code", name, (unsigned long long)site);
+        what = text;
+        return false;
+    };
+    const auto slot = [&](u64 site, const u8* expected, std::size_t length, GuestHookEx fn, void* context,
+                          std::initializer_list<u64> resume) {
+        if (std::memcmp(reinterpret_cast<const u8*>(image_base + site), expected, length) != 0) return false;
+        if (!committing) return Claim(image_base + site, length) && BbHookSites::Available(image_base + site);
+        return BbHookSites::Slot(image_base + site, image_base, length, fn, context, resume);
+    };
+    {
+        constexpr u8 code[] = {0x4d, 0x8d, 0xbc, 0x24, 0x68, 0x02, 0x00, 0x00};
+        if (!slot(0x203493d, code, sizeof(code), PacerModeSlot, nullptr, {})) return fail("the pacer's mode", 0x203493d);
+    }
+    {
+        // test dl, dl; je +5; mov eax, [r12 + 0x10]: the stub ran the mov always: the `je` becomes two nops.
+        constexpr u8 code[] = {0x84, 0xd2, 0x74, 0x05, 0x41, 0x8b, 0x44, 0x24, 0x10};
+        constexpr u8 patched[] = {0x84, 0xd2, 0x90, 0x90, 0x41, 0x8b, 0x44, 0x24, 0x10};
+        if (!PatchBytes(0x2034d96, code, patched, sizeof(code))) return fail("the pacer's late frame", 0x2034d96);
+    }
+    {
+        constexpr u8 code[] = {0xc7, 0x45, 0xc8, 0x89, 0x88, 0x08, 0x3d};
+        if (!slot(0x2018e36, code, sizeof(code), StepSlot, nullptr, {image_base + 0x2018e36 + 7}))
+            return fail("the main loop's step", 0x2018e36);
+    }
+    c.detours = 3;
+    for (const auto& [site, offset] : {std::pair<u64, std::int8_t>{0x17f9b71, -0x48}, {0x1572a7d, -0x30}}) {
+        const u8 code[] = {0xc7, 0x45, u8(offset), 0x89, 0x88, 0x08, 0x3d};
+        if (!slot(site, code, sizeof(code), FixedStepSlot, reinterpret_cast<void*>(std::intptr_t(offset)), {image_base + site + 7}))
+            return fail("a fixed step", site);
+    }
+    c.detours += 2;
+    {
+        constexpr u64 site = 0x1514c24;
+        const u8* code = reinterpret_cast<const u8*>(image_base + site);
+        constexpr u8 patched[] = {0xc5, 0xfa, 0x5e, 0x45, 0x8c, 0x0f, 0x1f, 0x00}; // vdivss xmm0, xmm0, [rbp - 0x74]; nop
+        if (std::memcmp(code, patched, sizeof(patched)) == 0) {
+            c.run = 2;
+        } else {
+            std::int32_t disp = 0;
+            std::memcpy(&disp, code + 4, 4);
+            if (code[0] != 0xc5 || code[1] != 0xfa || code[2] != 0x59 || code[3] != 0x05 ||
+                image_base + site + 8 + std::int64_t(disp) != image_base + 0x492632c) {
+                return fail("the run's wall check", site);
+            }
+            u8 expected[8];
+            std::memcpy(expected, code, 8);
+            if (!PatchBytes(site, expected, patched, 8)) return fail("the run's wall check", site);
+            c.run = 1;
+        }
+    }
+    c.detours += c.run == 1;
+    for (const Redirect& r : Redirects) {
+        if (!RedirectOperand(r)) return fail("a per-frame value", r.site);
+        ++c.redirects;
+    }
+    return true;
+}
+
 void Disabled(const char* why) {
     std::printf("Frame rate: hooks off (%s)\n", why);
 }
 } // namespace
 
-void PatchImage(unsigned char* image, std::uint64_t) {
+void PatchImage(unsigned char* image, std::uint64_t image_size) {
     // BB_FPS (run.sh, the launcher's frame rate): uncap (default), 60 or 90 (the same, at most that
     // many frames a second), 30 (the game's own). BB_FRAME_HOOKS=0: the community's frame rate
     // patches instead (scripts/patches.py, tools/android/run-bionic.sh; comparisons).
@@ -406,21 +518,30 @@ void PatchImage(unsigned char* image, std::uint64_t) {
         return Disabled("BB_FPS=30: the game's own frame rate");
     }
     image_base = reinterpret_cast<u64>(image);
-    u8* data = MapNear(PROT_READ | PROT_WRITE);
-    stub_page = MapNear(PROT_READ | PROT_WRITE);
+    // Recompiled game code with native hook slots at every detour site: callbacks instead of stubs (InstallAllSlots).
+    slot_mode = image_size >= LiveImageOffset + sizeof(Live) && BbHookSites::Available(image_base + 0x203493d) &&
+                BbHookSites::Available(image_base + 0x2018e36) && BbHookSites::Available(image_base + 0x17f9b71) &&
+                BbHookSites::Available(image_base + 0x1572a7d);
+    u8* data = nullptr;
     const auto release = [&] {
         if (data) munmap(data, StubPageSize);
         if (stub_page) munmap(stub_page, StubPageSize);
         data = stub_page = nullptr;
         live = nullptr;
     };
-    if (!data || !stub_page) {
-        release();
-        return Disabled("no memory next to the game's code");
+    if (slot_mode) {
+        live = new (image + LiveImageOffset) Live{};
+    } else {
+        data = MapNear(PROT_READ | PROT_WRITE);
+        stub_page = MapNear(PROT_READ | PROT_WRITE);
+        if (!data || !stub_page) {
+            release();
+            return Disabled("no memory next to the game's code");
+        }
+        // The stub page is guest code (FEXCore translates what the jumps lead to there).
+        guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), StubPageSize);
+        live = new (data) Live{};
     }
-    // The stub page is guest code (FEXCore translates what the jumps lead to there).
-    guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), StubPageSize);
-    live = new (data) Live{};
     // The upper bound of a step: BB_FRAME_DT_MAX_FPS, 30 (the game's own frame time) by default.
     // 20 keeps real time down to 20 FPS; below that the game slows down.
     if (const char* env = std::getenv("BB_FRAME_DT_MAX_FPS"); env && *env) {
@@ -445,20 +566,21 @@ void PatchImage(unsigned char* image, std::uint64_t) {
     Counts counts;
     std::string what;
     committing = false;
-    if (!InstallAll(counts, what)) {
+    const auto install = [&] { return slot_mode ? InstallAllSlots(counts, what) : InstallAll(counts, what); };
+    if (!install()) {
         release();
         return Disabled(what.c_str());
     }
     committing = true;
-    if (!InstallAll(counts, what)) {
+    if (!install()) {
         // Not expected: the check pass found every site. The game's code may be half changed.
         std::fprintf(stderr, "STOP: Frame rate: %s after the check\n", what.c_str());
         std::abort();
     }
-    mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
+    if (stub_page) mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
     unlocked = true;
-    std::printf("Frame rate: hooks on (%d redirects, %d detours), step 1/%.0f..1/%.0f s%s\n",
-                counts.redirects, counts.detours, 1.0f / live->shortest, 1.0f / longest_frame,
+    std::printf("Frame rate: hooks on (%d redirects, %d detours%s), step 1/%.0f..1/%.0f s%s\n",
+                counts.redirects, counts.detours, slot_mode ? ", native hook slots" : "", 1.0f / live->shortest, 1.0f / longest_frame,
                 counts.run == 2 ? "; the run's wall check was fixed by a Sprint Fix patch already" : "");
 }
 
