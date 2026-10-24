@@ -9,6 +9,7 @@ exe=$(realpath "$1"); game=${2:-}
 out=${BB_TEST_OUT:-$PWD/out/recomp-pkgs-test}
 rm -rf "$out"; mkdir -p "$out"
 python3 -I tests/recomp-pkgs/test_pkg_step.py "$exe" "$out/cases"
+[[ -n ${BB_TEST_MOD_PKG:-} ]] && python3 -I tests/recomp-pkgs/test_pkg_damage.py "$exe" "$BB_TEST_MOD_PKG" "$out/damage"
 if [[ -n $game ]]; then
     python3 -I tests/recomp-pkgs/make_fake_pkgs.py "$out/fake" "$game" >/dev/null
     "$exe" --pkgs "$out/fake/pkgs" --out "$out/result" --pkg-tool "$out/fake/fake-pkg-tool" --keep-work | tail -n 12
@@ -21,6 +22,7 @@ if [[ -n ${BB_TEST_MOD_PKG:-} && -n ${BB_TEST_PKG_TOOL:-} && -n $game ]]; then
     # may end at the game check afterwards (the mod changes files), what is tested is the unpacking and merging of a real PKG
     mkdir -p "$out/real/pkgs"
     cp "$out/fake/pkgs/"*A0100* "$out/real/pkgs/"; cp "$BB_TEST_MOD_PKG" "$out/real/pkgs/mod.pkg"
-    BB_REAL_TOOL=$(realpath "$BB_TEST_PKG_TOOL") "$exe" --pkgs "$out/real/pkgs" --out "$out/real/out" --pkg-tool "$out/fake/fake-pkg-tool" --keep-work 2>&1 | tee "$out/real/log.txt" | head -n 14 || true
+    BB_REAL_TOOL=$(realpath "$BB_TEST_PKG_TOOL") "$exe" --pkgs "$out/real/pkgs" --out "$out/real/out" --pkg-tool "$out/fake/fake-pkg-tool" --keep-work > "$out/real/log.txt" 2>&1 || true
+    tail -n 8 "$out/real/log.txt"
     grep -q "Extracting mod.pkg" "$out/real/log.txt" && grep -q "Merging mod.pkg" "$out/real/log.txt" && echo "real PKG unpacked and merged ok"
 fi

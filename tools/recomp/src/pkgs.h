@@ -23,6 +23,9 @@ struct PkgSet {
 bool readPkgHeader(const std::string& path, PkgInfo& info, std::string& err);
 // Finds the *.pkg files of a folder and sorts them out. false: `err` says what is wrong, for the player.
 bool findPkgs(const std::string& dir, PkgSet& set, std::string& err);
+// Checks every PKG of the set for damage (pkgverify.h) before anything is unpacked: false with `err` naming the file, what is wrong and what to do.
+// Reports bytes and speed through progress.h (stage "pkgcheck").
+bool checkPkgs(const PkgSet& set, std::string& err, const std::function<void(const std::string&)>& log, const std::function<bool()>& cancel);
 // Unpacks the base into <gameParent>/<TITLE_ID> and merges the updates into it (staging in `work`). gameDir: that folder.
 bool installPkgs(const PkgSet& set, const std::string& tool, const std::string& gameParent, const std::string& work, std::string& gameDir,
                  std::string& err, const std::function<void(const std::string&)>& log, const std::function<bool()>& cancel);

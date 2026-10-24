@@ -70,11 +70,20 @@ int runProcess(const std::vector<std::string>& argv, const std::function<void(co
   STARTUPINFOW si {}; si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES;
   si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
   PROCESS_INFORMATION pi {};
-  DWORD flags = CREATE_NO_WINDOW | (lowPriority ? BELOW_NORMAL_PRIORITY_CLASS : 0);
+  // The child (and what it starts) dies with this process: a Job object that kills its processes when its handle closes (also when this
+  // process is killed, which is how the window's Cancel stops a build that is running ps4-pkg-tool).
+  HANDLE job = CreateJobObjectW(nullptr, nullptr);
+  if (job) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li {}; li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
+  }
+  DWORD flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | (lowPriority ? BELOW_NORMAL_PRIORITY_CLASS : 0);
   if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, flags, nullptr, nullptr, &si, &pi)) {
     err = "cannot start " + argv[0] + " (error " + std::to_string(GetLastError()) + ")";
-    CloseHandle(rd); CloseHandle(wr); return -1;
+    CloseHandle(rd); CloseHandle(wr); if (job) CloseHandle(job); return -1;
   }
+  if (job) AssignProcessToJobObject(job, pi.hProcess);
+  ResumeThread(pi.hThread);
   CloseHandle(wr);
   std::atomic<bool> done {false}, killed {false};
   std::thread watch([&] {
@@ -90,7 +99,7 @@ int runProcess(const std::vector<std::string>& argv, const std::function<void(co
   WaitForSingleObject(pi.hProcess, INFINITE);
   DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
   done = true; watch.join();
-  CloseHandle(rd); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+  CloseHandle(rd); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); if (job) CloseHandle(job);
   return killed ? -1 : (int)code;
 }
 #else

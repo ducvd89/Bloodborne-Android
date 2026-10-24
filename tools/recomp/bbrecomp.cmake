@@ -101,7 +101,7 @@ if(BB_RECOMP_LLVM AND BB_RECOMP_PLAYER)
     list(REMOVE_ITEM BBR_PREPARE_SRCS "${BBR_PREPARE}/io.cpp")
     list(APPEND BBR_PREPARE_SRCS "${BB_RECOMP_DIR}/windows/io_win.cpp")
   endif()
-  target_sources(bb-recomp PRIVATE ${BBR_PREPARE_SRCS} "${BBR}/player.cpp" "${BBR}/pkgs.cpp" "${BBR}/proc.cpp")
+  target_sources(bb-recomp PRIVATE ${BBR_PREPARE_SRCS} "${BBR}/player.cpp" "${BBR}/pkgs.cpp" "${BBR}/proc.cpp" "${BBR}/pkgverify.cpp" "${BBR}/sha256.cpp")
   set_source_files_properties("${BBR_PREPARE}/bb_prepare.cpp" PROPERTIES COMPILE_DEFINITIONS "main=bb_prepare_main")
   # Their headers (hash.h, io.h ...) have generic names: they are found by quoted include only (-iquote), never as <io.h> (Windows has one).
   set_source_files_properties("${BBR}/player.cpp" "${BBR}/pkgs.cpp" PROPERTIES COMPILE_OPTIONS "-iquote;${BBR_PREPARE}")

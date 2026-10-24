@@ -213,7 +213,7 @@ int main(int argc, char** argv) {
 #endif
   if (argc >= 2 && !strcmp(argv[1], "--cli")) { --argc; ++argv; argv[0] = const_cast<char*>("bb-recomp"); }
 #ifdef BB_RECOMP_PLAYER
-  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--game") || !strcmp(argv[i], "--pkgs") || !strcmp(argv[i], "--help-player")) return playerMain(argc, argv);
+  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--game") || !strcmp(argv[i], "--pkgs") || !strcmp(argv[i], "--check-pkg") || !strcmp(argv[i], "--help-player")) return playerMain(argc, argv);
 #endif
   return recompMain(argc, argv);
 }

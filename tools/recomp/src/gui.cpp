@@ -43,7 +43,7 @@ constexpr const char* kDocs = "https://github.com/ducvd89/Bloodborne-android-reb
 // The stages the build reports (player.cpp) with their share of the whole bar.
 struct StageInfo { const char* id; const char* label; float weight; };
 const StageInfo kStages[] = {
-  {"check", "Checking the PKG files", 0.01f},      {"extract", "Extracting the game", 0.50f},   {"merge", "Merging the update", 0.05f},
+  {"check", "Finding the PKG files", 0.005f},      {"pkgcheck", "Checking the PKGs", 0.10f},     {"extract", "Extracting the game", 0.42f},   {"merge", "Merging the update", 0.05f},
   {"prepare", "Preparing the game image", 0.03f},  {"analyse", "Analysing the game's code", 0.07f}, {"compile", "Recompiling", 0.25f},
   {"link", "Linking", 0.03f},                      {"verify", "Checking the result", 0.02f},    {"finish", "Copying the result", 0.04f},
 };
@@ -51,7 +51,7 @@ const StageInfo kStages[] = {
 struct State {
   std::mutex mu;
   std::deque<std::string> log;
-  std::string stageId, stageText;
+  std::string stageId, stageText, statusText;
   uint64_t done = 0, total = 0;
   bool running = false, finished = false, failed = false, cancelled = false;
   std::string error, resultFolder;
@@ -89,9 +89,12 @@ void onLine(const std::string& line) {
   if (line.rfind("@@STAGE ", 0) == 0) {
     std::string rest = line.substr(8); size_t bar = rest.find('|');
     std::lock_guard<std::mutex> l(g.mu);
-    g.stageId = rest.substr(0, bar); g.stageText = bar == std::string::npos ? "" : rest.substr(bar + 1); g.done = g.total = 0;
+    const std::string id = rest.substr(0, bar);
+    if (id != g.stageId || id != "pkgcheck") { g.done = g.total = 0; }  // only the PKG check continues its bar from one file to the next
+    g.stageId = id; g.stageText = bar == std::string::npos ? "" : rest.substr(bar + 1); g.statusText.clear();
     return;
   }
+  if (line.rfind("@@STATUS ", 0) == 0) { std::lock_guard<std::mutex> l(g.mu); g.statusText = line.substr(9); return; }
   if (line.rfind("@@PROGRESS ", 0) == 0) {
     unsigned long long d = 0, t = 0;
     if (sscanf(line.c_str() + 11, "%llu %llu", &d, &t) == 2) { std::lock_guard<std::mutex> l(g.mu); g.done = std::max<uint64_t>(g.done, d); g.total = t; }
@@ -137,8 +140,9 @@ float overallFraction(const std::string& stage, uint64_t done, uint64_t total) {
   return std::min(1.f, acc / sum);
 }
 
-std::string stageLabel(const std::string& id, const std::string& text, uint64_t done, uint64_t total) {
+std::string stageLabel(const std::string& id, const std::string& text, uint64_t done, uint64_t total, const std::string& status) {
   char b[256];
+  if (id == "pkgcheck") return !status.empty() ? status : text.empty() ? "Checking the PKGs" : text;
   if (id == "extract" && total) { snprintf(b, sizeof b, "Extracting: %.1f of %.1f GB", done / 1073741824.0, total / 1073741824.0); return b; }
   if (id == "compile" && total) { snprintf(b, sizeof b, "Recompiling: %" PRIu64 " / %" PRIu64 " shards", std::min(done + 1, total), total); return b; }
   if (id == "compile") return "Recompiling";
@@ -230,11 +234,11 @@ void frame(SDL_Window* win) {
   ImGui::Separator();
 
   bool running, finished, failed, cancelled;
-  std::string stageId, stageText, error, result; uint64_t done, total; std::vector<std::string> lines; bool follow;
+  std::string stageId, stageText, statusText, error, result; uint64_t done, total; std::vector<std::string> lines; bool follow;
   std::chrono::steady_clock::time_point started;
   {
     std::lock_guard<std::mutex> l(g.mu);
-    running = g.running; finished = g.finished; failed = g.failed; cancelled = g.cancelled; stageId = g.stageId; stageText = g.stageText;
+    running = g.running; finished = g.finished; failed = g.failed; cancelled = g.cancelled; stageId = g.stageId; stageText = g.stageText; statusText = g.statusText;
     done = g.done; total = g.total; error = g.error; result = g.resultFolder; started = g.started;
     lines.assign(g.log.end() - std::min<size_t>(g.log.size(), 1200), g.log.end()); follow = g.logDirty; g.logDirty = false;
   }
@@ -254,7 +258,7 @@ void frame(SDL_Window* win) {
 
   if (running || finished) {
     float frac = finished && !failed ? 1.f : overallFraction(stageId, done, total);
-    std::string label = finished ? (failed ? (cancelled ? "Cancelled" : "Failed") : "Done") : stageLabel(stageId, stageText, done, total);
+    std::string label = finished ? (failed ? (cancelled ? "Cancelled" : "Failed") : "Done") : stageLabel(stageId, stageText, done, total, statusText);
     auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
     char right[64]; snprintf(right, sizeof right, "%d:%02d", (int)(secs / 60), (int)(secs % 60));
     ImGui::TextUnformatted(label.c_str());

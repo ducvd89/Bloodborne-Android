@@ -132,12 +132,13 @@ ARCH=x86_64 run "$appimagetool" --appimage-extract-and-run --no-appstream "$dist
 ls -l "out/dist/$APPNAME"
 echo "needs glibc: $(objdump -T "$dist/usr/bin/bb-recomp" "$dist/usr/bin/ps4-pkg-tool" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1) (or newer)"
 
-# 5. test in a clean environment
+# 5. test in a clean environment (XAUTHORITY is passed on: every AppImage runtime, this one included, fails on a host where DISPLAY is set but X
+# authorisation is missing from the environment)
 if [[ -n $test_pkgs ]]; then
-    t=$(mktemp -d /tmp/bb-recomp-clean.XXXXXX)
+    t=$(mktemp -d "$root/out/bb-recomp-clean.XXXXXX")
     echo "clean-environment test in $t (env -i, PATH=/usr/bin:/bin, no LLVM or NDK)"
     ( cd "$t" && TIMEFORMAT='wall %R s, user %U s' && time env -i HOME="$t" PATH=/usr/bin:/bin DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
-        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" BB_PKG_TOOL="${BB_PKG_TOOL:-}" "$root/out/dist/$APPNAME" --appimage-extract-and-run --pkgs "$test_pkgs" --out "$t/out" ) 2>&1 | tail -n 30
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" XAUTHORITY="${XAUTHORITY:-}" BB_PKG_TOOL="${BB_PKG_TOOL:-}" "$root/out/dist/$APPNAME" --appimage-extract-and-run --pkgs "$test_pkgs" --out "$t/out" ) 2>&1 | tail -n 30
     so=$(ls "$t"/out/*/aot/libbbaot.so)
     [[ -f $so && -f ${so%.so}.json ]] || { echo "TEST FAILED: no libbbaot.so" >&2; exit 1; }
     if [[ -n $compare ]]; then

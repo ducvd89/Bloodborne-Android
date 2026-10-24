@@ -14,6 +14,8 @@
 #include "hash.h"
 #include "io.h"
 #include "pkgs.h"
+#include "pkgverify.h"
+#include "sha256.h"
 #include "proc.h"
 #include "progress.h"
 #include "ps4.h"
@@ -88,6 +90,7 @@ void hookStage(const char* id, const char* text) {
   if (g_machine) printf("@@STAGE %s|%s\n", id, text); else printf("  %s\n", text);
   fflush(stdout);
 }
+void hookStatus(const char* text) { if (g_machine) { printf("@@STATUS %s\n", text); fflush(stdout); } }
 void hookProgress(uint64_t done, uint64_t total) {
   if (!total) return;
   if (g_machine) { printf("@@PROGRESS %" PRIu64 " %" PRIu64 "\n", done, total); fflush(stdout); return; }
@@ -117,6 +120,7 @@ void playerUsage() {
         "  --out <dir>        the output folder (default: ./bb-recomp-out)\n"
         "  --pkg-tool <file>  ps4-pkg-tool (default: next to this program)\n"
         "  --machine          progress lines for the GUI\n"
+        "  --check-pkg <file> only run the damage check on one PKG\n"
         "  --jobs <n>         worker threads (default: the CPU cores minus two, at most 22; fewer when the memory needs it)\n"
         "  --mem-fraction <f> share of the free memory the compile may use (default 0.6)\n"
         "  --variants <dir>   a variant catalog to use instead of the one next to the tool (--no-variants: none)\n"
@@ -316,6 +320,7 @@ int runPrepare(const std::string& game, const std::string& data, std::string& er
 int playerMain(int argc, char** argv) {
   std::string gameArg, pkgsArg, outArg = "bb-recomp-out", variantsArg, jobs, memFraction, toolArg;
   bool keepWork = false, noVariants = false;
+  std::string checkOnly;
   for (int i = 1; i < argc; ++i) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s); };
     auto arg = [&]() -> std::string { if (i + 1 >= argc) { playerUsage(); exit(2); } return argv[++i]; };
@@ -329,14 +334,28 @@ int playerMain(int argc, char** argv) {
     else if (is("--keep-work")) keepWork = true;
     else if (is("--pkg-tool")) toolArg = arg();
     else if (is("--machine")) g_machine = true;
+    else if (is("--check-pkg")) checkOnly = arg();
     else if (is("--help-player") || is("--help") || is("-h")) { playerUsage(); return 0; }
     else { fprintf(stderr, "bb-recomp: unknown option %s (bb-recomp --help-player)\n", argv[i]); return 2; }
   }
+  if (!checkOnly.empty()) {  // --check-pkg <file>: the damage check of one PKG (what the build runs first), for tests and curious players
+    PkgVerifier v(checkOnly); std::string e; PkgReport r;
+    if (!v.open(e)) { fprintf(stderr, "%s\n", e.c_str()); return 1; }
+    PkgInfo info;
+    if (!readPkgHeader(checkOnly, info, e)) { printf("%s: %s\n", checkOnly.c_str(), e.c_str()); return 1; }
+    bool ok = v.run(r, e, nullptr, nullptr);
+    if (!ok) { printf("%s: %s\n", checkOnly.c_str(), e.c_str()); return 1; }
+    printf("%s: %s %s v%s, %.2f GB checked (%s), %s\n", checkOnly.c_str(), info.titleId.c_str(), info.category.c_str(), info.appVer.c_str(), r.bytesRead / 1073741824.0,
+           Sha256::hardware() ? "SHA extensions" : "portable SHA", r.ok() ? "no damage found" : "DAMAGED");
+    if (!r.ok()) printf("%s\n", r.describe().c_str());
+    for (auto& m : r.matched) printf("  matched: %s\n", m.c_str());
+    return r.ok() ? 0 : 1;
+  }
   if (gameArg.empty() == pkgsArg.empty()) { playerUsage(); return 2; }
   const bool fromPkgs = !pkgsArg.empty();
-  g_steps = fromPkgs ? 6 : 5;
+  g_steps = fromPkgs ? 7 : 5;
   signal(SIGINT, onStopSignal); signal(SIGTERM, onStopSignal);
-  g_progress.stage = hookStage; g_progress.progress = hookProgress;
+  g_progress.stage = hookStage; g_progress.progress = hookProgress; g_progress.status = hookStatus;
   setvbuf(stdout, nullptr, _IOLBF, 0);
 
   const auto t0 = clk::now();
@@ -357,11 +376,16 @@ int playerMain(int argc, char** argv) {
   fs::path game;
   if (fromPkgs) {
     // ---- the PKG files: find, identify, unpack, merge ----
-    step("check", "Checking the PKG files");
+    step("check", "Finding the PKG files");
     PkgSet set;
     if (!findPkgs(fs::absolute(pkgsArg, ec).string(), set, err)) { cleanup(); die(err); }
     printf("  base game: %s (%s, version %s, %.1f GB)\n", set.base.file.c_str(), set.titleId.c_str(), set.base.appVer.c_str(), set.base.size / 1073741824.0);
     for (auto& u : set.updates) printf("  update:    %s (version %s, %.1f GB)\n", u.file.c_str(), u.appVer.c_str(), u.size / 1073741824.0);
+    step("pkgcheck", "Checking the PKGs for damage (reading every byte: a few minutes)");
+    g_stoppable = true;
+    const bool pkgsOk = checkPkgs(set, err, [](const std::string& l) { printf("  %s\n", l.c_str()); fflush(stdout); }, [] { return g_stop.load(); });
+    g_stoppable = false;
+    if (!pkgsOk) { cleanup(); die(err); }
     step("extract", "Unpacking the game (this takes a while: the game is tens of GB)");
     std::string tool = toolArg;
     if (tool.empty()) {

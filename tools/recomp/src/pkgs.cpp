@@ -3,11 +3,13 @@
 
 #include "game_check.h"
 #include "io.h"
+#include "pkgverify.h"
 #include "proc.h"
 #include "progress.h"
 #include "ps4.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -125,7 +127,11 @@ bool readPkgHeader(const std::string& path, PkgInfo& info, std::string& err) {
   size_t end = 0x40; while (end < 0x64 && head[end]) ++end;
   info.contentId.assign((const char*)head + 0x40, end - 0x40);
   info.size = be64(head + 0x430);
-  if (info.size > fileSize) { err = "This PKG file is incomplete (the download or copy was cut short)"; return false; }
+  if (info.size > fileSize) {
+    err = "This PKG file is incomplete: it should be " + std::to_string(info.size) + " bytes and has " + std::to_string(fileSize) +
+          " (the download or copy was cut short). Download or copy it again";
+    return false;
+  }
   uint64_t count = be32(head + 0x10), table = be32(head + 0x18);
   f.clear(); f.seekg((std::streamoff)table);
   Sfo sfoValues; bool haveSfo = false;
@@ -181,6 +187,12 @@ bool findPkgs(const std::string& dir, PkgSet& set, std::string& err) {
   for (size_t i = 1; i < updates.size(); ++i)
     if (updates[i].appVer == updates[i - 1].appVer) { err = "Two update PKGs have the same version " + updates[i].appVer + " (" + updates[i - 1].file + ", " + updates[i].file + "). Keep only one."; return false; }
   for (auto& u : updates) if (u.titleId != bases[0].titleId) { err = u.file + " is an update for " + u.titleId + ", but the base game is " + bases[0].titleId; return false; }
+  for (auto& u : updates)
+    if (versionKey(u.appVer) < versionKey(bases[0].appVer)) {
+      err = u.file + " is the update to version " + u.appVer + ", older than the base game " + bases[0].file + " (version " + bases[0].appVer +
+            "). Use the update PKG for 1.09 that belongs to this game.";
+      return false;
+    }
   int newest = versionKey(updates.empty() ? bases[0].appVer : updates.back().appVer);
   if (newest != versionKey("01.09")) {
     err = std::string("The newest PKG is version ") + (updates.empty() ? bases[0].appVer : updates.back().appVer) +
@@ -188,6 +200,52 @@ bool findPkgs(const std::string& dir, PkgSet& set, std::string& err) {
     return false;
   }
   set.titleId = bases[0].titleId; set.base = bases[0]; set.updates = updates;
+  return true;
+}
+
+bool checkPkgs(const PkgSet& set, std::string& err, const std::function<void(const std::string&)>& log, const std::function<bool()>& cancel) {
+  std::vector<const PkgInfo*> all = {&set.base};
+  for (auto& u : set.updates) all.push_back(&u);
+  std::vector<PkgVerifier> v;
+  uint64_t total = 0;
+  for (auto* p : all) {
+    v.emplace_back(p->path);
+    std::string e;
+    if (!v.back().open(e)) { err = e; return false; }
+    total += v.back().plannedBytes();
+  }
+  using clk = std::chrono::steady_clock;
+  const auto t0 = clk::now();
+  uint64_t before = 0;
+  for (size_t i = 0; i < all.size(); ++i) {
+    const PkgInfo& p = *all[i];
+    char label[512]; snprintf(label, sizeof label, "Checking PKGs (%zu/%zu): %s", i + 1, all.size(), p.file.c_str());
+    bbrStage("pkgcheck", label);
+    const auto tf = clk::now(); auto lastStatus = tf;
+    PkgReport r; std::string e;
+    const uint64_t base = before;
+    auto progress = [&](uint64_t done) {
+      bbrProgress(base + done, total);
+      auto now = clk::now();
+      if (now - lastStatus > std::chrono::milliseconds(700)) {
+        lastStatus = now;
+        double s = std::chrono::duration<double>(now - tf).count();
+        char st[256]; snprintf(st, sizeof st, "%s - %.0f MB/s", label, s > 0 ? done / 1048576.0 / s : 0.0);
+        bbrStatus(st);
+      }
+    };
+    if (!v[i].run(r, e, progress, cancel)) { err = e == "cancelled" ? "Cancelled" : p.file + ": " + e; return false; }
+    before += v[i].plannedBytes();
+    const double s = std::chrono::duration<double>(clk::now() - tf).count();
+    if (!r.ok()) {
+      err = p.file + " is damaged:\n" + r.describe() + (r.skippedImage ? "\n(the game data was not checked: the header or body is already damaged)" : "") +
+            "\nDownload or dump that file again (or copy it again, if it was copied), then run this again. Nothing was unpacked.";
+      return false;
+    }
+    char b[256]; snprintf(b, sizeof b, "%s: no damage found (%.1f GB checked in %.0f s, %.0f MB/s)", p.file.c_str(), r.bytesRead / 1073741824.0, s, s > 0 ? r.bytesRead / 1048576.0 / s : 0.0);
+    log(b);
+  }
+  (void)t0;
   return true;
 }
 

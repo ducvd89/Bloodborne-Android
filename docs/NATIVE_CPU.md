@@ -46,8 +46,10 @@ The tool does everything in one go. You give it the folder with your game's PKG 
 3. **Game PKG folder**: press **Browse...** and choose the folder with the base game PKG and the 1.09 update PKG.
 4. **Output folder**: press **Browse...** and choose where to put the result (an empty folder, or one that does not exist yet, on a disk
    with enough space).
-5. Press **Build**. The bar shows the stage (checking the PKGs, extracting, preparing, recompiling N/M shards, linking, copying) and the
-   log shows the details. **Cancel** stops it.
+5. Press **Build**. The bar shows the stage (finding the PKGs, checking them for damage, extracting, preparing, recompiling N/M shards, linking,
+   copying) and the log shows the details. **Cancel** stops it. Before anything is unpacked, **every PKG is read once and checked against the
+   checksums stored inside it** (this reads the whole file: a few minutes for the base game, and the window shows the speed). If a file is
+   damaged the build stops there, names the file and what is wrong, and unpacks nothing.
 6. When it says **Done**, the output folder holds the game folder (`CUSA03173` or the number of your release) and a `README.txt`.
 
 Folder names with accents or other alphabets are fine. If the tool says a file or folder cannot be created, choose a shorter path
@@ -136,7 +138,13 @@ everything but the Bloodborne game PKG and its update out of the folder.
 **"This PKG is encrypted for a retail PS4 and can't be read"** - only fake PKGs work. PKGs downloaded from the PlayStation Store for a real
 console are encrypted and cannot be used.
 
-**"This PKG file is incomplete / damaged"** - the copy or download did not finish. Get the file again.
+**"<file> is damaged: ..." / "This PKG file is incomplete: it should be N bytes and has M"** - the copy or download did not finish, or a byte was
+changed (a bad cable, card or disk). The message names the file and the part that fails (the file is shorter than it should be, or the header,
+the body or the game data does not match its checksum). Download or dump **that file** again, or copy it again, and run the tool again. Nothing
+had been unpacked yet.
+
+**"... is the update to version X, older than the base game"** - the update PKG does not belong to this base game. Use the 1.09 update for your
+game.
 
 **"Not enough free space"** - free some space on the disk of the output folder, or choose another disk.
 
