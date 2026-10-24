@@ -27,46 +27,88 @@ A port of Bloodborne (PS4, **v1.09**), not an emulator. Experimental. You need y
 
 ## How to get the game running (2.0.0)
 
-The native code is a translation of the game's own program, so it belongs to the game's copyright holders: **it cannot be downloaded from here or anywhere else, and you must build it yourself from your own game.** The tool runs on your PC, uploads nothing, and writes one folder that holds the game and its native code. **Never share the files it writes.** The whole thing takes about 15 to 30 minutes, most of it copying files.
+The native code is a translation of the game's own program, so it belongs to the game's copyright holders: **it cannot be downloaded from here or anywhere else, and you must build it yourself from your own game.** The [Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool) runs on your PC, uploads nothing, and only writes to the output folder you choose. **Never share the files it writes.**
+
+There are two ways in. Pick the one that matches the game files you have:
+
+| | **A. From PKG files** | **B. From an extracted game** |
+|---|---|---|
+| You have | the base game PKG and the 1.09 update PKG | a game folder with the 1.09 update merged in: `eboot.bin`, `sce_module/`, `sce_sys/` and the rest (for example the folder the app's **Install from PKG** made, or a dump you extracted yourself) |
+| The tool writes | the whole game folder (`CUSA03173`) with `aot/` inside | only the `aot/` folder (your game folder is never changed) |
+| Then you copy | the game folder to the phone (a large copy) | the `aot/` folder next to `eboot.bin` in the game folder on the phone (about 125 MB) |
+| Time | 15 to 30 minutes, mostly unpacking and copying | a few minutes |
+
+**Game already on the phone?** Build from whichever files you still have on the PC (the PKGs or the extracted folder), then copy only the `aot/` folder next to `eboot.bin` on the phone.
 
 ### What you need
 
-- Your own Bloodborne **base game PKG** and the **1.09 update PKG**, together in one folder with nothing else in it (the same fake PKGs the app's "Install from PKG" uses). Or an already extracted 1.09 dump of the game. Tested with **CUSA03173**; other 1.09 releases should work but are untested.
+- **Game files** for A or B above. Bloodborne **1.09**, original `eboot.bin` (pre-patched 60 FPS eboots crash in the gestures menu). Tested with **CUSA03173**; other 1.09 releases should work but are untested.
 - A PC with **Windows 10 (1903 or newer) or 11**, or **Linux with glibc 2.35 or newer** (Ubuntu 22.04, Debian 12, Fedora 36, Arch or newer), and a processor with **AVX2** (Intel from 2013, or any AMD Ryzen).
-- **8 GB of free RAM** (16 GB or more is faster) and free disk space of about the size of the base game PKG plus 3 GB.
-- This app (2.0.0 Beta 1 or newer) on an Adreno phone, with room for the game folder.
+- **8 GB of free RAM** (16 GB or more is faster). Free disk space: about 3 GB, plus the size of the base game PKG for A.
+- This app (2.0.0 Beta 1 or newer) on an Adreno phone.
 
-### Step by step
+### Step 1: Get the tool
 
-1. **Download the tool** from the [Rebuild Tool releases](https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/latest): `bb-recomp-windows-x86_64.zip` for Windows (unzip it anywhere), or `Bloodborne-Android-Rebuild-Tool-x86_64.AppImage` for Linux (`chmod +x` it). It is free: if you paid for it, you were scammed.
-2. **Start it.** On Windows, double-click `bb-recomp.exe`; if SmartScreen says the app is unknown, click **More info**, then **Run anyway** (the tool is not signed with a paid certificate). On Linux, double-click the AppImage; if nothing happens your system lacks FUSE 2, so run it from a terminal with `./Bloodborne-Android-Rebuild-Tool-x86_64.AppImage --appimage-extract-and-run`.
-3. **From PKG files → Browse…**: choose the folder with the base game PKG and the 1.09 update PKG. Already have the game extracted (a folder with `eboot.bin`, `sce_module` and `sce_sys`, update 1.09 merged)? Choose **From an extracted game** instead (since Rebuild Tool 1.1.0): only the `aot` folder is built, to copy next to `eboot.bin` on the phone.
-4. **Output folder → Browse…**: choose an empty folder on a disk with enough space (a short path such as `D:\bloodborne` or `~/bloodborne` is best).
-5. Press **Build** and wait. The tool checks every PKG for damage first (a few minutes; a damaged file stops the build before anything is unpacked and tells you which file), unpacks and merges the game and the update, then recompiles the game's code to ARM64 (about 1 to 2 minutes on a 12-core PC, longer on a laptop).
-6. When it says **Done**, the output folder holds a game folder like this:
+Download **Rebuild Tool 1.1.0** or newer from the [Rebuild Tool releases](https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/latest) (the same files are also attached to the app's [2.0.0 Beta 1 release](https://github.com/ducvd89/Bloodborne-Android/releases/tag/android-2.0.0-beta1)):
+
+- **Windows:** `bb-recomp-windows-x86_64.zip`. Unzip it anywhere and double-click `bb-recomp.exe`. If SmartScreen says the app is unknown, click **More info**, then **Run anyway** (the tool is not signed with a paid certificate).
+- **Linux:** `Bloodborne-Android-Rebuild-Tool-x86_64.AppImage`. `chmod +x` it and double-click it. If nothing happens your system lacks FUSE 2: run `./Bloodborne-Android-Rebuild-Tool-x86_64.AppImage --appimage-extract-and-run` from a terminal.
+
+It is free: if you paid for it, you were scammed.
+
+### Step 2: Build
+
+1. Choose your source. The row of the other source is grayed out.
+   - **A. From PKG files → Browse…**: the folder that holds the base game PKG and the 1.09 update PKG, with nothing else in it.
+   - **B. From an extracted game → Browse…** (the folder with `eboot.bin`) or **eboot.bin…** (pick the file itself).
+2. **Output folder → Browse…**: an empty folder on a disk with enough space (a short path such as `D:\bloodborne` or `~/bloodborne` is best).
+3. Press **Build** and wait.
+   - A checks every PKG for damage first (a few minutes; a damaged file stops the build before anything is unpacked and names the file), then unpacks and merges the game and the update.
+   - Both then recompile the game's code to ARM64: about 1 to 2 minutes on a 12-core PC, longer on a laptop.
+4. When it says **Done**, the output folder holds:
 
    ```
-   <output folder>/
-       CUSA03173/              <- the whole game, ready for the phone
-           eboot.bin, sce_sys/, sce_module/, dvdroot_ps4/ ...
+   A. From PKG files                          B. From an extracted game
+   <output folder>/                            <output folder>/
+       README.txt                                  bb-recomp.log
+       bb-recomp.log                               aot/
+       CUSA03173/      <- the whole game               libbbaot.so    <- native ARM64 code (~125 MB)
+           eboot.bin, sce_sys/, sce_module/ ...        libbbaot.json  <- what it was built from
            aot/
-               libbbaot.so     <- the game's code as native ARM64 (about 125 MB)
-               libbbaot.json   <- what it was built from (the app checks it)
+               libbbaot.so
+               libbbaot.json
    ```
 
-7. **Copy the game folder** (`CUSA03173`, with `aot` inside) to the phone's storage or SD card: USB cable in file transfer mode, a card reader, or `adb push`. It is a large copy. **Game already installed on the phone?** Copy only the `aot` folder next to `eboot.bin` in the phone's game folder.
-8. In the app, open the menu → **Game folder** and choose the folder you copied. Start the game: the app finds `aot/libbbaot.so`, checks that it matches your game (game build, ABI version, checksum) and imports it into its own storage by itself. There is nothing to switch on. The first start takes a few minutes. Menu → **Native CPU** shows the state.
+### Step 3: Copy to the phone
 
-**Prefer a terminal?** The same program runs without a window: `bb-recomp --pkgs <PKG folder> --out <output folder>` (on Linux pass the same arguments to the AppImage).
+Use a USB cable in file transfer mode, a card reader or `adb push`.
+
+- **A:** copy the game folder (`CUSA03173`, with `aot` inside) to the phone's storage or SD card.
+- **B:** copy the `aot` folder into the game folder on the phone, next to `eboot.bin`. (Or put `aot` into the extracted folder on the PC first, if you are about to copy that folder to the phone anyway.)
+
+### Step 4: Choose the folder in the app
+
+Menu → **Game folder** → choose the game folder (the one with `eboot.bin` and `aot`). Start the game: the app finds `aot/libbbaot.so`, checks that it matches your game (game build, ABI version, checksum) and imports it into its own storage by itself. There is nothing to switch on. The first start takes a few minutes. Menu → **Native CPU** shows the state and can also import `libbbaot.so` and `libbbaot.json` by hand.
+
+### Command line
+
+The same program runs without a window (on Linux, pass the same arguments to the AppImage):
+
+```
+bb-recomp --pkgs <PKG folder> --out <output folder>                  # A
+bb-recomp --game <game folder or its eboot.bin> --out <output folder>  # B
+```
 
 ### If something goes wrong
 
 - **A PKG is reported damaged or incomplete:** that file was not copied or downloaded completely. Get that one file again and rebuild; nothing was unpacked.
-- **The game stops with "native code is missing an entry at +0x...":** the library does not cover a place the game jumped to. The app saved the address in `logs/aot-misses.log`. Send it with menu → **Report a problem**, copy the file to the PC and rebuild once with `bb-recomp --pkgs <PKG folder> --out <output folder> --extra-entries aot-misses.log`. Every logged address becomes an entry of the new library.
-- **The app says the library is "not for this game" or has "another ABI version":** build again from the PKGs of the game you play, with the tool release that matches your app. You also need to build again after an app release that changes the ABI version.
-- **Out of memory, or the PC freezes while building:** close other programs, or use the terminal with `--jobs 4 --mem-fraction 0.4`.
+- **"This does not look like a Bloodborne game folder":** for B, choose the folder that directly holds `eboot.bin`, `sce_module` and `sce_sys` (the tool lists what is missing and suggests sub-folders that look right).
+- **"This game is not supported":** the game is not 1.09, the update is not merged in, or the `eboot.bin` is a patched one. Use the original 1.09 files.
+- **The game stops with "native code is missing an entry at +0x...":** the library does not cover a place the game jumped to. The app saved the address in `logs/aot-misses.log`. Send it with Menu → **Report a problem**, copy the file to the PC and rebuild once with `--extra-entries aot-misses.log` added to the command above. Every logged address becomes an entry of the new library.
+- **The app says the library is "not for this game" or has "another ABI version":** build again from the game files you play, with a tool release that matches your app. Builds are also needed again after an app release that changes the ABI version (the app says so).
+- **Out of memory, or the PC freezes while building:** close other programs, or use the command line with `--jobs 4 --mem-fraction 0.4`.
 
-The tool's own [README](https://github.com/ducvd89/Bloodborne-android-rebuild-tool#readme) has the full reference with every message. A new phone does not need a new build: copy the same game folder to it.
+The tool's own [README](https://github.com/ducvd89/Bloodborne-android-rebuild-tool#readme) has the full reference with every message. A new phone does not need a new build: copy the same folder to it.
 
 ## Features
 
@@ -100,7 +142,7 @@ Other Adreno 6xx/7xx/8xx devices are untested. **Mali is not supported** (PanVK 
 1. Install the APK from [Releases](https://github.com/ducvd89/Bloodborne-Android/releases/latest).
 2. Build the game once on a PC with the Rebuild Tool and copy the folder to the phone ([guide above](#how-to-get-the-game-running-200)), then pick it in the app.
 
-Already have an extracted 1.09 dump? Point the tool at it (`--game <dump>`) instead of PKGs, or install PKGs on the phone from the app (**Install from PKG**) and add the native code afterwards (see below). The app does not start the game without the native code.
+Already have an extracted 1.09 game, or installed it on the phone with **Install from PKG**? Build only the native code from that folder (way **B** in the guide) and copy the `aot` folder next to `eboot.bin`. The app does not start the game without the native code.
 
 Use the original 1.09 `eboot.bin`: pre-patched 60 FPS ones crash in the gestures menu. Updating keeps your saves, settings, mods and game folder; after updating from 1.2.0 or earlier you still need the native code before the game starts. Update checks in the menu only offer final releases, so install a Beta by hand.
 
@@ -123,7 +165,7 @@ Since 2.0.0 the app has no x86 translator: the game's code runs only as ahead-of
 - **Without a matching `libbbaot.so` the game does not start.** The app shows a full-screen message with the steps, a button to the tool's page, and **Choose game folder** / **Import libbbaot.so…**. The same page is in the menu under **Native CPU**, which shows what is installed and whether it fits your game.
 - **Choosing the folder the tool made** imports `aot/libbbaot.so` and `aot/libbbaot.json` automatically (the app copies them into its own storage). You can also import the two files by hand.
 - The library has to be built from the **same game build** (the original 1.09 `eboot.bin`) and by a tool version that matches the app (ABI version 1). The app checks both and the file's checksum before the game starts.
-- **Installing PKGs on the phone** (**Install from PKG**) still extracts the game, but it cannot make the native code: the tool's output already contains the game and the native code together, so building the folder on the PC is the recommended path.
+- **Installing PKGs on the phone** (**Install from PKG**) still extracts the game, but it cannot make the native code. Build it on the PC from the same game files (way A from the PKGs, or way B from the extracted folder) and add the `aot` folder.
 - If the game stops with *"native code is missing an entry"*, send the `logs/aot-misses.log` (Menu → **Report a problem**): the tool can close the gap from that log and you rebuild once.
 - If it stops with *"the game stopped itself after an internal error (panic)"*, no native code is missing: the game's own error check fired (the message after it is the game's text); report it with the log instead.
 
