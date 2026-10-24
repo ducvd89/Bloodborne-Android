@@ -31,12 +31,12 @@ checks the image once before the first guest call, so every start-up write is in
 | 5 | patch part fps=uncap.bin (`FPS_PRESETS['uncap']`) | 172 writes | 1-9 B | fixed | start-up, as `--fallback-patches` (only without the frame-rate hooks) or `--patches` with `BB_FRAME_HOOKS=0` | rare | **variant** |
 | 6 | patch part skip_network_choice=1.bin | 1 write | 46 B | fixed | start-up | setting | **variant** |
 | 7 | patch part cheats.bin (`cheat_writes`) | 1 jmp (0x18f78b1, 6 B) + 4 call rel32 (0x18f983d, 0x18fa58c, 0x18fa0b4, 0x18fa0cf) + cave 0x50d9700 (32 B) + stub 0x50d9740 (20 B) | | fixed; the cave tests two flag bytes (0x56d3f00/1) at run time | start-up, always on Android; the flags are data, written live by `cheat_poller` | always | **variant** (the cave is new code: a unit of the variant of the patched function; the cheats themselves switch with data, no code write) |
-| 8 | frame rate hooks (`gpu/shim/bbport_frame_rate.cpp`): 6 detours (0x203493d 8 B, 0x2034d96 9 B, 0x2018e36 7 B, 0x17f9b71 7 B, 0x1572a7d 7 B, 0x1514c24 8 B) | 6 | 7-9 B | **computed**: `jmp rel32` to a stub on a page mapped at run time; the stubs hold absolute addresses of the `live` struct and of FrameStep's guest-callable stub | start-up | `BB_FPS` above 30 (the default: uncap) and `BB_FRAME_HOOKS` not 0 | **fallback** (see 3) |
-| 9 | frame rate hooks: 48 operand redirects (`Redirects[]`: 24 dt, 16 cloth, step_down 2, step_up 2, approach30, approach10, decay95, decay08), the rel32 of a `[rip+disp]` VEX operand | 48 | 4 B | **computed**: the disp points into the run-time `live` page, whose fields `FrameStep` rewrites every frame | start-up | as row 8 | **fallback** (see 3) |
+| 8 | frame rate hooks (`gpu/shim/bbport_frame_rate.cpp`): 6 detours (0x203493d 8 B, 0x2034d96 9 B, 0x2018e36 7 B, 0x17f9b71 7 B, 0x1572a7d 7 B, 0x1514c24 8 B) | 6 | 7-9 B | **computed**: `jmp rel32` to a stub on a page mapped at run time; the stubs hold absolute addresses of the `live` struct and of FrameStep's guest-callable stub | start-up | `BB_FPS` above 30 (the default: uncap) and `BB_FRAME_HOOKS` not 0 | **hook slots / variant** (3 detours are `snap` slots, 0x2034d96 and 0x1514c24 byte patches; the other CPUs keep the stubs) |
+| 9 | frame rate hooks: 48 operand redirects (`Redirects[]`: 24 dt, 16 cloth, step_down 2, step_up 2, approach30, approach10, decay95, decay08), the rel32 of a `[rip+disp]` VEX operand | 48 | 4 B | **computed** with stubs; **fixed** with slots: `live` moves to 0x56d3f40, the unused end of the data segment's last page, so the displacement is the same bytes in every run | start-up | as row 8 | **variant** (`patcher:framerate`) |
 | 10 | display hooks (`bbport_display.cpp`): 5 camera, 3 marker, 1 viewport, 1 HUD detours (0x1436c2c 0x1436d8a 0x1436e68 0x1436eec 0x1436f4b; 0x1644379 0x1644c45 0x16452b7; 0x1f510; 0x1bf9e10) | 10 | 5-16 B | **computed**: stubs on a run-time page with absolute addresses of a data block (aspect values) and of HudFrame's host stub | start-up | output aspect other than 16:9 | **fallback** |
-| 11 | display: viewport aspect immediate (inside the stub of 0x1f510) | 1 | 4 B | computed from the aspect | start-up | as row 10 | fallback |
-| 12 | display `PatchSceneSize`: the two immediates at 0x1d96a6b+1 and 0x1d96a7a+1 (the scene's width and height) | 2 | 3 B each | **computed** from `BB_RENDER_RES` | start-up | `BB_RENDER_RES` set (the Android launcher sets it with a render resolution) | **fallback** (a run-time value; see 3) |
-| 13 | guest guards (`bbport_guest_guards.cpp`): 2 detours (0xbbc3e0 sample clamp, 0x2199310 null node) + 3 call retargets (0xebbc86, 0xebbca4, 0xebbcc2) | 5 | 4-6 B | **computed** (stub page, host function addresses) | start-up | 0x2199310 always; clamp and fx-clear by env | **fallback** |
+| 11 | display: viewport aspect immediate (inside the stub of 0x1f510) | 1 | 4 B | computed from the aspect | start-up | as row 10 | hook slot (the callback's context) |
+| 12 | display `PatchSceneSize`: the two immediates at 0x1d96a6b+1 and 0x1d96a7a+1 (the scene's width and height) | 2 | 3 B each | **computed** from `BB_RENDER_RES` | start-up | `BB_RENDER_RES` set (the Android launcher sets it with a render resolution) | **hook slots**: the `mov eax, imm32` stays as the resolution patch left it, the callback loads rax with the size (value slot) |
+| 13 | guest guards (`bbport_guest_guards.cpp`): 2 detours (0xbbc3e0 sample clamp, 0x2199310 null node) + 3 call retargets (0xebbc86, 0xebbca4, 0xebbcc2) | 5 | 4-6 B | **computed** (stub page, host function addresses) | start-up | 0x2199310 always; clamp and fx-clear by env | **hook slots** (clamp and fx clear: continue; the node guard and the three calls: `resume` after the replaced instruction or at the skip target) |
 | 14 | game menu hooks (`bbport_game_menu.cpp`): 2 detours (0xf6f340, 0x1b4e2a0) | 2 | 6-10 B | computed (thunks) | start-up | x86-64 hosts only; not used on Android | not applicable on ARM64 |
 | 15 | Gnm census (`bbport_gnm_hooks.cpp`, table `bbport_gnm_table.inc`): up to 513 function entries (500 libGnm + 13 ConstantCommandBuffer methods), 336 observers | 513 | 5-11 B | computed (slots on a run-time page) | start-up | `BB_GNM_CENSUS=1` / `BB_GNM_OBSERVE=1` (diagnostics, off by default) | not handled (diagnostics) |
 | 16 | guest hooks (`bbport_guest_hooks.cpp`, `guest_cpu_hook`): 6 sites by default (0x216d5ea and 0x2171fea memcpy calls, 0x26aa255 allocator return, 0x11e6629 0x11e6736 0x11e6846 heap returns), 8 with `BB_FRAME_STATS` (0x26aa860) and `BB_HEAP_SITES` (0xbb5fb0) | 6-8 | 2-5 B | the handler is host code; `guest_cpu_hook` writes `syscall` (FEX) | GPU init (BufferCache), after the start-up patches | in-place guest memory without UMA (not the Android default); the extra two by env | **hook slot** (kind `regs`, resume points declared) |
@@ -70,8 +70,9 @@ at start (row 1-7). The `tools/android/build_patch_parts.py` output is the data 
 | Fixed byte patches, start-up (patch parts) | 851 writes in 19 parts (rows 1-7; 2 are cave writes) | variant |
 | Fixed byte patches, BBSC | 13 seamless + 59 table entries (17 groups, 13+3 toggled at run time) | variant |
 | Native observer / replacement hooks | 190 BBSC (`snap`) + 6-8 shim (`regs`) | hook slot |
-| Computed detours and redirects, default Android configuration | 6 + 48 (frame rate) + 5 (guards) = 59, plus 2 scene immediates when a render size is set | fallback |
-| Computed, optional / diagnostic | 10 display (aspect other than 16:9), 2 game menu (x86-64), 513 Gnm census, 2 free check | not handled |
+| Computed detours and redirects, default Android configuration | 6 + 48 (frame rate) + 5 (guards) = 59, plus 2 scene immediates when a render size is set | hook slots (3 + 5 + 2 sites) and a variant (2 byte patches, 48 redirects) |
+| Computed, optional | 10 display (aspect other than 16:9) | hook slots |
+| Computed, diagnostic or x86-64 only | 2 game menu (x86-64), 513 Gnm census (`BB_GNM_CENSUS`), 2 free check (`BB_FREE_CHECK`, x86-64) | not handled (a function patched by them runs on the fallback) |
 | Data writes | 6 malloc table slots, 2 cheat flag bytes, 1 THD byte | not code |
 
 ## 2. What is native now
@@ -79,27 +80,29 @@ at start (row 1-7). The `tools/android/build_patch_parts.py` output is the data 
 * Everything in rows 1-7, 18, 19 and the run-time toggles of 19: the patched function runs as a precompiled variant, the original when the bytes are
   original. The hash check is per function, so the transient state while a group's sites are written one at a time is "dirty" (fallback) for a
   moment and then a variant.
+* Rows 8-13 (phase 4b): when the recompiled library has a slot at every site of a patcher, it installs C++ callbacks of hook slots instead of its stubs
+  (`gpu/shim/bbport_hook_sites.h`); the stubs stay for the other CPUs. The callbacks do what the stubs did:
+  * frame rate: the pacer's mode (a `snap` slot, the game's `lea` runs next), the main loop's step and two fixed steps (replace the `mov [rbp+x], 1/30`, resume after it),
+    the pacer's late-frame `je` and the run's wall check as byte patches (the same bytes the stubs implemented), and the 48 operand redirects as a variant:
+    `live` is at the fixed place image + 0x56d3f40, so the displacements are fixed (`patcher:framerate`, generated by running the patcher);
+  * guards: the clamp (`edi < 3`), the GX node guard (resume after the store or at the skip target) and the three effect-clear calls (FxInitClear with the call's
+    arguments, resume after the call);
+  * scene size: a value slot: the callback loads rax with the new immediate;
+  * display: the camera stores (the game's store, the aspect, the widened fov in double precision as the reduced x87 computes it), the marker vector math (single precision,
+    VEX.128), the viewport's pixel aspect, and the HUD frame (HudFrame, which calls guest code: slot callbacks may call `guest_cpu_call`).
+  `tests/test_aot_patchers.cpp` compares each callback with the semantics of its stub.
 * Rows 16 and 20: hooks fire from the recompiled units; no trampoline, no code write, the function stays native.
 
 ## 3. What still needs the fallback, and why
 
-* **Rows 8, 9, 13 (frame rate, guards), 10 and 12 (display)** write run-time addresses into the code (a stub page, the `live` struct, host-function
-  stubs, a resolution). A variant cannot hold them. They make about 35 functions dirty in the default Android configuration (the frame-rate
-  redirects touch the main loop, the pacer, cloth, physics and camera code). Follow-ups, in order of value:
-  1. Operand redirect slots: the lowering loads the address of a `[rip+disp]` operand from a slot (`bbr_operand_slot[k]`, null = the original constant); the 48 redirects become 48
-     slot values and the functions stay native. `live` is a plain data struct.
-  2. The six frame-rate detours and the two guards as `regs` hook slots with callbacks that do the stub's work in C++ (a few lines each: the stubs only set a few
-     fields and run the displaced instruction; FrameStep is already a host function).
-  3. The scene immediates: a value slot like 1 (`mov eax, imm32` reads the width and height from `bbr_value_slot`).
-  4. The display stubs likewise, or a fixed layout (stubs and data at deterministic addresses in the image's page padding, so the patched bytes are fixed and the stubs are new code
-     like the cheats' cave).
-* A function that is touched by an unknown write (any `guest_cpu_invalidate` on a range no catalog describes, or bytes the catalog does not combine) is dirty
-  and runs on the fallback; the table of variants has every subset of the groups that touch one function (single groups and all of them when a function
-  has more than six).
-* A hook at a site that is not in the hook table (`bbr_hook_sites`), or whose function is dirty, keeps the old trampoline / `syscall` path (and makes
-  its function dirty).
-* Hooks stop firing while their function runs on the fallback (another write made it dirty without a variant); the runtime says so once per site
-  (`AOT: the hook at +X is inactive`).
+With the default Android settings, the common non-default ones (below) and BBSC online **no function is dirty** (`tests/aot_so_check.cpp`, section 3b). What can still be:
+
+* A function that an unknown write patches (any `guest_cpu_invalidate` on a range no catalog describes, or bytes the catalog does not combine): dirty, on the fallback. The tables have every subset
+  of the groups that touch one function (single groups and all of them when a function has more than six).
+* The diagnostic writers: Gnm census (`BB_GNM_CENSUS=1` / `BB_GNM_OBSERVE=1`, up to 513 detours), the game menu hooks (x86-64 hosts only) and free check (`BB_FREE_CHECK=1`, x86-64 only).
+* A hook at a site that is not in the hook table (`bbr_hook_sites`), or whose function is dirty, keeps the old trampoline / `syscall` path (and makes its function dirty).
+* Hooks stop firing while their function runs on the fallback; the runtime says so once per site (`AOT: the hook at +X is inactive`).
+* The heap-sites wrappers store host function addresses into libc.prx's malloc table (data): not code, but the guest then calls arm64 code directly where FEX runs it; unchanged by phase 4.
 
 ## 3b. Measured (whole image, aarch64, -O1, `--verify-llvm`, all four catalogs)
 
@@ -110,6 +113,21 @@ at start (row 1-7). The `tools/android/build_patch_parts.py` output is the data 
   all matched to a variant, 0 dirty; with every BBSC group applied on top: 56 variants, 0 dirty (functions touched by several groups included).
 * Known, unrelated: `bb-recomp --func <vaddr>` (one function) fails intermittently with a glibc heap error at exit (about 8 % of runs, also on the `testing` tool before these changes); the whole-image compile does not.
 
+### Dirty functions per configuration (phase 4b, `tests/aot_so_check.cpp`, the real x86-64 `.so` and image, the patchers and hook catalogs run against the engine)
+
+The `.so` has 38 catalog groups (36 touch code), 146 variants (198 units, 48 only in the variant), 219 hook sites, all compiled into units. Each row applies the patch parts the launcher
+(`run-bionic.sh`) would pass, then the port's patchers with the settings' environment, then the BBSC hooks where marked, then classifies every function.
+
+| configuration | patch parts and patchers | functions as variants | dirty |
+|---|---|---|---|
+| A default Android (upscaler: render 1280x720, output 1080p, fps uncap) | res-scene, gx-heap, cheats; frame rate, scene size, guards | 45 | **0** |
+| B no render scale | gx-heap, cheats; frame rate, guards | 34 | **0** |
+| C community fps patch (`BB_FRAME_HOOKS=0`) | A plus fps=uncap.bin, no frame-rate patcher | 32 | **0** |
+| D 21:9 (output 2560x1080) | A plus the display hooks (camera, viewport, markers, HUD) | 45 | **0** |
+| E 4:3 (output 1440x1080) | A plus the display hooks | 45 | **0** |
+| F BBSC online | A plus the BBSC default groups and the 190 BBSC hook slots (190 set, 0 refused) | 82 | **0** |
+| G everything | D plus every BBSC group, 190 + 8 hook slots, graphics-heap, effect_dof/ssao/motion_blur=0, skip_network_choice, model_lod=1 | 90 | **0** |
+
 ## 4. The catalogs and their generators
 
 | file | generator | source | needs |
@@ -118,22 +136,8 @@ at start (row 1-7). The `tools/android/build_patch_parts.py` output is the data 
 | `tools/recomp/variants/bbsc-patches.txt` | `gen_bbsc.py` (+ `gen_bbsc_tables.cpp`) | `gpu/bbnet20/bbsc/core/bbsc_patch_tables.h` (compiled and run), constants of `bloodborne_re.cpp` (the 13 seamless patches) | a C++ compiler |
 | `tools/recomp/variants/hooks-bbsc.txt` | `gen_bbsc.py` | the sites `InstallGuestCodeHook` is called for, from `tools/android/dev/bbsc_sites.sh` (BBSC's own install code on the pristine eboot) | `out/eboot.elf`, the tool's build or `--sites-tool` |
 | `tools/recomp/variants/hooks-shim.txt` | `gen_hooks_shim.py` | constants of `gpu/shim/bbport_guest_hooks.cpp` | nothing |
+| `tools/recomp/variants/patchers.txt`, `hooks-patchers.txt` | `gen_patchers.py` (+ `gen_patchers.cpp`) | the real patcher sources (`bbport_frame_rate.cpp`, `bbport_display.cpp`, `bbport_guest_guards.cpp`) built with `BB_HOOK_SITE_DUMP` and run against the flat image in four settings | `out/boot-linked.bin`, `out/eboot.elf`, a C++ compiler |
 
-`gen_patch_parts.py --check <file>`, `gen_bbsc.py --check`, `gen_hooks_shim.py --check <file>` exit 1 when a catalog is out of date: run them when a
+`gen_patch_parts.py --check <file>`, `gen_bbsc.py --check`, `gen_hooks_shim.py --check <file>`, `gen_patchers.py --check` exit 1 when a catalog is out of date: run them when a
 patch table, a patch part or a hook site changes.
 
-## Paused at (2026-10-24, phase 4b)
-
-Done:
-* The `bb-recomp --func` heap crash (about 8 % of runs) is fixed. Root cause, found with an ASan build (`-DBB_RECOMP_SANITIZE=address,undefined`; use `--base 200000000000` under ASan,
-  the default base lies in ASan's shadow): FEXCore's config store converts a stored string in place on read (`Config::MetaLayer::GetConv<bool>` emplaces the variant), so two threads
-  creating a FEX context at once free the same string (bad-free). Every thread of the tool builds its own `Lifter`; `Lifter::Impl::build` now takes a process-wide mutex.
-  0 crashes in 60 release runs (was about 5 in 60) and 25 ASan runs; ASan + UBSan on a 60,000-function compile with the variant catalogs: no report.
-* ASan runs of the test tools: `bb-recomp-asmtest --hook-selftest` passes. The full ASM suite under ASan differs only where the tests map fixed low addresses inside ASan's shadow gap
-  (1752 pass with `protect_shadow_gap=0`, 3 more lift/crash lines, e.g. CALL.asm and Displacement_Encoding.asm, and `--variant-selftest` fails: its image base 0x300000000 is also in the gap).
-  Not yet confirmed as harness artifacts; difftest not run under ASan yet.
-
-Not started: the rest of phase 4b (operand-redirect slots, frame-rate and guard detours as hook slots, render-size value slots, fixed display stub layout, `aot_so_check` with the default
-Android settings and the 0-dirty goal).
-
-Next step: finish the ASan checks (move the test images out of the shadow gap, or run with `protect_shadow_gap=0`, then difftest), then start the operand-redirect slots.

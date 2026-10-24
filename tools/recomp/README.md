@@ -73,11 +73,15 @@ The catalogs are generated from the sources and checked in (they hold addresses,
     tools/recomp/variants/gen_patch_parts.py   > tools/recomp/variants/patch-parts.txt   # tools/android/build_patch_parts.py (needs out/eboot.elf)
     tools/recomp/variants/gen_bbsc.py                                                     # bbsc-patches.txt + hooks-bbsc.txt (gpu/bbnet20; needs the eboot and bbsc_sites)
     tools/recomp/variants/gen_hooks_shim.py    > tools/recomp/variants/hooks-shim.txt     # gpu/shim/bbport_guest_hooks.cpp
+    tools/recomp/variants/gen_patchers.py                                                 # patchers.txt + hooks-patchers.txt: runs the frame rate, display and guard patchers (needs the image)
     (each has --check: exit 1 when the catalog is out of date)
 
 Tests: `bb-recomp-asmtest --variant-selftest` (a patched function and a cave compiled as variants, run in the in-process JIT, hashes and alternatives checked),
 `bb-recomp-asmtest --hook-selftest` (a hook callback fires, edits registers, flags survive, resume points in the middle of a block and at block entries, return, dispatcher jump, loops),
-`tests/run_aot_variants_test.sh` (the runtime's classification of functions, redirects, un-dirtying and hook slots on synthetic tables) and `tests/run_guest_code_hooks_test.sh` (the shim's slot path).
+`tests/run_aot_patchers_test.sh` (the patchers' hook slot callbacks against the semantics of the stubs they replace), `tests/run_aot_variants_test.sh` (the runtime's classification of functions, redirects, un-dirtying and hook slots on synthetic tables) and `tests/run_guest_code_hooks_test.sh` (the shim's slot path).
+
+Sanitizers: `cmake ... -DBB_RECOMP_SANITIZE=address,undefined` builds the tool and the test tools with ASan and UBSan (FEXCore itself uncovered). Under ASan the default image base 0x200000000 and the tests'
+low fixed addresses lie in ASan's shadow gap: use `--base 200000000000` (bb-recomp), `--high-addresses` (bb-recomp-difftest) and `ASAN_OPTIONS=detect_leaks=0:protect_shadow_gap=0`.
 
 ### The runtime's image: eboot + linked modules, discovery, secondary entries
 

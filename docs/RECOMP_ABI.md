@@ -157,6 +157,9 @@ writes no trampoline and no code, `SlotAdapter` converts `GuestRegsEx` to the `G
 as the trampoline did). Differences from the x86 trampoline: the callback runs on the host stack (not the guest stack), registers are the callback's to change but rbx, rbp, r12-r15 must be the original values on a `GUEST_HOOK_RETURN`
 (a return from a function must preserve them anyway), and rflags in the snapshot is not the guest's.
 
+A slot callback may call guest code (`guest_cpu_call`): the nested call starts below the red zone of the rsp the unit stored before the slot call. The port's patchers use the slot mechanism too
+(`gpu/shim/bbport_hook_sites.h`: `Slot(address, image_base, length, callback, context, {resume addresses})` installs, and in the generator's build prints the catalog line).
+
 A hook installed in a slot stays set while its function runs on the fallback (a later write made it dirty) but does not fire there: the runtime prints `AOT: the hook at +X is inactive` once per site and the hook works again when the function is native again.
 
 ## Guest state
