@@ -693,6 +693,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       if (!fresh && it->second.targets.empty() && !jv.targets.empty()) it->second = jv;
     }
   };
+  std::set<uint64_t> claimed; // granular functions: instruction boundaries already given to a unit
   tl_valErr.clear();
   sigjmp_buf jb;
   tl_jmp = &jb;
@@ -711,7 +712,14 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       if (sink) {
         UnitMeta meta;
         meta.granular = impl_->granular;
-        if (meta.granular) { meta.insts = gu.instAt; std::sort(meta.insts.begin(), meta.insts.end()); meta.insts.erase(std::unique(meta.insts.begin(), meta.insts.end()), meta.insts.end()); }
+        if (meta.granular) {
+          // Each instruction boundary belongs to one unit of the function, the first that decoded it (the entry unit, then the gap and secondary
+          // units): the units duplicate code (a secondary entry repeats what follows it), and a switch entry and a block split for every copy would
+          // multiply the code of the function by its unit count. Entering through another unit's copy is the same code.
+          std::vector<uint64_t> mine = gu.instAt;
+          std::sort(mine.begin(), mine.end()); mine.erase(std::unique(mine.begin(), mine.end()), mine.end());
+          for (uint64_t a : mine) if (claimed.insert(a).second) meta.insts.push_back(a);
+        }
         for (auto& c : gu.cover) meta.end = std::max(meta.end, c.second - impl_->img.base);
         for (auto& j : gu.jumps) {
           if (j.targets.empty()) continue;

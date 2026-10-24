@@ -748,7 +748,7 @@ void Lower::run() {
     // Granular entries: every instruction boundary of the unit is a point the unit can be entered at. An instruction inside a block (not a
     // block entry) gets a block of its own, like a hook resume point: the fall-through path joins it with its flags in the allocas.
     for (uint64_t v : guestAt)
-      if (!hookBlockAt.count(v) && !hookSplit.count(v)) hookSplit[v] = newBB("gsplit");
+      if (!hookBlockAt.count(v) && !hookSplit.count(v) && std::binary_search(meta->insts.begin(), meta->insts.end(), v)) hookSplit[v] = newBB("gsplit");
   }
   if (m.O.hookSites) {
     // Resume points of the hook sites that are instructions inside a block (no block entry): the block gets a split there.
@@ -833,7 +833,7 @@ void Lower::run() {
   std::vector<std::pair<uint64_t, BasicBlock*>> bbCases;   // granular: the targets as blocks (instruction boundaries inside blocks are split blocks)
   if (m.O.resumeEntries) for (auto& rb : retBlocks) if (emitted.count(rb.second)) cases.push_back(rb);
   if (granular) {
-    for (auto& [v, id] : hookBlockAt) if (emitted.count(id)) cases.push_back({v, id});
+    for (auto& [v, id] : hookBlockAt) if (emitted.count(id) && std::binary_search(meta->insts.begin(), meta->insts.end(), v)) cases.push_back({v, id});
     for (auto& [v, bb] : hookSplit) if (!bb->empty()) bbCases.push_back({v, bb});   // (a split of a block that was never emitted stays empty)
   }
   std::sort(cases.begin(), cases.end());
