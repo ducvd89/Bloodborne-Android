@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# (Historical since phase 7: the app is native-code only; "off" restores a 1.2.0 release runtime, the last one with the FEX JIT. Needs an old out/release-1.2.0.)
 # Switch the AYN Thor's installed app (com.ducvd89.bloodborne 1.2.0) between the stock runtime (FEX JIT) and this branch's runtime
 # with ahead-of-time units (docs/AOT_DEVICE_STATUS.md). Run from the repository root.
 #   aot_device.sh on        branch libbbcpu.so + bb-probe + run-bionic.sh (out/deploy) and out/aot/libbbaot.so; libbbgpu.so and

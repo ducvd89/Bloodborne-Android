@@ -8,16 +8,14 @@
 //
 // With ahead-of-time recompiled code (BB_AOT, cpu/guest_cpu_aot.cpp) a site the recompiler has a native hook slot for (tools/recomp/variants/
 // hooks-bbsc.txt) is hooked there instead: no trampoline, no code written, the hook is called by the recompiled units (src/guest_cpu.h,
-// guest_cpu_hook_slot); other sites keep the trampoline.
+// guest_cpu_hook_slot); on Android other sites are refused, on an x86-64 host they keep the trampoline.
 //
 // The interface is shadPS4's (core/cpu_patches.h of the shadp2p/BBSC forks), so game modules
 // written against it (BBSC's bloodborne_re.cpp) build unchanged.
 //
-// Two CPUs run the game's code. On an x86-64 host the trampoline calls the hook directly. Where
-// FEXCore runs it (the Android build) the hook is arm64 code the guest cannot call: the trampoline
-// calls a guest-callable stub of a host function (guest_cpu_host_function) that passes the call on,
-// and every write into the game's code is followed by FEXCore dropping what it translated of the
-// range (GuestCodeWritten; FEXCore here has no page tracking of its own).
+// Where the game runs: on an x86-64 host the host CPU runs it and the trampoline calls the hook directly. On Android the game runs as ahead-of-time
+// recompiled units (libbbaot.so) and the game's code is never rewritten: a hook there is a native slot of the library or it is refused (logged), and a
+// write into the game's code (GuestCodeWritten) makes the function that holds it be classified again (original, patch variant, or no native code).
 #pragma once
 
 #include <array>

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// The FEX-free pieces of the native-only runtime (BB_AOT_ONLY), on an x86-64 PC: the AArch64 LSE atomic emulator for unaligned x86 `lock` operations
+// The platform pieces of the native runtime (no JIT, interpreter or fallback), on an x86-64 PC: the AArch64 LSE atomic emulator for unaligned x86 `lock` operations
 // (cpu/guest_cpu_atomics.h, run against instruction words) and the CPUID/XGETBV model (cpu/guest_cpu_cpuid.h).
 //   c++ -std=c++20 -O1 -g -Wall -Wextra -Werror -Icpu tests/test_aot_native.cpp -o out/aot-native-test
 #undef NDEBUG
