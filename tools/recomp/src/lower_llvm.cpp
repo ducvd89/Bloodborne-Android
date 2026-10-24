@@ -48,6 +48,9 @@ Lower::Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t e
   entryRip = IR.GetHeader()->OriginalRIP;
   val.assign(IR.GetSSACount() + 2, nullptr);
   var.assign(IR.GetSSACount() + 2, nullptr);
+  regionOf.assign(IR.GetSSACount() + 2, 0);
+  slotOf.assign(IR.GetSSACount() + 2, nullptr);
+  granularUnit = um && um->granular;
 }
 
 AllocaInst* Lower::newAlloca(Type* t, const char* name) {
@@ -112,7 +115,20 @@ Value* Lower::A(W w) {
   if (w.IsInvalid()) return nullptr;
   const uint32_t id = w.ID().Value;
   if (auto* a = var[id]) return B.CreateLoad(a->getAllocatedType(), a);
-  if (val[id]) return val[id];
+  if (val[id]) {
+    if (granularUnit && regionOf[id] != curRegion) {
+      if (auto* inst = dyn_cast<Instruction>(val[id])) {
+        if (!slotOf[id]) {
+          slotOf[id] = newAlloca(inst->getType(), "xr");
+          IRBuilder<> sb(inst->getParent());
+          if (inst->getNextNode()) sb.SetInsertPoint(inst->getNextNode());
+          sb.CreateStore(inst, slotOf[id]);
+        }
+        return B.CreateLoad(inst->getType(), slotOf[id]);
+      }
+    }
+    return val[id];
+  }
   auto* o = opOf(w);
   switch (o->Op) {
   case IR::OP_INLINECONSTANT: return c64(o->C<IR::IROp_InlineConstant>()->Constant);
@@ -125,7 +141,7 @@ Value* Lower::A(W w) {
   }
 }
 
-void Lower::def(Ref node, Value* v) { val[IR.GetID(node).Value] = v; }
+void Lower::def(Ref node, Value* v) { const uint32_t id = IR.GetID(node).Value; val[id] = v; regionOf[id] = curRegion; slotOf[id] = nullptr; }
 
 AllocaInst* Lower::varFor(W w) { return var[w.ID().Value]; }
 void Lower::setVar(W out, Value* v) {
@@ -596,6 +612,7 @@ bool Lower::emitOp(Ref node, IR::IROp_Header* op) {
         fd = FlagDesc{};
         B.CreateBr(sp->second);
         B.SetInsertPoint(sp->second);
+        ++curRegion;
       }
       if (m.O.hookSites) {
         auto hs = m.O.hookSites->find(vaddr);
@@ -809,6 +826,7 @@ void Lower::run() {
     emitted.insert(id);
     B.SetInsertPoint(bbOf[id]);
     fd = FlagDesc{};
+    ++curRegion;
     dirty = dirtyIn[id];
     for (auto [Node, op] : IR.GetCode(blocks[id].node)) {
       if (terminated()) break;
