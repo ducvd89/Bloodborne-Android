@@ -3,33 +3,52 @@
 The game's x86-64 code runs as ahead-of-time units (bb-recomp: FEX front end -> LLVM -> AArch64 `.so`) on the Thor
 (Snapdragon 8 Gen 2), with FEXCore as the fallback on the same CPU state (cpu/guest_cpu_aot.cpp, docs/RECOMP_ABI.md).
 
-## Paused at (2026-10-24, second pause)
+## Current state (2026-10-24, after phase 4b and phase 6; supersedes the older results below where they differ)
 
-**Done since the final report:** nothing merged or released; device back on the **stock 1.2.0 runtime** (`aot_device.sh off`,
-user's `bionic-local.sh` and `bbport.ini` restored, md5 checked).
+**The device runs in AOT mode** (all 10 verification launches clean): the merged recomp-rt runtime (libbbcpu with FEX as the
+idle fallback, bb-probe, run-bionic.sh, this branch's libbbgpu with phase 4b's native hook slots) and the units .so
+(`--variants tools/recomp/variants`, phase 6's granular jumps), the user's own `bionic-local.sh` and `bbport.ini`.
+`bash tools/android/dev/aot_device.sh off` puts the stock 1.2.0 runtime back.
 
-**In progress: open issue 2 (phase 4b frame-rate patcher in slot mode stops the game, AOT only).** Findings so far:
-- It is not a hang in a wait: the process main thread (which runs the game's main loop) **spins at 100 % CPU** inside units
-  (watchdog dump: in the unit of +0x21b8140, called from +0x2195f7c on the resolution-setup path +0x1d96bf3); the render thread and
-  workers wait for it. Its AOT trace (SIGUSR2 dump, now printed per thread) repeats one cycle of host calls (bb-probe+0x2e07c,
-  +0x2df64, +0x411e8, +0x4946c, +0x44764/+0x44788, +0x40c34..+0x40d1c, +0x48c50..+0x49da4) returning to guest +0x208b166,
-  +0x262d9b2, +0x20368d3, +0x207f41d, +0x207c407, +0x20e4318, +0x2804b43, +0x208400a.., +0x263b374..: the main loop keeps
-  iterating without making progress (symbolize those offsets against out/bionic/bin/bb-probe, unstripped).
-- **Not** the callbacks, the redirects, the Live struct's place, the byte patches or the slots themselves: with
-  `BB_FRAME_SLOT_TEST=63` (pacer/step/fixed-step callbacks do nothing, no redirects, no byte patches, no slots set) and with
-  `BB_FRAME_LIVE_NEAR=1` (Live in its own page) it still hangs; `BB_FRAME_HOOKS=0` hangs too.
-- **Not** a miscompiled unit of the 54 frame-rate functions: with all of them on FEX (`BB_AOT_FALLBACK_RANGES`) it still hangs.
-- The only working combination so far: the patcher in **detour mode** (`BB_AOT_NO_SLOTS=1572a7d`, or the release libbbgpu): it
-  allocates a stub page near the code (`guest_cpu_code`) and its detours put ~32 functions on FEX. So the difference is in what
-  detour mode does besides the patches (memory layout, the stub page registered as guest code, timing), or in another
-  libbbgpu (phase 4b shim) path that slot mode/hooks-off take: compare the shim's guest-code hooks (bbport_guest_code_hooks.cpp)
-  and display slots between the two modes next.
+**Verification on the Thor** (each: launch, title, Continue, 2 minutes of walking/attacks/rolls):
 
-**Next step:** symbolize the main thread's host-call cycle (which runtime calls it loops on: likely a wait/poll the game repeats
-because a condition never becomes true), then diff the shim's behaviour between detour and slot mode. Then open issue 3
-(flip IRQ assertion) by building the branch runtime with the phase 4b shim reverted.
+| configuration | launches | result |
+|---|---|---|
+| AOT, non-strict (FEX build) | 10 | 10 clean, ~29.6 FPS; misses log empty; **0 misses, 0 fallback runs, 0 dirty entries** in the statistics: no code ran on FEX |
+| AOT, `BB_AOT_STRICT=1` (FEX build) | 2 | 2 clean, misses log empty |
+| `BB_AOT_ONLY` runtime (no FEXCore: libbbcpu 1.1 MB) | 3 | 3 clean ("ahead-of-time units only"), misses log empty |
+| FEX mode with this branch's runtime (`BB_AOT=0`) | 8 | 8 clean |
+| phase 4b slot mode | all of the above | 45 patched functions as variants, 0 on the fallback, 0 dirty entries; frame-rate slots (pacer, step, fixed steps), the scene-size slots and the redirects all native |
 
-## Result
+No "Out of order flip IRQ" assertion in these ~26 launches (see open issue 3 below).
+
+**CPUID / XGETBV** (`BB_AOT_CPUID_LOG=1`; FEX's model against the native one strict mode and BB_AOT_ONLY use): equal except
+0x80000001 ECX bit 6 (SSE4a: native 1, FEX 0), 0x80000002 brand string (FEX: the host core's name, "Cortex-A510"; native:
+"Unknown ARM CPU"), 0x80000008 EBX bit 0 (CLZERO: FEX 1, native 0). XGETBV(0) = 7 in both. SSE4a is the one that can change
+the game's code paths: the native model should probably match FEX there (phase 6's cpu/guest_cpu_cpuid.h).
+
+**FPS and CPU, capped (user settings: limit 60, LSFG x2, GSR 2), 60 s each at the save spot, merged runtime:**
+AOT 29.7 FPS, process 325 % of a core (guest threads 113.6 %); FEX 29.4 FPS, 376 % (guest threads 124.0 %). The host GPU
+threads (bb:DrawRec, GpuComm, VkRecorder), which the CPU backend does not touch, also differ by ~20 % between the two runs, so
+part of the total gap is run-to-run variance; the guest side is reliable: FMOD mixer 13.8 vs 21.2 % (-35 %), GXWorker x5 42.3 vs
+47.0 %, GXRenderThread 16.6 vs 18.4 %. The game is GPU-bound at this spot: FPS is the same.
+
+**Fixed in this round:**
+
+| commit | bug |
+|---|---|
+| ef1a331 | **spin-waits hoisted**: `L: cmp eax, [r13 + 0x18]; jg L` (the main thread waiting for the GX workers, +0x21b8420) had no store in the loop, so the backend hoisted the load and the unit spun for ever on a stale value. Loads in loops without stores, atomics, fences or exits are now volatile (36,776 in the game). This was the "phase 4b slot-mode stall" (deterministic there) and, most likely, the intermittent pre-title stalls before the power outage that looked like an x87 problem |
+| c58a088 | **lift base collided with plain constants**: constants inside [0x200000000, +image size) were relocated as image addresses; `movabs rax, 0x200000002` (two packed counts, +0x221b124) became image + 2, a count of 0x104002, a 1 GB allocation, null, guest fault at +0x2264d20. Lift base now 0x3a7700000000; 186 wrongly relocated constants in the game |
+| ef66498 | `tests/run_recomp_device_regressions.sh`: both cases on the game's functions (fails with the old base, passes now) |
+| ac0058c, 0764277 | diagnostics: SIGUSR2 dumps print each thread's AOT trace (host functions as module+offset), `BB_AOT_FALLBACK_RANGES` pins functions against the variant classifier, `BB_AOT_PROBE_CALL`, `BB_AOT_CPUID_LOG`, strict mode announced, frame-rate shim `BB_FRAME_SLOT_TEST`/`BB_FRAME_LIVE_NEAR` |
+| 158e546 | merge of recomp-p6 (phase 6: misses fixed, granular entries, strict mode, BB_AOT_ONLY) |
+
+How it was found: the stall's thread was spinning (state R, 100 % CPU) at one host pc (unit +0x21b8140 offset 0x5b4: `cmp; b.gt .`);
+the crash after it was traced with an indirect-call probe (the allocation's size register) back to the struct a unit built.
+Ruled out on the way: the frame-rate callbacks, the Live struct in the image (+0x56d3f40 is unused, RW), the redirects, the slots
+themselves, memory layout.
+
+## Earlier results (before phase 4b/6)
 
 - **Title screen, main menu, save loaded (Continue), gameplay**: all in AOT mode. A 13-minute session at the save's spot
   (walking, camera turns, attacks, rolls; 32 rounds of input, after the Continue loading screen) ran without a crash, mean 33.1 FPS.
@@ -83,20 +102,22 @@ lowering) and `recomp-hooks` phase 4b (patch variants, native hook slots). The t
 
 ## Open issues
 
-1. **x87 hang: not reproducible, no fix.** Before the power outage about 1 launch in 3 stopped before the title (all threads
+1. **(Explained: the spin-wait hoisting fixed in ef1a331.)** x87 hang: not reproducible, no fix. Before the power outage about 1 launch in 3 stopped before the title (all threads
    parked in host waits); it followed the step 2d merge, and keeping the 127 x87-helper units on FEX avoided it (6/6).
    Bisection ended at libc.prx's `fabsl` (+0x571cc10: unit 65 alone on FEX, 6/6 clean), but the control (unit 66 alone on FEX)
    was also 6/6 clean, the baseline after the device's restart was 8/8 clean, and 30+ launches since never stalled. The
    lowered IR of `fabsl` matches FEX's reduced-precision path (F80 load + bbr_x87_f80_to_f64, x87 TOP/tag updates). If it comes
    back: `BB_AOT_FALLBACK_RANGES=571cc10-571cc11`, and a watchdog dump (kill -ALRM bb-probe) of the stall.
-2. **Phase 4b: the frame-rate patcher in slot mode stops the game before the title** (deterministic, AOT only; 4/4). Bisected
+2. **(Fixed: ef1a331 and c58a088, see above.)** Phase 4b: the frame-rate patcher in slot mode stops the game before the title (deterministic, AOT only; 4/4). Bisected
    to the frame-rate patcher's slots (0x203493d pacer mode, 0x2018e36 step, 0x1572a7d / 0x17f9b71 fixed steps) and its Live
    struct in the image (+0x56d3f40). Any one of them without a slot (`BB_AOT_NO_SLOTS=1572a7d`) makes the patcher use its
    old detours, and the game runs (then 32 patched functions are on the fallback). The display slots (scene size
    +0x1d96a6b/+0x1d96a7a) work ("the game's scene size 960x540 (native hook slots)"); patch variants work (45 patched functions
    native, 0 dirty entries). Phase 4b was checked on synthetic tables (aot_so_check), not in the running game; it needs the
    patcher's owner. Online (BBSC) hooks were not tested on the device.
-3. **"Out of order flip IRQ" GPU assertion** (shadPS4 video_out.cpp:357) at start, about 1 launch in 5-10 since the merges, in
+3. **"Out of order flip IRQ" GPU assertion** (update: not seen in ~26 launches after the lowering fixes and the phase 6 merge,
+   AOT and FEX mode; the earlier hits came in a period of heavy back-to-back testing, partly with the miscompiling .so; not
+   reproducible, so not bisected. If it returns: count it per configuration with the scratchpad `flipruns` style loop) (shadPS4 video_out.cpp:357) at start, about 1 launch in 5-10 since the merges, in
    AOT mode *and* in FEX mode with this branch's libbbcpu (2/4 with the branch GPU library), never with the stock 1.2.0
    runtime (5/5, and ~40 launches before the merges). A race between the flip IRQ and the buffer labels: not an AOT
    correctness bug, but it blocks "10 clean launches". With the release libbbgpu and the branch libbbcpu: 1 in 3.
