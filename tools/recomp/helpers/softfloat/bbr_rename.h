@@ -1,0 +1,29 @@
+// Renames the SoftFloat functions that end up as global symbols, so that linking the helpers into a program that has its own
+// SoftFloat (the PC tools link FEXCore, which bundles the same library) cannot collide. Functions that SoftFloat's headers
+// define inline are not renamed: renaming them would hide their include guards.
+#pragma once
+#define extF80_roundToInt bbrsf_extF80_roundToInt
+#define extF80_to_f32 bbrsf_extF80_to_f32
+#define extF80_to_f64 bbrsf_extF80_to_f64
+#define extF80_to_i32 bbrsf_extF80_to_i32
+#define extF80_to_i64 bbrsf_extF80_to_i64
+#define f32_to_extF80 bbrsf_f32_to_extF80
+#define f64_to_extF80 bbrsf_f64_to_extF80
+#define i32_to_extF80 bbrsf_i32_to_extF80
+#define softfloat_commonNaNToExtF80UI bbrsf_softfloat_commonNaNToExtF80UI
+#define softfloat_commonNaNToF32UI bbrsf_softfloat_commonNaNToF32UI
+#define softfloat_commonNaNToF64UI bbrsf_softfloat_commonNaNToF64UI
+#define softfloat_countLeadingZeros8 bbrsf_softfloat_countLeadingZeros8
+#define softfloat_extF80UIToCommonNaN bbrsf_softfloat_extF80UIToCommonNaN
+#define softfloat_f32UIToCommonNaN bbrsf_softfloat_f32UIToCommonNaN
+#define softfloat_f64UIToCommonNaN bbrsf_softfloat_f64UIToCommonNaN
+#define softfloat_normSubnormalExtF80Sig bbrsf_softfloat_normSubnormalExtF80Sig
+#define softfloat_normSubnormalF32Sig bbrsf_softfloat_normSubnormalF32Sig
+#define softfloat_normSubnormalF64Sig bbrsf_softfloat_normSubnormalF64Sig
+#define softfloat_propagateNaNExtF80UI bbrsf_softfloat_propagateNaNExtF80UI
+#define softfloat_raiseFlags bbrsf_softfloat_raiseFlags
+#define softfloat_roundPackToF32 bbrsf_softfloat_roundPackToF32
+#define softfloat_roundPackToF64 bbrsf_softfloat_roundPackToF64
+#define softfloat_roundToI32 bbrsf_softfloat_roundToI32
+#define softfloat_roundToI64 bbrsf_softfloat_roundToI64
+#define ui64_to_extF80 bbrsf_ui64_to_extF80
