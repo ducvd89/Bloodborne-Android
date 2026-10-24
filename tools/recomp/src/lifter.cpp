@@ -384,6 +384,22 @@ std::vector<jt::Jump> Lifter::Impl::analyseJumps(uint64_t lo, uint64_t hi, Gen* 
         const uint64_t t = i.pc + i.size + i.src.imm;
         if ((t < lo || t >= hi) && t >= imgLo && t < imgHi) g->outTargets.push_back(t - img.base);
       }
+  if (g && opt.collectTargets) {
+    // Exits of this decode to addresses inside the function that it did not decode as blocks: a block that runs into the unit's
+    // bound (a case body falling through into the loop head of the entry unit), or a jmp/jcc there. The lowering makes them
+    // constant tail jumps to an address that is no unit entry, which the runtime can only run on the fallback CPU to the end of
+    // the guest stack (the thread's whole loop when it is near its root). Collected like out-of-function targets, they become
+    // entry units of the function (discovery: "call/jmp targets inside functions that no unit started at").
+    std::set<uint64_t> have;
+    for (auto& b : th->FrontendDecoder->GetDecodedBlockInfo()->Blocks) have.insert(b.Entry);
+    auto exitTo = [&](uint64_t t) { if (t >= lo && t < hi && !have.count(t)) g->outTargets.push_back(t - img.base); };
+    for (auto& b : th->FrontendDecoder->GetDecodedBlockInfo()->Blocks) {
+      if (!b.NumInstructions) continue;
+      const jt::Ins last = jtInst(b.DecodedInstructions[b.NumInstructions - 1]);
+      if (last.kind != jt::K::Jmp && last.kind != jt::K::JmpInd && last.kind != jt::K::Ret) exitTo(last.pc + last.size);  // falls through
+      if ((last.kind == jt::K::Jmp || last.kind == jt::K::Jcc) && last.src.k == jt::Op::Imm) exitTo(last.pc + last.size + last.src.imm);
+    }
+  }
   if (g && opt.retTwiceTargets)
     for (auto& i : ins) {
       uint64_t site = 0;

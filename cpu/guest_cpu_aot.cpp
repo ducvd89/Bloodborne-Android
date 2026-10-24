@@ -80,6 +80,14 @@ struct Thread {
     unsigned trace_n = 0;
     // Statistics (only with BB_AOT_STATS).
     uint64_t unit_dispatch = 0, host_calls = 0, misses = 0, dirty_runs = 0, fb_cycles = 0;
+    uint64_t free_runs = 0;         // fallback runs to the end of the guest stack (everything above stays on the fallback)
+    uint64_t fb_ticks = 0;          // time in outermost fallback runs (Ticks(): TSC on x86-64, CNTVCT on ARM64)
+    uint64_t host_ticks = 0;        // time in host functions called from units
+    bool fb_running = false;        // the fallback clock runs (paused while units run inside a fallback run's host call)
+    uint64_t fb_start = 0;
+    uint64_t prev_fb = 0, prev_host = 0, prev_units = 0, prev_misses = 0;  // the previous report's values
+    unsigned host_depth = 0;
+    pid_t tid = 0;
     Thread* next_registered = nullptr;
 };
 thread_local Thread* self;
@@ -151,6 +159,53 @@ inline void Trace(Thread* t, uint32_t kind, uint64_t a, uint64_t b = 0, uint64_t
     if (E.trace) t->trace[t->trace_n++ % Thread::TraceSize] = {kind, a, b, c};
 }
 
+inline uint64_t Ticks() {
+#if defined(__aarch64__)
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    return v;
+#else
+    return __rdtsc();
+#endif
+}
+inline double TicksPerSecond() {
+#if defined(__aarch64__)
+    uint64_t f;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    return double(f);
+#else
+    return double(bb_fb_tsc_frequency());
+#endif
+}
+
+// A fallback run to the end of the guest stack: everything above it on this thread stays on the fallback CPU until the
+// guest call returns (a thread's whole loop when it happens near its root). Rare; with BB_AOT_STATS each is logged.
+void NoteFreeRun(const char* why, uint64_t target, uint64_t rsp) {
+    if (!E.stats) return;
+    static std::atomic<unsigned> logged {0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+    char name[32] = "?";
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    const uint64_t off = target - E.base;
+    const UnitEntry* end = E.units + E.count;
+    const UnitEntry* at = std::upper_bound(E.units, end, off, [](uint64_t v, const UnitEntry& u) { return v < u.vaddr; });
+    const uint64_t unit = at == E.units ? 0 : (at - 1)->vaddr;
+    std::fprintf(stderr, "AOT: free run (%s) at +%#llx (in unit +%#llx), rsp %#llx, [rsp] %#llx, thread %s\n", why, (unsigned long long)off,
+                 (unsigned long long)unit, (unsigned long long)rsp, (unsigned long long)(ReadGuest(rsp) - E.base), name);
+    if (E.trace && self) {
+        static const char* names[] = {"?", "miss", "fallback returned", "host call", "dirty unit", "free run", "unwind"};
+        const Thread* t = self;
+        const unsigned n = t->trace_n, first = n > 12 ? n - 12 : 0;
+        for (unsigned i = first; i < n; ++i) {
+            const auto& e = t->trace[i % Thread::TraceSize];
+            Dl_info info {};
+            const bool host = e.kind == EvHost && dladdr(reinterpret_cast<void*>(e.a), &info) && info.dli_sname;
+            std::fprintf(stderr, "AOT:     %-18s a=+%#llx b=%#llx c=+%#llx %s\n", names[e.kind], (unsigned long long)(e.a - E.base), (unsigned long long)e.b,
+                         (unsigned long long)(e.c - E.base), host ? info.dli_sname : "");
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------- miss statistics ----
 struct MissSlot { std::atomic<uint64_t> addr; std::atomic<uint64_t> count; std::atomic<uint64_t> dirty; };
 constexpr size_t MissSlots = 1 << 16;
@@ -200,6 +255,35 @@ void Report(const char* why) {
     for (auto& m : miss_table) {
         const uint64_t a = m.addr.load(std::memory_order_relaxed);
         if (a) rows.push_back({a & ~(1ull << 63), m.count.load(std::memory_order_relaxed), m.dirty.load(std::memory_order_relaxed)});
+    }
+    {
+        // Per thread, over the window since the last report: time on the fallback CPU (FEX) and in host functions called
+        // by units, as a share of the window; the rest is units (or waiting inside host functions, counted as host).
+        static uint64_t last = 0;
+        const uint64_t now = Ticks();
+        const double window = last ? double(now - last) : 0;
+        last = now;
+        if (window > 0) {
+            std::fprintf(stderr, "  per thread over %.1f s (fallback = FEX incl. its host calls; host = host functions called by units):\n", window / TicksPerSecond());
+            for (Thread* t = E.threads.load(); t; t = t->next_registered) {
+                uint64_t fb = t->fb_ticks;
+                const bool open = t->fb_running;
+                if (open) fb += now - t->fb_start;
+                const uint64_t dfb = fb - t->prev_fb, dhost = t->host_ticks - t->prev_host;
+                const uint64_t dunits = t->unit_dispatch - t->prev_units, dmiss = t->misses - t->prev_misses;
+                t->prev_fb = fb; t->prev_host = t->host_ticks; t->prev_units = t->unit_dispatch; t->prev_misses = t->misses;
+                if (!dfb && !dhost && !dunits && !dmiss) continue;
+                char name[32] = "?", path[64];
+                std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", int(t->tid));
+                if (FILE* f = std::fopen(path, "r")) {
+                    if (std::fgets(name, sizeof(name), f)) name[std::strcspn(name, "\n")] = 0;
+                    std::fclose(f);
+                }
+                std::fprintf(stderr, "    %-15s fallback %5.1f%%%s, host %5.1f%%, %llu unit entries, %llu misses, %llu free runs\n",
+                             name, 100.0 * double(dfb) / window, open ? " (in a run now)" : "", 100.0 * double(dhost) / window,
+                             (unsigned long long)dunits, (unsigned long long)dmiss, (unsigned long long)t->free_runs);
+            }
+        }
     }
     std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.count > b.count; });
     std::fprintf(stderr, "  %zu distinct miss addresses%s; top (image offset, calls):\n", rows.size(),
@@ -518,8 +602,12 @@ thread_local uint64_t guest_rsp_at_host_call;
 
 uint64_t Sentinel() { return bb_fb_sentinel(); }
 void FallbackRun(GuestState* s, uint64_t target, bool call, Thread* t) {
-    (void)t;
+    if (!E.stats) { bb_fb_run(s, target, call); return; }
+    if (!call) ++t->free_runs;
+    const bool outer = !t->fb_running;
+    if (outer) { t->fb_start = Ticks(); t->fb_running = true; }
     bb_fb_run(s, target, call);
+    if (outer) { t->fb_ticks += Ticks() - t->fb_start; t->fb_running = false; }
 }
 void CallHostFn(GuestState* s, void* fn) {
     HostArgs a;
@@ -555,6 +643,7 @@ Thread* Current() {
     ResetGuestState(*t->s);
     bbaot_state_ptr = t->s;
 #endif
+    t->tid = pid_t(syscall(SYS_gettid));
     if (E.stats) RegisterThread(t);
     self = t;
     return t;
@@ -568,7 +657,11 @@ inline void HostCall(GuestState* s, void* fn, Thread* t) {
     Trace(t, EvHost, reinterpret_cast<uint64_t>(fn), sp, ret);
     const uint64_t saved = GuestRspAtHostCall();
     NoteGuestRsp(sp);
+    const uint64_t h0 = E.stats && !t->fb_running && !t->host_depth ? Ticks() : 0;
+    ++t->host_depth;
     CallHostFn(s, fn);
+    --t->host_depth;
+    if (h0) t->host_ticks += Ticks() - h0;
     NoteGuestRsp(saved);
     s->gregs[RSP] = sp + 8;
     s->rip = ret;
@@ -606,6 +699,7 @@ bool IsUnitEntry(uint64_t offset) {
     mid_unit_jumps.fetch_add(1, std::memory_order_relaxed);
     if (E.stats) { ++t->misses; CountMiss(target, false); }
     Trace(t, EvFree, target, s->gregs[RSP]);
+    NoteFreeRun("jump into the middle of a unit", target, s->gregs[RSP]);
     FallbackRun(s, target, false, t);
 }
 
@@ -853,6 +947,7 @@ BBR_EXPORT void bbr_dirty_entry(GuestState* s, uint64_t vaddr) {
     if (at != end && at->vaddr == vaddr && E.extra[at - E.units]) {
         if (E.stats) { ++t->misses; ++t->dirty_runs; CountMiss(target, true); }
         Trace(t, EvFree, target, s->gregs[RSP]);
+        NoteFreeRun("dirty unit entered by a jump", target, s->gregs[RSP]);
         FallbackRun(s, target, false, t);
         return;
     }
@@ -1042,6 +1137,9 @@ uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t* args) {
         if (!E.on) return bb_fb_call(fn, count, args);
     }
     Thread* t = Current();
+    // Called by a host function that fallback code called: units run now, the fallback clock pauses.
+    const bool fb_paused = t->fb_running;
+    if (fb_paused) { t->fb_ticks += Ticks() - t->fb_start; t->fb_running = false; }
     GuestState& s = *t->s;
     uint64_t saved[16];
     std::memcpy(saved, s.gregs, sizeof(saved));
@@ -1088,10 +1186,12 @@ uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t* args) {
         else {
             if (E.stats) { ++t->misses; CountMiss(rip, false); }
             Trace(t, EvFree, rip, s.gregs[RSP]);
+            NoteFreeRun("unwound to an address with no unit", rip, s.gregs[RSP]);
             FallbackRun(&s, rip, false, t);
         }
     }
     --t->depth;
+    if (fb_paused) { t->fb_start = Ticks(); t->fb_running = true; }
     if (nested_stack) --t->nested_used;
     NoteGuestRsp(saved_host_rsp);
     const uint64_t result = s.gregs[RAX];
