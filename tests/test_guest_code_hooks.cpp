@@ -39,6 +39,18 @@ uintptr_t guest_cpu_host_function(void* fn) {
     return reinterpret_cast<uintptr_t>(fn);
 }
 void guest_cpu_invalidate(uintptr_t address, size_t size) { g_invalidated.emplace_back(address, size); }
+// Native hook slots (the ahead-of-time build): off unless a test turns them on.
+static bool g_slots = false;
+static GuestHookEx g_slot_fn = nullptr;
+static void* g_slot_context = nullptr;
+static uintptr_t g_slot_address = 0;
+int guest_cpu_has_hook_slot(uintptr_t address) { return g_slots && address != 0; }
+int guest_cpu_hook_slot(uintptr_t address, size_t, GuestHookEx fn, void* context) {
+    if (!g_slots) return 0;
+    g_slot_fn = fn; g_slot_context = context; g_slot_address = address;
+    return 1;
+}
+void guest_cpu_hook_slot_clear(uintptr_t) {}
 // An x86-64 host calls the "guest" function itself (src/runtime_cpu.c).
 uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t* args) {
     using Fn = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
@@ -499,6 +511,40 @@ int main() {
     assert(g_invalidated.size() == 2);
     KeepGuestCodeWritable();
     assert(GuestCodeProtection() == (PROT_READ | PROT_WRITE | PROT_EXEC));
+
+    // ---- A native hook slot: no trampoline, no code written; the adapter gives the hook its snapshot and honours the skip flag ----
+    {
+        g_slots = true;
+        u8* slot_fn = Copy(t_entry_begin, t_entry_end);
+        std::array<u8, 6> before;
+        std::memcpy(before.data(), slot_fn, 6);
+        std::array<u8, 6> expected_bytes = before;
+        const auto invalidated = g_invalidated.size();
+        static std::uint8_t skip = 0;
+        static std::uint64_t seen_rax = 0, seen_rdi = 0, seen_ymm1 = 0;
+        static int calls = 0;
+        const auto hook = +[](std::uint64_t tag, const Core::GuestRegisterSnapshot* r) BB_GUEST_HOOK_ABI {
+            ++calls;
+            seen_rax = r->rax; seen_rdi = r->rdi; std::memcpy(&seen_ymm1, r->ymm[1].data(), 8);
+            const_cast<Core::GuestRegisterSnapshot*>(r)->rax = 0x1234 + tag;
+            const_cast<Core::GuestRegisterSnapshot*>(r)->ymm[2][0] = 0x5a;
+            skip = 1;
+        };
+        assert(InstallGuestCodeHook(slot_fn, expected_bytes, 7, hook, &skip));
+        assert(g_slot_fn && g_slot_address == reinterpret_cast<std::uintptr_t>(slot_fn));
+        assert(std::memcmp(slot_fn, before.data(), 6) == 0);          // nothing written into the game's code
+        assert(g_invalidated.size() == invalidated);                    // ... and nothing to invalidate
+        GuestRegsEx regs{};
+        regs.gpr[GUEST_RAX] = 11; regs.gpr[GUEST_RDI] = 22; regs.gpr[GUEST_RSP] = 0x1000;
+        regs.ymm[1][0] = 0x77; regs.rflags = 0x202;
+        const std::uint32_t act = g_slot_fn(g_slot_context, &regs);
+        assert(calls == 1 && seen_rax == 11 && seen_rdi == 22 && seen_ymm1 == 0x77);
+        assert(regs.gpr[GUEST_RAX] == 0x1234 + 7 && regs.ymm[2][0] == 0x5a && regs.gpr[GUEST_RSP] == 0x1000);
+        assert(act == GUEST_HOOK_RETURN && skip == 0);                  // the skip flag: return from the function, flag cleared
+        const std::uint32_t again = g_slot_fn(g_slot_context, &regs);   // the hook sets it again: another return
+        assert(again == GUEST_HOOK_RETURN);
+        g_slots = false;
+    }
 
     std::puts("guest code hooks test: ok");
     return 0;
