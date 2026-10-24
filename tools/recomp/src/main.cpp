@@ -8,6 +8,7 @@
 #include "fde_scan.h"
 #ifdef BB_RECOMP_LLVM
 #include "compile.h"
+#include "bundle.h"
 #endif
 #include <chrono>
 #include <cinttypes>
@@ -20,7 +21,8 @@
 #endif
 
 static void usage() {
-  fputs("usage: bb-recomp --elf <eboot.elf> [options]\n"
+  fputs("usage: bb-recomp --pkgs <folder with the game PKGs> --out <dir>    (player mode: one command, see --help-player)\n"
+        "       bb-recomp --elf <eboot.elf> [options]\n"
         "  --boot <file>        boot-linked image (scripts/link_modules.py, out/boot-linked.bin): the eboot plus the linked\n"
         "                       system modules (libc.prx ...) at their image offsets, one image, one unit table. --elf then only\n"
         "                       supplies the eboot's program headers\n"
@@ -68,11 +70,12 @@ static void usage() {
         "  --variant-report     list every variant and hook site in the summary\n"
         "  --no-callee-saved    reload rbx, rbp, r12-r15 after calls too (default: the SysV callee-saved set is trusted)\n"
         "  --ndk <dir>          Android NDK for --so\n"
+        "  --bundle-dir <dir>   self-contained build: the bundle directory (default: <exe>/../share/bb-recomp, if present)\n"
         "  --helpers-dir <dir>  the x87 helper sources (default: tools/recomp/helpers of the build)\n"
         "  --stats <file>       also write the compile summary here\n", stderr);
 }
 
-int main(int argc, char** argv) {
+int recompMain(int argc, char** argv) {
   std::string elf = "out/eboot.elf", funcsFile, dumpArg, bootFile, prxDir, extraFile;
   // The lift base. The lowering takes a 64-bit IR constant inside [base, base + image size) for an image address (FEX folds
   // rip-relative arithmetic into such constants) and relocates it to the runtime's image base. With the old base 0x200000000
@@ -85,6 +88,7 @@ int main(int argc, char** argv) {
   CompileOptions cc;
   bool shardsSet = false, jobsSet = false;
   cc.statsPath = "out/recomp/compile.txt";
+  cc.bundleDir = bundleDirDefault();
 #endif
   unsigned hw = std::thread::hardware_concurrency();
   co.jobs = std::min(22u, hw > 2 ? hw - 2 : 1u);
@@ -150,6 +154,7 @@ int main(int argc, char** argv) {
     else if (is("--variants")) cc.variantPaths.push_back(arg());
     else if (is("--variant-report")) cc.variantReport = true;
     else if (is("--ndk")) cc.ndk = arg();
+    else if (is("--bundle-dir")) cc.bundleDir = arg();
     else if (is("--helpers-dir")) cc.helpersDir = arg();
     else if (is("--stats")) cc.statsPath = arg();
     else if (is("--func")) cc.onlyVaddr = strtoll(arg(), nullptr, 16);
@@ -233,4 +238,23 @@ int main(int argc, char** argv) {
   }
 #endif
   return runCensus(img, funcs, co);
+}
+
+// Player mode (player.cpp, BB_RECOMP_PLAYER): `bb-recomp --pkgs <folder> --out <dir>` (or --game <dump>) builds the runtime image and compiles it with
+// recompMain(). Started without arguments (a double click), or with --gui, the window opens (gui.cpp, BB_RECOMP_GUI); --cli forces the command line.
+#ifdef BB_RECOMP_PLAYER
+int playerMain(int argc, char** argv);
+#endif
+#ifdef BB_RECOMP_GUI
+#include "gui.h"
+#endif
+int main(int argc, char** argv) {
+#ifdef BB_RECOMP_GUI
+  if (argc == 1 || (argc >= 2 && (!strcmp(argv[1], "--gui") || !strcmp(argv[1], "--gui-selftest") || !strcmp(argv[1], "--about")))) return guiMain(argc, argv);
+#endif
+  if (argc >= 2 && !strcmp(argv[1], "--cli")) { --argc; ++argv; argv[0] = const_cast<char*>("bb-recomp"); }
+#ifdef BB_RECOMP_PLAYER
+  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--game") || !strcmp(argv[i], "--pkgs") || !strcmp(argv[i], "--check-pkg") || !strcmp(argv[i], "--help-player")) return playerMain(argc, argv);
+#endif
+  return recompMain(argc, argv);
 }

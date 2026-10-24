@@ -231,7 +231,11 @@ std::string signature(const std::string& game) {
         struct stat st;
         if (stat(p.c_str(), &st) < 0) raise_errno(errno, p);
         st_text[i] = "[" + std::to_string((long long)st.st_size) + ", " +
+#ifdef _WIN32  // bb-recomp on Windows (tools/recomp): seconds only, the marker is for the phone's own cache
+                     std::to_string((long long)st.st_mtime * 1000000000LL) + "]";
+#else
                      std::to_string((long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec) + "]";
+#endif
     }
     // sorted keys: eboot.bin, path, sce_module/libSceFios2.prx, sce_module/libc.prx, sce_sys/param.sfo
     result += st_text[0] + ", \"path\": " + json_string(resolved) + ", \"sce_module/libSceFios2.prx\": " + st_text[2] +

@@ -1,4 +1,6 @@
 #include "compile.h"
+#include "bundle.h"
+#include "progress.h"
 #include "lower_llvm.h"
 #include "variant_compile.h"
 
@@ -191,6 +193,16 @@ bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>&
     auto* gty = ArrayType::get(i8, gs.size());
     new GlobalVariable(m, gty, true, GlobalValue::ExternalLinkage, ConstantArray::get(gty, gs), "bbr_func_granular");
   }
+  {
+    // bbr_eh_frame_hdr[3 * n]: per module {base, size, .eh_frame_hdr vaddr}, image-relative; bbr_eh_frame_hdr_count = n. The
+    // runtime reads the CFI of a function it enters in the middle (a jump the units do not cover) to find the function's
+    // return address slot, so the fallback CPU only runs to the end of that function.
+    std::vector<Constant*> xs; xs.reserve(ehHdrs.size());
+    for (uint64_t v : ehHdrs) xs.push_back(ConstantInt::get(i64, v));
+    auto* t = ArrayType::get(i64, xs.size());
+    new GlobalVariable(m, t, true, GlobalValue::ExternalLinkage, ConstantArray::get(t, xs), "bbr_eh_frame_hdr");
+    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, ehHdrs.size() / 3), "bbr_eh_frame_hdr_count");
+  }
   // Variants (docs/RECOMP_ABI.md): bbr_vfuncs[] {func start, first unit, unit count, name offset}, bbr_vunits[] {vaddr, end, ehash, fn, original unit index},
   // bbr_vnames (the names, NUL separated).
   const bool haveVariants = vt && !vt->funcs.empty();
@@ -242,16 +254,6 @@ bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>&
   }
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, (opt.resumeEntries ? 1 : 0) | (opt.dirtyCheck ? 2 : 0) | (haveVariants ? 4 : 0) | (haveHooks ? 8 : 0) |
                                                                                                                 (std::find(granularFlags.begin(), granularFlags.end(), 1) != granularFlags.end() ? 16 : 0)), "bbr_abi_flags");
-  {
-    // bbr_eh_frame_hdr[3 * n]: per module {base, size, .eh_frame_hdr vaddr}, image-relative; bbr_eh_frame_hdr_count = n. The
-    // runtime reads the CFI of a function it enters in the middle (a jump the units do not cover) to find the function's
-    // return address slot, so the fallback CPU only runs to the end of that function.
-    std::vector<Constant*> xs; xs.reserve(ehHdrs.size());
-    for (uint64_t v : ehHdrs) xs.push_back(ConstantInt::get(i64, v));
-    auto* t = ArrayType::get(i64, xs.size());
-    new GlobalVariable(m, t, true, GlobalValue::ExternalLinkage, ConstantArray::get(t, xs), "bbr_eh_frame_hdr");
-    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, ehHdrs.size() / 3), "bbr_eh_frame_hdr_count");
-  }
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, imageHash), "bbr_image_hash");
   new GlobalVariable(m, i32, true, GlobalValue::ExternalLinkage, ConstantInt::get(i32, 1), "bbr_abi_version");
   new GlobalVariable(m, i64, false, GlobalValue::ExternalLinkage, ConstantInt::get(i64, 0), "bbr_image_base");
@@ -541,6 +543,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   if (!hookSites.empty()) lo.hookSites = &hookSites;
   lo.unitIndex = [&starts](uint64_t v) -> int64_t { auto it = std::lower_bound(starts.begin(), starts.end(), v); return it != starts.end() && *it == v ? it - starts.begin() : -1; };
 
+  bbrStage("compile", "Recompiling");
   std::vector<ShardStats> stats(nshards);
   std::vector<std::string> objFiles(nshards);
   std::atomic<unsigned> next {0};
@@ -555,6 +558,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     for (;;) {
       const unsigned k = next++;
       if (k >= nshards) break;
+      bbrProgress(k, nshards);
       ShardStats& st = stats[k];
       LLVMContext ctx;
       auto mod = std::make_unique<Module>("bbr_shard_" + std::to_string(k), ctx);
@@ -705,10 +709,11 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       cmd = "nice -n 19 clang";
     }
     cmd += " -O2 -fPIC -fvisibility=hidden -fno-stack-protector -ffp-contract=off -c " + dir + "/bbr_x87_all.c -o " + helperObj;
-    if (system(cmd.c_str()) != 0) { fprintf(stderr, "bb-recomp: compiling the x87 helpers failed: %s\n", cmd.c_str()); return 1; }
+    if (bbrSystem(opt.bundleDir, cmd) != 0) { fprintf(stderr, "bb-recomp: compiling the x87 helpers failed: %s\n", cmd.c_str()); return 1; }
     helperTime = since(t);
   }
 
+  bbrStage("link", "Linking");
   double linkTime = 0;
   uint64_t soBytes = 0;
   if (!opt.soPath.empty()) {
@@ -730,7 +735,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       // made here gives the entry; at run time it is the libbbcpu.so already loaded.
       const std::string stub = opt.soPath + ".libbbcpu-stub.so";
       const std::string mk = "nice -n 19 " + bin + "/bin/clang --target=aarch64-linux-android30 -shared -nostdlib -Wl,-soname,libbbcpu.so -x c /dev/null -o " + stub;
-      if (system(mk.c_str()) != 0) { fprintf(stderr, "bb-recomp: cannot make %s\n", stub.c_str()); return 1; }
+      if (bbrSystem(opt.bundleDir, mk) != 0) { fprintf(stderr, "bb-recomp: cannot make %s\n", stub.c_str()); return 1; }
       cmd += " --no-as-needed " + stub;
     } else {
       // The PC runtime (BB_AOT with an x86-64 host): the system clang links it with ld.lld and adds the builtins
@@ -741,7 +746,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       if (!tablePath.empty()) cmd += " " + tablePath;
       cmd += " " + helperObj + " -lm";
     }
-    const int rc = system(cmd.c_str());
+    const int rc = bbrSystem(opt.bundleDir, cmd);
     linkTime = since(t);
     if (rc != 0) { fprintf(stderr, "bb-recomp: link failed (%d): %s\n", rc, cmd.c_str()); return 1; }
     FILE* f = fopen(opt.soPath.c_str(), "rb");

@@ -460,6 +460,9 @@ fi
 # runtime's directory (bbport/aot, or bbport/bionic/aot), is run by libbbcpu in front of FEX (BB_AOT=<path> by hand wins).
 # Whatever it does not cover, and units whose code differs from the image, still run on FEX. BB_AOT_STATS=1: counts.
 # BB_AOT=0 (environment or bionic-local.sh): off, FEX alone, even with the .so in place.
+# The app's Native CPU menu (NativeCpuDialog.java) imports the .so and has the On/Off switch: native_cpu=0 in bbport.ini is Off, a missing
+# key or native_cpu=1 is On (when the .so is there). A BB_AOT set by hand (environment, bionic-local.sh) wins over the switch.
+if [ -z "${BB_AOT:-}" ] && [ "$(setting native_cpu)" = 0 ]; then export BB_AOT=0; fi
 if [ -z "${BB_AOT:-}" ]; then
     for aot in "$base/aot/libbbaot.so" "$bionic/aot/libbbaot.so"; do
         if [ -f "$aot" ]; then export BB_AOT="$aot"; break; fi
