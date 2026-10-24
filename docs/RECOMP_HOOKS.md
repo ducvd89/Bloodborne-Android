@@ -1,5 +1,8 @@
 # Code writers of the port, and how the recompiler handles each (phase 4, 2026-10-24)
 
+> Since phase 7 (2.0.0) there is no fallback CPU and the native build never rewrites the game's code: "fallback" below now means the game stops (a miss) when a function with no variant is entered, and
+> hooks without a slot are refused with a log line. The catalogs live in the tool repository (`tools/recomp/variants/`, the submodule).
+
 Everything that changes the game's x86-64 code, at start-up or while the game runs, and what `bb-recomp` / the AOT runtime
 (`cpu/guest_cpu_aot.cpp`) does with it. Addresses are image offsets (run-time address = image base + offset; the base is 0x800000000 on
 Android). "Fixed" means the written bytes are known at build time; "computed" means they hold a run-time address (a stub page, a host

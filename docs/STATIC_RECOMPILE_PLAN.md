@@ -1,4 +1,9 @@
-# Removing FEXCore: ahead-of-time x86-64 → ARM64 recompilation (plan, 2026-10-23)
+# Removing FEXCore: ahead-of-time x86-64 → ARM64 recompilation (plan, 2026-10-23; **phase 7 done, 2026-10-24: FEXCore is gone from the Android build**)
+
+> **Status.** All phases are done. Since phase 7 (release 2.0.0) the Android runtime contains no FEXCore: `libbbcpu.so` is the ahead-of-time unit engine alone
+> (`cpu/guest_cpu_aot.cpp` + `cpu/guest_cpu_native.cpp`, about 0.9 MB), and the app cannot start the game without a matching `libbbaot.so`, which every player builds
+> once on a PC with the Bloodborne Android Rebuild Tool (https://github.com/ducvd89/Bloodborne-android-rebuild-tool, the `tools/recomp` submodule of this repository). See "Phase 7 status" below.
+> The text from here on is the plan as written, with FEX as oracle and fallback; the paths `tools/recomp/...` now live in the tool repository.
 
 Goal: the game's x86-64 code runs on Android as ARM64 code compiled ahead of time, and FEXCore
 (`cpu/guest_cpu_fex.cpp`, `libbbcpu.so`, `fex-compatible.json`, the FEX submodule) is removed.
@@ -123,7 +128,7 @@ Each phase has a gate. FEX stays in the build as the **oracle and fallback** unt
 | 4 | Hooks and patches | Hook slot table, patch variants, invalidate → dirty functions | Atlas, online (Seamless Hunt), cheats and FPS uncap work on AOT | 1–2 wk |
 | 5 | On device | `bb-recomp` NDK build with static LLVM AArch64, run after `bb-prepare` with a progress UI, cache in `files/aot/`, incremental `extra.so` | A fresh install on the Thor and on a Mali device reaches gameplay | 2–3 wk |
 | 6 | Interpreter replaces FEX | x86 interpreter for misses and dirty code, miss log → recompile at next start | A full route with FEX disabled; zero or only logged misses | 2–3 wk |
-| 7 | Remove FEXCore | Delete `cpu/guest_cpu_fex.cpp`, `fex_project.cmake`, the FEX submodule and build steps, `fex-compatible.json`, FEX env in `run-bionic.sh`, the FEX notice | Release build and APK without FEX | 1 wk |
+| 7 | Remove FEXCore | Delete `cpu/guest_cpu_fex.cpp`, `fex_project.cmake`, the FEX submodule and build steps, `fex-compatible.json`, FEX env in `run-bionic.sh`, the FEX notice | Release build and APK without FEX | 1 wk (**done**) |
 
 Total: **about 4–5 months** of agent-driven work. The first in-game result (hybrid, phase 3) comes
 at about 2–2.5 months.
@@ -344,6 +349,40 @@ function granular with `--granular-funcs`), the `.so` is rebuilt (2 min), no cod
 **Strict mode** (`BB_AOT_STRICT=1`, always on in the `BB_AOT_ONLY` build): a miss logs and stops with "native code is missing an entry at +0x...; please report this, or turn Native CPU off". Without it the FEX fallback
 stays and every miss is logged the same way. `BB_AOT_ONLY` builds libbbcpu.so without FEXCore (`cpu/aot_only`): own CPUID/XGETBV (FEX's model with fixed host features), TSC, unaligned-atomic emulation, host-function stubs,
 thread state, and a native path for the import traps; strict mode uses the same native services in the FEX build, so it is a rehearsal of phase 7.
+
+## Phase 7 status: FEXCore removed from the Android build (2026-10-24, branch phase7, release 2.0.0)
+
+Decision (the user): only the Android build matters; the game runs **only** as ahead-of-time recompiled native code. Phone-only players without the `.so` can no longer run the game. The
+device had verified the `BB_AOT_ONLY` runtime (no FEX) in 3 clean launches, strict mode clean, 0 misses in about 20 minutes (docs/AOT_DEVICE_STATUS.md); phase 7 makes that runtime the only one.
+
+Removed: `cpu/guest_cpu_fex.cpp` (683 lines), `cpu/fex_project.cmake`, `cpu/bbcpu.cmake`, `cpu/guest_cpu_rename.h` and `cpu/guest_cpu_fallback.h` (the `bb_fb_*` interface to a fallback CPU),
+`tools/android/fex-compatible.json`, the `third_party/FEX` submodule, every FEX build path (`build_bionic.sh`, `build.sh`, `packaging/`, `shell.nix`), FEX's environment and config in
+`run-bionic.sh`, the x86-64 "native fallback" assembly in `cpu/guest_cpu_aot.cpp`, FEX thread-state sharing (`BB_AOT_FEX_STATE`), the CFI-bounded fallback runs (`.eh_frame` reader), `BB_AOT_STRICT`,
+`BB_AOT_FALLBACK_RANGES`, `BB_AOT_PROBE_CALL`, `BB_AOT_CFI`, `BB_AOT_VARIANTS=0`, `BB_AOT_HOOK_SLOTS=0`, `BB_AOT_NO_SLOTS`, the fallback statistics, the Native CPU On/Off switch (`native_cpu`) and
+the Native CPU user guide (it lives in the tool repository).
+
+What stays, as the only mode:
+
+- **Strict mode.** A guest address no unit covers (a gap in the library, code the game wrote at run time, a patched function without a variant) is written to `logs/aot-misses.log` (with the thread and a guest
+  backtrace; `bb-recomp --extra-entries` turns it into entries) and the game stops with `STOP: AOT: ...` (exit 22). No library: `STOP: AOT: libbbaot.so is missing` (exit 3 from `run-bionic.sh`, exit 21 from the engine).
+  `BB_AOT=<libbbaot.so>` is required.
+- **Hooks are native slots only.** `guest_cpu_hook` / `guest_cpu_hook_slot` set a hook in the slot the library has at that site, else the hook is refused with a log line (`AOT: no native hook slot at +0x...`):
+  no trampolines are written into the game, on Android. `InstallGuestCodeHook` refuses likewise (the x86-64 PC build keeps its trampolines: the host CPU runs the game there). The writers that relied on
+  trampolines are off on Android with a log line: `BB_GNM_CENSUS` / `BB_GNM_OBSERVE`, `BB_LABEL_TRAP` and the free check's hooks (already off), the game menu pages (already off). `CallGuestWithFloats` (BBSC) has a
+  native implementation (`guest_cpu_call_floats`: the floats go into the vector registers; no guest stub).
+- Diagnostics: `BB_AOT_STATS`, `BB_AOT_TRACE` (transitions, first hook hits, the crash report), `BB_AOT_CPUID_LOG`, `BB_AOT_DEBUG`, `BB_AOT_ELF` (whole-file image check), `BB_AOT_MISS_LOG`.
+- The CPUID model (`cpu/guest_cpu_cpuid.h`) is ported from FEX-Emu (MIT): its CPU-name table, leaf formulas, and the two constants a game could read from the hypervisor leaf (`FEXIFEXIEMU`, `FEX-2609.1`).
+  The MIT notice is in the app's `THIRD_PARTY_LICENSES.txt`.
+
+Repository: `tools/recomp` is a git submodule of the tool repository (pinned at 12eb090, the sources moved there unchanged). The runtime compiles without it; what ties the two together is the ABI of `libbbaot.so`
+(docs/RECOMP_ABI.md): the ABI version (1) is checked at run time (`BbrAbiVersion` in `cpu/guest_cpu_aot.cpp`, `NativeCpu.ABI_VERSION` in the app) and by `tools/check_recomp_abi.sh` against the tool's source;
+`GuestState`'s layout is pinned by `static_assert`s in `cpu/guest_state.h`. `tools/android/prepare` exists in both repositories and must stay the same (`tools/android/check_prepare_sync.sh`).
+
+App: without a library that fits (missing, another game build, ABI, checksum) the app shows a full-screen message with the steps, a button to the tool's page and Choose game folder / Import libbbaot.so;
+the drawer row says "Required: not installed". The game folder's `aot/` is imported automatically. The device-side "Install from PKG" extracts the game and then says the native code from the PC tool is still needed.
+
+Build: `libbbcpu.so` 0.93 MB (was 1.1 MB for the no-FEX rehearsal and ~12 MB with FEX); no FEX symbol or string in any output (`tools/android/check_bionic_symbols.sh`, but the two CPUID constants).
+Tests: `tests/run_aot_native_test.sh` (+ strict, variants), `tests/run_guest_code_hooks_test.sh`, `tests/run_aot_patchers_test.sh`, `tests/android-native-cpu/run.sh`. Not run: the game (never on the PC) and the device (not touched in this phase).
 
 ## Risks
 

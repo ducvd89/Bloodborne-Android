@@ -1,7 +1,10 @@
 # bb-recomp: how recompiled code runs (ABI, 2026-10-24)
 
-Shared design for the LLVM lowering (tools/recomp) and the runtime backend (cpu/guest_cpu_aot.cpp).
-See STATIC_RECOMPILE_PLAN.md for the plan.
+Shared design for the LLVM lowering (the Rebuild Tool, the `tools/recomp` submodule: https://github.com/ducvd89/Bloodborne-android-rebuild-tool) and the runtime backend
+(cpu/guest_cpu_aot.cpp). See STATIC_RECOMPILE_PLAN.md for the plan. The tool repository keeps a copy of this file; this one describes the runtime and wins where they differ.
+
+> **Since phase 7 (2.0.0) there is no fallback CPU.** Where this document says a unit, a function or a hook "runs on the fallback", "falls back" or "is dirty", read: the
+> game stops with a miss (strict mode, below). Strict mode is the only mode; FEXCore is not part of the runtime.
 
 ## Units
 
@@ -189,39 +192,35 @@ A *miss* is guest code about to run at an address no unit starts at, no granular
 thunk or an import trap: a jump into the middle of a unit, a call to code the tool did not find, a return after a longjmp to an address no unit holds, an entry of a
 patched function with no variant, an address outside the image.
 
-- **Always:** the first miss at each address is appended to `logs/aot-misses.log` (`BB_AOT_MISS_LOG=<path>` to move it; the working directory of the runtime is
+- **Always:** the miss is appended to `logs/aot-misses.log` (`BB_AOT_MISS_LOG=<path>` to move it; the working directory of the runtime is
   `files/bbport`): `miss +0x210ebc0 kind=jump thread=CSChrThread0 tid=1234 rsp=0x... backtrace=+0x2110a20,+0x1c40` (image offsets; kind: call, jump, unwind,
-  patched; `outside 0x...` for an address outside the image; the backtrace is the return address on the guest stack, then the rbp chain), and `# count` lines at exit
-  when an address missed more than once.
-- **`BB_AOT_STRICT=1`** (always on in the `BB_AOT_ONLY` build; the default in phase 7): no FEX for anything. A miss is logged (every time) and the game stops with
-  status 22 and `STOP: AOT: native code is missing an entry at +0x...; please report this, or turn Native CPU off (details: logs/aot-misses.log)`. Strict mode also takes CPUID,
-  XGETBV, the TSC and the unaligned-atomic handler from `cpu/guest_cpu_native.cpp` instead of FEX, in the FEX build too, so it rehearses the native-only runtime.
-- **Without strict mode** (the default for now) the fallback CPU runs the code as before; every miss is logged the same way, so testers' logs find the gaps.
+  patched; `outside 0x...` for an address outside the image; the backtrace is the return address on the guest stack, then the rbp chain).
+- **The game stops** (strict mode, the only mode): the miss is logged and the process exits with status 22 and
+  `STOP: AOT: native code is missing an entry at +0x...; please report this (details: logs/aot-misses.log)` (a patched function with no variant: `native code for a patched or hooked
+  function has no variant at +0x...`; outside the image: `guest code ran at 0x..., outside the image, which native code cannot run`). No fallback CPU exists to carry on.
 - **Closing a gap without a code change:** `bb-recomp ... --extra-entries aot-misses.log` makes every logged address a unit entry (an address inside a function becomes an extra unit of
   it, one outside every function a pseudo-function; addresses that do not decode as code are reported and ignored) and the `.so` is rebuilt. `--check-entries a,b,c` (with
   `--units-only`) says for each address whether it is a unit entry, a granular entry, a case of a resolved jump table, or not covered (exit status 3).
 - **Import traps.** `src/probe.c` gives unresolved imports 32-byte x86 stubs (`mov rsi,rdi; mov edi,<index>; movabs rax,<handler stub>; jmp rax`) in a code range of
   their own. The engine recognises exactly that sequence and calls the handler stub's host function with (index, rdi) instead of running it, so no CPU executes it.
 
-## BB_AOT_ONLY: libbbcpu without FEXCore
+## libbbcpu: the engine and its platform services
 
-`cpu/aot_only/CMakeLists.txt` builds `libbbcpu.so` from `guest_cpu_aot.cpp`, `guest_cpu_native.cpp` and `host_call_arm64.S` (`BB_AOT_ONLY=1 tools/android/build_bionic.sh`
-reuses the rest of an `out/bionic` build and relinks bb-probe). Strict mode is always on, `BB_AOT=<libbbaot.so>` is required (the runtime stops at start-up without it), and no
-guest instruction ever runs on a CPU other than the units. What the engine asks of "the fallback" is answered natively there:
+`cpu/CMakeLists.txt` builds `libbbcpu.so` from `guest_cpu_aot.cpp`, `guest_cpu_native.cpp` and `host_call_arm64.S` (`tools/android/build_bionic.sh`; `build.sh` on AArch64 hosts). `BB_AOT=<libbbaot.so>` is
+required (the runtime stops at start-up without it), and no guest instruction ever runs on a CPU other than the units. The services the engine needs (`cpu/guest_cpu_native.h`, namespace `bbnative`):
 
-| service | FEX build | native-only |
-|---|---|---|
-| thread state | FEX `CPUState` of the thread | the replica `GuestState` (`cpu/guest_state.h`, layout checked against FEX by `tests/guest_state_check.cpp`), allocated per thread |
-| host-function stubs | 16-byte stubs `mov r10,rcx; syscall; ret` executed by FEX | a table of addresses, never executed: the dispatcher recognises them |
-| guest calls (`guest_cpu_call`) | units, FEX for misses | units; sentinel = stub slot 0 |
-| CPUID, XGETBV | FEX's model with the host's features | `cpu/guest_cpu_cpuid.h`: FEX's Skylake model with the host features fixed to the lifter's profile (AVX/AVX2 bits as FEX reports with AVX, AES, PCLMUL, CRC, SHA, SSE4a, no RDRAND); cache sizes and TLB leaves as FEX's constants; the product name is "Unknown ARM CPU" |
-| TSC | `cntvct_el0 << shift`, shift so the rate is at least 1 GHz | the same |
-| unaligned `lock` operations | FEX's non-JIT unaligned handler | `cpu/guest_cpu_atomics.h`: decodes LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN/SWP/CAS/CASP (every width, any acquire/release form), performs them byte-wise under one global lock, advances the pc |
-| faults | FEX handles the call-return stack, the JIT buffer and the unaligned atomics | the unaligned atomics only; everything else is the host crash report |
-| `guest_cpu_hook` / `guest_cpu_invalidate` | patches guest code with a `syscall` trampoline | no code is written: a hook is a native slot or `0` (then the function is patched without a variant: a miss) |
+| service | how |
+|---|---|
+| thread state | `GuestState` (`cpu/guest_state.h`; the layout is the x86-64 front end's `CPUState`, pinned by `static_assert`s; `tests/guest_state_check.cpp` compares it with FEX's headers when a FEX tree is given to `tools/check_recomp_abi.sh`), allocated per thread |
+| host-function stubs | a table of 16-byte slots below 1 TiB, never executed: the dispatcher recognises the addresses |
+| guest calls (`guest_cpu_call`, `guest_cpu_call_floats`) | units; the sentinel is stub slot 0 |
+| CPUID, XGETBV | `cpu/guest_cpu_cpuid.h`: the model the game was verified with (ported from FEX-Emu, MIT): the Skylake identity with the host features fixed to the lifter's profile; cache and TLB leaves as constants; the product name from core 0's MIDR |
+| TSC | `cntvct_el0 << shift`, shift so the rate is at least 1 GHz |
+| unaligned `lock` operations | `cpu/guest_cpu_atomics.h`: decodes LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN/SWP/CAS/CASP (every width, any acquire/release form), performs them byte-wise under one global lock, advances the pc |
+| faults | the unaligned atomics only; everything else is the host crash report |
+| `guest_cpu_hook` / `guest_cpu_invalidate` | no code is written: a hook is a native slot or it is refused (logged); an invalidated function is classified again (original, variant, or no native code) |
 
-Still FEX-bound (phase 7): `cpu/guest_cpu_fex.cpp` and everything it links (FEXCore, Common, jemalloc, fmt) in the FEX build; `bbr_dirty_entry` of a patched function with no
-variant, the `BB_AOT_FALLBACK_RANGES`, `BB_AOT_TRACE` fallback traces and the free-run/CFI machinery (they only run in non-strict FEX builds); `guest_cpu_call` with BB_AOT off.
+The ABI version the runtime accepts is `BbrAbiVersion` (1) in `cpu/guest_cpu_aot.cpp`; `tools/check_recomp_abi.sh` compares it with the app's `NativeCpu.ABI_VERSION` and the tool's `bbr_abi_version`.
 
 ## Guest state
 
@@ -323,7 +322,7 @@ step adds (`libclang_rt.builtins-aarch64-android.a`).
 
 ## x87 helpers (linked into the `.so`, nothing for the runtime to provide)
 
-The runtime runs x87 as FEX does with `X87ReducedPrecision=1` (`tools/android/fex-compatible.json`): the stack is F64 and most
+The runtime runs x87 with reduced precision (FEX's `X87ReducedPrecision=1`, the configuration the game was verified with): the stack is F64 and most
 instructions lower inline (`fadd`, `fmul`, `fcom`, `fsqrt` ...). A few ops have no inline form and call the helpers below. Unlike the
 `bbr_*` helpers above, these are **defined in the generated `.so`** (hidden visibility, no import): `bb-recomp` compiles
 `tools/recomp/helpers/bbr_x87_all.c` with the target's clang (NDK clang, `aarch64-linux-android30`, for the Android `.so`; the system clang for

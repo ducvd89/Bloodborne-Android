@@ -1,5 +1,7 @@
 # Phase 6 (native-only AOT runtime): done on branch recomp-p6
 
+> Superseded by phase 7 (docs/STATIC_RECOMPILE_PLAN.md, "Phase 7 status"): the FEX build and the `BB_AOT_ONLY` switch are gone; the native-only runtime built from `cpu/CMakeLists.txt` is the only one, and strict mode is the only mode.
+
 Branch recomp-p6 (from recomp-rt 142f8e8); nothing pushed, nothing run on the device, the game was never run on the PC. Design and numbers: docs/STATIC_RECOMPILE_PLAN.md
 ("Phase 6"), the interfaces: docs/RECOMP_ABI.md ("Granular entries", "Misses, strict mode and the misses log", "BB_AOT_ONLY"), the tool: tools/recomp/README.md.
 

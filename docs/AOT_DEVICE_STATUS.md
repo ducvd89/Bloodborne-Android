@@ -1,5 +1,7 @@
 # AOT on the AYN Thor: status (branch recomp-rt, 2026-10-24)
 
+> Historical (before phase 7): FEXCore as the fallback, `aot_device.sh`, `BB_AOT=0` and the FEX builds described below no longer exist in this repository. The `BB_AOT_ONLY` results are the runtime that phase 7 made the only one (docs/STATIC_RECOMPILE_PLAN.md).
+
 The game's x86-64 code runs as ahead-of-time units (bb-recomp: FEX front end -> LLVM -> AArch64 `.so`) on the Thor
 (Snapdragon 8 Gen 2), with FEXCore as the fallback on the same CPU state (cpu/guest_cpu_aot.cpp, docs/RECOMP_ABI.md).
 

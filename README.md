@@ -34,7 +34,7 @@ A port of Bloodborne (PS4, **v1.09**), not an emulator. Experimental. You need y
 - **Online play** (new in 1.2.0): co-op, PvP, notes and bloodstains through the community servers **Seamless Hunt** (account from seamlesshunt.com) or **The Hunter's Dream** (Discord sign-in). Online status badge on the game screen; cheats and pause are off while you play online. Seamless co-op is available as an experimental option.
 - **Hunter's Atlas live map** (new in 1.1.0): your position, floors, lamps, pickups and NPCs on a second screen (the AYN Thor's other screen, or an external display), or as a floating mini map over the game. Based on [Hunter's Atlas](https://github.com/MikeTat1988/HuntersAtlas) by MikeTat1988; the map data (about 34 MB) is downloaded when you turn it on and updates itself.
 - **Route finding on the map** (new in 1.2.0): tap a lamp, item, NPC or any spot to get a route drawn as footprints, with ladders, lifts, drops, levers and doors (open, closed, which side opens). Hold the mini map for 2 seconds to open the full map over the game.
-- **Native CPU** (experimental, new): the game's code compiled to ARM ahead of time on your own PC, so the phone no longer translates it while you play. You build it from your own game PKGs with the free [Rebuild Tool](docs/NATIVE_CPU.md) (Windows, or a Linux AppImage), copy the folder it makes to the phone, and the app does the rest. It cannot be downloaded: it is made from your game.
+- **Native ARM64 code** (new in 2.0.0, required): the game's x86-64 code is compiled to ARM ahead of time, once, on your own PC with the free [Bloodborne Android Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool) (Windows or Linux), so the phone runs it as native code and never translates anything while you play. The tool turns your game PKGs into a folder to copy to the phone. See [Native code](#native-code-required) below.
 - **Pause game** from the side menu; the game also pauses on its own when you leave the app or the screen turns off.
 - **Unified memory** (new in 1.0.0): vertex and index data is shared by the game and the GPU instead of kept twice, about 8% less RAM.
 - **Updates and bug reports from the app's menu.**
@@ -51,8 +51,10 @@ Other Adreno 6xx/7xx/8xx devices are untested. **Mali is not supported** (PanVK 
 ## Install
 
 1. Install the APK from [Releases](https://github.com/ducvd89/Bloodborne-Android/releases/latest).
-2. Copy your extracted Bloodborne dump, with the **1.09 update** merged in, to the phone. Every region works (CUSA00900, 03179, 00207, 03173, 00208, 00299, 03014, 01363, 03023).
-3. Open the app and pick the folder with `eboot.bin`. The first start takes a few minutes.
+2. **On a PC, build the game once with the [Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool)** (its README has a step-by-step guide). It extracts your Bloodborne PKGs with the **1.09 update** merged in, compiles the game's code to native ARM64, and writes one folder with both. Every region works (CUSA00900, 03179, 00207, 03173, 00208, 00299, 03014, 01363, 03023).
+3. Copy that folder to the phone, open the app and pick it. The native code (its `aot/` folder) is imported by itself. The first start takes a few minutes.
+
+Already have an extracted 1.09 dump? Point the tool at it (`--game`) instead of PKGs, or install PKGs on the phone from the app and add the native code afterwards (see below). The app does not start the game without the native code.
 
 Use the original 1.09 `eboot.bin`: pre-patched 60 FPS ones crash in the gestures menu. Updates keep your saves, settings, mods and game folder. Later updates install from the menu (**Check for updates**).
 
@@ -62,11 +64,21 @@ On ColorOS / OxygenOS a "Security warning" may appear at launch: tap **Got it**.
 
 Swipe in from the left edge or press Back.
 
-- **Game**: Back to game, **Pause game** / Play game, Game settings (skip intros and the online screen, free camera, debug menu), Cheats, Mods, **Hunter's Atlas** (map on/off, second screen or floating mini map, opacity, size, footprint size), **Online** (server, account, connection test).
+- **Game**: Back to game, **Pause game** / Play game, Game settings (skip intros and the online screen, free camera, debug menu), Cheats, Mods, **Hunter's Atlas** (map on/off, second screen or floating mini map, opacity, size, footprint size), **Online** (server, account, connection test), **Native CPU** (status of the native code, import it, link to the Rebuild Tool).
 - **Graphics**: aspect ratio, resolution, upscaler, FPS limit, effects; **Bloodframe**; GPU driver.
 - **Controls**: on-screen controller and its layout (also moves and resizes the mini map). Drag outside the buttons to turn the camera.
 - **Storage**: game folder, back up and restore saves.
 - **App**: Report a problem, Check for updates, Debug options (turn off unified memory if you see new glitches or crashes).
+
+## Native code (required)
+
+Since 2.0.0 the app has no x86 translator: the game's code runs only as ahead-of-time compiled ARM64 code, in the file `libbbaot.so` (with `libbbaot.json`, which says which game build it was made from). It is made from **your** game, so it cannot be downloaded or shared: you build it once, on a PC, with the [Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool) (Windows, or a Linux AppImage; the tool's README has the guide). A phone-only install cannot produce it.
+
+- **Without a matching `libbbaot.so` the game does not start.** The app shows a full-screen message with the steps, a button to the tool's page, and **Choose game folder** / **Import libbbaot.so…**. The same page is in the menu under **Native CPU**, which shows what is installed and whether it fits your game.
+- **Choosing the folder the tool made** imports `aot/libbbaot.so` and `aot/libbbaot.json` automatically (the app copies them into its own storage). You can also import the two files by hand.
+- The library has to be built from the **same game build** (the original 1.09 `eboot.bin`) and by a tool version that matches the app (ABI version 1). The app checks both and the file's checksum before the game starts.
+- **Installing PKGs on the phone** (**Install from PKG**) still extracts the game, but it cannot make the native code: the tool's output already contains the game and the native code together, so building the folder on the PC is the recommended path.
+- If the game stops with *"native code is missing an entry"*, send the `logs/aot-misses.log` (Menu → **Report a problem**): the tool can close the gap from that log and you rebuild once.
 
 ## Settings and performance
 
@@ -100,13 +112,13 @@ Menu → **Report a problem** saves a logs zip (device, settings, logs; no saves
 
 ## How it works
 
-The game's own `eboot.bin` runs on the phone. [FEXCore](https://github.com/FEX-Emu/FEX) translates its x86-64 code to ARM64. Its calls to PS4 system libraries go to native replacements, and its GPU commands and shaders are translated to Vulkan by shadPS4's renderer as [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) tailored it. Everything is a plain Android (NDK) program: no Linux system, Wine or Box64.
+The game's own `eboot.bin` runs on the phone as native ARM64 code: the Rebuild Tool compiled its x86-64 code ahead of time (`libbbaot.so`), and nothing is translated while you play. Its calls to PS4 system libraries go to native replacements, and its GPU commands and shaders are translated to Vulkan by shadPS4's renderer as [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) tailored it. Everything is a plain Android (NDK) program: no Linux system, Wine or Box64.
 
 ```mermaid
 flowchart LR
   app["Android app<br>menu, screen, sound, input"] --> game
   subgraph game["Game process (ARM64)"]
-    eboot["eboot.bin (x86-64)"] --> fex["FEXCore"] --> rt["PS4 libraries<br>(native)"] --> gpu["Renderer → Vulkan<br>GSR 2 / FSR 3.1, Bloodframe"] --> drv["Turnip driver"]
+    eboot["eboot.bin (x86-64)<br>as native ARM64 (libbbaot.so)"] --> rt["PS4 libraries<br>(native)"] --> gpu["Renderer → Vulkan<br>GSR 2 / FSR 3.1, Bloodframe"] --> drv["Turnip driver"]
   end
   gpu -- "frames" --> app
 ```
@@ -125,6 +137,6 @@ More in [docs/ANDROID_THOR.md](docs/ANDROID_THOR.md). The Linux PC build: [bbpor
 
 ## Credits
 
-[bloodborne_pc](https://github.com/deadinside28/bloodborne_pc), [shadPS4](https://github.com/shadps4-emu/shadPS4), [ARM_bloodborne_pc](https://github.com/MaSieS4Fun/ARM_bloodborne_pc), [FEX](https://github.com/FEX-Emu/FEX), [fexdroid](https://github.com/cobrabm12/fexdroid), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), [mesa-unified](https://github.com/whitebelyash/mesa-unified), [StevenMXZ's Turnip builds](https://github.com/StevenMXZ/Adreno-Tools-Drivers), [panvk-kbase-android](https://github.com/JICA98/panvk-kbase-android), [Snapdragon GSR](https://github.com/SnapdragonStudios/snapdragon-gsr) (Qualcomm, BSD-3-Clause), [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) by PancakeTAS and [GameNative's fork](https://github.com/Ragnarok93/lsfg-vk-android), [GoldHEN cheats](https://github.com/GoldHEN/GoldHEN_Cheat_Repository) (Shiningami), [Hunter's Atlas](https://github.com/MikeTat1988/HuntersAtlas) by MikeTat1988 (live map, map generator and art, GPL-2.0), [BBSC](https://github.com/CLSAMG22/BBSC) (seamless co-op), [droogie/bbhost](https://github.com/droogie/bbhost) (The Hunter's Dream backend, GPL-3.0-or-later). Online servers run by [Seamless Hunt](https://seamlesshunt.com) and [The Hunter's Dream](https://thehuntersdream.com), who are not affiliated with this app.
+[bloodborne_pc](https://github.com/deadinside28/bloodborne_pc), [shadPS4](https://github.com/shadps4-emu/shadPS4), [ARM_bloodborne_pc](https://github.com/MaSieS4Fun/ARM_bloodborne_pc), [FEX-Emu](https://github.com/FEX-Emu/FEX) (its front end builds the native code in the Rebuild Tool; the CPUID model is ported from it, MIT), [fexdroid](https://github.com/cobrabm12/fexdroid), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), [mesa-unified](https://github.com/whitebelyash/mesa-unified), [StevenMXZ's Turnip builds](https://github.com/StevenMXZ/Adreno-Tools-Drivers), [panvk-kbase-android](https://github.com/JICA98/panvk-kbase-android), [Snapdragon GSR](https://github.com/SnapdragonStudios/snapdragon-gsr) (Qualcomm, BSD-3-Clause), [FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan), [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) by PancakeTAS and [GameNative's fork](https://github.com/Ragnarok93/lsfg-vk-android), [GoldHEN cheats](https://github.com/GoldHEN/GoldHEN_Cheat_Repository) (Shiningami), [Hunter's Atlas](https://github.com/MikeTat1988/HuntersAtlas) by MikeTat1988 (live map, map generator and art, GPL-2.0), [BBSC](https://github.com/CLSAMG22/BBSC) (seamless co-op), [droogie/bbhost](https://github.com/droogie/bbhost) (The Hunter's Dream backend, GPL-3.0-or-later). Online servers run by [Seamless Hunt](https://seamlesshunt.com) and [The Hunter's Dream](https://thehuntersdream.com), who are not affiliated with this app.
 
 Licensed under [GPL-2.0-or-later](LICENSE); the online module includes GPL-3.0-or-later code (droogie/bbhost), so the app as a whole is distributed under GPL-3.0-or-later; third-party notices in [THIRD_PARTY_LICENSES.txt](tools/android/frontend/THIRD_PARTY_LICENSES.txt). Not affiliated with Sony Interactive Entertainment, FromSoftware, Qualcomm, Valve or the developers of Lossless Scaling.

@@ -15,11 +15,11 @@ archive as an asset. At the first start `RuntimeInstaller` unpacks it into the a
 ```
 bbport/bionic/bin/    bb-probe (the game process)  bb-prepare (game preparation)
                       kgsl-chip-id (GPU family)    ps4-pkg-tool (PKG installs)
-bbport/bionic/lib/    libbbgpu.so  libbbcpu.so (FEXCore)  libc++_shared.so
+bbport/bionic/lib/    libbbgpu.so  libbbcpu.so (native units engine)  libc++_shared.so
                       libbloodframe.so (Lossless Scaling frame generation; libbbgpu loads it only when it is on)
 bbport/patch-parts/   the settings' game patches (effects, model detail, resolutions, cheats, ...)
 bbport/run-bionic.sh  the launch script (Android's own sh; toybox tools only)
-bbport/fex-compatible.json, bbport/bbport.default.ini, bbport/licenses/
+bbport/bbport.default.ini, bbport/licenses/
 bbport/data, logs, user   created empty; user/ holds the saves
 drivers/<name>/       GPU drivers the player installed (adrenotools-style zips: driver.lib names the library)
 home/bbport/          FEXCore's config and cache
@@ -249,10 +249,10 @@ combat actions and camera movement in 3D gameplay remain unverified.
 
 The Linux prototype has also hit host-memory faults in some runs, including
 during a menu-navigation test. Strict TSO memory ordering and full x87 precision
-were tested, but a later run still crashed. `fex-compatible.json` retains its
+were tested, but a later run still crashed. (Historical: `fex-compatible.json`, removed in 2.0.0, retained its
 historical filename; it now selects FEX's Fast profile (TSO emulation off,
 reduced x87 precision) for maximum CPU speed. This can expose additional
-crashes or hangs in multithreaded code.
+crashes or hangs in multithreaded code.)
 Logs are retained in `out/thor-game-controller.log` and
 `out/thor-game-controller-compatible.log`.
 

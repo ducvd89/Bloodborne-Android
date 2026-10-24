@@ -1,5 +1,7 @@
 # AOT runtime backend: state at the handoff (2026-10-24, branch recomp-rt)
 
+> Historical (before phase 7): written for the hybrid runtime with FEXCore as fallback; see docs/STATIC_RECOMPILE_PLAN.md, "Phase 7 status".
+
 Design: `cpu/guest_cpu_aot.cpp` exports guest_cpu.h; the old CPU (src/runtime_cpu.c on x86-64, cpu/guest_cpu_fex.cpp on ARM64) is the
 fallback, compiled under the names bb_fb_* (`cpu/guest_cpu_rename.h`, BB_AOT_FALLBACK). Details and requests: docs/RECOMP_ABI.md.
 
