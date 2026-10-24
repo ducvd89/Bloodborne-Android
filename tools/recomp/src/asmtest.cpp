@@ -285,6 +285,78 @@ std::string runResumeTest(int opt) {
 }
 
 
+// Granular entries (docs/RECOMP_ABI.md, "Granular entries"): a unit lifted with granularAll can be entered at every instruction boundary it holds, with
+// the resume flag set and rip at the address: it continues there with the registers in the guest state and the flags from the context (flags are
+// live across a jump, unlike after a call); at an address that is no instruction boundary it returns at once with the flag still set.
+//     @0 mov rbx, 5 ; @7 add rbx, 3 ; @11 mov rax, rbx ; @14 cmp rbx, 100 ; @18 jge @24 ; @20 add rax, 1 ; @24 hlt
+std::string runGranularTest(int opt) {
+  static const uint8_t code[] = {0x48, 0xc7, 0xc3, 5, 0, 0, 0,  0x48, 0x83, 0xc3, 3,  0x48, 0x89, 0xd8,  0x48, 0x83, 0xfb, 100,  0x7d, 4,  0x48, 0x83, 0xc0, 1,  0xf4};
+  mapFixed(0xe8000000 - PageSz, PageSz * 2);
+  mapFixed(CodeBase, PageSz);
+  memcpy((void*)CodeBase, code, sizeof code);
+  static ElfImage img; img.base = 0;
+  LiftOptions lo; lo.gapUnits = false; lo.multiblock = true; lo.granularAll = true;
+  TargetSpec ts; ts.aarch64 = false; ts.opt = opt;
+  Jit jit(img, lo, ts);
+  g_jit = &jit;
+  jit.rangeEnd = [](uint64_t t) -> uint64_t { return t >= CodeBase && t < CodeBase + sizeof code ? CodeBase + sizeof code : 0; };
+  if (!jit.err.empty()) return "FAIL jit init: " + jit.err;
+  alignas(64) static CPUState st;
+  static CPUState::gdt_segment gdt[32];
+  auto reset = [&] {
+    new (&st) CPUState();
+    st.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_GDT] = gdt;
+    st.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_LDT] = gdt;
+    st.cs_idx = CPUState::DEFAULT_USER_CS << 3;
+    auto* cs = CPUState::GetSegmentFromIndex(st, st.cs_idx);
+    CPUState::SetGDTBase(cs, 0); CPUState::SetGDTLimit(cs, 0xFFFFFu); cs->L = 1; cs->D = 0;
+    st.gregs[4] = 0xe8000000;
+  };
+  if (!jit.compile(CodeBase, CodeBase + sizeof code)) return "FAIL compile: " + jit.err + jit.liftFailure;
+  Jit::Fn entry = jit.find(CodeBase);
+  if (!entry) return "FAIL no entry";
+  struct sigaction sa {}; sa.sa_handler = jitOnSignal; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_NODEFER | SA_ONSTACK;
+  static char altstack[1 << 16];
+  stack_t ss {}; ss.ss_sp = altstack; ss.ss_size = sizeof altstack; sigaltstack(&ss, nullptr);
+  for (int sg : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(sg, &sa, nullptr);
+  alarm(20);
+  // 0 reached hlt, 1 returned without hlt, 2 failed
+  auto run = [&](uint64_t rip, uint64_t flag, uint64_t rax, uint64_t rbx, uint32_t nzcv) -> int {
+    reset(); st.rip = rip; st.gregs[0] = rax; st.gregs[3] = rbx; st._pad1 = flag;
+    memcpy(&st.flags[24], &nzcv, 4);
+    g_haltKind = 0;
+    if (sigsetjmp(g_halt, 1) == 0) { entry(&st); return 1; }
+    return g_haltKind == 1 ? 0 : 2;
+  };
+  auto expect = [&](const char* what, uint64_t got, uint64_t want) -> std::string {
+    return got == want ? "" : std::string("FAIL ") + what + ": got " + std::to_string(got) + ", want " + std::to_string(want);
+  };
+  std::string e;
+  if (run(CodeBase, 0, 0, 0, 0) != 0 || !(e = expect("ordinary run: rax", st.gregs[0], 9)).empty()) return e.empty() ? "FAIL ordinary run" : e;
+  const uint64_t flagN = 0x80000000u;   // NZCV word: N set, V clear: x86 jl taken (SF != OF), jge not taken
+  struct Case { const char* what; uint64_t at, rax, rbx; uint32_t nzcv; uint64_t wantRax; };
+  const Case cases[] = {
+    {"enter at add rbx", 7, 0, 40, 0, 44},
+    {"enter at mov rax, rbx", 11, 0, 200, 0, 200},        // cmp 200 vs 100 -> jge taken: no add
+    {"enter at cmp", 14, 5, 7, 0, 6},                      // 7 < 100: add rax, 1
+    {"enter at jge, flags clear (GE)", 18, 77, 0, 0, 77},  // taken: straight to hlt
+    {"enter at jge, flags N set (LT)", 20 - 2, 77, 0, uint32_t(flagN), 78},   // not taken: add rax, 1 (the flags come from the context)
+    {"enter at add rax, 1", 20, 41, 0, 0, 42},
+    {"enter at hlt", 24, 5, 0, 0, 5},
+    {"enter at the first instruction", 0, 0, 0, 0, 9},
+  };
+  for (auto& c : cases) {
+    const int r = run(CodeBase + c.at, 1, c.rax, c.rbx, c.nzcv);
+    if (r != 0) return std::string("FAIL ") + c.what + ": the unit did not reach hlt (" + std::to_string(r) + ")";
+    if (!(e = expect(c.what, st.gregs[0], c.wantRax)).empty()) return e;
+    if (st._pad1 != 0) return std::string("FAIL ") + c.what + ": the resume flag was not cleared";
+  }
+  for (uint64_t bad : {1ull, 3ull, 9ull, 12ull, 15ull, 19ull, 21ull, 25ull})
+    if (run(CodeBase + bad, 1, 0, 0, 0) != 1 || st._pad1 != 1) return "FAIL a non-boundary address (+" + std::to_string(bad) + ") must return at once with the flag set, flag " + std::to_string(st._pad1);
+  alarm(0);
+  return "PASS";
+}
+
 // Hook slots (docs/RECOMP_ABI.md, "Hook slots"): at a hook site the unit tests bbr_hook_slot[k]; when set it spills the state, calls the slot and
 // acts on the result: 0 = run the instruction, 1 = rip set by the callback (a resume point of the site, or the dispatcher), 2 = the callback
 // returned from the function. The slot may be set and cleared while the code runs. Each case compiles its own unit set.
@@ -619,7 +691,7 @@ std::string skipReason(const Test& t, const std::set<std::string>& disabled) {
 int main(int argc, char** argv) {
   setpriority(PRIO_PROCESS, 0, 19);
   std::string fexDir = "out/recomp-fex", nasm = BBR_NASM, outFile = "out/recomp/asmtest.txt", filter;
-  int opt = 1; unsigned jobs = 22; bool verbose = false; bool listAll = false, resumeTest = false, hookTest = false, variantTest = false;
+  int opt = 1; unsigned jobs = 22; bool verbose = false; bool listAll = false, resumeTest = false, hookTest = false, variantTest = false, granularTest = false;
   for (int i = 1; i < argc; ++i) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s); };
     auto arg = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "missing argument\n"); exit(2); } return argv[++i]; };
@@ -633,6 +705,7 @@ int main(int argc, char** argv) {
     else if (is("--list")) listAll = true;
     else if (is("--resume-selftest")) resumeTest = true;
     else if (is("--hook-selftest")) hookTest = true;
+    else if (is("--granular-selftest")) granularTest = true;
     else if (is("--variant-selftest")) variantTest = true;
     else { fprintf(stderr, "usage: bb-recomp-asmtest [--fex <FEX tree>] [--nasm <nasm>] [--filter <substr>] [--out <file>] [--jobs n] [-O0|-O1|-O2] [-v]\n"); return 2; }
   }
@@ -642,6 +715,13 @@ int main(int argc, char** argv) {
     if (pid == 0) { const std::string v = runResumeTest(opt); puts(v.c_str()); _exit(v == "PASS" ? 0 : 1); }
     int st = 0; waitpid(pid, &st, 0);
     printf("resume entries self-test: %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "PASS" : "FAIL");
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
+  }
+  if (granularTest) {
+    const pid_t pid = fork();
+    if (pid == 0) { const std::string v = runGranularTest(opt); puts(v.c_str()); fflush(stdout); _exit(v == "PASS" ? 0 : 1); }
+    int st = 0; waitpid(pid, &st, 0);
+    printf("granular entries self-test: %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "PASS" : "FAIL");
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
   }
   if (variantTest) {
