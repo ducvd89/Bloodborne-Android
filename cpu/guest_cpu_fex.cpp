@@ -553,6 +553,12 @@ void guest_cpu_invalidate(uintptr_t address, size_t size) {
     }
 }
 
+#ifndef BB_AOT_FALLBACK  // (the ahead-of-time engine, cpu/guest_cpu_aot.cpp, has the native hook slots; FEX alone has none)
+int guest_cpu_hook_slot(uintptr_t, size_t, GuestHookEx, void*) { return 0; }
+int guest_cpu_has_hook_slot(uintptr_t) { return 0; }
+void guest_cpu_hook_slot_clear(uintptr_t) {}
+#endif
+
 uint64_t guest_cpu_tsc(void) {
     uint64_t value;
     asm volatile("mrs %0, cntvct_el0" : "=r"(value));

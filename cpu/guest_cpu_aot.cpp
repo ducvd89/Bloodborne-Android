@@ -114,6 +114,7 @@ struct Engine {
     std::vector<Where> by_address;
     uintptr_t so_lo = ~uintptr_t(0), so_hi = 0;
     std::vector<uint8_t> dirty;     // per unit
+    std::vector<UnitFn> fns;        // per unit: what the dispatch table runs (patch variants replace entries; guest_cpu_aot_hooks.inc)
     std::atomic<uint64_t> dirty_count {0}, dirty_unchecked {0};
     uint8_t* dirty_flags = nullptr;       // the .so's bbr_dirty[] (units check it at entry), or null
     const uint64_t* ends = nullptr;       // bbr_unit_end[] or null
@@ -229,7 +230,7 @@ inline UnitFn Lookup(uint64_t offset) {
     uint32_t h = (key * 0x9E3779B1u) >> E.shift;
     for (;;) {
         const uint32_t k = E.table[h].key.load(std::memory_order_relaxed);
-        if (k == key) return E.units[E.table[h].index].fn;
+        if (k == key) return E.fns[E.table[h].index];
         if (k == 0) return nullptr;
         h = (h + 1) & E.mask;
     }
@@ -260,6 +261,8 @@ bool BuildTable() {
     std::sort(E.by_address.begin(), E.by_address.end(), [](const Engine::Where& a, const Engine::Where& b) { return a.fn < b.fn; });
     E.so_hi += 1 << 20; // the last function's body (no unit is anywhere near a megabyte past the previous entry)
     E.dirty.assign(E.count, 0);
+    E.fns.resize(E.count);
+    for (uint64_t i = 0; i < E.count; ++i) E.fns[i] = E.units[i].fn;
     return true;
 }
 
@@ -685,6 +688,8 @@ uint64_t UnitEnd(uint64_t i) {
     return i + 1 < E.count ? E.units[i + 1].vaddr : E.text_end;
 }
 
+#include "guest_cpu_aot_hooks.inc"  // patch variants and native hook slots (docs/RECOMP_ABI.md)
+
 void MarkDirty(uintptr_t address, size_t size) {
     if (!E.on || !E.base || !size || address + size <= E.base || address >= E.base + E.size) return;
     const uint64_t lo = std::max<uintptr_t>(address, E.base) - E.base;
@@ -695,8 +700,9 @@ void MarkDirty(uintptr_t address, size_t size) {
     // Units overlap (secondary entries repeat the code after them up to their function's end): units that start before lo
     // may still cover it.
     for (uint64_t back = 0; first > 0 && back < 4096; ++back) --first;
+    NewResolveEpoch();
     for (uint64_t i = first; i < E.count && E.units[i].vaddr < hi; ++i)
-        if (UnitEnd(i) > lo) DirtyUnit(i);
+        if (UnitEnd(i) > lo) ResolveUnit(i);  // (was DirtyUnit: the function is classified again from its bytes: original, variant or dirty)
 }
 
 uint64_t Fnv(const unsigned char* p, uint64_t n) {
@@ -733,7 +739,7 @@ void PrepareImage() {
     }
     {
         std::lock_guard<std::mutex> guard(E.lock);
-        for (uint64_t i : bad_units) DirtyUnit(i);
+        ResolveUnits(bad_units);
     }
     std::printf("AOT: image checked in %.0f ms: %llu units; %llu differ (patched or hooked), %llu units with their functions' other units "
                 "run on the fallback CPU\n", ms, (unsigned long long)E.count, (unsigned long long)bad, (unsigned long long)E.dirty_count.load());
@@ -801,6 +807,7 @@ void Load(const char* path) {
     if (E.dirty_flags)  // units the tool could not lower completely start dirty
         for (uint64_t i = 0; i < E.count; ++i)
             if (E.dirty_flags[i]) { E.dirty[i] = 1; ++E.trap_units; }
+    LoadVariantTables(so, abi_flags ? *abi_flags : 0);
     E.so_lo &= ~uintptr_t(0xfff);
     E.on = true;
     std::printf("AOT: %s: %llu units; unit entry check %s, exact unit ranges %s; %llu units with unsupported ops run on the fallback\n", path,
@@ -844,6 +851,7 @@ BBR_EXPORT void bbr_dispatch_tail(GuestState* s) {
 // body, a landing pad, a setjmp return site, a jump into a function) is entered by a jump, with no return address of its own on
 // top: the fallback runs from there to the end of the guest stack, as for a jump into the middle of a unit.
 BBR_EXPORT void bbr_dirty_entry(GuestState* s, uint64_t vaddr) {
+    if (UnitFn variant = VariantRedirect(vaddr)) { variant(s); return; }  // a patch variant of this unit is active (guest_cpu_aot_hooks.inc)
     Thread* t = Current();
     const uint64_t target = E.base + vaddr;
     s->rip = target;
@@ -1219,8 +1227,28 @@ int guest_cpu_handle_fault(int sig, siginfo_t* info, void* ucontext) {
 int guest_cpu_is_native(void) { return NativeFallback && !E.on; }
 
 int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook) {
-    MarkDirty(address, size);
-    return bb_fb_hook(address, size, hook);
+    if (InstallSlot(address, hook, nullptr, nullptr)) return 1;  // a native hook site: no code is written
+    const int done = bb_fb_hook(address, size, hook);
+    MarkDirty(address, size);  // (after the write: the function is classified from its bytes)
+    return done;
+}
+int guest_cpu_hook_slot(uintptr_t address, size_t size, GuestHookEx hook, void* context) {
+    (void)size;
+    return hook ? InstallSlot(address, nullptr, hook, context) : 0;
+}
+int guest_cpu_has_hook_slot(uintptr_t address) {
+    if (!E.on || !V.nsites) return 0;
+    const int64_t k = SiteIndex(address);
+    if (k < 0) return 0;
+    std::lock_guard<std::mutex> guard(E.lock);
+    return SiteRunsNatively(k) ? 1 : 0;
+}
+void guest_cpu_hook_slot_clear(uintptr_t address) {
+    if (!E.on || !V.nsites) return;
+    const int64_t k = SiteIndex(address);
+    if (k < 0) return;
+    __atomic_store_n(&V.slots[k], static_cast<void*>(nullptr), __ATOMIC_RELEASE);
+    V.recs[k].store(nullptr, std::memory_order_release);
 }
 void guest_cpu_invalidate(uintptr_t address, size_t size) {
     MarkDirty(address, size);
