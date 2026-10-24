@@ -1,5 +1,8 @@
 /* guest_cpu.h on x86-64 hosts: the game's code runs on the host CPU, so crossings are plain calls. */
 #define _GNU_SOURCE
+#ifdef BB_AOT_FALLBACK /* cpu/guest_cpu_aot.cpp exports guest_cpu.h and runs this CPU for the code the AOT units do not cover */
+#include "../cpu/guest_cpu_rename.h"
+#endif
 #include "guest_cpu.h"
 #if defined(GUEST_CPU_NATIVE)
 #include "runtime.h"
@@ -14,6 +17,9 @@
 #include <asm/prctl.h>
 #endif
 
+#ifndef BB_AOT_FALLBACK
+int guest_cpu_is_native(void) { return 1; }
+#endif
 void guest_cpu_init(void *(*map)(size_t size, int prot)) { (void)map; }
 void guest_cpu_code(uintptr_t base, size_t size) { (void)base; (void)size; }
 uintptr_t guest_cpu_host_function(void *fn) { return (uintptr_t)fn; }

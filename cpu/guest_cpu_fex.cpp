@@ -2,6 +2,7 @@
 // guest_cpu.h through FEXCore: the game's x86-64 code runs in FEX's JIT, each host thread with its own
 // guest CPU state. Host functions are reached from the guest through stubs that end in `syscall`
 // (dispatched by HandleSyscall below); guest functions are called with Context::HandleCallback.
+#include "guest_cpu_rename.h" // BB_AOT_FALLBACK: this file's guest_cpu_* become bb_fb_*, the fallback of cpu/guest_cpu_aot.cpp
 #include "guest_cpu.h"
 
 #include <Common/Config.h>
@@ -79,6 +80,7 @@ constexpr size_t StubBytes = 1 << 20;
 constexpr size_t SyscallOffset = 3;
 unsigned char* stubs;
 uintptr_t callback_ret;
+uintptr_t sentinel_ret;
 void* stub_functions[StubBytes / StubSize];
 std::atomic<size_t> stub_count;
 std::mutex stub_lock;
@@ -327,7 +329,11 @@ void guest_cpu_init(void* (*map)(size_t size, int prot)) {
     stubs[0] = 0x0f;
     stubs[1] = 0x3e;
     callback_ret = reinterpret_cast<uintptr_t>(stubs);
-    stub_count = 1;
+    // A second CALLBACKRET, the sentinel of guest_cpu_aot.cpp: where a guest call's bottom frame returns to.
+    stubs[StubSize] = 0x0f;
+    stubs[StubSize + 1] = 0x3e;
+    sentinel_ret = reinterpret_cast<uintptr_t>(stubs) + StubSize;
+    stub_count = 2;
     guest_cpu_code(reinterpret_cast<uintptr_t>(stubs), StubBytes);
     std::printf("Guest CPU: FEXCore JIT (x86-64 guest on this host), TSC x%u\n", 1u << tsc_shift);
 }
@@ -551,3 +557,67 @@ uint64_t guest_cpu_tsc_frequency(void) {
     return frequency << tsc_shift;
 }
 } // extern "C"
+
+// ---- cpu/guest_cpu_aot.cpp: the units' GuestState is FEX's CPUState of this thread; FEX runs what they do not cover ----
+#ifdef BB_AOT_FEX_STATE
+extern "C" {
+GuestState* bb_fb_state(void) {
+    return &Current()->thread->CurrentFrame->State;
+}
+
+int bb_fb_wide_xmm(void) {
+    return wide_xmm ? 1 : 0;
+}
+
+uint64_t bb_fb_sentinel(void) {
+    return sentinel_ret;
+}
+
+void* const* bb_fb_stubs(uintptr_t* base, size_t* bytes) {
+    *base = reinterpret_cast<uintptr_t>(stubs);
+    *bytes = StubBytes;
+    return stub_functions;
+}
+
+void bb_fb_run(GuestState* s, uint64_t target, int call) {
+    using namespace FEXCore::X86State;
+    GuestThread* t = Current();
+    auto& st = t->thread->CurrentFrame->State;
+    if (&st != s) {
+        Fatal("bb_fb_run on a state that is not this thread's");
+    }
+    if (!call) {
+        // In a frame the stack holds already (a longjmp or an exception unwound to it): runs to the sentinel at the bottom.
+        ctx->HandleCallback(t->thread, target);
+        st.rip = sentinel_ret;
+        return;
+    }
+    // The return address of the call that reached `target` is on top of the stack. HandleCallback pushes its own return
+    // trampoline 16 bytes below the stack pointer it is given: with RSP at slot + 16 that lands in the slot itself, replacing
+    // the return address (kept here), and the callee finds its stack arguments where a call left them.
+    const uint64_t slot = st.gregs[REG_RSP];
+    const uint64_t original = *reinterpret_cast<uint64_t*>(slot);
+    st.gregs[REG_RSP] = slot + 16;
+    ctx->HandleCallback(t->thread, target);
+    if (st.gregs[REG_RSP] == slot + 16) {
+        st.rip = original;            // the callee returned to the trampoline: the stack is as after a `ret`
+        st.gregs[REG_RSP] = slot + 8;
+    } else {
+        st.rip = sentinel_ret;        // the guest unwound past this call and returned to the sentinel
+    }
+}
+
+void bb_fb_cpuid(uint64_t function, uint64_t leaf, uint32_t out[4]) {
+    const auto r = ctx->RunCPUIDFunction(uint32_t(function), uint32_t(leaf));
+    out[0] = r.eax;
+    out[1] = r.ebx;
+    out[2] = r.ecx;
+    out[3] = r.edx;
+}
+
+uint64_t bb_fb_xgetbv(uint64_t function) {
+    const auto r = ctx->RunXCRFunction(uint32_t(function));
+    return uint64_t(r.eax) | uint64_t(r.edx) << 32;
+}
+} // extern "C"
+#endif

@@ -353,6 +353,8 @@ __asm__(".text\n"
 #endif
 static void fault(int sig, siginfo_t *info, void *context) __attribute__((noinline));
 void bb_fault_entry(int sig, siginfo_t *info, void *context);
+/* cpu/guest_cpu_aot.cpp (BB_AOT): the AOT state and trace at a crash; absent in builds without it. */
+void bbaot_crash_report(const void *ucontext) __attribute__((weak));
 #ifdef FAULT_ALTSTACK
 void bb_fault_on_thread_stack(int sig, siginfo_t *info, void *context);
 void bb_fault_on_thread_stack(int sig, siginfo_t *info, void *context) {
@@ -461,6 +463,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
         ssize_t written_=write(2, line, strlen(line)); (void)written_;
     }
 #endif
+    if (bbaot_crash_report) bbaot_crash_report(context);
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
     /* Outside the image and any shared object (generated code, a freed mapping): the mapping
      * from /proc/self/maps, and the thread. */
@@ -1007,11 +1010,15 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     typedef void (ABI *Entry)(void *, void (ABI *)(void));
     ((Entry)(image + entry))(&params, guest_exit);
-#elif defined(GUEST_CPU_NATIVE)
-    enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
 #else
-    const uint64_t entry_args[2]={(uint64_t)(uintptr_t)&params,guest_cpu_host_function((void *)guest_exit)};
-    guest_cpu_call((uintptr_t)(image+entry),2,entry_args);
+#ifdef GUEST_CPU_NATIVE
+    if (guest_cpu_is_native()) enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
+    else
+#endif
+    {
+        const uint64_t entry_args[2]={(uint64_t)(uintptr_t)&params,guest_cpu_host_function((void *)guest_exit)};
+        guest_cpu_call((uintptr_t)(image+entry),2,entry_args);
+    }
 #endif
     fail("entry unexpectedly returned");
 }

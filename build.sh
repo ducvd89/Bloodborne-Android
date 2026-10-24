@@ -89,6 +89,15 @@ if [[ $(uname -m) == aarch64 ]]; then
     echo 'Guest CPU: FEXCore (out/fex/libbbcpu.so)'
     cpu=(-Lout/fex -lbbcpu -Wl,-rpath,'$ORIGIN/cpu' -Wl,-rpath,"$PWD/out/fex")
 fi
+# x86-64 hosts: cpu/guest_cpu_aot.cpp runs ahead-of-time units (BB_AOT=<bb-recomp .so>, docs/RECOMP_ABI.md) and sends
+# what they do not cover to src/runtime_cpu.c's native execution (BB_AOT_FALLBACK renames that file's functions).
+aot=()
+aot_defs=()
+if [[ $(uname -m) == x86_64 ]]; then
+    "${CXX:-c++}" -std=c++20 -O2 -g -Wall -Wextra -Werror -pthread -Icpu -Isrc -c cpu/guest_cpu_aot.cpp -o out/guest_cpu_aot.o
+    aot=(out/guest_cpu_aot.o -lstdc++ -ldl)
+    aot_defs=(-DBB_AOT_FALLBACK)
+fi
 runtime=(src/runtime*.c)
 # Third-party decoders: compiled once, without this project's -Werror policy.
 atrac9=(third_party/LibAtrac9/C/src/*.c)
@@ -97,7 +106,7 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
     for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${cpu[@]}" "${libraries[@]}" -o out/bb-probe
+"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${aot_defs[@]}" "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c "${aot[@]}" out/libatrac9.a -lm "${gpu[@]}" "${cpu[@]}" "${libraries[@]}" -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities

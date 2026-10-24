@@ -71,6 +71,9 @@ int guest_cpu_hook(uintptr_t address, size_t size, GuestHook hook);
  * the new bytes when next run. A no-op on x86-64 hosts. The JIT has no page tracking here, so every write
  * of code that may already have run needs this call after it. */
 void guest_cpu_invalidate(uintptr_t address, size_t size);
+/* 1 when the guest code runs on the host CPU and the thread's own stack (x86-64 hosts without BB_AOT): the main thread
+ * then enters the game by calling its entry point on a stack of its own; otherwise it enters through guest_cpu_call. */
+int guest_cpu_is_native(void);
 /* The guest's time stamp counter (RDTSC) and its frequency in Hz. */
 uint64_t guest_cpu_tsc(void);
 uint64_t guest_cpu_tsc_frequency(void);
