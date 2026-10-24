@@ -212,6 +212,9 @@ int64_t runtime_file_close(int fd);
 int64_t runtime_file_read(int fd, void *buffer, uint64_t size);
 int64_t runtime_file_pread(int fd, void *buffer, uint64_t size, int64_t offset);
 int64_t runtime_file_write(int fd, const void *buffer, uint64_t size);
+/* The text of the game's last panic ("[Dantelion2 Panic] file(line) message", printed to fd 1/2 before its deliberate crash) as one line, or 0 (out is
+ * then empty) when it printed none. Async-signal-safe. */
+size_t runtime_panic_text(char *out, size_t size);
 int64_t runtime_file_lseek(int fd, int64_t offset, int whence);
 int64_t runtime_file_stat(const char *path, void *guest_stat);
 int64_t runtime_file_fstat(int fd, void *guest_stat);

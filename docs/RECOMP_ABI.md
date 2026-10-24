@@ -198,6 +198,11 @@ patched function with no variant, an address outside the image.
 - **The game stops** (strict mode, the only mode): the miss is logged and the process exits with status 22 and
   `STOP: AOT: native code is missing an entry at +0x...; please report this (details: logs/aot-misses.log)` (a patched function with no variant: `native code for a patched or hooked
   function has no variant at +0x...`; outside the image: `guest code ran at 0x..., outside the image, which native code cannot run`). No fallback CPU exists to carry on.
+- **The game's own panic is not a miss.** When the address is the instruction after a call (or a return address, `kind=unwind`) and that instruction is a store to address 0
+  (`movl $0xdeadba, 0x0`, any `mov [0], reg/imm`), the game stopped itself (Dantelion2's DL_PANIC prints its message, then crashes on purpose). The log line says `panic +0x... kind=...
+  text="..."` (not `miss`: `--extra-entries` must not turn it into an entry) and the message is `STOP: the game stopped itself after an internal error (panic) at +0x...: <the game's
+  panic text> (no native code is missing; ...)`. The text is what the guest printed to fd 1/2 after a `[Dantelion2 Panic]` marker (`runtime_panic_text`, src/runtime_file.c; the runtime
+  hands it to the engine with `guest_cpu_set_panic_text`); `src/probe.c` prints the same line when the store really faults (SIGSEGV at address 0).
 - **Closing a gap without a code change:** `bb-recomp ... --extra-entries aot-misses.log` makes every logged address a unit entry (an address inside a function becomes an extra unit of
   it, one outside every function a pseudo-function; addresses that do not decode as code are reported and ignored) and the `.so` is rebuilt. `--check-entries a,b,c` (with
   `--units-only`) says for each address whether it is a unit entry, a granular entry, a case of a resolved jump table, or not covered (exit status 3).
@@ -288,6 +293,12 @@ The ABI version the runtime accepts is `BbrAbiVersion` (1) in `cpu/guest_cpu_aot
     blocks, with `bbr_dispatch_tail` (the code above) as the default: an address that is not a case (a table the
     recogniser got wrong, or a computed target) still works, only slower. Registers and flags are not spilled on the switch
     edges (the case blocks are blocks of the same unit); the default edge spills as for any tail jump.
+- **Guest pointers may be null.** Every unit carries the LLVM function attribute `null_pointer_is_valid`. The game stores to address 0 on purpose after a panic
+  (`call <print routine> ; movl $0xdeadba, 0x0` in Dantelion2's DL_PANIC); without the attribute LLVM treats an access through a constant null pointer as undefined
+  behaviour and deletes the block, and with it the call-return block before it: the rip check after the call folds to "returned elsewhere", a normal return becomes
+  an unwind and the game stopped with a missing entry (`kind=unwind`) instead of faulting. With it such an access stays a load/store that faults at run time, as on the
+  PS4. Regression: `bb-recomp-asmtest --null-selftest`, `tests/run_recomp_device_regressions.sh` (case 3). A library built by an older tool still has the problem: the
+  runtime recognises the panic trap at the missed address (below) and says so.
 - **`bbr_image_base`** is a `uint64_t` the loader sets after `dlopen`; every unit loads it once at entry
   (`!invariant.load`) and adds it to each image-relative address. Constants that are image addresses are
   recognised by value: `EntrypointOffset`, `InlineEntrypointOffset`, and a `Constant` inside the image

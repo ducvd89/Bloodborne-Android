@@ -79,6 +79,7 @@ Since 2.0.0 the app has no x86 translator: the game's code runs only as ahead-of
 - The library has to be built from the **same game build** (the original 1.09 `eboot.bin`) and by a tool version that matches the app (ABI version 1). The app checks both and the file's checksum before the game starts.
 - **Installing PKGs on the phone** (**Install from PKG**) still extracts the game, but it cannot make the native code: the tool's output already contains the game and the native code together, so building the folder on the PC is the recommended path.
 - If the game stops with *"native code is missing an entry"*, send the `logs/aot-misses.log` (Menu → **Report a problem**): the tool can close the gap from that log and you rebuild once.
+- If it stops with *"the game stopped itself after an internal error (panic)"*, no native code is missing: the game's own error check fired (the message after it is the game's text); report it with the log instead.
 
 ## Settings and performance
 

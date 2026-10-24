@@ -447,6 +447,14 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    /* The game's own deliberate crash after a panic (a store to address 0 once DL_PANIC has printed its message): say so, with the message. */
+    if (sig == SIGSEGV && info->si_addr == NULL) {
+        char text[1024];
+        if (runtime_panic_text(text, sizeof(text))) {
+            snprintf(line, sizeof(line), "STOP: the game stopped itself after an internal error (panic): %s\n", text);
+            ssize_t written_=write(2, line, strlen(line)); (void)written_;
+        }
+    }
     if (in_guest == GUEST_CPU_IN_HOST_CALL && regs.rip - (uintptr_t)image < 0x10000000) {
         snprintf(line, sizeof(line), "  called by the game at guest offset 0x%lx\n", (unsigned long)(regs.rip - (uintptr_t)image));
         ssize_t written_=write(2, line, strlen(line)); (void)written_;
@@ -729,6 +737,7 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
     guest_cpu_init(runtime_low_map);
+    guest_cpu_set_panic_text(runtime_panic_text);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
     check_cpu();

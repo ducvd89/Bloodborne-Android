@@ -100,6 +100,9 @@ void guest_cpu_invalidate(uintptr_t address, size_t size);
 /* 1 when the guest code runs on the host CPU and the thread's own stack (x86-64 hosts): the main thread
  * then enters the game by calling its entry point on a stack of its own; otherwise it enters through guest_cpu_call. */
 int guest_cpu_is_native(void);
+/* Where the guest CPU gets the game's last panic text from when it has to stop the game (the runtime's runtime_panic_text: one line, 0 when there is
+ * none). Optional; a no-op on x86-64 hosts. */
+void guest_cpu_set_panic_text(size_t (*get)(char *out, size_t size));
 /* The guest's time stamp counter (RDTSC) and its frequency in Hz. */
 uint64_t guest_cpu_tsc(void);
 uint64_t guest_cpu_tsc_frequency(void);

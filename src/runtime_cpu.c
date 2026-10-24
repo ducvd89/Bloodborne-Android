@@ -17,6 +17,7 @@
 int guest_cpu_is_native(void) { return 1; }
 void guest_cpu_init(void *(*map)(size_t size, int prot)) { (void)map; }
 void guest_cpu_code(uintptr_t base, size_t size) { (void)base; (void)size; }
+void guest_cpu_set_panic_text(size_t (*get)(char *out, size_t size)) { (void)get; }
 uintptr_t guest_cpu_host_function(void *fn) { return (uintptr_t)fn; }
 uint64_t guest_cpu_call(uintptr_t fn, unsigned count, const uint64_t *args) {
     typedef uint64_t (ABI *Fn)(uint64_t,uint64_t,uint64_t,uint64_t,uint64_t,uint64_t);
