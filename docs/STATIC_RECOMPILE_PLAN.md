@@ -381,7 +381,7 @@ Repository: `tools/recomp` is a git submodule of the tool repository (pinned at 
 App: without a library that fits (missing, another game build, ABI, checksum) the app shows a full-screen message with the steps, a button to the tool's page and Choose game folder / Import libbbaot.so;
 the drawer row says "Required: not installed". The game folder's `aot/` is imported automatically. The device-side "Install from PKG" extracts the game and then says the native code from the PC tool is still needed.
 
-Build: `libbbcpu.so` 0.93 MB (was 1.1 MB for the no-FEX rehearsal and ~12 MB with FEX); no FEX symbol or string in any output (`tools/android/check_bionic_symbols.sh`, but the two CPUID constants).
+Build: `libbbcpu.so` 0.93 MB with debug info, 123 KB stripped in the APK (1.2.0: 3.9 MB stripped, 35 MB with debug info; the no-FEX rehearsal was 1.1 MB); no FEX symbol or string in any output (`tools/android/check_bionic_symbols.sh`, but the two CPUID constants).
 Tests: `tests/run_aot_native_test.sh` (+ strict, variants), `tests/run_guest_code_hooks_test.sh`, `tests/run_aot_patchers_test.sh`, `tests/android-native-cpu/run.sh`. Not run: the game (never on the PC) and the device (not touched in this phase).
 
 ## Risks

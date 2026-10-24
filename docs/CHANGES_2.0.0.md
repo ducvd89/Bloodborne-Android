@@ -19,7 +19,7 @@
 
 ## FEXCore removed
 
-- The runtime has no FEXCore any more: `libbbcpu.so` is the 0.9 MB native engine (it was about 12 MB with FEX), the APK is smaller, and there is no JIT, interpreter or fallback of any kind.
+- The runtime has no FEXCore any more: `libbbcpu.so` is the native engine alone (123 KB stripped in the APK, it was 3.9 MB with FEX), the APK is smaller, and there is no JIT, interpreter or fallback of any kind.
   Removed with it: `fex-compatible.json`, the FEX submodule and build, the fallback trampolines (`bb_fb_*`), FEX's environment variables and config files, `native_cpu` in `bbport.ini`.
 - Hooks are native slots only: the game's code is never rewritten. Diagnostics that wrote x86 stubs into it (the Gnm census, the observe mode) are off on Android with a log line.
 - The CPUID model the game sees is unchanged (ported from FEX-Emu, MIT; the notice is in the app's licenses).
