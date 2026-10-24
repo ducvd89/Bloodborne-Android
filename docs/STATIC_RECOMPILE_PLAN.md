@@ -306,6 +306,45 @@ Differential test on libc.prx: see `tools/recomp/README.md`.
 Done on the tool and runtime side, not yet run in the game: variant catalogs (patch parts, BBSC tables, cheats cave) compiled as alternate units selected by byte hash, and native hook slots
 (190 BBSC sites, 6-8 shim sites). Inventory and what is left on the fallback (the frame-rate, guard and display patches write run-time addresses): `docs/RECOMP_HOOKS.md`.
 
+## Phase 6: native only, no fallback CPU (2026-10-24, branch recomp-p6)
+
+Device result that motivates it: over 13 minutes 2.80 G unit dispatches and 208 k misses (0.0074 %), all with known causes (docs/AOT_DEVICE_STATUS.md). Fixes, all general:
+
+- **The start stub (+0x20).** The static-initialiser runner that the entry point (+0xa0) calls has no FDE and lies before the first FDE function, outside the module's "code range"
+  (first FDE .. last FDE) that discovery applied to every candidate. A direct call/jmp/jcc target found by lifting is certain control flow, so it now counts anywhere in a module's
+  executable segment. (Data pointers and `lea` targets still need the FDE range: they may be rodata.)
+- **Secondary units reported nothing.** Units lifted as landing pads, setjmp sites and mid-function entries did not feed their out-of-unit targets back into discovery, so a chain
+  entry unit -> mid-function unit -> jump behind it was never closed. They do now (and setjmp sites found inside them are queued): mid-function entries 2145 -> ~3000.
+- **+0x210ebc0 (CSChrThread, 85 k misses)** is a case of the jump table at +0x210eb7c (`movslq (%r11,%rbx,4)` ... `jmp *%rbx`, the `lea r11, [rip+table]` far before the loop). The table was not
+  recognised because `cltq` between the `lea` and the jump was treated as clobbering every register. Per-instruction write masks (cdqe/cdq/mul/div/xchg/cmpxchg/cpuid/rdtsc/syscall/string ops/leave) fix that
+  class: unresolved table-like jumps 45 -> 8.
+- **+0x23a9c9c (EzWorkPool)** is a case of the table at +0x23a97ba: `cmp rax, 11 ; mov rdx, [rbp-0x680] ; ja default ; lea rcx, [table] ; movslq (%rcx,%rax,4) ...` (the scheduler put a `mov` between the
+  `cmp` and the `ja`; the bound was not found and the table was scanned to its first non-target entry). Flag-preserving instructions (mov, lea, movzx, movsxd, push, pop, nop, cdqe ...) between a `cmp` and
+  its `jcc` are now skipped: scanned tables 124 -> 75.
+- `bb-recomp --units-only --check-entries 20,210ebc0,23a9c9c` (no code generated, 2 s): +0x20 unit entry; the two jump targets cases of resolved tables (a block inside the unit that holds the jump).
+
+**Granular entries** (docs/RECOMP_ABI.md) cover what the lifter still cannot resolve: the 8 unresolved and 75 scanned-only table-like jumps, in 62 functions. Every unit of such a function can be entered at any
+instruction boundary it holds, so a dynamic jump to any instruction of the function runs natively. Measured on the whole image (-O1, aarch64, with the variant catalogs, 22 jobs, 61 GB PC):
+
+| | functions | units | entry points | .text | objects | codegen CPU | wall | peak RSS |
+|---|---|---|---|---|---|---|---|---|
+| `--granular off` | 0 | 186,422 | 0 | 105.41 MB | 151.24 MB | 1045 s | 75.6 s | 15.5 GB |
+| `--granular jumps` (default) | 62 | 186,422 (243 granular) | 33,192 | 106.25 MB (+0.8 %) | 152.43 MB | 1170 s (+12 %) | 128 s | 15.2 GB |
+
+Each instruction boundary belongs to one unit of the function (the first that decoded it: entry unit, then gap and secondary units), because secondary units duplicate the code after them: without that the
+first version cost +6.5 MB (+6.2 %) and a shard that took 13 minutes. A block split at an instruction boundary is entered from a switch that bypasses every other block, so SSA values may not cross regions:
+values used from another region go through an alloca (mem2reg turns them back into phis, undefined on the switch edges; LLVM verifier clean on the whole image).
+
+**Instruction-granular entries for every function (`--granular all`) are not affordable.** On the first 12,000 functions (3.3 MB of x86 code, 12,110 units): .text 8.56 -> 15.16 MB (+77 %), 833,204 entry points, codegen CPU
+65 s -> 952 s (14.7x), wall 4.7 s -> 120 s. Scaled to the image that is ~190 MB of `.text` and about 4 CPU-hours (the dominant cost is the per-instruction block split: mem2reg, instruction selection and register
+allocation of tens of thousands of extra blocks and phis). Cross-function mid-targets (a register tail jump into the middle of another function, +0x210ebc0 was *not* one: it was an in-function jump) are
+therefore handled by the miss-log loop: the runtime logs the address with the thread and a guest backtrace (`logs/aot-misses.log`), `bb-recomp --extra-entries aot-misses.log` makes it a unit entry (or the
+function granular with `--granular-funcs`), the `.so` is rebuilt (2 min), no code change.
+
+**Strict mode** (`BB_AOT_STRICT=1`, always on in the `BB_AOT_ONLY` build): a miss logs and stops with "native code is missing an entry at +0x...; please report this, or turn Native CPU off". Without it the FEX fallback
+stays and every miss is logged the same way. `BB_AOT_ONLY` builds libbbcpu.so without FEXCore (`cpu/aot_only`): own CPUID/XGETBV (FEX's model with fixed host features), TSC, unaligned-atomic emulation, host-function stubs,
+thread state, and a native path for the import traps; strict mode uses the same native services in the FEX build, so it is a rehearsal of phase 7.
+
 ## Risks
 
 - **On-device compile time and APK size** (the phase 0 gate). The fallback is a downloadable
