@@ -41,6 +41,7 @@ class Jit {
   std::function<uint64_t(uint64_t)> rangeEnd;
   uint64_t liftBase = 0, imageSize = 0; // lifter base of the guest addresses; image span (constants inside are addresses)
   uint32_t callExits = 0;               // call exits (ExitFunction/Call) in the units of the last compile
+  bool resumeEntries = false;           // lower with resume entries (call-return blocks re-enterable with the resume flag)
   bool calleeSaved = false;             // false: reload everything after calls (exact); true: the game's setting
 
   Lifter lifter;

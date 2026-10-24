@@ -2,6 +2,7 @@
 // lower_ops.cpp, vector and FP ops in lower_vector.cpp.
 #include "lower_impl.h"
 
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Verifier.h>
 
 #include <algorithm>
@@ -39,8 +40,8 @@ FunctionCallee ModuleCtx::unitFn(uint64_t vaddr) {
 }
 
 // ------------------------------------------------------------------------------------ helpers -------
-Lower::Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry)
-  : m(mc), C(mc.C), M(mc.M), B(mc.C), IR(ir), res(r), entryVaddr(entry) {
+Lower::Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry, const UnitMeta* um)
+  : m(mc), C(mc.C), M(mc.M), B(mc.C), IR(ir), res(r), entryVaddr(entry), meta(um) {
   I1 = m.I1; I8 = m.I8; I16 = m.I16; I32 = m.I32; I64 = m.I64; I128 = m.I128; Ptr = m.Ptr; V128 = m.V128;
   entryRip = IR.GetHeader()->OriginalRIP;
   val.assign(IR.GetSSACount() + 2, nullptr);
@@ -363,6 +364,11 @@ void Lower::prologue() {
     B.CreateStore(B.CreateAlignedLoad(V128, gep(offsetof(Core::CPUState, xmm.sse.data) + 16 * i), Align(16)), xmm[i]);
   }
   fN = newAlloca(I1, "N"); fZ = newAlloca(I1, "Z"); fC = newAlloca(I1, "C"); fV = newAlloca(I1, "V");
+}
+
+// The flags at unit entry: from the context (when the unit reads them) or the x86 reset values. Not done on the resume path: the
+// flags are dead after a call, so a call-return block does not care what they were.
+void Lower::flagsInit() {
   if (flagsRead) {
     Value* w = B.CreateAlignedLoad(I32, gep(offsetof(Core::CPUState, flags) + X86State::RFLAG_NZCV_LOC), Align(1));
     auto bit = [&](unsigned sh) { return B.CreateTrunc(B.CreateLShr(w, sh), I1); };
@@ -413,7 +419,7 @@ void Lower::emitBreak(const IR::IROp_Break* op) {
   B.CreateRetVoid();
 }
 
-void Lower::emitExit(const IR::IROp_ExitFunction* op) {
+void Lower::emitExit(Ref node, const IR::IROp_ExitFunction* op) {
   const auto hint = op->Hint;
   uint64_t a = 0;
   const bool isConst = addrConst(op->NewRIP, a);
@@ -456,6 +462,20 @@ void Lower::emitExit(const IR::IROp_ExitFunction* op) {
       B.CreateRetVoid();
     }
     return;
+  }
+  // An indirect jump whose jump table the lifter resolved: a switch on the image offset over the unit's blocks.
+  // What is not a case (a stale table, a computed value) goes the ordinary way below.
+  if (!isConst) {
+    auto sw = swCases.find(IR.GetID(node).Value);
+    if (sw != swCases.end() && !sw->second.empty()) {
+      materialize();
+      Value* off = B.CreateSub(target, m.O.fixedImageBase ? (Value*)c64(m.O.imageBase) : ImgBase);
+      auto* def = newBB("swdef");
+      auto* si = B.CreateSwitch(off, def, sw->second.size());
+      for (auto [vaddr, id] : sw->second) si->addCase(cast<ConstantInt>(ConstantInt::get(I64, vaddr)), bbOf[id]);
+      ++res->switches; res->switchCases += sw->second.size();
+      B.SetInsertPoint(def);
+    }
   }
   // Tail call, jmp out of the unit, indirect jump.
   spill(true);
@@ -515,7 +535,7 @@ bool Lower::emitOp(Ref node, IR::IROp_Header* op) {
     B.CreateCondBr(c, bbOf[o->TrueBlock.ID().Value], bbOf[o->FalseBlock.ID().Value]);
     return true;
   }
-  case IR::OP_EXITFUNCTION: emitExit(op->C<IR::IROp_ExitFunction>()); return true;
+  case IR::OP_EXITFUNCTION: emitExit(node, op->C<IR::IROp_ExitFunction>()); return true;
   case IR::OP_BREAK: emitBreak(op->C<IR::IROp_Break>()); return true;
   default: break;
   }
@@ -536,7 +556,35 @@ void Lower::run() {
   S->setName("s");
   allocaBB = BasicBlock::Create(C, "entry", F);
   auto* proBB = BasicBlock::Create(C, "pro", F);
-  IRBuilder<>(allocaBB).CreateBr(proBB);
+  if (m.O.dirtyCheck && m.O.unitIndex) {
+    // The runtime sets bbr_dirty[i] when the code of unit i was modified (hooks, patches): the unit then does not run, the
+    // dispatcher's slow path (the fallback CPU) does. First thing in the unit; one byte load and a predictable branch.
+    const int64_t idx = m.O.unitIndex(entryVaddr);
+    if (idx < 0) fprintf(stderr, "bb-recomp: unit %s has no index in bbr_units\n", name.c_str());
+    auto* chk = BasicBlock::Create(C, "chk", F);
+    auto* dirtyBB = BasicBlock::Create(C, "dirty", F);
+    IRBuilder<>(allocaBB).CreateBr(chk);
+    B.SetInsertPoint(chk);
+    Value* p = B.CreateConstInBoundsGEP1_64(I8, m.dirtyVar, idx < 0 ? 0 : (uint64_t)idx);
+    Value* d = B.CreateLoad(I8, p);
+    auto* br = B.CreateCondBr(B.CreateICmpNE(d, ConstantInt::get(I8, 0)), dirtyBB, proBB);
+    br->setMetadata(LLVMContext::MD_prof, MDBuilder(C).createBranchWeights(1, 2000));
+    B.SetInsertPoint(dirtyBB);
+    if (m.O.resumeEntries) {
+      // a resume request (flag set, rip = the return address wanted) at a dirty unit: not here, the dispatcher tries the next unit
+      auto* go = BasicBlock::Create(C, "dirty_go", F);
+      auto* rs = BasicBlock::Create(C, "dirty_resume", F);
+      B.CreateCondBr(B.CreateICmpNE(B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, _pad1)), Align(8)), c64(0)), rs, go);
+      B.SetInsertPoint(rs); B.CreateRetVoid();
+      B.SetInsertPoint(go);
+    }
+    // the unit's image-relative vaddr: the runtime adds the image base and sets rip itself (a two-instruction tail call here)
+    auto* c = B.CreateCall(m.helper("bbr_dirty_entry", m.Void, {Ptr, I64}), {S, c64(entryVaddr)});
+    c->setTailCall(true);
+    B.CreateRetVoid();
+  } else {
+    IRBuilder<>(allocaBB).CreateBr(proBB);
+  }
   B.SetInsertPoint(proBB);
   prologue();
 
@@ -544,11 +592,41 @@ void Lower::run() {
   struct BlockInfo { Ref node; IR::IROp_Header* hdr; std::vector<uint32_t> succ; };
   std::vector<uint32_t> order;
   std::unordered_map<uint32_t, BlockInfo> blocks;
+  // Guest address (image vaddr) of every block, for the switch cases.
+  std::unordered_map<uint64_t, uint32_t> blockAt;
+  if (meta && !meta->switches.empty())
+    for (auto [BlockNode, BlockHeader] : IR.GetBlocks())
+      blockAt[entryRip - m.O.liftBase + BlockHeader->C<IR::IROp_CodeBlock>()->GuestEntryOffset] = IR.GetID(BlockNode).Value;
   for (auto [BlockNode, BlockHeader] : IR.GetBlocks()) {
     const uint32_t id = IR.GetID(BlockNode).Value;
     BlockInfo bi{BlockNode, BlockHeader, {}};
+    int64_t lastGuest = -1;
     for (auto [Node, op] : IR.GetCode(BlockNode)) {
-      (void)Node;
+      if (op->Op == IR::OP_GUESTOPCODE) lastGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset;
+      if (op->Op == IR::OP_EXITFUNCTION && m.O.resumeEntries) {
+        auto* o = op->C<IR::IROp_ExitFunction>();
+        uint64_t ra;
+        if (o->Hint == IR::BranchHint::Call && !o->CallReturnBlock.IsInvalid() && addrConst(o->CallReturnAddress, ra))
+          retBlocks.push_back({ra - m.O.liftBase, o->CallReturnBlock.ID().Value});
+      }
+      if (op->Op == IR::OP_EXITFUNCTION && lastGuest >= 0 && meta && !meta->switches.empty()) {
+        auto* o = op->C<IR::IROp_ExitFunction>();
+        uint64_t k;
+        if (o->Hint != IR::BranchHint::Call && o->Hint != IR::BranchHint::Return && !addrConst(o->NewRIP, k)) {
+          const uint64_t pc = entryRip - m.O.liftBase + lastGuest;
+          for (auto& sw : meta->switches) {
+            if (sw.jmpVaddr != pc) continue;
+            auto& cases = swCases[IR.GetID(Node).Value];
+            for (uint64_t t : sw.targets) {
+              auto it = blockAt.find(t);
+              if (it == blockAt.end()) continue;
+              cases.push_back({t, it->second});
+              bi.succ.push_back(it->second);
+            }
+            break;
+          }
+        }
+      }
       if (op->Op == IR::OP_JUMP) bi.succ.push_back(op->C<IR::IROp_Jump>()->TargetBlock.ID().Value);
       else if (op->Op == IR::OP_CONDJUMP) {
         auto* o = op->C<IR::IROp_CondJump>();
@@ -563,7 +641,7 @@ void Lower::run() {
     blocks.emplace(id, std::move(bi));
   }
   if (order.empty()) { B.CreateUnreachable(); return; }
-  B.CreateBr(bbOf[order[0]]);
+  auto* proEnd = B.GetInsertBlock(); // the prologue block: its terminator is emitted after the blocks (resume switch)
 
   // Reverse post-order from the entry: a block's dominators are emitted first, so every operand exists
   // when it is used (the IR list order does not guarantee that).
@@ -599,7 +677,8 @@ void Lower::run() {
         }
         case IR::OP_STOREPF: d |= 1ull << 16; break;
         case IR::OP_STOREAF: d |= 1ull << 17; break;
-        case IR::OP_EXITFUNCTION: case IR::OP_BREAK: case IR::OP_SYSCALL: d = 0; break;
+        case IR::OP_EXITFUNCTION: if (swCases.count(IR.GetID(Node).Value) && !swCases[IR.GetID(Node).Value].empty()) break; d = 0; break; // a switch keeps the registers dirty
+        case IR::OP_BREAK: case IR::OP_SYSCALL: d = 0; break;
         default: break;
         }
       }
@@ -630,6 +709,36 @@ void Lower::run() {
       B.CreateUnreachable();
     }
   }
+  // Prologue exit: into the unit's entry block, or (resume entries) into the switch that re-enters at a call-return block when
+  // the dispatcher asks for it with the resume flag in the guest state (docs/RECOMP_ABI.md).
+  B.SetInsertPoint(proEnd);
+  std::vector<std::pair<uint64_t, uint32_t>> cases;
+  for (auto& rb : retBlocks) if (emitted.count(rb.second)) cases.push_back(rb);
+  std::sort(cases.begin(), cases.end());
+  cases.erase(std::unique(cases.begin(), cases.end(), [](auto& a, auto& b) { return a.first == b.first; }), cases.end());
+  if (m.O.resumeEntries && !cases.empty()) {
+    auto* rsw = newBB("resume");
+    auto* fi = newBB("flags");
+    auto* flag = B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, _pad1)), Align(8));
+    B.CreateCondBr(B.CreateICmpNE(flag, c64(0)), rsw, fi);
+    B.SetInsertPoint(fi);
+    flagsInit();
+    B.CreateBr(bbOf[order[0]]);
+    B.SetInsertPoint(rsw);
+    B.CreateAlignedStore(c64(0), gep(offsetof(Core::CPUState, _pad1)), Align(8));
+    Value* rip = B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, rip)), Align(8));
+    Value* off = B.CreateSub(rip, m.O.fixedImageBase ? (Value*)c64(m.O.imageBase) : ImgBase);
+    auto* miss = newBB("resume_miss");
+    auto* si = B.CreateSwitch(off, miss, cases.size());
+    for (auto [vaddr, id] : cases) si->addCase(cast<ConstantInt>(ConstantInt::get(I64, vaddr)), bbOf[id]);
+    B.SetInsertPoint(miss);
+    B.CreateAlignedStore(c64(1), gep(offsetof(Core::CPUState, _pad1)), Align(8)); // not here: the dispatcher tries the next unit
+    B.CreateRetVoid();
+    res->resumeCases = cases.size();
+  } else {
+    flagsInit();
+    B.CreateBr(bbOf[order[0]]);
+  }
   for (uint32_t id : order)
     if (!emitted.count(id)) bbOf[id]->eraseFromParent();
 
@@ -648,15 +757,19 @@ struct UnitLowerer::Impl {
       m.imageBaseVar = new GlobalVariable(mod, m.I64, false, GlobalValue::ExternalLinkage, nullptr, "bbr_image_base");
       m.imageBaseVar->setDSOLocal(true);
     }
+    if (o.dirtyCheck) {
+      m.dirtyVar = new GlobalVariable(mod, m.I8, false, GlobalValue::ExternalLinkage, nullptr, "bbr_dirty");
+      m.dirtyVar->setDSOLocal(true);
+    }
   }
 };
 
 UnitLowerer::UnitLowerer(LLVMContext& ctx, Module& mod, const LowerOptions& opt) : impl_(new Impl(ctx, mod, opt)) {}
 UnitLowerer::~UnitLowerer() = default;
 
-void UnitLowerer::lower(uint64_t entry, const void* irView, LowerResult* res) {
+void UnitLowerer::lower(uint64_t entry, const void* irView, LowerResult* res, const UnitMeta* meta) {
   const auto& ir = *static_cast<const IR::IRListView*>(irView);
-  Lower l(impl_->m, ir, res, entry);
+  Lower l(impl_->m, ir, res, entry, meta);
   l.run();
 }
 

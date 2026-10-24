@@ -1,7 +1,7 @@
 # bb-recomp target, inside FEX's build. FEXCore's per-target settings (the DEFINES list in
 # FEXCore/Source/CMakeLists.txt) change header layouts, so they are repeated here.
 set(BBR "${BB_RECOMP_DIR}/src")
-set(BBR_COMMON "${BBR}/elf_image.cpp" "${BBR}/fde_scan.cpp" "${BBR}/lifter.cpp")
+set(BBR_COMMON "${BBR}/elf_image.cpp" "${BBR}/fde_scan.cpp" "${BBR}/lifter.cpp" "${BBR}/jumptable.cpp" "${BBR}/eh_frame.cpp" "${BBR}/discover.cpp")
 set(BBR_JIT "${BBR}/jit_host.cpp")
 set(BBR_LLVM_SRCS "${BBR}/lower_llvm.cpp" "${BBR}/lower_ops.cpp" "${BBR}/lower_vector.cpp" "${BBR}/codegen.cpp" "${BBR}/compile.cpp")
 add_executable(bb-recomp "${BBR}/main.cpp" ${BBR_COMMON} "${BBR}/census.cpp")

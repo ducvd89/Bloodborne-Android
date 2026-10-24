@@ -5,7 +5,9 @@
 #include "elf_image.h"
 #include "fde_scan.h"
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -13,11 +15,19 @@ struct LiftOptions {
   bool multiblock = true;     // whole function as one IR unit (the shipped config, Multiblock=1)
   bool tso = false;           // TSOEnabled; the game runs with it off (fex-compatible.json)
   bool gapUnits = true;       // lift code the entry unit does not reach (switch case bodies) as extra units
+  bool switchTables = true;   // resolve jump tables: case targets become blocks of the unit, the jump a `switch`
   bool validate = false;      // also run FEX's IR validation pass (errors become a failure reason)
   bool passes = true;         // x87 stack optimisation + dead flag calculation elimination
   std::string host = "armv8.4"; // HostFeatures profile of the target: armv8.2 | armv8.4 | armv9
   int64_t injectCrash = -1;   // test hooks (crash containment): fault / FEX assert inside the lift of the function at this vaddr
   int64_t injectAssert = -1;
+  // Secondary entries (image vaddrs; shared, owned by the caller, must outlive the lifters): the unit set also gets a unit at
+  // every landing pad of the function (key: function start) and at the return address of every call to a returns-twice target.
+  const std::map<uint64_t, std::vector<uint64_t>>* landingPads = nullptr;
+  const std::set<uint64_t>* retTwiceTargets = nullptr;  // direct call targets (setjmp, its PLT stubs)
+  const std::set<uint64_t>* retTwiceSlots = nullptr;    // GOT slots of `call [rip+slot]`
+  const std::map<uint64_t, std::vector<uint64_t>>* entryUnits = nullptr; // function start -> extra unit entries (direct call/jmp targets inside it that no unit starts at)
+  bool collectTargets = false;                          // FuncResult::outTargets: direct call/jmp/jcc targets outside the function (discovery)
   uint64_t maxInst = 0x10000;  // decoder limit per unit (FEX's own buffer limit is 0x10000)
 };
 
@@ -43,17 +53,39 @@ struct FuncResult {
   uint32_t extraUnits = 0;       // extra units lifted for code the entry unit does not reach
   uint32_t extraFailed = 0;      // ... of which cut short or not liftable
   uint32_t extraInsts = 0;       // x86 instructions lifted by extra units (not in `insts`)
+  uint32_t padUnits = 0, setjmpUnits = 0; // secondary entry units lifted for landing pads / setjmp return sites (also counted in extraUnits? no: separate)
+  uint32_t secondaryFailed = 0;  // ... of which cut short or not liftable
+  uint32_t secondaryInsts = 0;   // x86 instructions in them
+  uint32_t padsKnown = 0, padsInUnit = 0; // landing pads of the function, and how many already were a unit entry (no extra unit needed)
   std::string extraReason;       // first extra-unit failure
   bool spansPastEnd = false;     // decoded bytes ran past the FDE end (should not happen: the range is bounded)
   std::string reason;            // first failure, "category: detail"; empty when Clean
   std::vector<std::string> gapReasons; // "category: detail" for undecodable gap bytes
+  // Indirect jumps (`jmp reg`, `jmp [mem]`) of the function, counted once per address over all its units.
+  uint32_t indJmps = 0;          // distinct indirect jmp instructions
+  uint32_t jmpResolved = 0;      // ... resolved as a bounded jump table (cmp/ja or and mask)
+  uint32_t jmpScanned = 0;       // ... resolved by scanning the table to its first non-target entry (no bound found)
+  uint32_t jmpMem = 0;           // ... jmp [mem] (GOT stubs and vtable tail calls): not tables
+  uint32_t jmpMemRip = 0, jmpMemIdx = 0; // ... of which [rip+x] (import stubs) and [base+index*scale+x] (absolute tables)
+  uint32_t jmpReg = 0;           // ... jmp reg that is no table (register tail calls)
+  uint32_t jmpFailed = 0;        // ... table-like but not resolved (reasons in jmpExamples)
+  uint32_t tableEntries = 0;     // case targets read from resolved tables (before de-duplication)
+  uint64_t tableBytes = 0;       // bytes of resolved tables
+  std::vector<uint64_t> outTargets;      // collectTargets: direct branch/call targets outside [start, end) inside the image (image vaddrs, sorted, unique)
+  std::vector<uint64_t> leaTargets;      // collectTargets: `lea reg, [rip+x]` targets (address-taken code), image vaddrs, sorted, unique
+  uint32_t entryUnitsLifted = 0;         // units lifted at entryUnits addresses
+  std::vector<std::string> jmpExamples; // "vaddr reason" of unresolved jmp reg / table-like jumps (first few)
 };
+
+// What the lowering needs to know about a unit besides its IR: the resolved jump tables (image vaddrs).
+struct SwitchInfo { uint64_t jmpVaddr; std::vector<uint64_t> targets; };
+struct UnitMeta { std::vector<SwitchInfo> switches; uint64_t end = 0; /* image vaddr just past the last decoded byte of the unit (0: unknown) */ };
 
 // Receives each lifted unit while its IR is alive (valid only inside the call): entry is the image vaddr,
 // irView a `const FEXCore::IR::IRListView*` (the lowering casts it back).
 struct UnitSink {
   virtual ~UnitSink() = default;
-  virtual void unit(uint64_t entryVaddr, bool extra, const void* irView) = 0;
+  virtual void unit(uint64_t entryVaddr, bool extra, const void* irView, const UnitMeta& meta) = 0;
 };
 
 class Lifter {

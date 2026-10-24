@@ -97,12 +97,12 @@ bool Jit::compile(uint64_t from, uint64_t hi) {
       setModuleTarget(*mod, *j.tm);
       LowerOptions lo;
       lo.liftBase = j.liftBase; lo.imageSize = j.imageSize; lo.fixedImageBase = true; lo.imageBase = j.liftBase;
-      lo.aarch64 = false; lo.hiddenUnits = false; lo.calleeSaved = j.calleeSaved; lo.storeFlagsAtCalls = true;
+      lo.aarch64 = false; lo.hiddenUnits = false; lo.calleeSaved = j.calleeSaved; lo.resumeEntries = j.resumeEntries; lo.storeFlagsAtCalls = true;
       lo.isKnownUnit = [](uint64_t) { return false; };
       ul.reset(new UnitLowerer(*ctx, *mod, lo));
     }
-    void unit(uint64_t entry, bool, const void* ir) override {
-      LowerResult lr; ul->lower(entry, ir, &lr);
+    void unit(uint64_t entry, bool, const void* ir, const UnitMeta& meta) override {
+      LowerResult lr; ul->lower(entry, ir, &lr, &meta);
       j.callExits += lr.callExits;
       for (auto& u : lr.unsupported) unsup.push_back(u);
       entries.push_back(entry + j.liftBase);

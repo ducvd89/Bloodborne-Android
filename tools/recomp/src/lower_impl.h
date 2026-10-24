@@ -46,6 +46,7 @@ struct ModuleCtx {
   LowerOptions O;
   llvm::Type *I1, *I8, *I16, *I32, *I64, *I128, *Ptr, *V128, *Void;
   llvm::GlobalVariable* imageBaseVar = nullptr;
+  llvm::GlobalVariable* dirtyVar = nullptr; // bbr_dirty[]
   ModuleCtx(llvm::LLVMContext& c, llvm::Module& m, const LowerOptions& o);
   llvm::FunctionCallee helper(const char* name, llvm::Type* ret, llvm::ArrayRef<llvm::Type*> args);
   llvm::FunctionCallee unitFn(uint64_t vaddr); // declaration of bbr_<vaddr>
@@ -81,7 +82,12 @@ struct Lower {
   uint32_t curGuest = 0;       // offset of the current guest instruction from the entry (GuestOpcode)
   std::set<std::string> unsup; // unsupported op names of this unit
 
-  Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry);
+  const UnitMeta* meta = nullptr;
+  std::vector<std::pair<uint64_t, uint32_t>> retBlocks; // (image vaddr of the return address, IR block id) of every call with a return block
+  // ExitFunction node id -> (image vaddr, IR block id) of the cases of the switch the jump became
+  std::unordered_map<uint32_t, std::vector<std::pair<uint64_t, uint32_t>>> swCases;
+
+  Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t entry, const UnitMeta* meta = nullptr);
   void run();
 
   // ---- helpers
@@ -123,13 +129,14 @@ struct Lower {
   // ---- state
   void scan();
   void prologue();
+  void flagsInit();
   void spill(bool flags);                 // store the dirty registers (and the flags when asked)
   void fill();
   Value* loadRegValue(unsigned cls, unsigned reg);
 
   // ---- control flow
   void emitBlockTerminatorsFix();
-  void emitExit(const IR::IROp_ExitFunction* op);
+  void emitExit(Ref node, const IR::IROp_ExitFunction* op);
   void emitBreak(const IR::IROp_Break* op);
   llvm::BasicBlock* curBB() { return B.GetInsertBlock(); }
   llvm::BasicBlock* newBB(const char* n) { return llvm::BasicBlock::Create(C, n, F); }

@@ -17,12 +17,16 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdarg>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <thread>
 #ifndef _WIN32
 #include <sys/resource.h>
+#else
+#include <windows.h>
 #endif
 
 using namespace llvm;
@@ -35,7 +39,8 @@ struct ShardStats {
   double liftLower = 0, opt = 0, codegen = 0;
   uint64_t funcs = 0, units = 0, unitsWithTrap = 0, trapSites = 0, irOps = 0, directCalls = 0, dispatchCalls = 0, relocConsts = 0;
   uint64_t liftFailed = 0, objBytes = 0, textBytes = 0;
-  std::vector<uint64_t> unitVaddrs, extraVaddrs; // extra: units the entry unit does not reach (switch case bodies), entered by jumps
+  uint64_t resumeCases = 0, switches = 0, switchCases = 0, indJmps = 0, jmpResolved = 0, jmpScanned = 0, jmpMem = 0, jmpReg = 0, jmpFailed = 0, tableBytes = 0;
+  std::vector<uint64_t> unitVaddrs;
   std::map<std::string, uint64_t> opUnits; // op name -> units containing a trap for it
 };
 
@@ -60,15 +65,22 @@ uint64_t textSize(const std::string& obj) {
 struct Sink : UnitSink {
   UnitLowerer& ul; ShardStats& st;
   Sink(UnitLowerer& u, ShardStats& s) : ul(u), st(s) {}
-  void unit(uint64_t entry, bool extra, const void* ir) override {
+  void unit(uint64_t entry, bool, const void* ir, const UnitMeta& meta) override {
     LowerResult lr;
-    ul.lower(entry, ir, &lr);
+    ul.lower(entry, ir, &lr, &meta);
     ++st.units; st.unitVaddrs.push_back(entry);
-    if (extra) st.extraVaddrs.push_back(entry);
     st.trapSites += lr.trapSites; st.irOps += lr.irOps; st.directCalls += lr.directCalls; st.dispatchCalls += lr.dispatchCalls;
-    st.relocConsts += lr.relocConstants;
+    st.relocConsts += lr.relocConstants; st.switches += lr.switches; st.switchCases += lr.switchCases; st.resumeCases += lr.resumeCases;
     if (!lr.unsupported.empty()) { ++st.unitsWithTrap; for (auto& n : lr.unsupported) ++st.opUnits[n]; }
   }
+};
+
+// What the pre-pass learns about each unit: whether it is a function start, and where its code ends.
+struct UnitInfo { uint64_t entry; uint64_t end; bool extra; };
+struct RecordSink : UnitSink {
+  std::vector<UnitInfo>& out;
+  explicit RecordSink(std::vector<UnitInfo>& o) : out(o) {}
+  void unit(uint64_t entry, bool extra, const void*, const UnitMeta& meta) override { out.push_back({entry, meta.end, extra}); }
 };
 
 uint64_t fnv1a(const std::vector<uint8_t>& d) {
@@ -77,36 +89,37 @@ uint64_t fnv1a(const std::vector<uint8_t>& d) {
   return h;
 }
 
-// bbr_unit_hash[i]: FNV-1a 64 of the executable segment's bytes [units[i], units[i+1]) (the last unit: to the end of the segment),
-// as the runtime sees them in memory. The runtime hashes the same ranges of the loaded image once, before the first guest
-// call: a different hash means the code was patched (hooks, byte patches) or the image is another one, and that unit runs on
-// the fallback CPU. bb-prepare patches fs -> gs segment prefixes (0x64 -> 0x65) in the image, so 0x65 hashes as 0x64.
-std::vector<uint64_t> unitHashes(const ElfImage& img, const std::vector<uint64_t>& units) {
+// unitHashes(ends)[i]: FNV-1a 64 of the image bytes [units[i], ends[i]) (clamped to the unit's executable segment) as the runtime sees them in memory. The runtime hashes the
+// same ranges of the loaded image once, before the first guest call: a different hash means the code was patched (hooks, byte
+// patches) or the image is another one, and that unit is dirty. bb-prepare patches fs -> gs segment prefixes (0x64 -> 0x65) in the
+// image, so 0x65 hashes as 0x64. Units in every executable segment (the eboot and the linked modules) are covered.
+std::vector<uint64_t> unitHashes(const ElfImage& img, const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends) {
   std::vector<uint64_t> out(units.size(), 0);
-  for (auto& s : img.loads) {
-    if (!(s.flags & 1)) continue;
-    for (size_t i = 0; i < units.size(); ++i) {
-      const uint64_t lo = units[i] - s.vaddr, hi = (i + 1 < units.size() ? units[i + 1] : s.vaddr + s.memsz) - s.vaddr;
+  for (size_t i = 0; i < units.size(); ++i) {
+    for (auto& s : img.loads) {
+      if (!(s.flags & 1) || units[i] < s.vaddr || units[i] >= s.vaddr + s.memsz) continue;
+      const uint64_t lo = units[i] - s.vaddr, hi = std::min(ends[i] - s.vaddr, s.memsz);
       uint64_t h = 1469598103934665603ull;
-      for (uint64_t k = lo; k < hi && k < s.memsz; ++k) {
+      for (uint64_t k = lo; k < hi; ++k) {
         uint8_t b = k < s.filesz ? img.file[s.offset + k] : 0;
         if (b == 0x65) b = 0x64;
         h ^= b; h *= 1099511628211ull;
       }
       out[i] = h;
+      break;
     }
-    break;
   }
   return out;
 }
 
-// bbr_units[] (sorted), bbr_unit_count, bbr_unit_hash[], bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
-bool emitTable(const std::vector<uint64_t>& units, uint64_t imageHash, const std::vector<uint64_t>& hashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
-               const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
+// bbr_units[] (sorted), bbr_unit_count, bbr_unit_end[], bbr_unit_hash[], bbr_unit_extra[], bbr_text_end, bbr_dirty[], bbr_funcs[],
+// bbr_func_count, bbr_abi_flags, bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
+bool emitTable(const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends, const std::vector<uint64_t>& hashes, const std::vector<uint64_t>& ehashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
+               const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path) {
   LLVMContext ctx;
   Module m("bbr_table", ctx);
   setModuleTarget(m, tm);
-  auto* i64 = Type::getInt64Ty(ctx); auto* i32 = Type::getInt32Ty(ctx); auto* ptr = PointerType::getUnqual(ctx);
+  auto* i64 = Type::getInt64Ty(ctx); auto* i32 = Type::getInt32Ty(ctx); auto* i8 = Type::getInt8Ty(ctx); auto* ptr = PointerType::getUnqual(ctx);
   auto* ent = StructType::get(ctx, {i64, ptr});
   std::vector<Constant*> es;
   es.reserve(units.size());
@@ -119,22 +132,44 @@ bool emitTable(const std::vector<uint64_t>& units, uint64_t imageHash, const std
   auto* aty = ArrayType::get(ent, es.size());
   new GlobalVariable(m, aty, true, GlobalValue::ExternalLinkage, ConstantArray::get(aty, es), "bbr_units");
   new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, units.size()), "bbr_unit_count");
-  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, imageHash), "bbr_image_hash");
+  auto arr64 = [&](const std::vector<uint64_t>& v, const char* name) {
+    std::vector<Constant*> xs; xs.reserve(v.size());
+    for (uint64_t h : v) xs.push_back(ConstantInt::get(i64, h));
+    auto* t = ArrayType::get(i64, xs.size());
+    new GlobalVariable(m, t, true, GlobalValue::ExternalLinkage, ConstantArray::get(t, xs), name);
+  };
+  arr64(ends, "bbr_unit_end");       // end vaddr of each unit's code (just past its last decoded byte)
+  arr64(hashes, "bbr_unit_hash");    // over [units[i], units[i+1]) (the last unit of a segment: to its end)
+  arr64(ehashes, "bbr_unit_ehash");  // over [units[i], bbr_unit_end[i]): exact, for marking units dirty
+  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, textEnd), "bbr_text_end"); // end of the last executable segment
   {
-    std::vector<Constant*> hs;
-    hs.reserve(hashes.size());
-    for (uint64_t h : hashes) hs.push_back(ConstantInt::get(i64, h));
-    auto* hty = ArrayType::get(i64, hs.size());
-    new GlobalVariable(m, hty, true, GlobalValue::ExternalLinkage, ConstantArray::get(hty, hs), "bbr_unit_hash");
-    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, textEnd), "bbr_text_end"); // end of the last unit's hashed range
-    // bbr_unit_extra[i]: 1 for a unit that is not a function start (a switch case body): it belongs to the function of the
-    // nearest preceding unit with 0, and is entered by jumps, not calls.
-    std::vector<Constant*> xs;
-    xs.reserve(extra.size());
-    for (uint8_t e : extra) xs.push_back(ConstantInt::get(Type::getInt8Ty(ctx), e));
-    auto* xty = ArrayType::get(Type::getInt8Ty(ctx), xs.size());
+    // bbr_unit_extra[i]: 1 for a unit that is not the start of a function (case bodies, landing pads, setjmp return sites, jump targets
+    // into the middle of a function): it belongs to the function of the nearest preceding unit with 0, and is entered by jumps.
+    std::vector<Constant*> xs; xs.reserve(extra.size());
+    for (uint8_t e : extra) xs.push_back(ConstantInt::get(i8, e));
+    auto* xty = ArrayType::get(i8, xs.size());
     new GlobalVariable(m, xty, true, GlobalValue::ExternalLinkage, ConstantArray::get(xty, xs), "bbr_unit_extra");
+    // bbr_dirty[i]: written by the runtime (1: the code of unit i changed); every unit tests its byte first (opt.dirtyCheck)
+    auto* dty = ArrayType::get(i8, units.size());
+    new GlobalVariable(m, dty, false, GlobalValue::ExternalLinkage, ConstantAggregateZero::get(dty), "bbr_dirty");
   }
+  // bbr_funcs[]: the functions in address order with the contiguous run of bbr_units[] entries inside each (the entry unit
+  // first, then gap and secondary units): how a dispatcher finds the units that may hold a mid-function address.
+  {
+    auto* fent = StructType::get(ctx, {i32, i32, i32, i32}); // start, end, first unit index, unit count
+    std::vector<Constant*> fs;
+    fs.reserve(funcs.size());
+    for (const Func& f : funcs) {
+      const size_t a = std::lower_bound(units.begin(), units.end(), f.start) - units.begin();
+      const size_t b = std::lower_bound(units.begin(), units.end(), f.end) - units.begin();
+      fs.push_back(ConstantStruct::get(fent, {ConstantInt::get(i32, f.start), ConstantInt::get(i32, f.end), ConstantInt::get(i32, a), ConstantInt::get(i32, b - a)}));
+    }
+    auto* faty = ArrayType::get(fent, fs.size());
+    new GlobalVariable(m, faty, true, GlobalValue::ExternalLinkage, ConstantArray::get(faty, fs), "bbr_funcs");
+    new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, fs.size()), "bbr_func_count");
+  }
+  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, (opt.resumeEntries ? 1 : 0) | (opt.dirtyCheck ? 2 : 0)), "bbr_abi_flags");
+  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, imageHash), "bbr_image_hash");
   new GlobalVariable(m, i32, true, GlobalValue::ExternalLinkage, ConstantInt::get(i32, 1), "bbr_abi_version");
   new GlobalVariable(m, i64, false, GlobalValue::ExternalLinkage, ConstantInt::get(i64, 0), "bbr_image_base");
   std::string obj;
@@ -144,6 +179,68 @@ bool emitTable(const std::vector<uint64_t>& units, uint64_t imageHash, const std
   fwrite(obj.data(), 1, obj.size(), f);
   fclose(f);
   return true;
+}
+
+// Available memory in GB: MemAvailable (Linux), limited by a cgroup v2 memory.max; GlobalMemoryStatusEx on Windows. 0: unknown.
+double availableMemoryGB() {
+#ifdef _WIN32
+  MEMORYSTATUSEX m; m.dwLength = sizeof m;
+  return GlobalMemoryStatusEx(&m) ? m.ullAvailPhys / 1073741824.0 : 0.0;
+#else
+  double avail = 0;
+  if (FILE* f = fopen("/proc/meminfo", "r")) {
+    char line[256]; unsigned long long kb;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { avail = kb / 1048576.0; break; }
+    fclose(f);
+  }
+  auto readNum = [](const char* path, double& v) {
+    FILE* f = fopen(path, "r"); if (!f) return false;
+    char b[64] = {}; const bool ok = fgets(b, sizeof b, f) && isdigit((unsigned char)b[0]); fclose(f);
+    if (ok) v = atof(b) / 1073741824.0;
+    return ok;
+  };
+  double lim, cur;
+  if (readNum("/sys/fs/cgroup/memory.max", lim) && readNum("/sys/fs/cgroup/memory.current", cur) && lim - cur > 0 && (avail == 0 || lim - cur < avail)) avail = lim - cur;
+  return avail;
+#endif
+}
+
+// Memory model, measured on the game (docs/STATIC_RECOMPILE_PLAN.md, "Compile time"): a worker holds one shard as an LLVM
+// module plus its optimiser and code generator state, about 1.15 GB per MB of x86 code in the shard (+ 0.04 GB fixed);
+// the process keeps the image (twice: the file and its mapping), the lifter tables and the FDE list, about 0.5 GB.
+// jobs x (0.04 + 1.15 x shardMB) + 0.5 <= memFraction x available. Smaller shards cost nothing (64 -> 256 shards: same wall
+// time), so the shard size shrinks before the worker count does.
+struct MemPlan { unsigned jobs, shards; double availGB = 0, budgetGB = 0, shardMB = 0, estPeakGB = 0; bool limited = false; };
+MemPlan planMemory(const CompileOptions& opt, double codeMB, size_t nfuncs) {
+  constexpr double kBase = 0.5, kFixed = 0.04, kPerMB = 1.15, kMinShardMB = 0.08;
+  MemPlan p;
+  p.jobs = std::max(1u, opt.jobs);
+  p.shards = std::max(1u, opt.shards);
+  p.availGB = availableMemoryGB();
+  if (const char* e = getenv("BBR_FAKE_MEM_GB")) p.availGB = atof(e); // test hook: pretend this much RAM is available
+  p.budgetGB = p.availGB * opt.memFraction;
+  const double want = std::max(codeMB / p.shards, 0.0001); // shard size of the requested configuration
+  double shardMB = want;
+  unsigned jobs = p.jobs;
+  if (p.availGB > 0) {
+    auto fit = [&](unsigned j) { return ((p.budgetGB - kBase) / j - kFixed) / kPerMB; }; // largest shard (MB) j workers can hold
+    if (opt.shardsFixed) {
+      if (!opt.jobsFixed) while (jobs > 1 && kBase + jobs * (kFixed + kPerMB * want) > p.budgetGB) --jobs;
+    } else if (opt.jobsFixed) {
+      shardMB = std::min(want, std::max(fit(jobs), 0.02));
+    } else {
+      while (jobs > 1 && fit(jobs) < kMinShardMB) --jobs;       // workers only come down when the shards cannot get smaller
+      shardMB = std::min(want, std::max(fit(jobs), 0.02));
+    }
+    p.limited = jobs < p.jobs || shardMB < want * 0.999;
+  }
+  p.jobs = jobs;
+  if (!opt.shardsFixed) p.shards = std::max<unsigned>(p.shards, (unsigned)std::ceil(codeMB / shardMB));
+  p.shards = std::min<unsigned>(p.shards, (unsigned)std::max<size_t>(1, nfuncs));
+  p.jobs = std::min(p.jobs, p.shards);
+  p.shardMB = codeMB / p.shards;
+  p.estPeakGB = kBase + p.jobs * (kFixed + kPerMB * p.shardMB);
+  return p;
 }
 
 FILE* g_sf = nullptr;
@@ -168,10 +265,18 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   } else {
     for (size_t i = 0; i < funcs.size() && (!opt.limit || todo.size() < opt.limit); ++i) todo.push_back(i);
   }
-  const unsigned nshards = std::max(1u, std::min<unsigned>(opt.shards, todo.size()));
-  // Shards of equal code size (compile time follows bytes, and the function sizes are very skewed).
   uint64_t totalBytes = 0;
   for (size_t i : todo) totalBytes += funcs[i].end - funcs[i].start;
+  const bool wantCode0 = !opt.objPath.empty() || !opt.soPath.empty();
+  MemPlan plan {std::max(1u, opt.jobs), std::max(1u, opt.shards)};
+  if (wantCode0 || !opt.llPath.empty() || opt.planOnly) plan = planMemory(opt, totalBytes / 1e6, todo.size());
+  if (opt.planOnly) {
+    printf("memory plan: %.1f GB available, budget %.1f GB (%.0f%%): %u jobs, %u shards of %.2f MB (%.1f MB of code), estimated peak %.1f GB%s\n", plan.availGB, plan.budgetGB, opt.memFraction * 100,
+           plan.jobs, plan.shards, plan.shardMB, totalBytes / 1e6, plan.estPeakGB, plan.limited ? " (reduced to fit)" : "");
+    return 0;
+  }
+  const unsigned nshards = std::max(1u, std::min<unsigned>(plan.shards, todo.size()));
+  // Shards of equal code size (compile time follows bytes, and the function sizes are very skewed).
   std::vector<size_t> bound(nshards + 1, 0);
   {
     uint64_t acc = 0; unsigned k = 1;
@@ -183,10 +288,35 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     bound[nshards] = todo.size();
   }
 
-  // Direct calls go to function starts.
-  std::vector<uint64_t> starts;
-  starts.reserve(funcs.size());
-  for (auto& f : funcs) starts.push_back(f.start);
+  // Pre-pass: lift every function once, only to learn the unit set (entries, ends, which are not function starts). Direct calls and
+  // jumps then go straight to any unit, not only to function starts, and bbr_dirty[] gets a fixed index per unit. Lifting is about
+  // a tenth of the work, and the units it makes are the ones the second pass makes (same lifter, same options).
+  std::vector<UnitInfo> pre;
+  {
+    std::vector<std::vector<UnitInfo>> part(std::max(1u, plan.jobs));
+    std::atomic<size_t> nextF {0};
+    auto w = [&](unsigned id) {
+      Lifter lifter(img, opt.lift);
+      RecordSink rs(part[id]);
+      for (;;) {
+        const size_t j = nextF++;
+        if (j >= todo.size()) break;
+        const Func& f = funcs[todo[j]];
+        FuncResult fr;
+        lifter.lift(f, fr, nullptr, nullptr, nullptr, &rs);
+        if (fr.status == LiftStatus::Failed || fr.status == LiftStatus::Crashed) part[id].push_back({f.start, f.end, false});
+      }
+    };
+    std::vector<std::thread> th;
+    for (unsigned i = 0; i < part.size(); ++i) th.emplace_back(w, i);
+    for (auto& t : th) t.join();
+    for (auto& p : part) pre.insert(pre.end(), p.begin(), p.end());
+    std::sort(pre.begin(), pre.end(), [](const UnitInfo& a, const UnitInfo& b) { return a.entry < b.entry || (a.entry == b.entry && a.end > b.end); });
+    pre.erase(std::unique(pre.begin(), pre.end(), [](const UnitInfo& a, const UnitInfo& b) { return a.entry == b.entry; }), pre.end());
+  }
+  std::vector<uint64_t> starts; // sorted unit entries
+  starts.reserve(pre.size());
+  for (auto& u : pre) starts.push_back(u.entry);
   const bool wantCode = !opt.objPath.empty() || !opt.soPath.empty();
   const bool emitLl = !opt.llPath.empty();
   LowerOptions lo;
@@ -196,13 +326,16 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   lo.aarch64 = opt.target.aarch64;
   lo.storeFlagsAtCalls = opt.storeFlagsAtCalls;
   lo.calleeSaved = opt.calleeSaved;
+  lo.resumeEntries = opt.resumeEntries;
   lo.isKnownUnit = [&starts](uint64_t v) { return std::binary_search(starts.begin(), starts.end(), v); };
+  lo.dirtyCheck = opt.dirtyCheck;
+  lo.unitIndex = [&starts](uint64_t v) -> int64_t { auto it = std::lower_bound(starts.begin(), starts.end(), v); return it != starts.end() && *it == v ? it - starts.begin() : -1; };
 
   std::vector<ShardStats> stats(nshards);
   std::vector<std::string> objFiles(nshards);
   std::atomic<unsigned> next {0};
   std::atomic<bool> failed {false};
-  const unsigned jobs = std::max(1u, std::min(opt.jobs, nshards));
+  const unsigned jobs = std::max(1u, std::min(plan.jobs, nshards));
   std::mutex errMu;
 
   auto worker = [&] {
@@ -224,6 +357,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
         FuncResult fr;
         lifter.lift(f, fr, nullptr, nullptr, nullptr, &sink);
         ++st.funcs;
+        st.indJmps += fr.indJmps; st.jmpResolved += fr.jmpResolved; st.jmpScanned += fr.jmpScanned; st.jmpMem += fr.jmpMem; st.jmpReg += fr.jmpReg; st.jmpFailed += fr.jmpFailed; st.tableBytes += fr.tableBytes;
         if (fr.status == LiftStatus::Failed || fr.status == LiftStatus::Crashed) {
           ++st.liftFailed; ++st.units; st.unitVaddrs.push_back(f.start);
           ul.stub(f.start);
@@ -266,17 +400,17 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
 
   // Totals.
   ShardStats tot;
-  std::vector<uint64_t> units, extraAll;
+  std::vector<uint64_t> units;
   for (auto& s : stats) {
     tot.liftLower += s.liftLower; tot.opt += s.opt; tot.codegen += s.codegen;
     tot.funcs += s.funcs; tot.units += s.units; tot.unitsWithTrap += s.unitsWithTrap; tot.trapSites += s.trapSites; tot.irOps += s.irOps;
     tot.directCalls += s.directCalls; tot.dispatchCalls += s.dispatchCalls; tot.relocConsts += s.relocConsts; tot.liftFailed += s.liftFailed;
     tot.objBytes += s.objBytes; tot.textBytes += s.textBytes;
+    tot.resumeCases += s.resumeCases; tot.switches += s.switches; tot.switchCases += s.switchCases; tot.indJmps += s.indJmps; tot.jmpResolved += s.jmpResolved; tot.jmpScanned += s.jmpScanned;
+    tot.jmpMem += s.jmpMem; tot.jmpReg += s.jmpReg; tot.jmpFailed += s.jmpFailed; tot.tableBytes += s.tableBytes;
     for (auto& [n, c] : s.opUnits) tot.opUnits[n] += c;
     units.insert(units.end(), s.unitVaddrs.begin(), s.unitVaddrs.end());
-    extraAll.insert(extraAll.end(), s.extraVaddrs.begin(), s.extraVaddrs.end());
   }
-  std::sort(extraAll.begin(), extraAll.end());
   std::sort(units.begin(), units.end());
   units.erase(std::unique(units.begin(), units.end()), units.end());
 
@@ -289,10 +423,17 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     const size_t dot = tablePath.rfind('.');
     tablePath = (dot == std::string::npos ? tablePath : tablePath.substr(0, dot)) + ".table.o";
     uint64_t textEnd = 0;
-    for (auto& sg : img.loads) if (sg.flags & 1) { textEnd = sg.vaddr + sg.memsz; break; }
-    std::vector<uint8_t> extraFlags(units.size(), 0);
-    for (size_t i = 0; i < units.size(); ++i) extraFlags[i] = std::binary_search(extraAll.begin(), extraAll.end(), units[i]);
-    if (!emitTable(units, fnv1a(img.file), unitHashes(img, units), extraFlags, textEnd, opt, *tm, tablePath)) return 1;
+    for (auto& sg : img.loads) if (sg.flags & 1) textEnd = std::max(textEnd, sg.vaddr + sg.memsz);
+    if (units != starts) { fprintf(stderr, "bb-recomp: the units of the second pass (%zu) differ from the pre-pass (%zu)\n", units.size(), starts.size()); return 1; }
+    std::vector<uint64_t> ends(pre.size());
+    std::vector<uint8_t> extraFlags(pre.size());
+    for (size_t i = 0; i < pre.size(); ++i) { ends[i] = pre[i].end > pre[i].entry ? pre[i].end : (i + 1 < pre.size() ? pre[i + 1].entry : textEnd); extraFlags[i] = pre[i].extra; }
+    std::vector<Func> compiled;
+    compiled.reserve(todo.size());
+    for (size_t i : todo) compiled.push_back(funcs[i]);
+    std::vector<uint64_t> nexts(pre.size());
+    for (size_t i = 0; i < pre.size(); ++i) nexts[i] = i + 1 < pre.size() ? pre[i + 1].entry : textEnd;
+    if (!emitTable(units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, compiled, fnv1a(img.file), opt, *tm, tablePath)) return 1;
     tableTime = since(t);
   }
 
@@ -328,8 +469,14 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   struct rusage ru; if (getrusage(RUSAGE_SELF, &ru) == 0) rssKb = ru.ru_maxrss;
 #endif
   say("\n== compile summary (%s, -O%d, %u shards, %u threads) ==\n", opt.target.aarch64 ? "aarch64" : "x86_64", opt.target.opt, nshards, jobs);
+  if (plan.availGB > 0)
+    say("memory plan: %.1f GB available, budget %.1f GB (%.0f%%): %u jobs, %u shards of %.2f MB, estimated peak %.1f GB%s\n", plan.availGB, plan.budgetGB, opt.memFraction * 100, jobs, nshards,
+        plan.shardMB, plan.estPeakGB, plan.limited ? " (reduced to fit)" : "");
   say("functions %" PRIu64 " (%.1f MB), units %" PRIu64 " (lift failures %" PRIu64 "), IR ops lowered %" PRIu64 "\n", tot.funcs, totalBytes / 1e6, tot.units, tot.liftFailed, tot.irOps);
   say("units with bbr_trap (unsupported ops): %" PRIu64 " (%.2f%%), trap sites %" PRIu64 "\n", tot.unitsWithTrap, tot.units ? 100.0 * tot.unitsWithTrap / tot.units : 0.0, tot.trapSites);
+  say("indirect jmps %" PRIu64 ": %" PRIu64 " jump tables (%" PRIu64 " bounded + %" PRIu64 " scanned, %.2f MB of tables), %" PRIu64 " jmp [mem], %" PRIu64 " jmp reg tail calls, %" PRIu64 " table-like unresolved; %" PRIu64 " lowered as switch (%" PRIu64 " cases)\n",
+      tot.indJmps, tot.jmpResolved + tot.jmpScanned, tot.jmpResolved, tot.jmpScanned, tot.tableBytes / 1e6, tot.jmpMem, tot.jmpReg, tot.jmpFailed, tot.switches, tot.switchCases);
+  if (opt.resumeEntries) say("resume entries: %" PRIu64 " call-return blocks reachable through the unit-entry resume switch\n", tot.resumeCases);
   say("direct calls %" PRIu64 ", dispatch calls/jumps %" PRIu64 ", relocated constants %" PRIu64 "\n", tot.directCalls, tot.dispatchCalls, tot.relocConsts);
   if (wantCode) {
     say("CPU time: lift+lower %.1f s, optimise %.1f s, codegen %.1f s (sum over threads); table %.1f s, link %.1f s\n", tot.liftLower, tot.opt, tot.codegen, tableTime, linkTime);

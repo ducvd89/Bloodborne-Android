@@ -18,7 +18,9 @@ struct Agg {
   uint64_t insts = 0, irOps = 0, blocks = 0, bytes = 0, covered = 0, gap = 0, gapInsts = 0, gapPad = 0, gapData = 0, gapInvalid = 0, pastEnd = 0;
   uint64_t realOps = 0, extraUnits = 0, extraFailed = 0, extraInsts = 0, funcsWithExtra = 0, funcsExtraFailed = 0;
   uint64_t instsClean = 0;
-  std::map<std::string, Group> fail, gapFail;
+  uint64_t padUnits = 0, setjmpUnits = 0, secondaryFailed = 0, secondaryInsts = 0, padsKnown = 0, padsInUnit = 0, entryUnitsLifted = 0;
+  uint64_t indJmps = 0, jmpResolved = 0, jmpScanned = 0, jmpMem = 0, jmpMemRip = 0, jmpMemIdx = 0, jmpReg = 0, jmpFailed = 0, tableEntries = 0, tableBytes = 0;
+  std::map<std::string, Group> fail, gapFail, jmpFail;
   Agg() : ops(Lifter::numOps()), funcsUsing(Lifter::numOps()) {}
 };
 
@@ -71,6 +73,9 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
       a.gapInsts += r.gapInsts; a.gapPad += r.gapPad; a.gapData += r.gapData; a.gapInvalid += r.gapInvalid; a.pastEnd += r.spansPastEnd;
       a.extraUnits += r.extraUnits; a.extraFailed += r.extraFailed; a.extraInsts += r.extraInsts; a.funcsWithExtra += r.extraUnits != 0; a.funcsExtraFailed += r.extraFailed != 0;
       a.insts += r.insts; a.irOps += r.irOps; a.blocks += r.blocks;
+      a.padUnits += r.padUnits; a.setjmpUnits += r.setjmpUnits; a.secondaryFailed += r.secondaryFailed; a.secondaryInsts += r.secondaryInsts; a.padsKnown += r.padsKnown; a.padsInUnit += r.padsInUnit; a.entryUnitsLifted += r.entryUnitsLifted;
+      a.indJmps += r.indJmps; a.jmpResolved += r.jmpResolved; a.jmpScanned += r.jmpScanned; a.jmpMem += r.jmpMem; a.jmpMemRip += r.jmpMemRip; a.jmpMemIdx += r.jmpMemIdx; a.jmpReg += r.jmpReg; a.jmpFailed += r.jmpFailed; a.tableEntries += r.tableEntries; a.tableBytes += r.tableBytes;
+      for (auto& e : r.jmpExamples) { auto& g = a.jmpFail[e.substr(e.find(' ') + 1)]; if (!g.count++) g.example = "jmp at vaddr " + e.substr(0, e.find(' ')) + " in function " + std::to_string(f.start); }
       if (r.status == LiftStatus::Clean) a.instsClean += r.insts;
       for (size_t o = 0; o < nOps; ++o) if (cnt[o]) { a.ops[o] += cnt[o]; ++a.funcsUsing[o]; if (!Lifter::isStructuralOp(o)) a.realOps += cnt[o]; }
       if (!r.reason.empty()) addGroup(a.fail, std::string(statusName(r.status)) + " " + r.reason);
@@ -96,6 +101,9 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
     t.insts += a.insts; t.irOps += a.irOps; t.blocks += a.blocks; t.bytes += a.bytes; t.covered += a.covered; t.gap += a.gap;
     t.gapInsts += a.gapInsts; t.gapPad += a.gapPad; t.gapData += a.gapData; t.gapInvalid += a.gapInvalid; t.pastEnd += a.pastEnd; t.instsClean += a.instsClean; t.realOps += a.realOps; t.extraUnits += a.extraUnits; t.extraFailed += a.extraFailed; t.extraInsts += a.extraInsts; t.funcsWithExtra += a.funcsWithExtra; t.funcsExtraFailed += a.funcsExtraFailed;
     for (auto& [k, g] : a.fail) { auto& d = t.fail[k]; if (!d.count) { d.example = g.example; d.exampleAddr = g.exampleAddr; } d.count += g.count; }
+    t.padUnits += a.padUnits; t.setjmpUnits += a.setjmpUnits; t.secondaryFailed += a.secondaryFailed; t.secondaryInsts += a.secondaryInsts; t.padsKnown += a.padsKnown; t.padsInUnit += a.padsInUnit; t.entryUnitsLifted += a.entryUnitsLifted;
+    t.indJmps += a.indJmps; t.jmpResolved += a.jmpResolved; t.jmpScanned += a.jmpScanned; t.jmpMem += a.jmpMem; t.jmpMemRip += a.jmpMemRip; t.jmpMemIdx += a.jmpMemIdx; t.jmpReg += a.jmpReg; t.jmpFailed += a.jmpFailed; t.tableEntries += a.tableEntries; t.tableBytes += a.tableBytes;
+    for (auto& [k, g] : a.jmpFail) { auto& d = t.jmpFail[k]; if (!d.count) { d.example = g.example; d.exampleAddr = g.exampleAddr; } d.count += g.count; }
     for (auto& [k, g] : a.gapFail) { auto& d = t.gapFail[k]; if (!d.count) { d.example = g.example; d.exampleAddr = g.exampleAddr; } d.count += g.count; }
   }
 
@@ -104,10 +112,10 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
   std::string mk = "mkdir -p '" + dir + "'"; if (system(mk.c_str())) return 1;
 
   // functions.csv
-  { FILE* f = open("functions.csv"); fprintf(f, "start,end,size,status,insts,blocks,ir_ops,covered,gap,gap_pad,gap_data,gap_invalid,extra_units,extra_failed,extra_insts,reason\n");
+  { FILE* f = open("functions.csv"); fprintf(f, "start,end,size,status,insts,blocks,ir_ops,covered,gap,gap_pad,gap_data,gap_invalid,extra_units,extra_failed,extra_insts,ind_jmps,jmp_resolved,jmp_scanned,jmp_unresolved,reason\n");
     for (size_t k = 0; k < todo.size(); ++k) { auto& fn = funcs[todo[k]]; auto& r = results[k];
-      fprintf(f, "%" PRIx64 ",%" PRIx64 ",%" PRIu64 ",%s,%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%u,%u,%u,%u,%u,%u,\"%s\"\n", fn.start, fn.end, fn.end - fn.start, statusName(r.status),
-              r.insts, r.blocks, r.irOps, r.coveredBytes, r.gapBytes, r.gapPad, r.gapData, r.gapInvalid, r.extraUnits, r.extraFailed, r.extraInsts, r.reason.c_str()); }
+      fprintf(f, "%" PRIx64 ",%" PRIx64 ",%" PRIu64 ",%s,%u,%u,%u,%" PRIu64 ",%" PRIu64 ",%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,\"%s\"\n", fn.start, fn.end, fn.end - fn.start, statusName(r.status),
+              r.insts, r.blocks, r.irOps, r.coveredBytes, r.gapBytes, r.gapPad, r.gapData, r.gapInvalid, r.extraUnits, r.extraFailed, r.extraInsts, r.indJmps, r.jmpResolved, r.jmpScanned, r.jmpReg + r.jmpFailed, r.reason.c_str()); }
     fclose(f); }
 
   // ir_ops.csv sorted by count
@@ -134,6 +142,7 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
   };
   { FILE* f = open("failures.txt");
     fprintf(f, "Functions not lifted cleanly (grouped by first failure; count = functions)\n\n"); dumpGroups(f, t.fail);
+    fprintf(f, "\nIndirect jumps that look like a table but are not resolved, and register jumps without a table (count = jumps)\n\n"); dumpGroups(f, t.jmpFail);
     fprintf(f, "\nUndecodable bytes inside function ranges outside every lifted block (count = bytes; includes dead code after noreturn calls)\n\n"); dumpGroups(f, t.gapFail);
     fclose(f); }
 
@@ -141,7 +150,10 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
   uint64_t nf = todo.size();
   FILE* sf = g_sf = open("census.txt");
   both("== bb-recomp census ==\n");
-  both("image:            %s functions (FDEs) in %.1f MB; %" PRIu64 " functions censused (every %" PRIu64 ")\n", std::to_string(funcs.size()).c_str(), t.bytes / 1e6, nf, opt.every);
+  {
+    size_t pseudo = 0; for (auto& f : funcs) pseudo += f.kind != 0;
+    both("image:            %zu functions (%zu FDE functions + %zu without an FDE: module starts, PLT stubs, discovered thunks) in %.1f MB; %" PRIu64 " functions censused (every %" PRIu64 ")\n", funcs.size(), funcs.size() - pseudo, pseudo, t.bytes / 1e6, nf, opt.every);
+  }
   both("config:           multiblock=%d tso=%d passes=%d host=%s jobs=%u\n", opt.lift.multiblock, opt.lift.tso, opt.lift.passes, opt.lift.host.c_str(), opt.jobs);
   both("time:             %.2f s wall (%.0f functions/s, %.0f x86 instr/s)\n", secs, nf / secs, (t.insts + t.extraInsts) / secs);
   both("clean:            %" PRIu64 " (%.3f%%)\n", t.byStatus[0], 100.0 * t.byStatus[0] / nf);
@@ -154,8 +166,31 @@ int runCensus(const ElfImage& img, const std::vector<Func>& funcs, const CensusO
   both("  excluding Inline* constants, block markers and GuestOpcode: %" PRIu64 " = %.2f per x86 instruction\n", t.realOps, t.insts ? (double)t.realOps / (t.insts + t.extraInsts) : 0.0);
   both("distinct IR ops:  %zu of %zu in IR.json used; %zu never emitted\n", used, nOps, nOps - used);
   both("bytes:            %.1f MB in FDEs, %.1f MB covered by lifted blocks (%.2f%%), %.1f MB gap\n", t.bytes / 1e6, t.covered / 1e6, 100.0 * t.covered / t.bytes, t.gap / 1e6);
+  { uint64_t fb = 0, fc = 0;
+    for (size_t k = 0; k < todo.size(); ++k) if (funcs[todo[k]].kind == 0) { fb += funcs[todo[k]].end - funcs[todo[k]].start; fc += results[k].coveredBytes; }
+    both("  FDE functions only: %.1f MB, %.1f MB covered (%.2f%%)\n", fb / 1e6, fc / 1e6, fb ? 100.0 * fc / fb : 0.0); }
   both("  gap contents:   %.2f MB padding (int3/nop/ud2), %.2f MB switch table data, %.2f MB other instructions (dead or dropped), %" PRIu64 " undecodable bytes\n", t.gapPad / 1e6, t.gapData / 1e6, t.gapInsts / 1e6, t.gapInvalid);
   both("  units past FDE end: %" PRIu64 "\n", t.pastEnd);
+  both("secondary units: %" PRIu64 " landing pads (of %" PRIu64 " in the functions: %" PRIu64 " were already a unit entry), %" PRIu64 " setjmp return sites, %" PRIu64 " call/jmp-target entries; %" PRIu64 " not clean; %" PRIu64 " x86 instructions\n",
+       t.padUnits, t.padsKnown, t.padsInUnit, t.setjmpUnits, t.entryUnitsLifted, t.secondaryFailed, t.secondaryInsts);
+  if (img.modules.size() > 1) {
+    both("per module (functions incl. pseudo-functions for module starts and PLT stubs):\n");
+    for (auto& m : img.modules) {
+      uint64_t n = 0, fb = 0, cov = 0, ins = 0, units = 0, extra = 0, pseudo = 0, bad = 0;
+      for (size_t k = 0; k < todo.size(); ++k) {
+        const Func& fn = funcs[todo[k]];
+        if (fn.start < m.base || fn.start >= m.base + m.size) continue;
+        const FuncResult& r = results[k];
+        ++n; fb += fn.end - fn.start; cov += r.coveredBytes; ins += r.insts + r.extraInsts + r.secondaryInsts; units += 1 + r.extraUnits + r.padUnits + r.setjmpUnits;
+        extra += r.extraUnits + r.padUnits + r.setjmpUnits; pseudo += fn.kind != 0; bad += r.status != LiftStatus::Clean;
+      }
+      both("  %-16s %7" PRIu64 " functions (%" PRIu64 " pseudo), %6.2f MB, %5.2f%% of the bytes in lifted blocks, %8" PRIu64 " x86 instructions, %7" PRIu64 " units (%" PRIu64 " extra), %" PRIu64 " not clean\n",
+           m.name.c_str(), n, pseudo, fb / 1e6, fb ? 100.0 * cov / fb : 0.0, ins, units, extra, bad);
+    }
+  }
+  both("indirect jmps:    %" PRIu64 " (jmp reg/mem): %" PRIu64 " jump tables resolved (%" PRIu64 " bounded by cmp/ja or and, %" PRIu64 " scanned without a bound; %" PRIu64 " case entries, %.2f MB of tables),\n"
+       "                  %" PRIu64 " jmp [mem] (%" PRIu64 " [rip+x] import stubs, %" PRIu64 " [base+index*scale+x], rest [reg+x] vtable tail calls), %" PRIu64 " jmp reg that is no table (register tail calls), %" PRIu64 " table-like but unresolved\n",
+       t.indJmps, t.jmpResolved + t.jmpScanned, t.jmpResolved, t.jmpScanned, t.tableEntries, t.tableBytes / 1e6, t.jmpMem, t.jmpMemRip, t.jmpMemIdx, t.jmpReg, t.jmpFailed);
   both("\ntop IR ops by count:\n  %-28s %12s %7s %9s\n", "op", "count", "%", "functions");
   for (size_t i = 0; i < 40 && i < order.size(); ++i) { size_t o = order[i]; both("  %-28s %12" PRIu64 " %6.2f%% %9" PRIu64 "\n", Lifter::opName(o), t.ops[o], 100.0 * t.ops[o] / std::max<uint64_t>(t.irOps, 1), t.funcsUsing[o]); }
   fclose(sf);
