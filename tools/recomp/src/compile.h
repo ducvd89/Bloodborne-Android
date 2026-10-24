@@ -22,6 +22,7 @@ struct CompileOptions {
   std::string soPath;            // --so: link an Android ARM64 shared object
   std::string statsPath;         // where the summary is also written
   std::string ndk = "/home/cid/BloodbornePC/.local-deps/android/sdk/ndk/29.0.14206865";
+  std::string bundleDir;         // self-contained build: bundle directory (bundle.h); empty: the NDK and the system clang
   std::string helpersDir;        // the x87 helper sources (tools/recomp/helpers); default: the directory compiled into the tool
   bool table = true;             // emit the unit table object
   bool verify = false;           // run the LLVM verifier on every module

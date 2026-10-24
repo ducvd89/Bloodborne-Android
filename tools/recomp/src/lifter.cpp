@@ -308,6 +308,11 @@ struct Lifter::Impl {
   Impl(const ElfImage& i, const LiftOptions& o) : img(i), opt(o) { build(); }
 
   void build() {
+    // FEXCore's config is a process-wide store whose reads convert the stored string in place (Config::MetaLayer::GetConv<bool> emplaces
+    // the variant): two threads creating a context at once free the same string (glibc "free(): invalid pointer", found with ASan:
+    // bad-free in GetConv from the ContextImpl constructor). Every thread of the tool builds its own Lifter, so building is serialised.
+    static std::mutex buildLock;
+    std::lock_guard<std::mutex> guard(buildLock);
     setConfig(opt);
     ctx = static_cast<Context::ContextImpl*>(Context::Context::CreateNewContext(makeHost(opt.host)).release());
     ctx->SetSyscallHandler(&g_handler);

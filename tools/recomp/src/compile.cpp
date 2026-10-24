@@ -1,4 +1,5 @@
 #include "compile.h"
+#include "bundle.h"
 #include "lower_llvm.h"
 
 #include <llvm/IR/Constants.h>
@@ -479,7 +480,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       cmd = "nice -n 19 clang";
     }
     cmd += " -O2 -fPIC -fvisibility=hidden -fno-stack-protector -ffp-contract=off -c " + dir + "/bbr_x87_all.c -o " + helperObj;
-    if (system(cmd.c_str()) != 0) { fprintf(stderr, "bb-recomp: compiling the x87 helpers failed: %s\n", cmd.c_str()); return 1; }
+    if (bbrSystem(opt.bundleDir, cmd) != 0) { fprintf(stderr, "bb-recomp: compiling the x87 helpers failed: %s\n", cmd.c_str()); return 1; }
     helperTime = since(t);
   }
 
@@ -503,7 +504,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       // made here gives the entry; at run time it is the libbbcpu.so already loaded.
       const std::string stub = opt.soPath + ".libbbcpu-stub.so";
       const std::string mk = "nice -n 19 " + bin + "/bin/clang --target=aarch64-linux-android30 -shared -nostdlib -Wl,-soname,libbbcpu.so -x c /dev/null -o " + stub;
-      if (system(mk.c_str()) != 0) { fprintf(stderr, "bb-recomp: cannot make %s\n", stub.c_str()); return 1; }
+      if (bbrSystem(opt.bundleDir, mk) != 0) { fprintf(stderr, "bb-recomp: cannot make %s\n", stub.c_str()); return 1; }
       cmd += " --no-as-needed " + stub;
     } else {
       // The PC runtime (BB_AOT with an x86-64 host): the system clang links it with ld.lld and adds the builtins
@@ -513,7 +514,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
       if (!tablePath.empty()) cmd += " " + tablePath;
       cmd += " " + helperObj + " -lm";
     }
-    const int rc = system(cmd.c_str());
+    const int rc = bbrSystem(opt.bundleDir, cmd);
     linkTime = since(t);
     if (rc != 0) { fprintf(stderr, "bb-recomp: link failed (%d): %s\n", rc, cmd.c_str()); return 1; }
     FILE* f = fopen(opt.soPath.c_str(), "rb");

@@ -8,6 +8,7 @@
 #include "fde_scan.h"
 #ifdef BB_RECOMP_LLVM
 #include "compile.h"
+#include "bundle.h"
 #endif
 #include <chrono>
 #include <cinttypes>
@@ -20,7 +21,8 @@
 #endif
 
 static void usage() {
-  fputs("usage: bb-recomp --elf <eboot.elf> [options]\n"
+  fputs("usage: bb-recomp --game <game dump folder> [--out <dir>]    (player mode: one command, see --help-player)\n"
+        "       bb-recomp --elf <eboot.elf> [options]\n"
         "  --boot <file>        boot-linked image (scripts/link_modules.py, out/boot-linked.bin): the eboot plus the linked\n"
         "                       system modules (libc.prx ...) at their image offsets, one image, one unit table. --elf then only\n"
         "                       supplies the eboot's program headers\n"
@@ -59,11 +61,12 @@ static void usage() {
         "  --resume-entries     every call-return block is also an entry of its unit (resume flag in the guest state)\n"
         "  --no-callee-saved    reload rbx, rbp, r12-r15 after calls too (default: the SysV callee-saved set is trusted)\n"
         "  --ndk <dir>          Android NDK for --so\n"
+        "  --bundle-dir <dir>   self-contained build: the bundle directory (default: <exe>/../share/bb-recomp, if present)\n"
         "  --helpers-dir <dir>  the x87 helper sources (default: tools/recomp/helpers of the build)\n"
         "  --stats <file>       also write the compile summary here\n", stderr);
 }
 
-int main(int argc, char** argv) {
+int recompMain(int argc, char** argv) {
   std::string elf = "out/eboot.elf", funcsFile, dumpArg, bootFile, prxDir;
   uint64_t base = 0x200000000ull;
   bool scanOnly = false, nice = true, dump = false, noSecondary = false, noDiscovery = false;
@@ -72,6 +75,7 @@ int main(int argc, char** argv) {
   CompileOptions cc;
   bool shardsSet = false, jobsSet = false;
   cc.statsPath = "out/recomp/compile.txt";
+  cc.bundleDir = bundleDirDefault();
 #endif
   unsigned hw = std::thread::hardware_concurrency();
   co.jobs = std::min(22u, hw > 2 ? hw - 2 : 1u);
@@ -119,6 +123,7 @@ int main(int argc, char** argv) {
     else if (is("--no-dirty-check")) cc.dirtyCheck = false;
     else if (is("--no-callee-saved")) cc.calleeSaved = false;
     else if (is("--ndk")) cc.ndk = arg();
+    else if (is("--bundle-dir")) cc.bundleDir = arg();
     else if (is("--helpers-dir")) cc.helpersDir = arg();
     else if (is("--stats")) cc.statsPath = arg();
     else if (is("--func")) cc.onlyVaddr = strtoll(arg(), nullptr, 16);
@@ -192,4 +197,15 @@ int main(int argc, char** argv) {
   }
 #endif
   return runCensus(img, funcs, co);
+}
+
+// Player mode (player.cpp, BB_RECOMP_PLAYER): `bb-recomp --game <dump folder> [--out <dir>]` builds the runtime image and compiles it with recompMain().
+#ifdef BB_RECOMP_PLAYER
+int playerMain(int argc, char** argv);
+#endif
+int main(int argc, char** argv) {
+#ifdef BB_RECOMP_PLAYER
+  for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--game") || !strcmp(argv[i], "--help-player")) return playerMain(argc, argv);
+#endif
+  return recompMain(argc, argv);
 }

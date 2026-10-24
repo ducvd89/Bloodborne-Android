@@ -7,7 +7,7 @@ set(BBR_HELPERS "${BB_RECOMP_DIR}/helpers")
 # The x87 helpers (plain C, one translation unit) are linked into every tool: the in-process JIT of the test tools calls them
 # directly. The same file is compiled again for the target and linked into the generated .so (compile.cpp).
 set_source_files_properties("${BBR_HELPERS}/bbr_x87_all.c" PROPERTIES LANGUAGE C COMPILE_OPTIONS "-O2;-fvisibility=hidden;-fno-stack-protector;-ffp-contract=off")
-set(BBR_LLVM_SRCS "${BBR}/lower_llvm.cpp" "${BBR}/lower_ops.cpp" "${BBR}/lower_vector.cpp" "${BBR}/codegen.cpp" "${BBR}/compile.cpp")
+set(BBR_LLVM_SRCS "${BBR}/lower_llvm.cpp" "${BBR}/lower_ops.cpp" "${BBR}/lower_vector.cpp" "${BBR}/codegen.cpp" "${BBR}/compile.cpp" "${BBR}/bundle.cpp")
 add_executable(bb-recomp "${BBR}/main.cpp" ${BBR_COMMON} "${BBR}/census.cpp")
 target_include_directories(bb-recomp PRIVATE
   "${CMAKE_SOURCE_DIR}/FEXCore/Source" "${CMAKE_SOURCE_DIR}/FEXCore/include" "${CMAKE_BINARY_DIR}/include" "${BBR}" "${BBR_HELPERS}")
@@ -20,9 +20,21 @@ set_target_properties(bb-recomp PROPERTIES CXX_STANDARD 20 CXX_VISIBILITY_PRESET
 
 if(BB_RECOMP_LLVM)
   # Step 2: the system LLVM (AArch64 and X86 targets) as a shared library.
+  if(BB_RECOMP_LLVM_DIR)
+    set(LLVM_DIR "${BB_RECOMP_LLVM_DIR}")
+  endif()
+  if(BB_RECOMP_DEPS_PREFIX)
+    # LLVM's CMake files find zlib and zstd again (static libraries from the prefix)
+    list(APPEND CMAKE_PREFIX_PATH "${BB_RECOMP_DEPS_PREFIX}")
+    set(ZLIB_USE_STATIC_LIBS ON)
+  endif()
   find_package(LLVM REQUIRED CONFIG)
   message(STATUS "bb-recomp: LLVM ${LLVM_PACKAGE_VERSION} (${LLVM_DIR})")
-  foreach(t bb-recomp bb-recomp-asmtest bb-recomp-difftest)
+  set(BBR_TOOLS bb-recomp bb-recomp-asmtest bb-recomp-difftest)
+  if(BB_RECOMP_BUNDLED)
+    set(BBR_TOOLS bb-recomp)
+  endif()
+  foreach(t ${BBR_TOOLS})
     if(NOT t STREQUAL "bb-recomp")
       # the host-side test tools: the lifter, the lowering and the in-process JIT, no census
       if(t STREQUAL "bb-recomp-asmtest")
@@ -50,6 +62,31 @@ if(BB_RECOMP_LLVM)
       target_link_libraries(${t} PRIVATE ${BB_LLVM_LIBS})
     endif()
   endforeach()
-  set(BB_RECOMP_TEST_NASM "${BB_RECOMP_NASM}" CACHE STRING "")
-  target_compile_definitions(bb-recomp-asmtest PRIVATE BBR_NASM="${BB_RECOMP_NASM}" BBR_FEX_SRC="${CMAKE_SOURCE_DIR}")
+  if(NOT BB_RECOMP_BUNDLED)
+    set(BB_RECOMP_TEST_NASM "${BB_RECOMP_NASM}" CACHE STRING "")
+    target_compile_definitions(bb-recomp-asmtest PRIVATE BBR_NASM="${BB_RECOMP_NASM}" BBR_FEX_SRC="${CMAKE_SOURCE_DIR}")
+  endif()
+  if(BB_RECOMP_BUNDLED)
+    # ld.lld in the process (bundle.cpp): LLD's ELF driver as a static library, and a fully static executable (no glibc or
+    # libstdc++ version needed on the player's machine). The libraries are linked by path: LLD's CMake target would pull in every
+    # LLVM target, which the ELF driver does not need without LTO.
+    llvm_map_components_to_libnames(BB_LLD_DEPS option targetparser binaryformat demangle lto transformutils profiledata bitwriter bitreader mc debuginfodwarf)
+    target_compile_definitions(bb-recomp PRIVATE BBR_BUNDLED=1)
+    target_link_libraries(bb-recomp PRIVATE "${LLVM_LIBRARY_DIR}/liblldELF.a" "${LLVM_LIBRARY_DIR}/liblldCommon.a" ${BB_LLD_DEPS})
+    target_link_options(bb-recomp PRIVATE -static)
+  endif()
+endif()
+
+# Player mode: bb-prepare's own sources (tools/android/prepare) are compiled into bb-recomp, with its main() renamed, so the game image
+# the PC tool builds is what the phone builds. player.cpp drives it (and recompMain) for `bb-recomp --game <dump folder>`.
+if(BB_RECOMP_LLVM AND BB_RECOMP_PLAYER)
+  get_filename_component(BBR_PREPARE "${BB_RECOMP_DIR}/../android/prepare" ABSOLUTE)
+  file(GLOB BBR_PREPARE_SRCS "${BBR_PREPARE}/*.cpp")
+  target_sources(bb-recomp PRIVATE ${BBR_PREPARE_SRCS} "${BBR}/player.cpp")
+  set_source_files_properties("${BBR_PREPARE}/bb_prepare.cpp" PROPERTIES COMPILE_DEFINITIONS "main=bb_prepare_main")
+  # their headers (hash.h, io.h ...) only for these files: the names are generic
+  set_source_files_properties(${BBR_PREPARE_SRCS} "${BBR}/player.cpp" PROPERTIES INCLUDE_DIRECTORIES "${BBR_PREPARE};${BBR}")
+  target_compile_definitions(bb-recomp PRIVATE BB_RECOMP_PLAYER=1 BBR_TOOL_VERSION="${BB_RECOMP_VERSION}")
+  find_package(ZLIB REQUIRED)
+  target_link_libraries(bb-recomp PRIVATE ZLIB::ZLIB)
 endif()
