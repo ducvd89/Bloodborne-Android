@@ -23,7 +23,7 @@ constexpr uint32_t MaxEntries = 4096; // unbounded fallback scan
 
 uint32_t writeMask(const Ins& p) {
   switch (p.kind) {
-  case K::Clobber: return 0xffff;
+  case K::Clobber: return p.clobber;
   case K::NoWrite: case K::Cmp: case K::Jcc: case K::Jmp: case K::JmpInd: case K::Ret: case K::Call: case K::CallInd: return 0;
   default: return p.dst.k == Op::Reg ? 1u << p.dst.reg : 0;
   }
@@ -120,8 +120,18 @@ std::vector<Jump> analyze(const std::vector<Ins>& ins, const Env& env) {
       // X need not be the index register itself: it may be the register the index was copied from (`mov ecx, esi ;
       // cmp esi, N ; ja ; ... [tbl+rcx*4]`); it counts once the walk reaches that copy with X untouched in between.
       if (!haveBound && p->kind == K::Jcc && ((!taken && (p->cc == 7 || p->cc == 3)) || (taken && (p->cc == 6 || p->cc == 2))) && at > 0) {
-        const Ins* q = ins[at - 1].pc + ins[at - 1].size == p->pc ? &ins[at - 1] : nullptr;
-        if (q && q->kind == K::Cmp && q->dst.k == Op::Reg && q->src.k == Op::Imm && q->src.imm >= 0 && q->src.imm < (1 << 20))
+        // The cmp may not sit right before the jcc: the scheduler puts flag-preserving instructions (mov, lea ...) between them
+        // (`cmp rax, 11 ; mov rdx, [rbp-0x680] ; ja default`), as long as they do not write the compared register.
+        const Ins* q = nullptr;
+        uint32_t between = 0;
+        for (size_t b = at, back = 0; b > 0 && back < 8; --b, ++back) {
+          const Ins& pi = ins[b - 1];
+          if (pi.pc + pi.size != ins[b].pc) break;
+          if (pi.kind == K::Cmp) { q = &pi; break; }
+          if (!pi.flagSafe) break;
+          between |= writeMask(pi);
+        }
+        if (q && q->kind == K::Cmp && q->dst.k == Op::Reg && q->src.k == Op::Imm && q->src.imm >= 0 && q->src.imm < (1 << 20) && !(between >> q->dst.reg & 1))
           cands.push_back({q->dst.reg, (uint64_t)q->src.imm + (p->cc == 7 || p->cc == 6 ? 1 : 0)});
       }
       if (!haveBound && wm)

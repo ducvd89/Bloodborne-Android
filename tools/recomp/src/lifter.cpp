@@ -271,6 +271,24 @@ jt::Ins jtInst(const X86Tables::DecodedInst& d) {
            is("XADD") || starts("CMPXCHG") || is("CPUID") || starts("RDTSC") || is("SYSCALL") || starts("MOVS") || starts("STOS") ||
            starts("LODS") || starts("SCAS") || starts("CMPS") || is("LEAVE") || is("ENTER") || is("SAHF") || is("LAHF") || is("XLAT"))
     r.kind = (is("MOVSXD") || starts("MOVSX") || is("MOVSS") || is("MOVSD") || is("MOVSLDUP") || is("MOVSHDUP")) ? jt::K::Other : jt::K::Clobber;
+  r.flagSafe = is("MOV") || is("LEA") || is("MOVZX") || is("MOVSXD") || starts("MOVSX") || is("PUSH") || is("POP") || is("NOP") || starts("PREFETCH") ||
+               is("CDQE") || is("CDQ") || is("CQO") || is("CBW") || is("CWDE") || is("CWD");
+  if (r.kind == jt::K::Clobber) {
+    // The registers the instruction writes, so that a table base held in another register survives it: `cltq` between the base lea and the
+    // jump does not touch r11 (the unresolved switch of CSChrThread's +0x210eb7c). Anything not listed clobbers everything.
+    auto regs = [&](const jt::Op& o) -> uint16_t { return o.k == jt::Op::Reg ? uint16_t(1u << o.reg) : 0; };
+    constexpr uint16_t rax = 1 << 0, rcx = 1 << 1, rdx = 1 << 2, rbx = 1 << 3, rsp = 1 << 4, rbp = 1 << 5, rsi = 1 << 6, rdi = 1 << 7, r11 = 1 << 11;
+    if (is("CDQE") || is("CBW") || is("CWDE") || is("SAHF") || is("LAHF") || is("XLAT")) r.clobber = rax;
+    else if (is("CDQ") || is("CQO") || is("CWD")) r.clobber = rdx;
+    else if (is("MUL") || is("DIV") || is("IDIV")) r.clobber = rax | rdx;
+    else if (is("XCHG") || is("XADD")) r.clobber = regs(r.dst) | regs(r.src);
+    else if (starts("CMPXCHG")) r.clobber = rax | regs(r.dst);
+    else if (is("CPUID")) r.clobber = rax | rbx | rcx | rdx;
+    else if (starts("RDTSC")) r.clobber = rax | rcx | rdx;
+    else if (is("SYSCALL")) r.clobber = rax | rcx | r11;
+    else if (starts("MOVS") || starts("STOS") || starts("LODS") || starts("SCAS") || starts("CMPS")) r.clobber = rax | rcx | rsi | rdi;
+    else if (is("LEAVE") || is("ENTER")) r.clobber = rsp | rbp;
+  }
   return r;
 }
 
@@ -343,7 +361,9 @@ struct Lifter::Impl {
     std::vector<uint64_t> retSites; // return addresses (image vaddrs) of calls to returns-twice targets (setjmp)
     std::vector<uint64_t> leaTargets; // rip-relative lea targets (collectTargets)
     std::vector<uint64_t> outTargets; // direct call/jmp/jcc targets outside the unit's function range (image vaddrs; collectTargets)
+    std::vector<uint64_t> instAt;     // granular functions: image vaddr of every instruction lifted
   };
+  bool granular = false;             // the function being lifted gets granular entries: a GuestOpcode marker at every instruction
   bool generate(uint64_t rip, uint64_t lo, uint64_t hi, Gen& g);
   void decode(uint64_t rip, uint64_t lo, uint64_t hi, const std::set<uint64_t>& seeds);
   std::vector<jt::Jump> analyseJumps(uint64_t lo, uint64_t hi, Gen* g);
@@ -516,7 +536,7 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
       const bool IsLocked = DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_LOCK;
 
       OD.FlushRegisterCache(true);
-      if (OD.CanHaveSideEffects(TableInfo, DecodedInfo) || (opt.forceGuestOpcode && opt.forceGuestOpcode->count(InstAddress - img.base))) OD._GuestOpcode(InstAddress - GuestRIP);
+      if (granular || OD.CanHaveSideEffects(TableInfo, DecodedInfo) || (opt.forceGuestOpcode && opt.forceGuestOpcode->count(InstAddress - img.base))) OD._GuestOpcode(InstAddress - GuestRIP);
 
       if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
         auto Fn = TableInfo->OpcodeDispatcher.OpDispatch;
@@ -531,6 +551,7 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
           if (OD.HasHandledLock() != IsLocked) { HadDispatchError = true; fail("lock not handled", TableInfo, InstAddress); }
           BlockInstructionsLength += DecodedInfo->InstSize;
           ++g.insts;
+          if (granular) g.instAt.push_back(InstAddress - img.base);
         }
       } else {
         // Invalid instruction. The decoder drops such blocks silently unless they are the entry block.
@@ -658,6 +679,8 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
   tl_range = {lo, hi};
   tl_log = &log_;
   impl_->fnJumps.clear();
+  impl_->granular = impl_->opt.granularAll || (impl_->opt.granularFuncs && impl_->opt.granularFuncs->count(f.start));
+  r.granular = impl_->granular;
   Impl::Gen g;
   std::vector<uint64_t> extraEntries, retSites, outTargets, leaTargets; // gap unit entries (host addresses), setjmp return sites and out-of-function branch targets (image vaddrs)
   impl_->tables.clear();
@@ -670,6 +693,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       if (!fresh && it->second.targets.empty() && !jv.targets.empty()) it->second = jv;
     }
   };
+  std::set<uint64_t> claimed; // granular functions: instruction boundaries already given to a unit
   tl_valErr.clear();
   sigjmp_buf jb;
   tl_jmp = &jb;
@@ -687,6 +711,15 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       }
       if (sink) {
         UnitMeta meta;
+        meta.granular = impl_->granular;
+        if (meta.granular) {
+          // Each instruction boundary belongs to one unit of the function, the first that decoded it (the entry unit, then the gap and secondary
+          // units): the units duplicate code (a secondary entry repeats what follows it), and a switch entry and a block split for every copy would
+          // multiply the code of the function by its unit count. Entering through another unit's copy is the same code.
+          std::vector<uint64_t> mine = gu.instAt;
+          std::sort(mine.begin(), mine.end()); mine.erase(std::unique(mine.begin(), mine.end()), mine.end());
+          for (uint64_t a : mine) if (claimed.insert(a).second) meta.insts.push_back(a);
+        }
         for (auto& c : gu.cover) meta.end = std::max(meta.end, c.second - impl_->img.base);
         for (auto& j : gu.jumps) {
           if (j.targets.empty()) continue;
@@ -763,7 +796,12 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
       }
       std::sort(want.begin(), want.end());
       want.erase(std::unique(want.begin(), want.end()), want.end());
-      for (auto [a, kind] : want) {
+      std::set<uint64_t> queued;
+      for (auto& w : want) queued.insert(w.first);
+      // A worklist: a unit lifted here may hold a call of setjmp whose return site is a new entry (kind 1), and its exits
+      // (collectTargets) belong to the function's out-of-function targets like those of the other units (discovery).
+      for (size_t qi = 0; qi < want.size(); ++qi) {
+        const auto [a, kind] = want[qi];
         const uint64_t pc = impl_->img.base + a;
         if (pc < lo || pc >= hi) continue;
         if (entries.count(pc)) { if (kind == 0) ++r.padsInUnit; continue; }
@@ -782,6 +820,9 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
           if (!g3.reason.empty()) { ++r.secondaryFailed; if (r.extraReason.empty()) r.extraReason = "secondary entry: " + g3.reason; }
           account(pc, true, g3);
           noteJumps(g3);
+          outTargets.insert(outTargets.end(), g3.outTargets.begin(), g3.outTargets.end());
+          leaTargets.insert(leaTargets.end(), g3.leaTargets.begin(), g3.leaTargets.end());
+          for (uint64_t rs : g3.retSites) if (queued.insert(rs).second) want.push_back({rs, 1});
         }
       }
     }
@@ -808,6 +849,7 @@ void Lifter::lift(const Func& f, FuncResult& r, std::vector<uint32_t>* opCounts,
         else if (j.why == jt::Why::NotTable) ++r.jmpReg;
         else ++r.jmpFailed;
         if (res && seenTables.insert(j.table).second) { r.tableEntries += j.entries; r.tableBytes += 4ull * j.entries; }
+        if (!j.memForm && ((!res && j.why != jt::Why::NotTable) || (res && j.why != jt::Why::Resolved))) r.weakJumps.push_back({pc, (uint8_t)j.why, j.table, j.entries, res});
         if (!res && !j.memForm && r.jmpExamples.size() < 4) {
           char b[160]; snprintf(b, sizeof b, "%#lx %s", (unsigned long)pc, jt::whyName(j.why));
           r.jmpExamples.push_back(b);

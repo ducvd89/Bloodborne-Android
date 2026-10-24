@@ -12,8 +12,14 @@ struct DiscoverResult {
   size_t pseudoFuncs = 0;       // functions added (kind 3)
   size_t pseudoBytes = 0;
   size_t midEntries = 0;        // call/jmp targets in the middle of a function that no unit starts at (units added)
+  size_t extraGiven = 0, extraFuncStarts = 0, extraMid = 0, extraNew = 0, extraRejected = 0; // --extra-entries: addresses, already function starts, mid-function units added, new pseudo-functions, did not decode
   unsigned rounds = 0;
 };
 
 // funcs: sorted; gets the pseudo-functions (Func::kind 3) added and stays sorted. entryUnits: function start -> extra unit entries.
-DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, std::map<uint64_t, std::vector<uint64_t>>& entryUnits, const LiftOptions& lift, unsigned jobs);
+// extra: addresses the runtime was seen to enter that no unit starts at (a misses log, --extra-entries): each becomes a unit entry like a discovered target.
+DiscoverResult discoverEntries(const ElfImage& img, std::vector<Func>& funcs, std::map<uint64_t, std::vector<uint64_t>>& entryUnits, const LiftOptions& lift, unsigned jobs,
+                               const std::vector<uint64_t>* extra = nullptr);
+// Reads a list of image offsets: the runtime's misses log (`miss +0x210ebc0 ...` lines, docs/RECOMP_ABI.md "Strict mode"), or one hex address per line
+// ('+0x' and '0x' prefixes optional, '#' comments).
+std::vector<uint64_t> readEntryList(const char* path, std::string& err);

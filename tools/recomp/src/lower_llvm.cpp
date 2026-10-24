@@ -51,6 +51,9 @@ Lower::Lower(ModuleCtx& mc, const IR::IRListView& ir, LowerResult* r, uint64_t e
   entryRip = IR.GetHeader()->OriginalRIP;
   val.assign(IR.GetSSACount() + 2, nullptr);
   var.assign(IR.GetSSACount() + 2, nullptr);
+  regionOf.assign(IR.GetSSACount() + 2, 0);
+  slotOf.assign(IR.GetSSACount() + 2, nullptr);
+  granularUnit = um && um->granular;
 }
 
 AllocaInst* Lower::newAlloca(Type* t, const char* name) {
@@ -115,7 +118,20 @@ Value* Lower::A(W w) {
   if (w.IsInvalid()) return nullptr;
   const uint32_t id = w.ID().Value;
   if (auto* a = var[id]) return B.CreateLoad(a->getAllocatedType(), a);
-  if (val[id]) return val[id];
+  if (val[id]) {
+    if (granularUnit && regionOf[id] != curRegion) {
+      if (auto* inst = dyn_cast<Instruction>(val[id])) {
+        if (!slotOf[id]) {
+          slotOf[id] = newAlloca(inst->getType(), "xr");
+          IRBuilder<> sb(inst->getParent());
+          if (inst->getNextNode()) sb.SetInsertPoint(inst->getNextNode());
+          sb.CreateStore(inst, slotOf[id]);
+        }
+        return B.CreateLoad(inst->getType(), slotOf[id]);
+      }
+    }
+    return val[id];
+  }
   auto* o = opOf(w);
   switch (o->Op) {
   case IR::OP_INLINECONSTANT: return c64(o->C<IR::IROp_InlineConstant>()->Constant);
@@ -128,7 +144,7 @@ Value* Lower::A(W w) {
   }
 }
 
-void Lower::def(Ref node, Value* v) { val[IR.GetID(node).Value] = v; }
+void Lower::def(Ref node, Value* v) { const uint32_t id = IR.GetID(node).Value; val[id] = v; regionOf[id] = curRegion; slotOf[id] = nullptr; }
 
 AllocaInst* Lower::varFor(W w) { return var[w.ID().Value]; }
 void Lower::setVar(W out, Value* v) {
@@ -589,7 +605,7 @@ bool Lower::emitOp(Ref node, IR::IROp_Header* op) {
     return true;
   case IR::OP_GUESTOPCODE: {
     curGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset;
-    if (m.O.hookSites) {
+    if (m.O.hookSites || !hookSplit.empty()) {
       const uint64_t vaddr = entryRip - m.O.liftBase + curGuest;
       // A point a hook callback may continue at, in the middle of a block: the block starts here (the fall-through path comes in
       // with its flags in the allocas), the callback's jump path joins it.
@@ -599,9 +615,12 @@ bool Lower::emitOp(Ref node, IR::IROp_Header* op) {
         fd = FlagDesc{};
         B.CreateBr(sp->second);
         B.SetInsertPoint(sp->second);
+        ++curRegion;
       }
-      auto hs = m.O.hookSites->find(vaddr);
-      if (hs != m.O.hookSites->end()) emitHookSite(hs->second);
+      if (m.O.hookSites) {
+        auto hs = m.O.hookSites->find(vaddr);
+        if (hs != m.O.hookSites->end()) emitHookSite(hs->second);
+      }
     }
     return true;
   }
@@ -645,6 +664,7 @@ bool Lower::emitOp(Ref node, IR::IROp_Header* op) {
 
 void Lower::run() {
   scan();
+  const bool granular = meta && meta->granular;
   const std::string name = unitName(entryVaddr);
   F = cast<Function>(m.defFn(entryVaddr).getCallee());
   F->setDoesNotThrow();
@@ -667,7 +687,7 @@ void Lower::run() {
     auto* br = B.CreateCondBr(B.CreateICmpNE(d, ConstantInt::get(I8, 0)), dirtyBB, proBB);
     br->setMetadata(LLVMContext::MD_prof, MDBuilder(C).createBranchWeights(1, 2000));
     B.SetInsertPoint(dirtyBB);
-    if (m.O.resumeEntries) {
+    if (m.O.resumeEntries || granular) {
       // a resume request (flag set, rip = the return address wanted) at a dirty unit: not here, the dispatcher tries the next unit
       auto* go = BasicBlock::Create(C, "dirty_go", F);
       auto* rs = BasicBlock::Create(C, "dirty_resume", F);
@@ -699,11 +719,11 @@ void Lower::run() {
     const uint32_t id = IR.GetID(BlockNode).Value;
     BlockInfo bi{BlockNode, BlockHeader, {}};
     int64_t lastGuest = -1;
-    if (m.O.hookSites) hookBlockAt[entryRip - m.O.liftBase + BlockHeader->C<IR::IROp_CodeBlock>()->GuestEntryOffset] = id;
+    if (m.O.hookSites || granular) hookBlockAt[entryRip - m.O.liftBase + BlockHeader->C<IR::IROp_CodeBlock>()->GuestEntryOffset] = id;
     for (auto [Node, op] : IR.GetCode(BlockNode)) {
       if (op->Op == IR::OP_GUESTOPCODE) {
         lastGuest = op->C<IR::IROp_GuestOpcode>()->GuestEntryOffset;
-        if (m.O.hookSites) guestAt.insert(entryRip - m.O.liftBase + lastGuest);
+        if (m.O.hookSites || granular) guestAt.insert(entryRip - m.O.liftBase + lastGuest);
       }
       if (op->Op == IR::OP_EXITFUNCTION && m.O.resumeEntries) {
         auto* o = op->C<IR::IROp_ExitFunction>();
@@ -744,6 +764,12 @@ void Lower::run() {
   }
   if (order.empty()) { B.CreateUnreachable(); return; }
   auto* proEnd = B.GetInsertBlock(); // the prologue block: its terminator is emitted after the blocks (resume switch)
+  if (granular) {
+    // Granular entries: every instruction boundary of the unit is a point the unit can be entered at. An instruction inside a block (not a
+    // block entry) gets a block of its own, like a hook resume point: the fall-through path joins it with its flags in the allocas.
+    for (uint64_t v : guestAt)
+      if (!hookBlockAt.count(v) && !hookSplit.count(v) && std::binary_search(meta->insts.begin(), meta->insts.end(), v)) hookSplit[v] = newBB("gsplit");
+  }
   if (m.O.hookSites) {
     // Resume points of the hook sites that are instructions inside a block (no block entry): the block gets a split there.
     for (auto& [vaddr, hs] : *m.O.hookSites) {
@@ -842,6 +868,7 @@ void Lower::run() {
     curBlock = id;
     B.SetInsertPoint(bbOf[id]);
     fd = FlagDesc{};
+    ++curRegion;
     dirty = dirtyIn[id];
     for (auto [Node, op] : IR.GetCode(blocks[id].node)) {
       if (terminated()) break;
@@ -859,14 +886,20 @@ void Lower::run() {
       B.CreateUnreachable();
     }
   }
-  // Prologue exit: into the unit's entry block, or (resume entries) into the switch that re-enters at a call-return block when
-  // the dispatcher asks for it with the resume flag in the guest state (docs/RECOMP_ABI.md).
+  // Prologue exit: into the unit's entry block, or (resume entries, granular entries) into the switch that re-enters at a call-return block or at
+  // any instruction boundary of the unit when the dispatcher asks for it with the resume flag in the guest state (docs/RECOMP_ABI.md).
   B.SetInsertPoint(proEnd);
   std::vector<std::pair<uint64_t, uint32_t>> cases;
-  for (auto& rb : retBlocks) if (emitted.count(rb.second)) cases.push_back(rb);
+  std::vector<std::pair<uint64_t, BasicBlock*>> bbCases;   // granular: the targets as blocks (instruction boundaries inside blocks are split blocks)
+  if (m.O.resumeEntries) for (auto& rb : retBlocks) if (emitted.count(rb.second)) cases.push_back(rb);
+  if (granular) {
+    for (auto& [v, id] : hookBlockAt) if (emitted.count(id) && std::binary_search(meta->insts.begin(), meta->insts.end(), v)) cases.push_back({v, id});
+    for (auto& [v, bb] : hookSplit) if (!bb->empty()) bbCases.push_back({v, bb});   // (a split of a block that was never emitted stays empty)
+  }
   std::sort(cases.begin(), cases.end());
   cases.erase(std::unique(cases.begin(), cases.end(), [](auto& a, auto& b) { return a.first == b.first; }), cases.end());
-  if (m.O.resumeEntries && !cases.empty()) {
+  std::sort(bbCases.begin(), bbCases.end(), [](auto& a, auto& b) { return a.first < b.first; });
+  if ((m.O.resumeEntries || granular) && (!cases.empty() || !bbCases.empty())) {
     auto* rsw = newBB("resume");
     auto* fi = newBB("flags");
     auto* flag = B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, _pad1)), Align(8));
@@ -876,15 +909,20 @@ void Lower::run() {
     B.CreateBr(bbOf[order[0]]);
     B.SetInsertPoint(rsw);
     B.CreateAlignedStore(c64(0), gep(offsetof(Core::CPUState, _pad1)), Align(8));
+    // Granular entries are entered by jumps: the flags the jumping unit stored are the ones the code at the target sees. (After a call the
+    // flags are dead, so the call-return resume entries leave them alone.)
+    if (granular) flagsInit();
     Value* rip = B.CreateAlignedLoad(I64, gep(offsetof(Core::CPUState, rip)), Align(8));
     Value* off = B.CreateSub(rip, m.O.fixedImageBase ? (Value*)c64(m.O.imageBase) : ImgBase);
     auto* miss = newBB("resume_miss");
-    auto* si = B.CreateSwitch(off, miss, cases.size());
+    auto* si = B.CreateSwitch(off, miss, cases.size() + bbCases.size());
     for (auto [vaddr, id] : cases) si->addCase(cast<ConstantInt>(ConstantInt::get(I64, vaddr)), bbOf[id]);
+    for (auto [vaddr, bb] : bbCases) si->addCase(cast<ConstantInt>(ConstantInt::get(I64, vaddr)), bb);
     B.SetInsertPoint(miss);
     B.CreateAlignedStore(c64(1), gep(offsetof(Core::CPUState, _pad1)), Align(8)); // not here: the dispatcher tries the next unit
     B.CreateRetVoid();
-    res->resumeCases = cases.size();
+    res->resumeCases = cases.size() + bbCases.size();
+    if (granular) { res->granularUnits = 1; res->granularCases = cases.size() + bbCases.size(); }
   } else {
     flagsInit();
     B.CreateBr(bbOf[order[0]]);

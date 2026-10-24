@@ -12,7 +12,7 @@ using Rep = replica::GuestState;
 #define SAME(m) static_assert(offsetof(Fex, m) == offsetof(Rep, m), #m)
 SAME(pf_raw); SAME(af_raw); SAME(rip); SAME(gregs); SAME(L1Pointer); SAME(L1Mask); SAME(callret_sp); SAME(avx_high); SAME(xmm);
 SAME(es_idx); SAME(cs_idx); SAME(gs_idx); SAME(fs_idx); SAME(mxcsr); SAME(es_cached); SAME(gs_cached); SAME(fs_cached); SAME(flags);
-SAME(mm); SAME(segment_arrays); SAME(FCW); SAME(AbridgedFTW); SAME(private_gdt);
+SAME(_pad1); SAME(mm); SAME(segment_arrays); SAME(FCW); SAME(AbridgedFTW); SAME(private_gdt);
 static_assert(sizeof(Fex) == sizeof(Rep) && alignof(Fex) == alignof(Rep));
 int main() {
     Fex f; Rep r;

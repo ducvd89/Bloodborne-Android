@@ -41,6 +41,7 @@ struct ShardStats {
   double liftLower = 0, opt = 0, codegen = 0;
   uint64_t funcs = 0, units = 0, unitsWithTrap = 0, trapSites = 0, irOps = 0, directCalls = 0, dispatchCalls = 0, relocConsts = 0;
   uint64_t liftFailed = 0, objBytes = 0, textBytes = 0;
+  uint64_t granularUnits = 0, granularCases = 0;
   uint64_t volatileLoads = 0, resumeCases = 0, switches = 0, switchCases = 0, indJmps = 0, jmpResolved = 0, jmpScanned = 0, jmpMem = 0, jmpReg = 0, jmpFailed = 0, tableBytes = 0;
   std::vector<uint64_t> unitVaddrs;
   std::vector<uint32_t> hookSeen;   // hook site indices that got a slot test in this shard
@@ -75,6 +76,7 @@ struct Sink : UnitSink {
     ++st.units; st.unitVaddrs.push_back(entry);
     st.trapSites += lr.trapSites; st.irOps += lr.irOps; st.directCalls += lr.directCalls; st.dispatchCalls += lr.dispatchCalls;
     st.relocConsts += lr.relocConstants; st.switches += lr.switches; st.volatileLoads += lr.volatileLoads; st.switchCases += lr.switchCases; st.resumeCases += lr.resumeCases;
+    st.granularUnits += lr.granularUnits; st.granularCases += lr.granularCases;
     for (uint32_t i : lr.hookIdx) st.hookSeen.push_back(i);
     if (!lr.unsupported.empty()) { ++st.unitsWithTrap; st.trapVaddrs.push_back(entry); for (auto& n : lr.unsupported) ++st.opUnits[n]; }
   }
@@ -82,6 +84,7 @@ struct Sink : UnitSink {
 
 // What the pre-pass learns about each unit: whether it is a function start, and where its code ends.
 struct UnitInfo { uint64_t entry; uint64_t end; bool extra; };
+struct WeakRec { uint64_t func; FuncResult::WeakJump j; };   // an indirect jump whose case set is not known for sure (and the function it is in)
 struct RecordSink : UnitSink {
   std::vector<UnitInfo>& out;
   explicit RecordSink(std::vector<UnitInfo>& o) : out(o) {}
@@ -121,7 +124,7 @@ std::vector<uint64_t> unitHashes(const ElfImage& img, const std::vector<uint64_t
 // bbr_func_count, bbr_abi_flags, bbr_image_hash, bbr_abi_version, and the bbr_image_base the loader sets.
 struct HookTable { const HookSites* sites = nullptr; const std::vector<HookDecl>* decls = nullptr; std::vector<uint8_t> compiled; };
 bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>& units, const std::vector<uint64_t>& ends, const std::vector<uint64_t>& hashes, const std::vector<uint64_t>& ehashes, const std::vector<uint8_t>& extra, uint64_t textEnd,
-               const std::vector<uint8_t>& dirtyInit, const std::vector<Func>& funcs, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path,
+               const std::vector<uint8_t>& dirtyInit, const std::vector<Func>& funcs, const std::vector<uint8_t>& granularFlags, uint64_t imageHash, const CompileOptions& opt, TargetMachine& tm, const std::string& path,
                const VariantTable* vt, const HookTable* ht) {
   LLVMContext ctx;
   Module m("bbr_table", ctx);
@@ -182,6 +185,11 @@ bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>&
     auto* faty = ArrayType::get(fent, fs.size());
     new GlobalVariable(m, faty, true, GlobalValue::ExternalLinkage, ConstantArray::get(faty, fs), "bbr_funcs");
     new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, fs.size()), "bbr_func_count");
+    // bbr_func_granular[i]: 1 when every unit of function i has a switch at its entry for every instruction boundary it holds (granular entries).
+    std::vector<Constant*> gs; gs.reserve(funcs.size());
+    for (size_t i = 0; i < funcs.size(); ++i) gs.push_back(ConstantInt::get(i8, i < granularFlags.size() ? granularFlags[i] : 0));
+    auto* gty = ArrayType::get(i8, gs.size());
+    new GlobalVariable(m, gty, true, GlobalValue::ExternalLinkage, ConstantArray::get(gty, gs), "bbr_func_granular");
   }
   // Variants (docs/RECOMP_ABI.md): bbr_vfuncs[] {func start, first unit, unit count, name offset}, bbr_vunits[] {vaddr, end, ehash, fn, original unit index},
   // bbr_vnames (the names, NUL separated).
@@ -232,7 +240,8 @@ bool emitTable(const std::vector<uint64_t>& ehHdrs, const std::vector<uint64_t>&
     auto* sa = ArrayType::get(ptr, hs.size());
     new GlobalVariable(m, sa, false, GlobalValue::ExternalLinkage, ConstantAggregateZero::get(sa), "bbr_hook_slot");
   }
-  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, (opt.resumeEntries ? 1 : 0) | (opt.dirtyCheck ? 2 : 0) | (haveVariants ? 4 : 0) | (haveHooks ? 8 : 0)), "bbr_abi_flags");
+  new GlobalVariable(m, i64, true, GlobalValue::ExternalLinkage, ConstantInt::get(i64, (opt.resumeEntries ? 1 : 0) | (opt.dirtyCheck ? 2 : 0) | (haveVariants ? 4 : 0) | (haveHooks ? 8 : 0) |
+                                                                                                                (std::find(granularFlags.begin(), granularFlags.end(), 1) != granularFlags.end() ? 16 : 0)), "bbr_abi_flags");
   {
     // bbr_eh_frame_hdr[3 * n]: per module {base, size, .eh_frame_hdr vaddr}, image-relative; bbr_eh_frame_hdr_count = n. The
     // runtime reads the CFI of a function it enters in the middle (a jump the units do not cover) to find the function's
@@ -323,6 +332,70 @@ __attribute__((format(printf, 1, 2))) void say(const char* fmt, ...) {
   vfprintf(stdout, fmt, a); if (g_sf) vfprintf(g_sf, fmt, b);
   va_end(a); va_end(b);
 }
+// --dump-units and --check-entries: the unit table as the compile will build it, and whether given addresses are entries (a unit starts there, or a
+// granular function holds the instruction boundary in one of its units). No code is generated; the granular functions are lifted once more.
+struct EntrySink : UnitSink {
+  struct U { uint64_t entry, end; bool extra; std::vector<uint64_t> insts; std::vector<SwitchInfo> switches; };
+  std::vector<U> units;
+  void unit(uint64_t entry, bool extra, const void*, const UnitMeta& meta) override { units.push_back({entry, meta.end, extra, meta.insts, meta.switches}); }
+};
+
+int reportUnits(const ElfImage& img, const std::vector<Func>& funcs, const LiftOptions& liftOpt, const std::vector<UnitInfo>& pre, const std::set<uint64_t>& granular, bool granularAll,
+                const std::vector<WeakRec>& weak, const CompileOptions& opt) {
+  auto funcOf = [&](uint64_t a) -> const Func* {
+    auto it = std::upper_bound(funcs.begin(), funcs.end(), a, [](uint64_t v, const Func& f) { return v < f.start; });
+    return it != funcs.begin() && a < (it - 1)->end ? &*(it - 1) : nullptr;
+  };
+  auto isUnit = [&](uint64_t a) { auto it = std::lower_bound(pre.begin(), pre.end(), a, [](const UnitInfo& u, uint64_t v) { return u.entry < v; }); return it != pre.end() && it->entry == a; };
+  if (!opt.unitsDump.empty()) {
+    FILE* f = fopen(opt.unitsDump.c_str(), "w");
+    if (!f) { perror(opt.unitsDump.c_str()); return 1; }
+    fprintf(f, "# bb-recomp unit table: unit <entry> <end> <extra: 0 function start, 1 other entry> <function start> <granular: 0|1>  (image offsets, hex)\n");
+    size_t fi = 0;
+    for (const UnitInfo& u : pre) {
+      const Func* fn = funcOf(u.entry);
+      (void)fi;
+      const bool g = fn && (granularAll || granular.count(fn->start));
+      fprintf(f, "unit %#" PRIx64 " %#" PRIx64 " %d %#" PRIx64 " %d\n", u.entry, u.end, u.extra ? 1 : 0, fn ? fn->start : 0, g ? 1 : 0);
+    }
+    for (uint64_t g : granular) fprintf(f, "granular %#" PRIx64 "\n", g);
+    for (const WeakRec& w : weak)
+      fprintf(f, "weak %#" PRIx64 " %#" PRIx64 " %s entries=%u %s\n", w.j.pc, w.func, w.j.scanned ? "scanned" : "unresolved", w.j.entries, jt::whyName((jt::Why)w.j.why));
+    fclose(f);
+    printf("unit table: %zu units written to %s\n", pre.size(), opt.unitsDump.c_str());
+  }
+  int missing = 0;
+  if (!opt.checkEntries.empty()) {
+    LiftOptions lo = liftOpt;
+    lo.gapUnits = liftOpt.gapUnits;
+    Lifter lifter(img, lo);
+    for (uint64_t a : opt.checkEntries) {
+      if (isUnit(a)) { printf("+%#" PRIx64 ": unit entry\n", a); continue; }
+      const Func* fn = funcOf(a);
+      if (!fn) { printf("+%#" PRIx64 ": NOT COVERED: in no function\n", a); ++missing; continue; }
+      EntrySink sink; FuncResult fr;
+      lifter.lift(*fn, fr, nullptr, nullptr, nullptr, &sink);
+      bool found = false;
+      const bool gran = granularAll || granular.count(fn->start);
+      for (auto& u : sink.units) {
+        if (gran && std::binary_search(u.insts.begin(), u.insts.end(), a)) { printf("+%#" PRIx64 ": granular entry of the unit at +%#" PRIx64 " (function +%#" PRIx64 ")\n", a, u.entry, fn->start); found = true; break; }
+      }
+      // A case of a jump table the lifter resolved: the code is a block of the unit that holds the jump, reached by the switch inside it (it
+      // is no entry: nothing outside the unit jumps there).
+      for (auto& u : sink.units) {
+        if (found) break;
+        for (auto& sw : u.switches)
+          if (std::binary_search(sw.targets.begin(), sw.targets.end(), a)) {
+            printf("+%#" PRIx64 ": case of the jump table of the switch at +%#" PRIx64 " (unit at +%#" PRIx64 ", function +%#" PRIx64 "): a block inside the unit, reached by its switch\n", a, sw.jmpVaddr, u.entry, fn->start);
+            found = true; break;
+          }
+      }
+      if (!found) { printf("+%#" PRIx64 ": NOT COVERED: inside function +%#" PRIx64 " (%s), no unit starts there, no resolved jump table has it as a case\n", a, fn->start, gran ? "granular, but not an instruction boundary of any unit" : "no granular entries"); ++missing; }
+    }
+    printf("%d of %zu addresses are not covered\n", missing, opt.checkEntries.size());
+  }
+  return missing ? 3 : 0;
+}
 } // namespace
 
 int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const CompileOptions& opt) {
@@ -384,8 +457,12 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   // jumps then go straight to any unit, not only to function starts, and bbr_dirty[] gets a fixed index per unit. Lifting is about
   // a tenth of the work, and the units it makes are the ones the second pass makes (same lifter, same options).
   std::vector<UnitInfo> pre;
+  std::set<uint64_t> granular;   // function starts whose units get granular entries (below)
+  std::vector<WeakRec> weakAll;
   {
     std::vector<std::vector<UnitInfo>> part(std::max(1u, plan.jobs));
+    std::vector<std::vector<uint64_t>> weak(part.size());
+    std::vector<std::vector<WeakRec>> weakRecs(part.size());
     std::atomic<size_t> nextF {0};
     auto w = [&](unsigned id) {
       Lifter lifter(img, liftOpt);
@@ -396,6 +473,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
         const Func& f = funcs[todo[j]];
         FuncResult fr;
         lifter.lift(f, fr, nullptr, nullptr, nullptr, &rs);
+        if (!fr.weakJumps.empty()) { weak[id].push_back(f.start); for (auto& j : fr.weakJumps) weakRecs[id].push_back({f.start, j}); }
         if (fr.status == LiftStatus::Failed || fr.status == LiftStatus::Crashed) part[id].push_back({f.start, f.end, false});
       }
     };
@@ -405,12 +483,51 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     for (auto& p : part) pre.insert(pre.end(), p.begin(), p.end());
     std::sort(pre.begin(), pre.end(), [](const UnitInfo& a, const UnitInfo& b) { return a.entry < b.entry || (a.entry == b.entry && a.end > b.end); });
     pre.erase(std::unique(pre.begin(), pre.end(), [](const UnitInfo& a, const UnitInfo& b) { return a.entry == b.entry; }), pre.end());
+    if (opt.granular == CompileOptions::Granular::Jumps)
+      for (auto& w : weak) granular.insert(w.begin(), w.end());
+    for (auto& w : weakRecs) weakAll.insert(weakAll.end(), w.begin(), w.end());
+    std::sort(weakAll.begin(), weakAll.end(), [](const WeakRec& a, const WeakRec& b) { return a.j.pc < b.j.pc; });
+    if (!opt.granularList.empty()) {
+      // Functions named by address in a file (hex addresses, one per line, '#' comments; a misses log works too): granular as well.
+      if (FILE* gf = fopen(opt.granularList.c_str(), "r")) {
+        char line[512];
+        size_t added = 0;
+        while (fgets(line, sizeof line, gf)) {
+          const char* p = line;
+          while (*p == ' ' || *p == '\t') ++p;
+          if (*p == '#' || *p == '\n' || !*p) continue;
+          if (!strncmp(p, "miss ", 5)) p += 5;
+          if (*p == '+') ++p;
+          char* e = nullptr;
+          const uint64_t a = strtoull(p, &e, 16);
+          if (e == p) continue;
+          auto it = std::upper_bound(funcs.begin(), funcs.end(), a, [](uint64_t v, const Func& f) { return v < f.start; });
+          if (it != funcs.begin() && a < (it - 1)->end && granular.insert((it - 1)->start).second) ++added;
+        }
+        fclose(gf);
+        fprintf(stderr, "bb-recomp: %s: %zu more granular functions\n", opt.granularList.c_str(), added);
+      } else perror(opt.granularList.c_str());
+    }
   }
   std::vector<uint64_t> starts; // sorted unit entries
   starts.reserve(pre.size());
   for (auto& u : pre) starts.push_back(u.entry);
+  // Granular entries: the functions chosen by the pre-pass (every unit of them gets an entry at every instruction boundary it holds). The
+  // lifters of the second pass and of the variants take the set: it does not change the unit set, only the GuestOpcode markers and the switch.
+  const bool granularAll = opt.granular == CompileOptions::Granular::All;
+  if (granularAll) liftOpt.granularAll = true;
+  else if (!granular.empty()) liftOpt.granularFuncs = &granular;
+  if (opt.granular != CompileOptions::Granular::Off || !granular.empty())
+    say("granular entries: %s%zu functions (%s)\n", granularAll ? "all " : "", granularAll ? todo.size() : granular.size(),
+        granularAll ? "every instruction boundary of every unit" : "table-like indirect jumps the lifter could not resolve for sure, and --granular-funcs");
+  if (!opt.unitsDump.empty() || !opt.checkEntries.empty()) {
+    const int rc = reportUnits(img, funcs, liftOpt, pre, granular, granularAll, weakAll, opt);
+    if (rc) return rc;
+  }
+  if (opt.unitsOnly) return 0;
   const bool wantCode = !opt.objPath.empty() || !opt.soPath.empty();
   const bool emitLl = !opt.llPath.empty();
+  (void)wantCode0;
   LowerOptions lo;
   lo.liftBase = img.base;
   lo.imageSize = 0;
@@ -499,6 +616,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     tot.funcs += s.funcs; tot.units += s.units; tot.unitsWithTrap += s.unitsWithTrap; tot.trapSites += s.trapSites; tot.irOps += s.irOps;
     tot.directCalls += s.directCalls; tot.dispatchCalls += s.dispatchCalls; tot.relocConsts += s.relocConsts; tot.liftFailed += s.liftFailed;
     tot.objBytes += s.objBytes; tot.textBytes += s.textBytes;
+    tot.granularUnits += s.granularUnits; tot.granularCases += s.granularCases;
     tot.resumeCases += s.resumeCases; tot.volatileLoads += s.volatileLoads; tot.switches += s.switches; tot.switchCases += s.switchCases; tot.indJmps += s.indJmps; tot.jmpResolved += s.jmpResolved; tot.jmpScanned += s.jmpScanned;
     tot.jmpMem += s.jmpMem; tot.jmpReg += s.jmpReg; tot.jmpFailed += s.jmpFailed; tot.tableBytes += s.tableBytes;
     for (auto& [n, c] : s.opUnits) tot.opUnits[n] += c;
@@ -564,7 +682,9 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
     for (auto& md : img.modules) if (md.ehFrameHdrVaddr) { ehHdrs.push_back(md.base); ehHdrs.push_back(md.size); ehHdrs.push_back(md.ehFrameHdrVaddr); }
     if (ehHdrs.empty() && img.ehFrameHdrVaddr) { ehHdrs.push_back(0); ehHdrs.push_back(img.textHi); ehHdrs.push_back(img.ehFrameHdrVaddr); }
     HookTable ht; ht.sites = &hookSites; ht.decls = &catalog.hooks; ht.compiled = hookCompiled;
-    if (!emitTable(ehHdrs, units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, dirtyInit, compiled, fnv1a(img.file), opt, *tm, tablePath,
+    std::vector<uint8_t> granularFlags(compiled.size(), 0);
+    for (size_t i = 0; i < compiled.size(); ++i) granularFlags[i] = granularAll || granular.count(compiled[i].start) ? 1 : 0;
+    if (!emitTable(ehHdrs, units, ends, unitHashes(img, units, nexts), unitHashes(img, units, ends), extraFlags, textEnd, dirtyInit, compiled, granularFlags, fnv1a(img.file), opt, *tm, tablePath,
                    haveVariantCode ? &vres.table : nullptr, catalog.hooks.empty() ? nullptr : &ht)) return 1;
     tableTime = since(t);
   }
@@ -642,6 +762,7 @@ int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const Compil
   say("indirect jmps %" PRIu64 ": %" PRIu64 " jump tables (%" PRIu64 " bounded + %" PRIu64 " scanned, %.2f MB of tables), %" PRIu64 " jmp [mem], %" PRIu64 " jmp reg tail calls, %" PRIu64 " table-like unresolved; %" PRIu64 " lowered as switch (%" PRIu64 " cases)\n",
       tot.indJmps, tot.jmpResolved + tot.jmpScanned, tot.jmpResolved, tot.jmpScanned, tot.tableBytes / 1e6, tot.jmpMem, tot.jmpReg, tot.jmpFailed, tot.switches, tot.switchCases);
   say("spin-wait loads (loops without stores or synchronisation) lowered volatile: %" PRIu64 "\n", tot.volatileLoads);
+  if (tot.granularUnits) say("granular entries: %" PRIu64 " units (%" PRIu64 " functions), %" PRIu64 " entry points in their dispatch switches\n", tot.granularUnits, granularAll ? tot.funcs : (uint64_t)granular.size(), tot.granularCases);
   if (opt.resumeEntries) say("resume entries: %" PRIu64 " call-return blocks reachable through the unit-entry resume switch\n", tot.resumeCases);
   if (!catalog.groups.empty() || !catalog.hooks.empty()) {
     size_t hc = 0; for (uint8_t c : hookCompiled) hc += c;

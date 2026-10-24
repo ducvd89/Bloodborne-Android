@@ -47,6 +47,7 @@ struct LowerResult {
   uint32_t callExits = 0;               // ExitFunction with the Call hint (of directCalls + dispatchCalls)
   uint32_t irOps = 0;                   // IR ops lowered (all blocks)
   uint32_t resumeCases = 0;             // call-return blocks reachable through the resume switch at the unit entry
+  uint32_t granularUnits = 0, granularCases = 0; // the unit got granular entries: entry points (instruction boundaries) in its switch
   uint32_t hookSites = 0;               // hook slot tests emitted
   std::vector<uint32_t> hookIdx;        // ... their site indices
   uint32_t switches = 0, switchCases = 0; // indirect jumps lowered as an LLVM switch over the unit's blocks, and their cases

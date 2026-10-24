@@ -25,6 +25,17 @@ int bb_fb_hook(uintptr_t address, size_t size, GuestHook hook);
 void bb_fb_invalidate(uintptr_t address, size_t size);
 uint64_t bb_fb_tsc(void);
 uint64_t bb_fb_tsc_frequency(void);
+#if defined(BB_AOT_FEX_STATE) || defined(BB_AOT_ONLY)
+/* FEX builds and BB_AOT_ONLY builds (cpu/guest_cpu_native.cpp provides these without FEX). */
+/* A guest address that ends a guest call / returns control to the host when the guest jumps or returns to it. */
+uint64_t bb_fb_sentinel(void);
+/* The 16-byte host-function stubs: the host function of the stub at base + 16 * i is table[i] (NULL: none). */
+void *const *bb_fb_stubs(uintptr_t *base, size_t *bytes);
+void bb_fb_cpuid(uint64_t function, uint64_t leaf, uint32_t out[4]);
+uint64_t bb_fb_xgetbv(uint64_t function);
+/* SIGBUS BUS_ADRALN at an atomic instruction of ahead-of-time code: emulated (the signal's pc is advanced); 0: not handled. */
+int bb_fb_handle_unaligned(void *ucontext);
+#endif
 #ifdef BB_AOT_FEX_STATE
 /* FEX builds only. The calling host thread's guest state (its FEX thread is created on first use). */
 GuestState *bb_fb_state(void);
@@ -39,14 +50,6 @@ void bb_fb_run(GuestState *s, uint64_t target, int call);
  * (replaced by a trap meanwhile): 1, rip = that return address, rsp past the slot. 0: the guest left otherwise (to the
  * sentinel at the bottom of the stack), rip = bb_fb_sentinel(). */
 int bb_fb_run_until(GuestState *s, uint64_t target, uint64_t slot);
-/* A guest address that ends a bb_fb_run / returns control to the host when the guest jumps or returns to it. */
-uint64_t bb_fb_sentinel(void);
-/* The 16-byte host-function stubs: the host function of the stub at base + 16 * i is table[i] (NULL: none). */
-void *const *bb_fb_stubs(uintptr_t *base, size_t *bytes);
-void bb_fb_cpuid(uint64_t function, uint64_t leaf, uint32_t out[4]);
-uint64_t bb_fb_xgetbv(uint64_t function);
-/* SIGBUS BUS_ADRALN at an atomic instruction of ahead-of-time code: emulated (the signal's pc is advanced); 0: not handled. */
-int bb_fb_handle_unaligned(void *ucontext);
 #endif
 #ifdef __cplusplus
 }
