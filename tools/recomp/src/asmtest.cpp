@@ -9,6 +9,7 @@
 //   - the initial state is a default CPUState (all registers 0, flags as FEX resets them); the test ends at hlt
 // Each test runs in a forked child: fixed address mappings, signals and crashes stay isolated.
 #include "jit_host.h"
+#include "variant_compile.h"
 
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
@@ -283,6 +284,287 @@ std::string runResumeTest(int opt) {
   return "PASS";
 }
 
+
+// Hook slots (docs/RECOMP_ABI.md, "Hook slots"): at a hook site the unit tests bbr_hook_slot[k]; when set it spills the state, calls the slot and
+// acts on the result: 0 = run the instruction, 1 = rip set by the callback (a resume point of the site, or the dispatcher), 2 = the callback
+// returned from the function. The slot may be set and cleared while the code runs. Each case compiles its own unit set.
+struct HookRun {
+  std::vector<uint8_t> code;
+  HookSites sites;
+  std::function<void(CPUState*)> prepare;   // before the run
+  uint64_t start = CodeBase;
+};
+uint64_t g_hookCalls = 0;
+std::function<uint64_t(CPUState*, uint64_t)> g_hookFn;
+extern "C" uint64_t bbrTestHook(CPUState* s, uint64_t k) { ++g_hookCalls; return g_hookFn(s, k); }
+
+// Runs the case: returns the guest state after `hlt` in `out`; "" or a failure text.
+std::string runHookCase(HookRun& hr, int opt, CPUState& out, bool slotSet) {
+  mapFixed(0xe8000000 - PageSz, PageSz * 2);
+  mapFixed(CodeBase, (hr.code.size() + PageSz - 1) & ~(PageSz - 1));
+  memcpy((void*)CodeBase, hr.code.data(), hr.code.size());
+  static ElfImage img; img.base = 0;
+  static std::set<uint64_t> force;
+  force.clear();
+  for (auto& [v, h] : hr.sites) { force.insert(v); for (uint64_t r : h.resume) force.insert(r); }
+  LiftOptions lo; lo.gapUnits = false; lo.multiblock = true; lo.forceGuestOpcode = &force;
+  TargetSpec ts; ts.aarch64 = false; ts.opt = opt;
+  Jit jit(img, lo, ts);
+  jit.hookSites = &hr.sites;
+  g_jit = &jit;
+  const uint64_t hi = CodeBase + hr.code.size();
+  jit.rangeEnd = [hi](uint64_t t) -> uint64_t { return t >= CodeBase && t < hi ? hi : 0; };
+  if (!jit.err.empty()) return "jit init: " + jit.err;
+  for (auto& s : g_hookSlot) s = nullptr;
+  if (slotSet) for (auto& [v, h] : hr.sites) g_hookSlot[h.index] = (void*)&bbrTestHook;
+  alignas(64) static CPUState st;
+  static CPUState::gdt_segment gdt[32];
+  new (&st) CPUState();
+  st.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_GDT] = gdt;
+  st.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_LDT] = gdt;
+  st.cs_idx = CPUState::DEFAULT_USER_CS << 3;
+  auto* cs = CPUState::GetSegmentFromIndex(st, st.cs_idx);
+  CPUState::SetGDTBase(cs, 0); CPUState::SetGDTLimit(cs, 0xFFFFFu); cs->L = 1; cs->D = 0;
+  st.gregs[4] = 0xe8000000;
+  st.rip = hr.start;
+  if (hr.prepare) hr.prepare(&st);
+  if (!jit.compile(CodeBase, hi)) return "compile: " + jit.err + jit.liftFailure;
+  Jit::Fn entry = jit.find(hr.start);
+  if (!entry) return "no entry unit";
+  struct sigaction sa {}; sa.sa_handler = jitOnSignal; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_NODEFER | SA_ONSTACK;
+  static char altstack[1 << 16];
+  stack_t ss {}; ss.ss_sp = altstack; ss.ss_size = sizeof altstack; sigaltstack(&ss, nullptr);
+  for (int sg : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(sg, &sa, nullptr);
+  alarm(20);
+  g_haltKind = 0;
+  if (sigsetjmp(g_halt, 1) == 0) {
+    entry(&st);
+    for (;;) Jit::dispatch(&st, st.rip);
+  }
+  alarm(0);
+  if (g_haltKind != 1) return "the code did not reach hlt (kind " + std::to_string(g_haltKind) + ", arg " + hex(g_trapArg) + ")";
+  memcpy((void*)&out, (const void*)&st, sizeof out);
+  return "";
+}
+
+std::string runHookTest(int opt) {
+  CPUState st;
+  std::string e;
+  auto expect = [&](const char* what, uint64_t got, uint64_t want) -> std::string { return got == want ? "" : std::string("FAIL ") + what + ": got " + std::to_string(got) + " want " + std::to_string(want); };
+  auto site = [](uint64_t at, std::vector<uint64_t> resume = {}) { HookSites h; HookSite s; s.vaddr = at; s.index = 0; s.resume = std::move(resume); h[at] = s; return h; };
+
+  // 1. An observer edits a register and the instruction then runs. The slot is set after the code was compiled: the test is in the unit.
+  //    mov rbx, 5 ; H: add rbx, 1 ; mov rax, rbx ; hlt
+  {
+    HookRun hr; hr.code = {0x48, 0xc7, 0xc3, 5, 0, 0, 0,  0x48, 0x83, 0xc3, 1,  0x48, 0x89, 0xd8,  0xf4};
+    hr.sites = site(CodeBase + 7);
+    g_hookFn = [](CPUState* s, uint64_t k) -> uint64_t { s->gregs[3] += 100; return k == 0 ? 0 : 9; };
+    g_hookCalls = 0;
+    if (!(e = runHookCase(hr, opt, st, false)).empty()) return "FAIL 1a: " + e;
+    if (!(e = expect("1a no slot: rax", st.gregs[0], 6)).empty() || g_hookCalls != 0) return e + " (hook calls " + std::to_string(g_hookCalls) + ")";
+    if (!(e = runHookCase(hr, opt, st, true)).empty()) return "FAIL 1b: " + e;
+    if (!(e = expect("1b slot: rax (rbx edited by the hook, then add 1)", st.gregs[0], 106)).empty() || g_hookCalls != 1) return e + " (hook calls " + std::to_string(g_hookCalls) + ")";
+  }
+  // 2. The hook sees the registers and rip = the site; a register it does not touch survives; flags survive the call.
+  //    mov rax, 1 ; cmp rax, 1 ; mov rcx, 7 ; H: mov rdx, 3 ; jne bad ; mov rax, 99 ; hlt ; bad: mov rax, 1 ; hlt
+  {
+    HookRun hr; hr.code = {0x48, 0xc7, 0xc0, 1, 0, 0, 0,  0x48, 0x83, 0xf8, 1,  0x48, 0xc7, 0xc1, 7, 0, 0, 0,
+                           0x48, 0xc7, 0xc2, 3, 0, 0, 0,  0x75, 8,  0x48, 0xc7, 0xc0, 99, 0, 0, 0,  0xf4,  0x48, 0xc7, 0xc0, 1, 0, 0, 0,  0xf4};
+    const uint64_t H = CodeBase + 18;
+    hr.sites = site(H);
+    static uint64_t seenRip, seenRcx;
+    g_hookFn = [](CPUState* s, uint64_t) -> uint64_t { seenRip = s->rip; seenRcx = s->gregs[1]; s->gregs[1] = 55; return 0; };
+    if (!(e = runHookCase(hr, opt, st, true)).empty()) return "FAIL 2: " + e;
+    if (!(e = expect("2 flags survive the hook: rax", st.gregs[0], 99)).empty()) return e;
+    if (!(e = expect("2 rip at the hook", seenRip, H)).empty()) return e;
+    if (!(e = expect("2 rcx seen", seenRcx, 7)).empty()) return e;
+    if (!(e = expect("2 rcx edited", st.gregs[1], 55)).empty()) return e;
+    if (!(e = expect("2 rdx (the hooked instruction ran)", st.gregs[2], 3)).empty()) return e;
+  }
+  // 3. Return from a function at its entry (act 2): the callback sets rax, pops the return address.
+  //    mov rax, 0 ; call f ; add rax, 1000 ; hlt ; f: H: mov rax, 1 ; ret
+  {
+    HookRun hr; hr.code = {0x48, 0xc7, 0xc0, 0, 0, 0, 0,  0xe8, 8, 0, 0, 0,  0x48, 0x05, 0xe8, 3, 0, 0,  0xf4, 0x48, 0xc7, 0xc0, 1, 0, 0, 0,  0xc3};
+    // (the add rax, imm32 is 6 bytes: 48 05 imm32; fix the call offset below)
+    hr.code = {0x48, 0xc7, 0xc0, 0, 0, 0, 0,  0xe8, 7, 0, 0, 0,  0x48, 0x05, 0xe8, 3, 0, 0,  0xf4,  0x48, 0xc7, 0xc0, 1, 0, 0, 0,  0xc3};
+    const uint64_t F = CodeBase + 19;
+    hr.sites = site(F);
+    g_hookFn = [](CPUState* s, uint64_t) -> uint64_t { s->gregs[0] = 42; s->rip = *(uint64_t*)s->gregs[4]; s->gregs[4] += 8; return 2; };
+    if (!(e = runHookCase(hr, opt, st, false)).empty()) return "FAIL 3a: " + e;
+    if (!(e = expect("3a without the hook: rax", st.gregs[0], 1001)).empty()) return e;
+    if (!(e = runHookCase(hr, opt, st, true)).empty()) return "FAIL 3b: " + e;
+    if (!(e = expect("3b the hook returned: rax", st.gregs[0], 1042)).empty()) return e;
+  }
+  // 4. The callback replaces an instruction and continues after it (act 1): a resume point in the middle of a block, then one at a block entry.
+  //    mov rax, 0 ; H: mov rax, 1 ; R: add rax, 10 ; hlt        (hook: rax = 5, rip = R)
+  {
+    HookRun hr; hr.code = {0x48, 0xc7, 0xc0, 0, 0, 0, 0,  0x48, 0xc7, 0xc0, 1, 0, 0, 0,  0x48, 0x83, 0xc0, 10,  0xf4};
+    const uint64_t H = CodeBase + 7, R = CodeBase + 14;
+    hr.sites = site(H, {R});
+    g_hookFn = [R](CPUState* s, uint64_t) -> uint64_t { s->gregs[0] = 5; s->rip = R; return 1; };
+    if (!(e = runHookCase(hr, opt, st, false)).empty()) return "FAIL 4a: " + e;
+    if (!(e = expect("4a without the hook: rax", st.gregs[0], 11)).empty()) return e;
+    if (!(e = runHookCase(hr, opt, st, true)).empty()) return "FAIL 4b: " + e;
+    if (!(e = expect("4b resume in the middle of a block: rax", st.gregs[0], 15)).empty()) return e;
+  }
+  {
+    //    mov rax, 0 ; H: je +7 (not taken: rax is 0... use cmp) ...
+    //    xor eax, eax ; H: jne T ; mov rbx, 1 ; hlt ; T: mov rbx, 2 ; hlt      (ZF = 1: the branch is not taken; the hook sends it to T)
+    HookRun hr; hr.code = {0x31, 0xc0,  0x75, 8,  0x48, 0xc7, 0xc3, 1, 0, 0, 0,  0xf4,  0x48, 0xc7, 0xc3, 2, 0, 0, 0,  0xf4};
+    const uint64_t H = CodeBase + 2, T = CodeBase + 12;
+    hr.sites = site(H, {T, CodeBase + 4});
+    g_hookFn = [T](CPUState* s, uint64_t) -> uint64_t { s->rip = T; return 1; };
+    if (!(e = runHookCase(hr, opt, st, false)).empty()) return "FAIL 4c: " + e;
+    if (!(e = expect("4c without the hook: rbx", st.gregs[3], 1)).empty()) return e;
+    if (!(e = runHookCase(hr, opt, st, true)).empty()) return "FAIL 4d: " + e;
+    if (!(e = expect("4d resume at a block entry: rbx", st.gregs[3], 2)).empty()) return e;
+  }
+  // 5. A jump the site does not list goes through the dispatcher (the code there is compiled on demand).
+  //    H: mov rax, 1 ; hlt ; T: mov rax, 77 ; hlt       (hook: rip = T, not a resume point)
+  {
+    HookRun hr; hr.code = {0x48, 0xc7, 0xc0, 1, 0, 0, 0,  0xf4,  0x48, 0xc7, 0xc0, 77, 0, 0, 0,  0xf4};
+    const uint64_t T = CodeBase + 8;
+    hr.sites = site(CodeBase);
+    g_hookFn = [T](CPUState* s, uint64_t) -> uint64_t { s->rip = T; return 1; };
+    if (!(e = runHookCase(hr, opt, st, true)).empty()) return "FAIL 5: " + e;
+    if (!(e = expect("5 dispatcher: rax", st.gregs[0], 77)).empty()) return e;
+  }
+  // 6. A site in a loop, the callback counts and clears nothing: it runs once per iteration; xmm registers survive.
+  //    mov rcx, 3 ; movd xmm1, ecx ; L: H: dec rcx ; jnz L ; movq rax, xmm1 ; hlt
+  {
+    HookRun hr; hr.code = {0x48, 0xc7, 0xc1, 3, 0, 0, 0,  0x66, 0x0f, 0x6e, 0xc9,  0x48, 0xff, 0xc9,  0x75, 0xfb,  0x66, 0x48, 0x0f, 0x7e, 0xc8,  0xf4};
+    hr.sites = site(CodeBase + 11);
+    g_hookFn = [](CPUState* s, uint64_t) -> uint64_t { s->xmm.sse.data[1][0] += 10; return 0; };
+    g_hookCalls = 0;
+    if (!(e = runHookCase(hr, opt, st, true)).empty()) return "FAIL 6: " + e;
+    if (!(e = expect("6 hook calls in the loop", g_hookCalls, 3)).empty()) return e;
+    if (!(e = expect("6 xmm1 edited by the hook", st.gregs[0], 33)).empty()) return e;
+  }
+  return "PASS";
+}
+
+
+// Variants (docs/RECOMP_ABI.md, "Variants"): the functions a catalog's patch groups touch are lifted again from the patched bytes and lowered as
+// alternate units bbrv<k>_<vaddr>; the table entries carry the hash of the patched bytes. A tiny image in this process:
+//   F  0x100: mov eax, 1 ; ret                  group g1 patches the immediate (mov eax, 2)
+//   H  0x300: mov eax, 5 ; nop*5 ; add eax, 7 ; ret    group g3 puts `jmp cave` over the nops and writes the cave at 0x2000:
+//   cave 0x2000: add eax, 100 ; jmp H+10        (new code, and a unit inside H that only the variant has)
+//   K  0x400: mov eax, 1 ; mov ebx, 1 ; ret     alternatives g4 / g5 (excl=x) patch the two immediates; g4+g5 is never built
+std::string runVariantTest(int opt) {
+  constexpr uint64_t Base = 0x300000000ull, Size = 0x10000;
+  mapFixed(Base, Size);
+  mapFixed(0xe8000000 - PageSz, PageSz * 2);
+  auto put = [&](uint64_t v, std::initializer_list<uint8_t> b) { size_t i = 0; for (uint8_t x : b) ((uint8_t*)(Base + v))[i++] = x; };
+  put(0x100, {0xb8, 1, 0, 0, 0, 0xc3});
+  put(0x300, {0xb8, 5, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x05, 7, 0, 0, 0, 0xc3});
+  put(0x400, {0xb8, 1, 0, 0, 0, 0xbb, 1, 0, 0, 0, 0xc3});
+  static ElfImage img;
+  img.base = Base; img.loads.assign(1, ElfSegment{0, Size, Size, 0, 5}); img.textLo = 0; img.textHi = Size;
+  const int32_t toCave = int32_t(0x2000 - (0x305 + 5)), back = int32_t((0x300 + 10) - (0x2005 + 5));
+  char cat[1024];
+  auto hexle = [](int32_t v) { char b[16]; snprintf(b, sizeof b, "%02x%02x%02x%02x", v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255); return std::string(b); };
+  snprintf(cat, sizeof cat, "group g1\nw 101 02\ngroup g3\nw 305 e9%s\nc 2000 0564000000e9%s\ngroup g4 excl=x\nw 401 02\ngroup g5 excl=x\nw 406 07\n", hexle(toCave).c_str(), hexle(back).c_str());
+  Catalog catalog; std::string err;
+  if (!parseCatalog(cat, "test", catalog, err)) return "FAIL catalog: " + err;
+  std::vector<Func> funcs = {{0x100, 0x106, 0, 0}, {0x300, 0x310, 0, 0}, {0x400, 0x40b, 0, 0}};
+  std::vector<uint64_t> starts = {0x100, 0x300, 0x400}, traps;
+  LiftOptions lo; lo.gapUnits = false; lo.multiblock = true;
+  VariantJob vj;
+  vj.img = &img; vj.funcs = &funcs; vj.starts = &starts; vj.trapUnits = &traps; vj.catalog = &catalog; vj.lift = lo;
+  vj.lower.liftBase = Base; vj.lower.imageSize = Size; vj.lower.fixedImageBase = true; vj.lower.imageBase = Base; vj.lower.aarch64 = false; vj.lower.hiddenUnits = false;
+  vj.lower.calleeSaved = false; vj.lower.storeFlagsAtCalls = true;
+  vj.target.aarch64 = false; vj.target.opt = opt; vj.jobs = 2; vj.verify = true;
+  char dir[] = "/tmp/bbr-vartest-XXXXXX";
+  if (!mkdtemp(dir)) return "FAIL mkdtemp";
+  struct Rm { std::string d; ~Rm() { std::error_code ec; fs::remove_all(d, ec); } } rm{dir};
+  vj.objBase = std::string(dir) + "/v";
+  VariantResult vr;
+  if (!compileVariants(vj, vr)) return "FAIL compileVariants";
+  // F: g1; H: g3 (3 units: H, the cave, the jump-back target inside H); K: g4, g5 (not both): 3 variants
+  if (vr.table.funcs.size() != 4) { std::string n; for (auto& f : vr.table.funcs) n += " " + f.name; return "FAIL expected 4 variants, got " + std::to_string(vr.table.funcs.size()) + ":" + n; }
+  const VFunc* vf = nullptr;
+  for (auto& f : vr.table.funcs) if (f.funcStart == 0x300) vf = &f;
+  if (!vf || vf->unitCount != 3) return "FAIL the variant of H must have 3 units (H, the cave, the unit inside H)";
+  std::set<uint64_t> entries;
+  for (uint32_t i = 0; i < vf->unitCount; ++i) entries.insert(vr.table.units[vf->firstUnit + i].vaddr);
+  if (!entries.count(0x300) || !entries.count(0x2000) || !entries.count(0x30a)) return "FAIL the variant of H lacks one of the units 0x300, 0x2000, 0x30a";
+  for (uint32_t i = 0; i < vf->unitCount; ++i) {
+    const VUnit& u = vr.table.units[vf->firstUnit + i];
+    if ((u.vaddr == 0x300) != (u.orig == 1)) return "FAIL original unit index of " + hex(u.vaddr) + ": " + std::to_string(u.orig);
+  }
+  for (auto& f : vr.table.funcs) if (f.name.find("g4+g5") != std::string::npos) return "FAIL alternatives g4, g5 were combined";
+  // The bytes the runtime will see after the groups were applied hash to the table's values; the original bytes do not.
+  auto apply = [&](const std::string& g) { for (auto& grp : catalog.groups) if (grp.name == g) for (auto& w : grp.writes) memcpy((void*)(Base + w.vaddr), w.bytes.data(), w.bytes.size()); };
+  apply("g1"); apply("g3");
+  for (auto& f : vr.table.funcs) {
+    if (f.funcStart != 0x100 && f.funcStart != 0x300) continue;
+    for (uint32_t i = 0; i < f.unitCount; ++i) {
+      const VUnit& u = vr.table.units[f.firstUnit + i];
+      if (hashRange((const uint8_t*)(Base + u.vaddr), u.end - u.vaddr) != u.ehash) return "FAIL the patched bytes do not hash to the table's value at " + hex(u.vaddr);
+    }
+  }
+  const uint64_t pristineF = hashRange((const uint8_t*)(Base + 0x100), 6);
+  (void)pristineF;
+  // Run the variants (in a JIT with the objects added) and the originals (lowered from the pristine bytes): behaviour differs as patched.
+  TargetSpec ts; ts.aarch64 = false; ts.opt = opt;
+  Jit jit(img, lo, ts);
+  if (!jit.err.empty()) return "FAIL jit init: " + jit.err;
+  g_jit = &jit;
+  jit.liftBase = Base; jit.imageSize = Size;
+  for (auto& o : vr.objFiles) {
+    auto buf = MemoryBuffer::getFile(o);
+    if (!buf) return "FAIL cannot read " + o;
+    if (auto e = jit.jit->addObjectFile(std::move(*buf))) return "FAIL add object: " + toString(std::move(e));
+  }
+  // (the pristine units: undo the patches for the lift)
+  auto revertAll = [&] { memset((void*)(Base + 0x2000), 0, 16); put(0x100, {0xb8, 1, 0, 0, 0, 0xc3}); put(0x300, {0xb8, 5, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x05, 7, 0, 0, 0, 0xc3}); };
+  revertAll();
+  jit.rangeEnd = [](uint64_t) -> uint64_t { return 0; };
+  if (!jit.compile(Base + 0x100, Base + 0x106) || !jit.compile(Base + 0x300, Base + 0x310)) return "FAIL compile originals: " + jit.err + jit.liftFailure;
+  alignas(64) static CPUState st;
+  static CPUState::gdt_segment gdt[32];
+  struct sigaction sa {}; sa.sa_handler = jitOnSignal; sigemptyset(&sa.sa_mask); sa.sa_flags = SA_NODEFER | SA_ONSTACK;
+  static char altstack[1 << 16];
+  stack_t ss {}; ss.ss_sp = altstack; ss.ss_size = sizeof altstack; sigaltstack(&ss, nullptr);
+  for (int sg : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(sg, &sa, nullptr);
+  alarm(20);
+  auto call = [&](Jit::Fn fn, uint64_t* eax) -> std::string {
+    new (&st) CPUState();
+    st.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_GDT] = gdt; st.segment_arrays[CPUState::SEGMENT_ARRAY_INDEX_LDT] = gdt;
+    st.cs_idx = CPUState::DEFAULT_USER_CS << 3;
+    auto* cs = CPUState::GetSegmentFromIndex(st, st.cs_idx);
+    CPUState::SetGDTBase(cs, 0); CPUState::SetGDTLimit(cs, 0xFFFFFu); cs->L = 1; cs->D = 0;
+    st.gregs[4] = 0xe8000000; *(uint64_t*)st.gregs[4] = 0xdead0;
+    g_haltKind = 0;
+    if (sigsetjmp(g_halt, 1) == 0) { fn(&st); } else return "signal";
+    if (st.rip != 0xdead0) return "did not return";
+    *eax = st.gregs[0];
+    return "";
+  };
+  auto variantFn = [&](uint64_t funcStart, uint64_t vaddr) -> Jit::Fn {
+    for (auto& f : vr.table.funcs) {
+      if (f.funcStart != funcStart) continue;
+      for (uint32_t i = 0; i < f.unitCount; ++i) if (vr.table.units[f.firstUnit + i].vaddr == vaddr) {
+        auto r = jit.jit->lookup(vr.table.units[f.firstUnit + i].symbol);
+        return r ? r->toPtr<Jit::Fn>() : nullptr;
+      }
+    }
+    return nullptr;
+  };
+  uint64_t eax = 0;
+  std::string e;
+  if (!(e = call(jit.find(Base + 0x100), &eax)).empty() || eax != 1) return "FAIL original F: " + e + " eax " + std::to_string(eax);
+  Jit::Fn vF = variantFn(0x100, 0x100);
+  if (!vF) return "FAIL no variant function for F";
+  if (!(e = call(vF, &eax)).empty() || eax != 2) return "FAIL variant of F: " + e + " eax " + std::to_string(eax);
+  if (!(e = call(jit.find(Base + 0x300), &eax)).empty() || eax != 12) return "FAIL original H: " + e + " eax " + std::to_string(eax);
+  Jit::Fn vH = variantFn(0x300, 0x300);
+  if (!vH) return "FAIL no variant function for H";
+  if (!(e = call(vH, &eax)).empty() || eax != 112) return "FAIL variant of H (through the cave): " + e + " eax " + std::to_string(eax);
+  alarm(0);
+  return "PASS";
+}
+
 // ------------------------------------------------------------------------------------ the parent ----
 struct Counts { unsigned pass = 0, fail = 0, unsup = 0, lift = 0, skip = 0, crash = 0; };
 
@@ -313,7 +595,7 @@ std::string skipReason(const Test& t, const std::set<std::string>& disabled) {
 int main(int argc, char** argv) {
   setpriority(PRIO_PROCESS, 0, 19);
   std::string fexDir = "out/recomp-fex", nasm = BBR_NASM, outFile = "out/recomp/asmtest.txt", filter;
-  int opt = 1; unsigned jobs = 22; bool verbose = false; bool listAll = false, resumeTest = false;
+  int opt = 1; unsigned jobs = 22; bool verbose = false; bool listAll = false, resumeTest = false, hookTest = false, variantTest = false;
   for (int i = 1; i < argc; ++i) {
     auto is = [&](const char* s) { return !strcmp(argv[i], s); };
     auto arg = [&]() -> const char* { if (i + 1 >= argc) { fprintf(stderr, "missing argument\n"); exit(2); } return argv[++i]; };
@@ -326,6 +608,8 @@ int main(int argc, char** argv) {
     else if (is("-v")) verbose = true;
     else if (is("--list")) listAll = true;
     else if (is("--resume-selftest")) resumeTest = true;
+    else if (is("--hook-selftest")) hookTest = true;
+    else if (is("--variant-selftest")) variantTest = true;
     else { fprintf(stderr, "usage: bb-recomp-asmtest [--fex <FEX tree>] [--nasm <nasm>] [--filter <substr>] [--out <file>] [--jobs n] [-O0|-O1|-O2] [-v]\n"); return 2; }
   }
   jobs = std::min(jobs, 22u);
@@ -334,6 +618,20 @@ int main(int argc, char** argv) {
     if (pid == 0) { const std::string v = runResumeTest(opt); puts(v.c_str()); _exit(v == "PASS" ? 0 : 1); }
     int st = 0; waitpid(pid, &st, 0);
     printf("resume entries self-test: %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "PASS" : "FAIL");
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
+  }
+  if (variantTest) {
+    const pid_t pid = fork();
+    if (pid == 0) { const std::string v = runVariantTest(opt); puts(v.c_str()); fflush(stdout); _exit(v == "PASS" ? 0 : 1); }
+    int st = 0; waitpid(pid, &st, 0);
+    printf("variant self-test: %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "PASS" : "FAIL");
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
+  }
+  if (hookTest) {
+    const pid_t pid = fork();
+    if (pid == 0) { const std::string v = runHookTest(opt); puts(v.c_str()); fflush(stdout); _exit(v == "PASS" ? 0 : 1); }
+    int st = 0; waitpid(pid, &st, 0);
+    printf("hook slot self-test: %s\n", WIFEXITED(st) && WEXITSTATUS(st) == 0 ? "PASS" : "FAIL");
     return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 1;
   }
   const fs::path asmDir = fs::path(fexDir) / "unittests/ASM";

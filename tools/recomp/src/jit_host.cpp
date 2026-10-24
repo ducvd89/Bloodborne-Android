@@ -23,6 +23,7 @@ sigjmp_buf g_halt;
 volatile int g_haltKind = 0;
 volatile uint64_t g_trapArg = 0;
 Jit* g_jit = nullptr;
+void* g_hookSlot[64];
 bool g_allowSyscalls = true;
 
 void jitOnSignal(int sig) { g_haltKind = 4; g_trapArg = sig; siglongjmp(g_halt, 1); }
@@ -82,6 +83,7 @@ Jit::Jit(const ElfImage& img, const LiftOptions& lo, const TargetSpec& ts) : lif
   sym("bbr_trap", (void*)&bbr_trap); sym("bbr_dispatch", (void*)&Jit::dispatch); sym("bbr_dispatch_tail", (void*)&Jit::dispatchTail);
   sym("bbr_cpuid", (void*)&bbr_cpuid); sym("bbr_rdtsc", (void*)&bbr_rdtsc); sym("bbr_processor_id", (void*)&bbr_processor_id);
   sym("bbr_set_rounding", (void*)&bbr_set_rounding); sym("bbr_xgetbv", (void*)&bbr_xgetbv); sym("bbr_syscall", (void*)&bbr_syscall);
+  sym("bbr_hook_slot", (void*)g_hookSlot);
   sym("bbr_get_rounding", (void*)&bbr_get_rounding); sym("bbr_push_rounding", (void*)&bbr_push_rounding); sym("bbr_pop_rounding", (void*)&bbr_pop_rounding);
 #define BBR_SYM(n) sym(#n, (void*)&n);
   BBR_X87_HELPERS(BBR_SYM)
@@ -103,6 +105,7 @@ bool Jit::compile(uint64_t from, uint64_t hi) {
       lo.liftBase = j.liftBase; lo.imageSize = j.imageSize; lo.fixedImageBase = true; lo.imageBase = j.liftBase;
       lo.aarch64 = false; lo.hiddenUnits = false; lo.calleeSaved = j.calleeSaved; lo.resumeEntries = j.resumeEntries; lo.storeFlagsAtCalls = true;
       lo.isKnownUnit = [](uint64_t) { return false; };
+      lo.hookSites = j.hookSites;
       ul.reset(new UnitLowerer(*ctx, *mod, lo));
     }
     void unit(uint64_t entry, bool, const void* ir, const UnitMeta& meta) override {
