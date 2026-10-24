@@ -100,7 +100,7 @@ void SetUnitsBack(uint64_t f) {  // E.lock held: the original units run again (o
     const FuncRec& fr = V.funcs[f];
     for (uint32_t u = fr.first; u < fr.first + fr.count; ++u) {
         __atomic_store_n(&V.redirect[u], UnitFn(nullptr), __ATOMIC_RELEASE);
-        E.fns[u] = E.units[u].fn;
+        __atomic_store_n(&E.fns[u], E.units[u].fn, __ATOMIC_RELEASE);
     }
     V.active[f] = -1;
 }
@@ -155,7 +155,7 @@ void Activate(uint64_t f, uint32_t vi) {  // E.lock held
         const VUnitRec* it = std::lower_bound(vlo, vhi, va, [](const VUnitRec& x, uint64_t v) { return x.vaddr < v; });
         UnitFn fn = it != vhi && it->vaddr == va ? it->fn : nullptr;
         __atomic_store_n(&V.redirect[u], fn, __ATOMIC_RELEASE);   // the redirect first, then the dirty byte that makes the unit use it
-        E.fns[u] = fn ? fn : E.units[u].fn;
+        __atomic_store_n(&E.fns[u], fn ? fn : E.units[u].fn, __ATOMIC_RELEASE);
         DirtyOne(u);
     }
     if (V.state[f] != 1 || V.active[f] != int32_t(vi)) V.to_variant.fetch_add(1);
