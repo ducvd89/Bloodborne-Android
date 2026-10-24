@@ -22,12 +22,12 @@ import java.util.Set;
  *  defaults once more (raise REVISION only for that). Runs after RuntimeInstaller extracted the runtime
  *  (that is what brings the defaults file) and before run-bionic.sh reads bbport.ini.
  *  When updating, every key of the defaults file takes its default value, except the player's own: the
- *  controller mapping (pad.*), the GPU driver, the mods menu position and language, and the mods switch.
+ *  controller mapping (pad.*), the GPU driver, the mods menu position and language, the mods switch and the game's language.
  *  Keys that are not in the defaults file stay as they are, as do the comments. */
 final class SettingsDefaults {
     static final int REVISION=1;
     private static final String MARKER="settings_defaults";
-    private static final String[] KEPT={"gpu_driver","menu_pos","menu_language","mods_enabled"};
+    private static final String[] KEPT={"gpu_driver","menu_pos","menu_language","mods_enabled","language"};
 
     private SettingsDefaults() {}
 

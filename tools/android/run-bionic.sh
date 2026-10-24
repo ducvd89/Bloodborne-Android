@@ -245,6 +245,15 @@ export BB_VRAM_IDLE_SECONDS=${BB_VRAM_IDLE_SECONDS:-20}
 # (BB_PRESENT_MODE) while frame generation runs, so BB_VSYNC is the setting alone. BB_VSYNC=0/1 in
 # bionic-local.sh overrides.
 if [ "$(setting vsync)" = 1 ]; then export BB_VSYNC=1; else export BB_VSYNC=0; fi
+# The game's language (language: a PS4 system language id, 1 English US when missing or unknown; the game reads
+# it at start). BB_LANGUAGE in bionic-local.sh overrides.
+if [ -z "${BB_LANGUAGE:-}" ]; then
+    case $(setting language) in
+        0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20) BB_LANGUAGE=$(setting language) ;;
+        *) BB_LANGUAGE=1 ;;
+    esac
+fi
+export BB_LANGUAGE
 # CPU cores (thor_cpus, a taskset list such as 3-7): empty for all of them.
 [ -z "${BB_THOR_CPUS:-}" ] && BB_THOR_CPUS=$(setting thor_cpus)
 

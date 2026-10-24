@@ -480,6 +480,8 @@ public final class MainActivity extends Activity {
         if ("1".equals(setting("skip_intro"))) game.add("no intros");
         if ("1".equals(setting("debug_camera"))) game.add("free camera");
         if ("1".equals(setting("debug_menu"))) game.add("debug menu");
+        String language=setting("language");
+        if (language!=null && !language.isEmpty() && !language.equals("1")) game.add(SettingsDialog.languageName(language));
         setDetail(gameSettingsItem,game.isEmpty() ? "Online/offline screen shown" : String.join(" · ",game));
         java.util.List<String> cheats=new java.util.ArrayList<>();
         if ("1".equals(setting("cheat_health"))) cheats.add("infinite health");
