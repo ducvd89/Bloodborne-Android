@@ -6,6 +6,9 @@
 #include <llvm/IR/Verifier.h>
 
 #include <algorithm>
+#include <functional>
+#include <set>
+#include <string_view>
 #include <cstdio>
 
 using namespace llvm;
@@ -795,9 +798,48 @@ void Lower::run() {
     }
   }
 
+  // Loops (strongly connected blocks) with no guest store, atomic, fence or exit: their guest loads are volatile (loadVal).
+  quietLoop.clear();
+  {
+    auto sideEffect = [&](uint32_t id) {
+      for (auto [Node, op] : IR.GetCode(blocks[id].node)) {
+        const std::string_view n = IR::GetName(op->Op);
+        if (n.find("StoreMem") != n.npos || n.find("VStore") != n.npos || n.find("CAS") != n.npos || n.find("Atomic") != n.npos ||
+            n == "Fence" || n == "ExitFunction" || n == "Break" || n == "Syscall" || n == "Thunk" || n == "CallbackReturn" ||
+            n.find("Push") != n.npos || n.find("CacheLine") != n.npos || n == "MemSet" || n == "MemCpy" || n == "StoreStackMem")
+          return true;
+      }
+      return false;
+    };
+    std::unordered_map<uint32_t, int> index, low;
+    std::vector<uint32_t> stack;
+    std::set<uint32_t> onStack;
+    int next = 0;
+    std::function<void(uint32_t)> strong = [&](uint32_t v) {
+      index[v] = low[v] = next++;
+      stack.push_back(v); onStack.insert(v);
+      for (uint32_t w : blocks[v].succ) {
+        if (!blocks.count(w)) continue;
+        if (!index.count(w)) { strong(w); low[v] = std::min(low[v], low[w]); }
+        else if (onStack.count(w)) low[v] = std::min(low[v], index[w]);
+      }
+      if (low[v] != index[v]) return;
+      std::vector<uint32_t> scc;
+      uint32_t w;
+      do { w = stack.back(); stack.pop_back(); onStack.erase(w); scc.push_back(w); } while (w != v);
+      const auto& sv = blocks[v].succ;
+      const bool loop = scc.size() > 1 || std::find(sv.begin(), sv.end(), v) != sv.end();
+      if (!loop) return;
+      for (uint32_t b : scc) if (sideEffect(b)) return;
+      quietLoop.insert(scc.begin(), scc.end());
+    };
+    for (uint32_t id : order) if (!index.count(id)) strong(id);
+  }
+
   std::set<uint32_t> emitted;
   for (uint32_t id : post) {
     emitted.insert(id);
+    curBlock = id;
     B.SetInsertPoint(bbOf[id]);
     fd = FlagDesc{};
     dirty = dirtyIn[id];

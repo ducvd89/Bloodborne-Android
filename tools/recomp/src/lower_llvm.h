@@ -50,6 +50,7 @@ struct LowerResult {
   uint32_t hookSites = 0;               // hook slot tests emitted
   std::vector<uint32_t> hookIdx;        // ... their site indices
   uint32_t switches = 0, switchCases = 0; // indirect jumps lowered as an LLVM switch over the unit's blocks, and their cases
+  uint32_t volatileLoads = 0;           // guest loads in loops without stores, atomics or exits (spin-waits), lowered volatile
 };
 
 // bbr_trap kinds (second argument of bbr_trap). Bit 63 set: unsupported IR op, low bits = op index.

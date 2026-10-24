@@ -79,6 +79,8 @@ struct Lower {
   bool flagsRead = false, flagsWritten = false;
   llvm::AllocaInst *fN = nullptr, *fZ = nullptr, *fC = nullptr, *fV = nullptr;
   FlagDesc fd;
+  std::set<uint32_t> quietLoop;             // blocks of loops with no guest store, atomic, fence or exit: their guest loads are volatile
+  uint32_t curBlock = ~0u;                  // the IR block being emitted
   uint64_t dirty = 0;                       // static registers (bit g: GPR g, bit 18+x: XMM x) that differ from the context
   std::unordered_map<uint32_t, uint64_t> dirtyIn; // per block, from the dataflow in run()
   uint32_t curGuest = 0;       // offset of the current guest instruction from the entry (GuestOpcode)

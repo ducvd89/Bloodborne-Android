@@ -44,9 +44,15 @@ static Value* shiftBy(IRBuilder<>& B, IR::ShiftType t, Value* v, unsigned amt) {
 
 Value* Lower::loadVal(Value* addr, unsigned bytes, bool fpr) {
   Value* p = B.CreateIntToPtr(addr, Ptr);
-  if (!fpr) return zx(B.CreateAlignedLoad(iN(bytes * 8), p, Align(1)));
-  if (bytes == 16) return B.CreateAlignedLoad(V128, p, Align(1));
-  return toV(B.CreateZExt(B.CreateAlignedLoad(iN(bytes * 8), p, Align(1)), I128));
+  // In a loop that neither stores nor synchronises (a spin-wait such as `L: cmp eax, [r13 + 0x18]; jg L`), a plain load is
+  // loop-invariant to LLVM: the backend hoists it and the loop never sees another thread's store (the game's main thread
+  // spun for ever in such a loop waiting for its GX workers). Volatile keeps one load per iteration; still a plain ldr.
+  const bool vol = quietLoop.count(curBlock) != 0;
+  if (vol) ++res->volatileLoads;
+  auto ld = [&](Type* t) { auto* l = B.CreateAlignedLoad(t, p, Align(1)); l->setVolatile(vol); return l; };
+  if (!fpr) return zx(ld(iN(bytes * 8)));
+  if (bytes == 16) return ld(V128);
+  return toV(B.CreateZExt(ld(iN(bytes * 8)), I128));
 }
 void Lower::storeVal(Value* addr, Value* v, unsigned bytes, bool fpr) {
   Value* p = B.CreateIntToPtr(addr, Ptr);
