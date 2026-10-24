@@ -3,6 +3,7 @@
 #pragma once
 #include "codegen.h"
 #include "lifter.h"
+#include "variants.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -29,6 +30,8 @@ struct CompileOptions {
   bool calleeSaved = true;        // see LowerOptions
   bool dirtyCheck = true;         // every unit tests bbr_dirty[its index] first (--no-dirty-check)
   bool resumeEntries = false;     // see LowerOptions
+  std::vector<std::string> variantPaths; // variant catalogs (files or directories of *.txt): patch variants and native hook sites (docs/RECOMP_ABI.md)
+  bool variantReport = false;     // list every variant and hook site in the summary
 };
 
 int runCompile(const ElfImage& img, const std::vector<Func>& funcs, const CompileOptions& opt);

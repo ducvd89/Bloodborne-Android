@@ -28,6 +28,7 @@ struct LiftOptions {
   const std::set<uint64_t>* retTwiceSlots = nullptr;    // GOT slots of `call [rip+slot]`
   const std::map<uint64_t, std::vector<uint64_t>>* entryUnits = nullptr; // function start -> extra unit entries (direct call/jmp targets inside it that no unit starts at)
   bool collectTargets = false;                          // FuncResult::outTargets: direct call/jmp/jcc targets outside the function (discovery)
+  const std::set<uint64_t>* forceGuestOpcode = nullptr; // image vaddrs of instructions that always get a GuestOpcode marker (hook sites, hook resume points; docs/RECOMP_ABI.md, "Hook slots")
   uint64_t maxInst = 0x10000;  // decoder limit per unit (FEX's own buffer limit is 0x10000)
 };
 

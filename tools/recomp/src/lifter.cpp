@@ -483,7 +483,7 @@ bool Lifter::Impl::generate(uint64_t GuestRIP, uint64_t lo, uint64_t hi, Gen& g)
       const bool IsLocked = DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_LOCK;
 
       OD.FlushRegisterCache(true);
-      if (OD.CanHaveSideEffects(TableInfo, DecodedInfo)) OD._GuestOpcode(InstAddress - GuestRIP);
+      if (OD.CanHaveSideEffects(TableInfo, DecodedInfo) || (opt.forceGuestOpcode && opt.forceGuestOpcode->count(InstAddress - img.base))) OD._GuestOpcode(InstAddress - GuestRIP);
 
       if (TableInfo && TableInfo->OpcodeDispatcher.OpDispatch) {
         auto Fn = TableInfo->OpcodeDispatcher.OpDispatch;
