@@ -220,6 +220,12 @@ void LoadVariantTables(void* so, uint64_t abi_flags) {
             if (E.dirty[u]) { const int64_t f = FuncOfUnit(u); if (f >= 0) V.locked[f] = 1; }
         V.enabled = true;
     }
+    // BB_AOT_VARIANTS=0 / BB_AOT_HOOK_SLOTS=0: without patch variants / native hook slots (A/B tests: patched functions and hooked
+    // sites then run on the fallback CPU as before phase 4).
+    const char* ev = std::getenv("BB_AOT_VARIANTS");
+    const char* eh = std::getenv("BB_AOT_HOOK_SLOTS");
+    if (ev && std::strcmp(ev, "0") == 0) abi_flags &= ~uint64_t(4);
+    if (eh && std::strcmp(eh, "0") == 0) abi_flags &= ~uint64_t(8);
     if ((abi_flags & 4) && V.enabled) {
         const auto* vfuncs = static_cast<const VFuncRec*>(dlsym(so, "bbr_vfuncs"));
         const auto* nv = static_cast<const uint64_t*>(dlsym(so, "bbr_vfunc_count"));
@@ -260,6 +266,15 @@ void LoadVariantTables(void* so, uint64_t abi_flags) {
 uint64_t RunSlot(GuestState* s, uint64_t k) {
     HookRec* r = k < V.nsites ? V.recs[k].load(std::memory_order_acquire) : nullptr;
     if (!r) return GUEST_HOOK_CONTINUE;
+    if (E.trace) {  // BB_AOT_TRACE: the first hits of each site
+        static std::atomic<uint8_t> seen[4096];
+        if (k < 4096 && seen[k].fetch_add(1, std::memory_order_relaxed) < 3) {
+            char name[32] = "?";
+            pthread_getname_np(pthread_self(), name, sizeof(name));
+            std::fprintf(stderr, "AOT: hook slot %llu at +%#llx (%s) on %s, rsp %#llx\n", (unsigned long long)k, (unsigned long long)V.sites[k].vaddr,
+                         r->regs ? "regs" : "ex", name, (unsigned long long)s->gregs[RSP]);
+        }
+    }
     if (E.stats) V.slot_hits.fetch_add(1, std::memory_order_relaxed);
     const uint64_t site = E.base + V.sites[k].vaddr;
     uint64_t sp;
@@ -328,7 +343,23 @@ bool SiteRunsNatively(int64_t k) {
     return V.state[f] != 2;
 }
 
+// BB_AOT_NO_SLOTS=hex[,hex...] (image offsets) or "all": those hooks take the old way (A/B tests of single sites).
+bool NoSlotByEnv(uintptr_t address) {
+    const char* no = std::getenv("BB_AOT_NO_SLOTS");
+    if (!no) return false;
+    if (std::strcmp(no, "all") == 0) return true;
+    for (const char* p = no; *p;) {
+        char* end;
+        const uint64_t off = std::strtoull(p, &end, 16);
+        if (end == p) break;
+        if (off == address - E.base) return true;
+        p = *end == ',' ? end + 1 : end;
+    }
+    return false;
+}
+
 int InstallSlot(uintptr_t address, GuestHook regs, GuestHookEx ex, void* context) {
+    if (NoSlotByEnv(address)) return 0;
     if (!E.on || !V.nsites) return 0;
     const int64_t k = SiteIndex(address);
     if (k < 0) return 0;

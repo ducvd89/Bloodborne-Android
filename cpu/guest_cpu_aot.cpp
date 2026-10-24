@@ -1578,7 +1578,7 @@ int guest_cpu_hook_slot(uintptr_t address, size_t size, GuestHookEx hook, void* 
     return hook ? InstallSlot(address, nullptr, hook, context) : 0;
 }
 int guest_cpu_has_hook_slot(uintptr_t address) {
-    if (!E.on || !V.nsites) return 0;
+    if (!E.on || !V.nsites || NoSlotByEnv(address)) return 0;
     const int64_t k = SiteIndex(address);
     if (k < 0) return 0;
     std::lock_guard<std::mutex> guard(E.lock);
