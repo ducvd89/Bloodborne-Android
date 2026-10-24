@@ -561,7 +561,7 @@ uint64_t guest_cpu_tsc_frequency(void) {
 // ---- cpu/guest_cpu_aot.cpp: the units' GuestState is FEX's CPUState of this thread; FEX runs what they do not cover ----
 #ifdef BB_AOT_FEX_STATE
 extern "C" {
-GuestState* bb_fb_state(void) {
+FEXCore::Core::CPUState* bb_fb_state(void) {
     return &Current()->thread->CurrentFrame->State;
 }
 
@@ -579,7 +579,7 @@ void* const* bb_fb_stubs(uintptr_t* base, size_t* bytes) {
     return stub_functions;
 }
 
-void bb_fb_run(GuestState* s, uint64_t target, int call) {
+void bb_fb_run(FEXCore::Core::CPUState* s, uint64_t target, int call) {
     using namespace FEXCore::X86State;
     GuestThread* t = Current();
     auto& st = t->thread->CurrentFrame->State;
