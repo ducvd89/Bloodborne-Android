@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
+#include "bbport_gnm_hooks.h"
 
 #include <array>
 #include <atomic>
@@ -109,6 +110,7 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     guest_cpu_signal_regs(ucontext, &guest);
     const std::uint64_t* g = guest.gpr;
     BbFreeCheck::DumpAtFault(g[GUEST_RAX], g[GUEST_R14]);
+    BbGnmHooks::DumpDriverWrites(0, ~std::uint64_t(0) >> 1); // the last command-buffer writes of our driver, any thread
     if (Mode() == 0) {
         return;
     }

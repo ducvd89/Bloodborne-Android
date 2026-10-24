@@ -35,6 +35,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
+#include "bbport_gnm_hooks.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/amdgpu/pm4_selftest.h"
 #include "cp_decoder.h"
@@ -1298,7 +1299,8 @@ void ScanDcb(std::span<const u32> dcb, int depth) {
 }
 // bbport: an invalid packet header (Steam Deck: "PM4 type 0" with dword 0, 8 or 0x10, mid-game): where
 // in which buffer, what surrounds it, and which logged writes of ours landed in the buffer.
-void ReportBadPacket(uintptr_t base, std::size_t dwords, const u32* at, u64 seq, int depth) {
+void ReportBadPacket(uintptr_t base, std::size_t dwords, const u32* at, u64 seq, int depth,
+                     const Liverpool::SubmittedCopy* copy = nullptr) {
     const uintptr_t address = reinterpret_cast<uintptr_t>(at);
     int prot = 0, type = -1;
     uintptr_t end = 0;
@@ -1319,6 +1321,35 @@ void ReportBadPacket(uintptr_t base, std::size_t dwords, const u32* at, u64 seq,
         std::fprintf(stderr, "\n");
     }
     BbWriteLog::DumpRange(base, dwords * 4);
+    // A copied submission (BB_COPY_GPU_BUFFERS): the guest's own buffer, what it holds now, the
+    // whole copy, and which of our driver writes (sceGnm* filling space the game reserved) landed in it.
+    if (copy && copy->guest_dcb && base == reinterpret_cast<uintptr_t>(copy->data.data()) &&
+        dwords == copy->dcb_dwords) {
+        const auto guest = reinterpret_cast<uintptr_t>(copy->guest_dcb);
+        std::fprintf(stderr, "Bad PM4 packet: guest buffer %#llx (packet at %#llx), submitted by tid %u (%s)\n",
+                     (unsigned long long)guest, (unsigned long long)(guest + (address - base)), copy->tid,
+                     BbGnmHooks::ThreadName(copy->tid).c_str());
+        for (std::size_t i = 0; i < dwords; i += 8) {
+            std::fprintf(stderr, "  +%#06zx:", i * 4);
+            for (std::size_t k = i; k < std::min(i + 8, dwords); ++k) {
+                std::fprintf(stderr, " %08x", copy->data[k]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        std::array<u32, 64> now{};
+        const std::size_t first = std::size_t(at - reinterpret_cast<const u32*>(base));
+        const std::size_t n = std::min<std::size_t>(now.size(), dwords - first);
+        iovec local{now.data(), n * 4}, remote{const_cast<u32*>(copy->guest_dcb + first), n * 4};
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(n * 4)) {
+            std::fprintf(stderr, "  guest memory now at the packet:");
+            for (std::size_t k = 0; k < std::min<std::size_t>(n, 16); ++k) {
+                std::fprintf(stderr, " %08x", now[k]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        BbGnmHooks::DumpDriverWrites(guest, dwords * 4);
+        BbWriteLog::DumpRange(guest, dwords * 4);
+    }
     std::fflush(stderr);
 }
 } // namespace
@@ -1449,8 +1480,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         std::size_t dwords;
         u64 seq;
         int depth;
+        const SubmittedCopy* copy;
         void OnBadPacket(std::span<const u32> rest, const char* what, int) override {
-            ReportBadPacket(base, dwords, rest.data(), seq, depth);
+            ReportBadPacket(base, dwords, rest.data(), seq, depth, copy);
             UNREACHABLE_MSG("PM4: {}", what);
         }
     } cp_sink;
@@ -1458,6 +1490,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     cp_sink.dwords = dcb_dwords;
     cp_sink.seq = seq;
     cp_sink.depth = dcb_depth;
+    cp_sink.copy = copy.get();
     std::optional<BbCp::Cursor> cp_cursor;
     if (CpDecoderEnabled()) {
         cp_cursor.emplace(CpDecoder(), dcb, cp_sink, dcb_depth, false);
@@ -1479,11 +1512,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         switch (type) {
         default:
-            ReportBadPacket(base_addr, dcb_dwords, dcb.data(), seq, dcb_depth);
+            ReportBadPacket(base_addr, dcb_dwords, dcb.data(), seq, dcb_depth, copy.get());
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
         case 0:
-            ReportBadPacket(base_addr, dcb_dwords, dcb.data(), seq, dcb_depth);
+            ReportBadPacket(base_addr, dcb_dwords, dcb.data(), seq, dcb_depth, copy.get());
             UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
                             header->type0.base.Value(), header->type0.NumWords());
             break;
@@ -2747,6 +2780,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb, bo
         copy->guest_ccb = force_copy ? copy->data.data() + dcb.size() : ccb.data();
         copy->ccb_dwords = ccb.size();
         copy->submitted = std::chrono::steady_clock::now();
+        copy->tid = static_cast<u32>(gettid());
         dcb = std::span<const u32>{copy->data.data(), copy->dcb_dwords};
         ccb = std::span<const u32>{copy->data.data() + copy->dcb_dwords, copy->ccb_dwords};
     }

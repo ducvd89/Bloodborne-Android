@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_gnm_hooks.h"
 #include "bbport_patch_notes.h"
+#include "../../src/guest_cpu.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -9,9 +10,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace BbGnmHooks {
@@ -153,6 +156,7 @@ std::atomic<u64> uncovered_sh_reg[0x400];
 std::atomic<u64> callback_seen[8];
 std::atomic<u64> callback_hits[8];
 u64 image_base = 0;
+u64 image_size = 0;
 
 void NoteCallback(u64 cb) {
     const u64 fn = *reinterpret_cast<const u64*>(cb + 0x18) - image_base;
@@ -511,6 +515,8 @@ void CheckSubmission(const std::uint32_t* commands, std::uint64_t dwords) {
 }
 
 void PatchImage(unsigned char* image, std::uint64_t size) {
+    image_base = reinterpret_cast<u64>(image);
+    image_size = size;
     const char* env = std::getenv("BB_GNM_CENSUS");
     const char* observe_env = std::getenv("BB_GNM_OBSERVE");
     observe = observe_env && observe_env[0] == '1';
@@ -606,7 +612,114 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
 } // namespace BbGnmHooks
 
 namespace BbGnmHooks {
+namespace {
+// The last driver writes into guest command buffers, for the bad-packet report (DumpDriverWrites).
+struct WriteRecord {
+    std::uint64_t address, dwords, tsc;
+    std::uint32_t first, tid;
+    std::uint32_t callers[10]; // image offsets of return addresses on the guest stack
+};
+constexpr std::size_t WriteRingSize = 4096;
+WriteRecord write_ring[WriteRingSize];
+std::atomic<std::uint64_t> write_head{0};
+std::uint64_t Now() {
+    return std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+}
+} // namespace
+
+// An address right after a call instruction (e8 rel32, ff /2 with a register, [reg], [reg+d8], [reg+d32] or [rip+d32]).
+bool IsReturnAddress(std::uint64_t v) {
+    const auto* b = reinterpret_cast<const std::uint8_t*>(v);
+    if (b[-5] == 0xe8) return true;
+    if (b[-2] == 0xff && (b[-1] & 0xf8) == 0xd0) return true;              // call reg
+    if (b[-3] == 0x41 && b[-2] == 0xff && (b[-1] & 0xf8) == 0xd0) return true;
+    if (b[-3] == 0xff && (b[-2] & 0xf8) == 0x50) return true;              // call [reg+d8]
+    if (b[-6] == 0xff && ((b[-5] & 0xf8) == 0x90 || b[-5] == 0x15)) return true; // [reg+d32], [rip+d32]
+    if (b[-2] == 0xff && (b[-1] & 0xf8) == 0x10) return true;              // call [reg]
+    return false;
+}
+
+int GuestBacktrace(std::uint32_t* callers, int max) {
+    for (int i = 0; i < max; ++i) callers[i] = 0;
+    const std::uint64_t rsp = guest_cpu_stack_pointer();
+    if (!rsp || !image_base) return 0;
+    std::uint64_t stack[768];
+    std::size_t got = 0;
+    for (std::size_t chunk = 0; chunk < 768; chunk += 64) {
+        iovec local{stack + chunk, 64 * 8}, remote{reinterpret_cast<void*>(rsp + chunk * 8), 64 * 8};
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 64 * 8) break;
+        got = chunk + 64;
+    }
+    int n = 0;
+    if (got && stack[0] - image_base < image_size) callers[n++] = std::uint32_t(stack[0] - image_base);
+    const auto in_window = [&](std::uint64_t fp) { return fp >= rsp && fp + 16 <= rsp + got * 8 && !(fp & 7); };
+    for (std::size_t k = 1; k + 1 < got; ++k) {
+        if (!in_window(stack[k]) || stack[k + 1] - image_base >= image_size || !IsReturnAddress(stack[k + 1])) continue;
+        std::uint64_t fp = rsp + k * 8;
+        while (n < max && in_window(fp)) {
+            const std::size_t i = (fp - rsp) / 8;
+            const std::uint64_t ret = stack[i + 1];
+            if (ret - image_base >= image_size) break;
+            callers[n++] = std::uint32_t(ret - image_base);
+            if (stack[i] <= fp) break;
+            fp = stack[i];
+        }
+        break;
+    }
+    return n;
+}
+
+std::string ThreadName(std::uint32_t tid) {
+    char path[64], name[32] = {};
+    std::snprintf(path, sizeof path, "/proc/self/task/%u/comm", tid);
+    if (FILE* f = std::fopen(path, "r")) {
+        if (!std::fgets(name, sizeof name, f)) {
+            name[0] = 0;
+        }
+        std::fclose(f);
+    }
+    std::string n = name;
+    while (!n.empty() && n.back() == '\n') {
+        n.pop_back();
+    }
+    return n.empty() ? "?" : n;
+}
+
+void DumpDriverWrites(std::uint64_t address, std::uint64_t bytes) {
+    const std::uint64_t n = write_head.load(std::memory_order_acquire), now = Now();
+    int shown = 0;
+    for (std::uint64_t i = n; i-- > (n > WriteRingSize ? n - WriteRingSize : 0) && shown < 32;) {
+        const WriteRecord& w = write_ring[i % WriteRingSize];
+        if (w.address < address + bytes && address < w.address + w.dwords * 4) {
+            std::fprintf(stderr,
+                         "Driver write: %#llx (+%#llx) %llu dwords, first %08x, tid %u (%s), %.3f s ago; "
+                         "callers +%#x +%#x +%#x +%#x +%#x +%#x +%#x +%#x +%#x +%#x\n",
+                         (unsigned long long)w.address, (unsigned long long)(w.address - address),
+                         (unsigned long long)w.dwords, w.first, w.tid, ThreadName(w.tid).c_str(),
+                         double(now - w.tsc) / 1e9, w.callers[0], w.callers[1], w.callers[2], w.callers[3],
+                         w.callers[4], w.callers[5], w.callers[6], w.callers[7], w.callers[8], w.callers[9]);
+            ++shown;
+        }
+    }
+    std::fprintf(stderr, "Driver writes: %d of the last %llu into %#llx +%#llx\n", shown,
+                 (unsigned long long)std::min<std::uint64_t>(n, WriteRingSize),
+                 (unsigned long long)address, (unsigned long long)bytes);
+}
+
 DriverWrite::~DriverWrite() {
+    if (commands) {
+        static thread_local const std::uint32_t tid = std::uint32_t(gettid());
+        WriteRecord& w = write_ring[write_head.fetch_add(1, std::memory_order_acq_rel) % WriteRingSize];
+        w = WriteRecord{reinterpret_cast<std::uint64_t>(commands), dwords, Now(), commands[0], tid, {}};
+        // BB_DRIVER_WRITE_CALLERS=1: the guest backtrace of each write too (a stack read per call).
+        static const bool callers = [] {
+            const char* e = std::getenv("BB_DRIVER_WRITE_CALLERS");
+            return e && e[0] == '1';
+        }();
+        if (callers) {
+            GuestBacktrace(w.callers, 10);
+        }
+    }
     if (!observe || !commands) {
         return;
     }

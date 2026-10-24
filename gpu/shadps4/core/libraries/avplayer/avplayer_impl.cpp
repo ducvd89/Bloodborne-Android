@@ -6,19 +6,34 @@
 #include "core/libraries/avplayer/avplayer_impl.h"
 #include "bbport_guest_call.h"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+
+// bbport BB_AVPLAYER_LOG=1: the game's allocator callbacks as AvPlayer calls them (crash at the opening movie).
+static bool AvLogOn() {
+    static const bool on = [] { const char* e = std::getenv("BB_AVPLAYER_LOG"); return e && e[0] == '1'; }();
+    return on;
+}
+#define AVLOG(...) do { if (AvLogOn()) { std::fprintf(stderr, "AvPlayer[%d]: ", int(gettid())); std::fprintf(stderr, __VA_ARGS__); } } while (0)
+
 namespace Libraries::AvPlayer {
 
 void* PS4_SYSV_ABI AvPlayer::Allocate(void* handle, u32 alignment, u32 size) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto allocate = self->m_init_data_original.memory_replacement.allocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
-    return GuestCall(allocate, ptr, alignment, size);
+    void* r = GuestCall(allocate, ptr, alignment, size);
+    AVLOG("allocate(align %#x, size %#x) = %p\n", alignment, size, r);
+    return r;
 }
 
 void PS4_SYSV_ABI AvPlayer::Deallocate(void* handle, void* memory) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
+    AVLOG("deallocate(%p)\n", memory);
     return GuestCall(deallocate, ptr, memory);
 }
 
@@ -26,13 +41,16 @@ void* PS4_SYSV_ABI AvPlayer::AllocateTexture(void* handle, u32 alignment, u32 si
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto allocate = self->m_init_data_original.memory_replacement.allocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
-    return GuestCall(allocate, ptr, alignment, size);
+    void* r = GuestCall(allocate, ptr, alignment, size);
+    AVLOG("allocate_texture(align %#x, size %#x) = %p\n", alignment, size, r);
+    return r;
 }
 
 void PS4_SYSV_ABI AvPlayer::DeallocateTexture(void* handle, void* memory) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
+    AVLOG("deallocate_texture(%p)\n", memory);
     return GuestCall(deallocate, ptr, memory);
 }
 

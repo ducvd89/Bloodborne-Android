@@ -30,6 +30,8 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
+#include <cstdio>
+
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
 std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -620,6 +622,12 @@ s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32
             sceKernelIsNeoMode() ? flags & 0xe0000000u | 2u : 2u);
         WriteTrailingNop<3>(cmdbuf);
         return ORBIS_OK;
+    }
+    // bbport: the game reserved the space and keeps its zeros (a "PM4 type 0" packet later).
+    static std::atomic<u32> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+        std::fprintf(stderr, "sceGnmDrawIndexAuto: size %u (7 expected), flags %#x: nothing written at %p\n", size,
+                     flags, static_cast<void*>(cmdbuf));
     }
     return -1;
 }
@@ -1300,6 +1308,8 @@ s32 PS4_SYSV_ABI sceGnmInsertWaitFlipDone(u32* cmdbuf, u32 size, s32 vo_handle, 
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (size != 7) {
+        std::fprintf(stderr, "sceGnmInsertWaitFlipDone: size %u (7 expected), nothing written at %p\n", size,
+                     static_cast<void*>(cmdbuf));
         return -1;
     }
 

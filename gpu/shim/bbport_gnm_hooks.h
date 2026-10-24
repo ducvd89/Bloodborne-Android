@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace BbGnmHooks {
 /// Patches the image (the loader calls it once, before any game code runs, while the image is
@@ -17,10 +18,18 @@ void PatchImage(unsigned char* image, std::uint64_t size);
 void CheckSubmission(const std::uint32_t* commands, std::uint64_t dwords);
 
 /// BB_GNM_OBSERVE: packets our GnmDriver writes into space the game reserved ([commands,
-/// commands + dwords)), marked when the guard goes out of scope.
+/// commands + dwords)), marked when the guard goes out of scope. Every write is also kept in a
+/// small ring (address, size, first dword written, thread) for the bad-packet report.
 struct DriverWrite {
     std::uint32_t* commands;
     std::uint64_t dwords;
     ~DriverWrite();
 };
+
+/// The driver writes (DriverWrite) that overlap [address, address + bytes), newest first, to stderr.
+void DumpDriverWrites(std::uint64_t address, std::uint64_t bytes);
+/// The name of a thread of this process (/proc/self/task/<tid>/comm), "?" if unknown.
+std::string ThreadName(std::uint32_t tid);
+/// The calling guest thread's return addresses (image offsets), up to `max`; 0-filled. Diagnostics.
+int GuestBacktrace(std::uint32_t* callers, int max);
 } // namespace BbGnmHooks

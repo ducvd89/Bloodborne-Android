@@ -8,10 +8,27 @@
 #include "core/libraries/libs.h"
 
 #include <string_view>
+#include <chrono>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+
+// bbport BB_AVPLAYER_LOG=1: the game's AvPlayer calls (crash at the opening movie).
+static bool AvLogOn() {
+    static const bool on = [] { const char* e = std::getenv("BB_AVPLAYER_LOG"); return e && e[0] == '1'; }();
+    return on;
+}
+#define AVLOG(...) do { if (AvLogOn()) { std::fprintf(stderr, "AvPlayer[%d]: ", int(gettid())); std::fprintf(stderr, __VA_ARGS__); } } while (0)
 
 namespace Libraries::AvPlayer {
 
+// bbport: frames handed to the game, and when playing started (the pacing line at sceAvPlayerClose).
+static std::atomic<u64> video_frames_shown{0};
+static std::chrono::steady_clock::time_point started_at{};
+
 s32 PS4_SYSV_ABI sceAvPlayerAddSource(AvPlayerHandle handle, const char* filename) {
+    AVLOG("AddSource(%p, %s)\n", (void*)handle, filename ? filename : "(null)");
     LOG_TRACE(Lib_AvPlayer, "filename = {}", filename);
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
@@ -35,6 +52,12 @@ int PS4_SYSV_ABI sceAvPlayerChangeStream() {
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerClose(AvPlayerHandle handle) {
+    AVLOG("Close(%p)\n", (void*)handle);
+    if (const u64 frames = video_frames_shown.exchange(0); frames != 0) {
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+        std::printf("AvPlayer: %llu video frames in %.1f s (%.1f per second)\n", (unsigned long long)frames, secs,
+                    secs > 0 ? frames / secs : 0.0);
+    }
     LOG_TRACE(Lib_AvPlayer, "called");
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
@@ -72,7 +95,13 @@ bool PS4_SYSV_ABI sceAvPlayerGetAudioData(AvPlayerHandle handle, AvPlayerFrameIn
     if (handle == nullptr || p_info == nullptr) {
         return false;
     }
-    return handle->GetAudioData(*p_info);
+    const bool got = handle->GetAudioData(*p_info);
+    static std::atomic<int> logged{0};
+    if (got && AvLogOn() && logged.fetch_add(1) < 6) {
+        AVLOG("GetAudioData(%p) = %p size %u ch %u rate %u\n", (void*)handle, (void*)p_info->p_data,
+              p_info->details.audio.size, p_info->details.audio.channel_count, p_info->details.audio.sample_rate);
+    }
+    return got;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerGetStreamInfo(AvPlayerHandle handle, u32 stream_id,
@@ -98,10 +127,21 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoDataEx(AvPlayerHandle handle,
     if (handle == nullptr || video_info == nullptr) {
         return false;
     }
-    return handle->GetVideoData(*video_info);
+    const bool got = handle->GetVideoData(*video_info);
+    if (got) {
+        video_frames_shown.fetch_add(1, std::memory_order_relaxed);
+    }
+    static std::atomic<int> logged{0};
+    if (got && AvLogOn() && logged.fetch_add(1) < 12) {
+        AVLOG("GetVideoDataEx(%p) = %p %ux%u pitch %u ts %llu\n", (void*)handle, video_info->p_data,
+              video_info->details.video.width, video_info->details.video.height,
+              video_info->details.video.pitch, (unsigned long long)video_info->timestamp);
+    }
+    return got;
 }
 
 AvPlayerHandle PS4_SYSV_ABI sceAvPlayerInit(AvPlayerInitData* data) {
+    AVLOG("Init(%p) framebuffers %d\n", (void*)data, data ? data->num_output_video_framebuffers : -1);
     LOG_TRACE(Lib_AvPlayer, "called");
     if (data == nullptr) {
         return nullptr;
@@ -161,6 +201,7 @@ s32 PS4_SYSV_ABI sceAvPlayerJumpToTime(AvPlayerHandle handle, uint64_t time) {
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerPause(AvPlayerHandle handle) {
+    AVLOG("Pause(%p)\n", (void*)handle);
     LOG_TRACE(Lib_AvPlayer, "called");
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
@@ -169,6 +210,7 @@ s32 PS4_SYSV_ABI sceAvPlayerPause(AvPlayerHandle handle) {
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerPostInit(AvPlayerHandle handle, AvPlayerPostInitData* data) {
+    AVLOG("PostInit(%p)\n", (void*)handle);
     LOG_TRACE(Lib_AvPlayer, "called");
     if (handle == nullptr || data == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
@@ -182,6 +224,7 @@ s32 PS4_SYSV_ABI sceAvPlayerPrintf(const char* format, ...) {
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerResume(AvPlayerHandle handle) {
+    AVLOG("Resume(%p)\n", (void*)handle);
     LOG_TRACE(Lib_AvPlayer, "called");
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
@@ -222,14 +265,21 @@ s32 PS4_SYSV_ABI sceAvPlayerSetTrickSpeed(AvPlayerHandle handle, s32 trick_speed
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerStart(AvPlayerHandle handle) {
+    AVLOG("Start(%p)\n", (void*)handle);
     LOG_TRACE(Lib_AvPlayer, "called");
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    return handle->Start();
+    const s32 result = handle->Start();
+    if (result == ORBIS_OK) {
+        video_frames_shown = 0;
+        started_at = std::chrono::steady_clock::now();
+    }
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerStop(AvPlayerHandle handle) {
+    AVLOG("Stop(%p)\n", (void*)handle);
     LOG_TRACE(Lib_AvPlayer, "called");
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;

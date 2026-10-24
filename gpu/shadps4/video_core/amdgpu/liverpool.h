@@ -250,6 +250,7 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
+public:
     /// bbport: a submission's command buffers copied when the guest submits them
     /// (BB_COPY_GPU_BUFFERS): the guest reused their memory before the GPU thread decoded
     /// them ("PM4 type 0" from zeros or the next frame's commands, while an area loads).
@@ -260,7 +261,10 @@ private:
         const u32* guest_ccb{};
         std::size_t ccb_dwords{};
         std::chrono::steady_clock::time_point submitted;
+        u32 tid{}; ///< bbport: the submitting thread (bad-packet report)
     };
+
+private:
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq,
                          std::shared_ptr<SubmittedCopy> copy = {});
     /// After a copied submission is decoded: whether the guest changed its command buffers since.
