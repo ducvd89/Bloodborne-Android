@@ -55,7 +55,7 @@ public final class MainActivity extends Activity {
     private View resume;
     private LinearLayout pauseItem;
     private TextView pausedChip;
-    private LinearLayout gameSettingsItem, cheatsItem, modsItem, graphicsItem, frameGenItem, driverItem, controllerItem, folderItem;
+    private LinearLayout vibrationItem, gameSettingsItem, cheatsItem, modsItem, graphicsItem, frameGenItem, driverItem, controllerItem, remapItem, folderItem;
     private TouchControllerOverlay controllerOverlay;
     private PadBridge pad;
     private AudioBridge audio;
@@ -66,6 +66,7 @@ public final class MainActivity extends Activity {
     private static final int SIGSTOP=19, SIGCONT=18;
     private final Object pauseLock=new Object();
     private int gamePid;
+    private RumbleBridge rumble;
     private boolean userPaused, backgrounded, notTop, stopped;
     /** The running game started online (OnlineSettings.launchedOnline() when it started; it stays so until the game
      *  ends, whatever the Online switch says later). It is never stopped: a stopped process drops the online session
@@ -153,6 +154,9 @@ public final class MainActivity extends Activity {
             getWindow().setAttributes(attrs);
         }
         pad=new PadBridge(new File(BASE,"android-pad.state"));
+        pad.remap(ButtonRemapDialog.load(getSharedPreferences("bloodborne",MODE_PRIVATE)));
+        rumble=new RumbleBridge(this,new File(BASE,"android-rumble.state"));
+        rumble.setEnabled(vibrationEnabled()); rumble.start();
         audio=new AudioBridge(new File(BASE,"audio.fifo")); audio.start();
         buildScreen();
         immersive();
@@ -352,6 +356,13 @@ public final class MainActivity extends Activity {
             closeDrawer();
             controllerOverlay.edit(null);
         });
+        vibrationItem=menuItem("ic_gamepad","Vibration","",() -> {
+            boolean on=!vibrationEnabled();
+            getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("vibration",on).apply();
+            rumble.setEnabled(on);
+            refreshDrawer();
+        });
+        remapItem=menuItem("ic_gamepad","Remap buttons","",() -> { closeDrawer(); new ButtonRemapDialog(this,pad).show(); });
 
         section("Storage");
         folderItem=menuItem("ic_folder","Game folder","",() -> { closeDrawer(); askGameFolder(true); });
@@ -475,6 +486,8 @@ public final class MainActivity extends Activity {
         if ("1".equals(setting("skip_intro"))) game.add("no intros");
         if ("1".equals(setting("debug_camera"))) game.add("free camera");
         if ("1".equals(setting("debug_menu"))) game.add("debug menu");
+        String language=setting("language");
+        if (language!=null && !language.isEmpty() && !language.equals("1")) game.add(SettingsDialog.languageName(language));
         setDetail(gameSettingsItem,game.isEmpty() ? "Online/offline screen shown" : String.join(" · ",game));
         java.util.List<String> cheats=new java.util.ArrayList<>();
         if ("1".equals(setting("cheat_health"))) cheats.add("infinite health");
@@ -500,13 +513,15 @@ public final class MainActivity extends Activity {
         setDetail(driverItem,choice.equals("auto") ? "Automatic: "+AutoDriver.describe(gpu,Build.VERSION.SDK_INT)
             : driver==null ? "Phone's own driver" : driver.title());
         setDetail(controllerItem,controllerEnabled() ? "On" : "Off");
+        setDetail(vibrationItem,vibrationEnabled() ? "On" : "Off");
+        setDetail(remapItem,ButtonRemapDialog.summary(getSharedPreferences("bloodborne",MODE_PRIVATE)));
         setDetail(folderItem,gameDir==null ? "Not chosen" : gameDir);
         updatePauseUi();
     }
 
     private void openDrawer() {
         if (drawerOpen) return;
-        drawerOpen=true; controllerOverlay.release(); pad.reset();
+        drawerOpen=true; controllerOverlay.release(); pad.reset(); rumble.setDrawer(true);
         refreshDrawer();
         applyOverlayVisibility();
         handle.setVisibility(View.GONE);
@@ -517,7 +532,7 @@ public final class MainActivity extends Activity {
     }
     private void closeDrawer() {
         if (!drawerOpen) return;
-        drawerOpen=false; pad.reset();
+        drawerOpen=false; pad.reset(); rumble.setDrawer(false);
         updatePauseUi(); // also shows the controller again
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.animate().alpha(0).setDuration(180).withEndAction(() -> scrim.setVisibility(View.GONE)).start();
@@ -670,6 +685,9 @@ public final class MainActivity extends Activity {
     @Override public boolean dispatchGenericMotionEvent(MotionEvent e) {
         if ((drawerOpen || userPaused) && e.isFromSource(android.view.InputDevice.SOURCE_JOYSTICK)) return true;
         return pad.motion(e) || super.dispatchGenericMotionEvent(e);
+    }
+    private boolean vibrationEnabled() {
+        return getSharedPreferences("bloodborne",MODE_PRIVATE).getBoolean("vibration",true);
     }
     private boolean controllerEnabled() {
         return getSharedPreferences("bloodborne",MODE_PRIVATE).getBoolean("controller_overlay",false);
@@ -870,6 +888,7 @@ public final class MainActivity extends Activity {
             if (stop && !stopped) { pad.reset(); android.os.Process.sendSignal(gamePid,SIGSTOP); }
             else if (!stop && stopped) android.os.Process.sendSignal(gamePid,SIGCONT);
             stopped=stop;
+            if (rumble!=null) rumble.setPaused(hold);
             boolean quiet=hold && onlineGame;
             if (quiet) pad.reset();
             // Online: the game runs on, so its sound is muted (the track keeps flowing, see AudioBridge.mute) and its
@@ -899,7 +918,7 @@ public final class MainActivity extends Activity {
             BbPresent.setHold(false);
             if (audio!=null) { audio.mute(false); if (!backgrounded && !notTop) audio.resume(); }
         }
-        main.post(() -> { if (!destroyed) { updatePauseUi(); clearNetStatus(); } });
+        main.post(() -> { if (!destroyed) { updatePauseUi(); clearNetStatus(); if (rumble!=null) rumble.reset(); } });
     }
     /** The pause row (Pause game / Play game), the "Paused" chip and the on-screen controller, which a pause hides. */
     private void updatePauseUi() {
@@ -1801,7 +1820,7 @@ public final class MainActivity extends Activity {
         if (p!=null) { p.destroyForcibly(); try { p.waitFor(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
     @Override protected void onDestroy() {
-        destroyed=true; if (nativeCpu!=null) nativeCpu.close(); if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); audio.stop(); main.removeCallbacksAndMessages(null);
+        destroyed=true; if (nativeCpu!=null) nativeCpu.close(); if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); rumble.close(); audio.stop(); main.removeCallbacksAndMessages(null);
         stopGame();
         worker.shutdownNow(); super.onDestroy();
     }

@@ -120,6 +120,19 @@ final class SettingsDialog {
     private static final String[] CORE_NAMES={"Core 0 · efficiency A510 2.0 GHz","Core 1 · efficiency A510 2.0 GHz",
         "Core 2 · efficiency A510 2.0 GHz","Core 3 · performance A715 2.8 GHz","Core 4 · performance A715 2.8 GHz",
         "Core 5 · performance A715 2.8 GHz","Core 6 · performance A715 2.8 GHz","Core 7 · prime X3 3.2 GHz"};
+    /** The game's language (language, PS4 system language ids; run-bionic.sh exports BB_LANGUAGE): English (US), 1, is the default. */
+    private static final String[] LANG_VALUES={"1","18","2","4","5","3","20","7","17","6","8","16","19","13","14","15","12","0","9","10","11"};
+    private static final String[] LANG_NAMES={"English (US)","English (UK)","Fran\u00e7ais (French)","Deutsch (German)","Italiano (Italian)",
+        "Espa\u00f1ol, Espa\u00f1a (Spanish, Spain)","Espa\u00f1ol, Latinoam\u00e9rica (Spanish, Latin America)",
+        "Portugu\u00eas, Portugal (Portuguese, Portugal)","Portugu\u00eas, Brasil (Portuguese, Brazil)","Nederlands (Dutch)",
+        "\u0420\u0443\u0441\u0441\u043a\u0438\u0439 (Russian)","Polski (Polish)","T\u00fcrk\u00e7e (Turkish)","Svenska (Swedish)","Dansk (Danish)",
+        "Norsk (Norwegian)","Suomi (Finnish)","\u65e5\u672c\u8a9e (Japanese)","\ud55c\uad6d\uc5b4 (Korean)",
+        "\u7e41\u9ad4\u4e2d\u6587 (Chinese, Traditional)","\u7b80\u4f53\u4e2d\u6587 (Chinese, Simplified)"};
+    /** The English name of a language id ("German"; English (US) for an unknown one), for the drawer. */
+    static String languageName(String id) {
+        String n=LANG_NAMES[indexOf(LANG_VALUES,id,0)];
+        return n.startsWith("English") ? n : n.substring(n.lastIndexOf('(')+1,n.length()-1);
+    }
     private static final String[] LOD_VALUES={"-2","0","1","2"};
     private static final String[] LOD_NAMES={"Highest","Game default","Lower","Lowest"};
 
@@ -412,8 +425,12 @@ final class SettingsDialog {
     private void apply(Map<String,String> changed) {
         boolean same=true;
         // A key an older bbport.ini lacks counts as its default (speed_floor: 20, as run-bionic.sh reads it).
-        for (Map.Entry<String,String> e:changed.entrySet())
-            if (!e.getValue().equals(values.containsKey(e.getKey()) || !e.getKey().equals("speed_floor") ? values.get(e.getKey()) : "20")) same=false;
+        // (language: 1, English US).
+        for (Map.Entry<String,String> e:changed.entrySet()) {
+            String old=values.get(e.getKey());
+            if (old==null) old=e.getKey().equals("speed_floor") ? "20" : e.getKey().equals("language") ? "1" : null;
+            if (!e.getValue().equals(old)) same=false;
+        }
         if (same) return;
         if (save(changed)) restart.run();
         else new AlertDialog.Builder(activity).setMessage("The settings could not be saved.").setPositiveButton("OK",null).show();
@@ -440,8 +457,10 @@ final class SettingsDialog {
             note.setText(GAME_PATCHES[i][2]); note.setPadding(0,0,0,dp(6));
             box.addView(note);
         }
+        heading(box,"Language");
+        final RadioGroup langs=choices(box,LANG_NAMES,indexOf(LANG_VALUES,get("language","1"),0));
         TextView restartNote=new TextView(activity); restartNote.setTextSize(13); restartNote.setAlpha(0.7f);
-        restartNote.setText("These are patches to the game: Apply restarts it (unsaved progress is lost).");
+        restartNote.setText("These are patches to the game, and its language: Apply restarts it (unsaved progress is lost).");
         restartNote.setPadding(0,dp(8),0,0);
         box.addView(restartNote);
         ScrollView scroll=new ScrollView(activity); scroll.addView(box);
@@ -451,6 +470,7 @@ final class SettingsDialog {
                 Map<String,String> changed=new LinkedHashMap<>();
                 for (int i=0;i<GAME_PATCHES.length;++i)
                     if (toggles[i]!=null) changed.put(GAME_PATCHES[i][0],toggles[i].isChecked() ? "1" : "0");
+                changed.put("language",LANG_VALUES[Math.max(0,checkedIndex(langs))]);
                 apply(changed);
             }).show();
     }

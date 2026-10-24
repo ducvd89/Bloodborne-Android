@@ -31,6 +31,7 @@ setting() { sed -n "s/^$1=//p" "$BB_CONFIG" 2>/dev/null | tail -n 1; }
 # The app's pad state file (PadBridge.java) and text requests (the character name: its touch keyboard).
 export BB_ANDROID_INPUT=1
 export BB_PAD_FILE="$base/android-pad.state" BB_PAD_QUIET=1
+export BB_RUMBLE_FILE="$base/android-rumble.state"
 export BB_IME_FILE="$base/ime.request"
 # ---- Aspect ratio, output and scene size ----
 # aspect_ratio (auto, 4:3, 16:10, 16:9, 21:9, 32:9; auto when missing, 16:9 when unknown) is the display's: the app
@@ -244,6 +245,15 @@ export BB_VRAM_IDLE_SECONDS=${BB_VRAM_IDLE_SECONDS:-20}
 # (BB_PRESENT_MODE) while frame generation runs, so BB_VSYNC is the setting alone. BB_VSYNC=0/1 in
 # bionic-local.sh overrides.
 if [ "$(setting vsync)" = 1 ]; then export BB_VSYNC=1; else export BB_VSYNC=0; fi
+# The game's language (language: a PS4 system language id, 1 English US when missing or unknown; the game reads
+# it at start). BB_LANGUAGE in bionic-local.sh overrides.
+if [ -z "${BB_LANGUAGE:-}" ]; then
+    case $(setting language) in
+        0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20) BB_LANGUAGE=$(setting language) ;;
+        *) BB_LANGUAGE=1 ;;
+    esac
+fi
+export BB_LANGUAGE
 # CPU cores (thor_cpus, a taskset list such as 3-7): empty for all of them.
 [ -z "${BB_THOR_CPUS:-}" ] && BB_THOR_CPUS=$(setting thor_cpus)
 
