@@ -121,3 +121,19 @@ at start (row 1-7). The `tools/android/build_patch_parts.py` output is the data 
 
 `gen_patch_parts.py --check <file>`, `gen_bbsc.py --check`, `gen_hooks_shim.py --check <file>` exit 1 when a catalog is out of date: run them when a
 patch table, a patch part or a hook site changes.
+
+## Paused at (2026-10-24, phase 4b)
+
+Done:
+* The `bb-recomp --func` heap crash (about 8 % of runs) is fixed. Root cause, found with an ASan build (`-DBB_RECOMP_SANITIZE=address,undefined`; use `--base 200000000000` under ASan,
+  the default base lies in ASan's shadow): FEXCore's config store converts a stored string in place on read (`Config::MetaLayer::GetConv<bool>` emplaces the variant), so two threads
+  creating a FEX context at once free the same string (bad-free). Every thread of the tool builds its own `Lifter`; `Lifter::Impl::build` now takes a process-wide mutex.
+  0 crashes in 60 release runs (was about 5 in 60) and 25 ASan runs; ASan + UBSan on a 60,000-function compile with the variant catalogs: no report.
+* ASan runs of the test tools: `bb-recomp-asmtest --hook-selftest` passes. The full ASM suite under ASan differs only where the tests map fixed low addresses inside ASan's shadow gap
+  (1752 pass with `protect_shadow_gap=0`, 3 more lift/crash lines, e.g. CALL.asm and Displacement_Encoding.asm, and `--variant-selftest` fails: its image base 0x300000000 is also in the gap).
+  Not yet confirmed as harness artifacts; difftest not run under ASan yet.
+
+Not started: the rest of phase 4b (operand-redirect slots, frame-rate and guard detours as hook slots, render-size value slots, fixed display stub layout, `aot_so_check` with the default
+Android settings and the 0-dirty goal).
+
+Next step: finish the ASan checks (move the test images out of the shadow gap, or run with `protect_shadow_gap=0`, then difftest), then start the operand-redirect slots.
