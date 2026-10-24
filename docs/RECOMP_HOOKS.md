@@ -101,6 +101,15 @@ at start (row 1-7). The `tools/android/build_patch_parts.py` output is the data 
 * Hooks stop firing while their function runs on the fallback (another write made it dirty without a variant); the runtime says so once per site
   (`AOT: the hook at +X is inactive`).
 
+## 3b. Measured (whole image, aarch64, -O1, `--verify-llvm`, all four catalogs)
+
+* 37 groups (35 touch code), **117 variants** built (0 skipped): 169 units, 48 of them only in the variant (the cheats' cave pieces and the entries a jump back into a function needs), 0.43 MB of code,
+  3.8 s of the compile. 68 patch-part writes lie outside every function (floats and other data). **198 hook sites** declared (190 BBSC + 8 shim), all 198 compiled into at least one unit.
+* The whole compile: 76.6 s (62 s without the variants and hook slots, which add forced `GuestOpcode` markers and one slot test per site), 14.5 GB peak, `.so` 124.5 MB.
+* `tests/aot_so_check.cpp` (dev check, needs the game's prepared image): the real x86-64 `.so` with the real image and BBPATCH2 parts applied as the loader does: cheats + res-scene + gx-heap + skip_network_choice = 17 functions,
+  all matched to a variant, 0 dirty; with every BBSC group applied on top: 56 variants, 0 dirty (functions touched by several groups included).
+* Known, unrelated: `bb-recomp --func <vaddr>` (one function) fails intermittently with a glibc heap error at exit (about 8 % of runs, also on the `testing` tool before these changes); the whole-image compile does not.
+
 ## 4. The catalogs and their generators
 
 | file | generator | source | needs |
