@@ -23,96 +23,69 @@
 
 A port of Bloodborne (PS4, **v1.09**), not an emulator. Experimental. You need your own copy of the game.
 
-> **New in 2.0.0 (Beta 1): the game now runs as native ARM64 code.** The app has no x86 emulator any more. Instead, each player builds the game's native code **once, on a PC (Windows or Linux)**, from their own game files, with the free [Bloodborne Android Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool). The guide is right below. Nothing is translated while you play, so there is no translation stutter and the CPU does less work.
+> **New in 2.1.0 (Beta 1): the app builds the game's native code on the phone.** Since 2.0.0 the game runs as native ARM64 code made from **your own game files**. Until now that needed a PC. Now the app does it itself: when the native code is missing, the app asks, and a few minutes later the game starts. Building on a PC with the free [Bloodborne Android Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool) still works.
 
-## How to get the game running (2.0.0)
+## How to get the game running
 
-The native code is a translation of the game's own program, so it belongs to the game's copyright holders: **it cannot be downloaded from here or anywhere else, and you must build it yourself from your own game.** The [Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool) runs on your PC, uploads nothing, and only writes to the output folder you choose. **Never share the files it writes.**
+1. **Install the APK** from [Releases](https://github.com/ducvd89/Bloodborne-Android/releases/latest).
+2. **Put the game on the phone.** Either **Install from PKG** (the base game PKG and the 1.09 update PKG; it is offered when you choose the game folder), or choose a folder that already holds an extracted 1.09 game (`eboot.bin`, `sce_module/`, `sce_sys/` and the rest) with Menu → **Game folder**. Use the original 1.09 `eboot.bin`: pre-patched 60 FPS ones crash in the gestures menu. Tested with **CUSA03173**; other 1.09 releases should work but are untested.
+3. **Start the game.** The first time, the app says **Native code needed** and offers three choices: **Build on this phone**, **Build on a PC** and **Quit**. Choose the first one and follow the steps below. When it is done, **Start game**.
 
-There are two ways in. Pick the one that matches the game files you have:
+## Native code (required)
 
-| | **A. From PKG files** | **B. From an extracted game** |
-|---|---|---|
-| You have | the base game PKG and the 1.09 update PKG | a game folder with the 1.09 update merged in: `eboot.bin`, `sce_module/`, `sce_sys/` and the rest (for example the folder the app's **Install from PKG** made, or a dump you extracted yourself) |
-| The tool writes | the whole game folder (`CUSA03173`) with `aot/` inside | only the `aot/` folder (your game folder is never changed) |
-| Then you copy | the game folder to the phone (a large copy) | the `aot/` folder next to `eboot.bin` in the game folder on the phone (about 125 MB) |
-| Time | 15 to 30 minutes, mostly unpacking and copying | a few minutes |
+The game's x86-64 code is translated to ARM64 ahead of time, once, into a file `libbbaot.so` (with `libbbaot.json`, which says which game build and which tool it came from). The app has no x86 emulator, so **the game does not start without it**. The translation is made from the game's own program, so it belongs to the game's copyright holders: **it cannot be downloaded from here or anywhere else, and you have to build it from your own game.** Nothing is uploaded; everything runs on your device or your PC. **Never share the files it writes.**
 
-**Game already on the phone?** Build from whichever files you still have on the PC (the PKGs or the extracted folder), then copy only the `aot/` folder next to `eboot.bin` on the phone.
+### On the phone (default)
 
-### What you need
+Menu → **Native CPU** → **Rebuild on this phone**, or the **Build on this phone** choice of the **Native code needed** dialog. The app runs the same compiler as the PC tool (Rebuild Tool 1.2.0, built into the app) on the game image it already made, and writes the same `libbbaot.so` a PC would.
 
-- **Game files** for A or B above. Bloodborne **1.09**, original `eboot.bin` (pre-patched 60 FPS eboots crash in the gestures menu). Tested with **CUSA03173**; other 1.09 releases should work but are untested.
-- A PC with **Windows 10 (1903 or newer) or 11**, or **Linux with glibc 2.35 or newer** (Ubuntu 22.04, Debian 12, Fedora 36, Arch or newer), and a processor with **AVX2** (Intel from 2013, or any AMD Ryzen).
-- **8 GB of free RAM** (16 GB or more is faster). Free disk space: about 3 GB, plus the size of the base game PKG for A.
-- This app (2.0.0 Beta 1 or newer) on an Adreno phone.
+| | |
+|---|---|
+| **Time** | About **6 minutes** on a Snapdragon 8 Gen 2 (AYN Thor) with the charger connected. Other phones differ; the dialog shows its estimate for your phone. |
+| **Heat** | The fast cores run at full speed for the whole build. The CPU reaches about **95 °C**: take the phone out of its case and do not hold it on your lap. |
+| **Charger** | Connect it. The app asks you to confirm if you build on the battery, which is slower and uses a lot of it. |
+| **Memory** | About **4 GB of free RAM** (the app picks 1 to 4 parallel jobs to fit your free memory; the game is closed first). With less than about 1.5 GB free it cannot build here. |
+| **Storage** | About **1 GB free** in the app's storage while it works, about 130 MB for the result. |
+| **Phone** | arm64 only. |
 
-### Step 1: Get the tool
+What you see: two confirmations (the phone will get hot; the charger), then a progress bar with the stage, the time left, the time elapsed, the CPU temperature (when the phone lets the app read it), the charger and the memory used. **Run in background** closes the dialog and the build goes on with a notification; you can use other apps, but do not close Bloodborne from the recent apps. **Cancel** stops it and keeps the finished parts. If a build stops for any reason (cancel, a crash, the phone restarted), the next start offers **Continue the build** and goes on where it left off. If it fails, the dialog shows the reason with **Retry** and **Report a problem**.
 
-Download **Rebuild Tool 1.1.0** or newer from the [Rebuild Tool releases](https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/latest) (the same files are also attached to the app's [2.0.0 Beta 1 release](https://github.com/ducvd89/Bloodborne-Android/releases/tag/android-2.0.0-beta1)):
+When it is done the app checks the result (game build, ABI version, checksum), installs it, and also keeps a copy in the game folder's `aot/` so the folder always holds the current library.
 
-- **Windows:** `bb-recomp-windows-x86_64.zip`. Unzip it anywhere and double-click `bb-recomp.exe`. If SmartScreen says the app is unknown, click **More info**, then **Run anyway** (the tool is not signed with a paid certificate).
-- **Linux:** `Bloodborne-Android-Rebuild-Tool-x86_64.AppImage`. `chmod +x` it and double-click it. If nothing happens your system lacks FUSE 2: run `./Bloodborne-Android-Rebuild-Tool-x86_64.AppImage --appimage-extract-and-run` from a terminal.
+### On a PC
 
-It is free: if you paid for it, you were scammed.
+The Rebuild Tool 1.2.0 for Windows and Linux makes the same files from the PKG files or from an extracted game. It is the way to go if the phone is too slow, too hot, or short of memory. The **Build on a PC** choice of the dialog opens the tool's page in your browser; the tool's own [README](https://github.com/ducvd89/Bloodborne-android-rebuild-tool#readme) has the full guide with every message.
 
-### Step 2: Build
+1. Download **Rebuild Tool 1.2.0** from the [Rebuild Tool releases](https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/latest). Windows (10 1903 or newer, or 11): `bb-recomp-windows-x86_64.zip`, unzip it and run `bb-recomp.exe` (if SmartScreen warns, **More info**, then **Run anyway**: the tool is not signed). Linux (glibc 2.35 or newer): `Bloodborne-Android-Rebuild-Tool-x86_64.AppImage`, `chmod +x` it and run it. It needs a processor with AVX2 and 8 GB of free RAM, and about 3 GB of disk (plus the PKG size when you start from PKGs). It is free: if you paid for it, you were scammed.
+2. Choose your source: **From PKG files** (the folder with the base game PKG and the 1.09 update PKG; the tool writes the whole game folder with `aot/` inside), or **From an extracted game** (the folder with `eboot.bin`; the tool writes only `aot/`). Choose an empty output folder and press **Build**. It takes a few minutes (a PKG source adds a damage check and unpacking).
+3. Copy the result to the phone with a cable, a card reader or `adb push`: the whole game folder, or only the `aot` folder next to `eboot.bin`.
+4. In the app: Menu → **Game folder** → choose the folder with `eboot.bin` and `aot`. Or, with the **Native code needed** dialog open, copy the `aot` folder in and press **Check again**. The app checks it (game build, ABI version, checksum) and imports it by itself. **Native CPU** in the menu can also import `libbbaot.so` and `libbbaot.json` by hand.
 
-1. Choose your source. The row of the other source is grayed out.
-   - **A. From PKG files → Browse…**: the folder that holds the base game PKG and the 1.09 update PKG, with nothing else in it.
-   - **B. From an extracted game → Browse…** (the folder with `eboot.bin`) or **eboot.bin…** (pick the file itself).
-2. **Output folder → Browse…**: an empty folder on a disk with enough space (a short path such as `D:\bloodborne` or `~/bloodborne` is best).
-3. Press **Build** and wait.
-   - A checks every PKG for damage first (a few minutes; a damaged file stops the build before anything is unpacked and names the file), then unpacks and merges the game and the update.
-   - Both then recompile the game's code to ARM64: about 1 to 2 minutes on a 12-core PC, longer on a laptop.
-4. When it says **Done**, the output folder holds:
+The same program runs without a window: `bb-recomp --pkgs <PKG folder> --out <folder>` or `bb-recomp --game <game folder or its eboot.bin> --out <folder>`.
 
-   ```
-   A. From PKG files                          B. From an extracted game
-   <output folder>/                            <output folder>/
-       README.txt                                  bb-recomp.log
-       bb-recomp.log                               aot/
-       CUSA03173/      <- the whole game               libbbaot.so    <- native ARM64 code (~125 MB)
-           eboot.bin, sce_sys/, sce_module/ ...        libbbaot.json  <- what it was built from
-           aot/
-               libbbaot.so
-               libbbaot.json
-   ```
+### When you have to build it again
 
-### Step 3: Copy to the phone
+- **After an app update that changes the ABI version.** 2.1.0 does (ABI 2): every library built by Rebuild Tool 1.1.0 or older is refused, and the app asks for a rebuild once. This also brings the Rebuild Tool 1.2.0 fix for the game stopping with `guest trap (0x800d0b, 0x287188a)`.
+- **After a fix in the tool** that the app tells you about the same way (a new ABI version).
+- **When the game changes:** another game build in the folder (the library has to be built from the **same game build**, the original 1.09 `eboot.bin`).
+- **When the library is damaged** (the checksum does not match) or its two files do not belong together.
+- If the game stops with *"native code is missing an entry"*, send `logs/aot-misses.log` (Menu → **Report a problem**): the tool can close the gap from that log (`--extra-entries`), and you rebuild once on a PC.
 
-Use a USB cable in file transfer mode, a card reader or `adb push`.
-
-- **A:** copy the game folder (`CUSA03173`, with `aot` inside) to the phone's storage or SD card.
-- **B:** copy the `aot` folder into the game folder on the phone, next to `eboot.bin`. (Or put `aot` into the extracted folder on the PC first, if you are about to copy that folder to the phone anyway.)
-
-### Step 4: Choose the folder in the app
-
-Menu → **Game folder** → choose the game folder (the one with `eboot.bin` and `aot`). Start the game: the app finds `aot/libbbaot.so`, checks that it matches your game (game build, ABI version, checksum) and imports it into its own storage by itself. There is nothing to switch on. The first start takes a few minutes. Menu → **Native CPU** shows the state and can also import `libbbaot.so` and `libbbaot.json` by hand.
-
-### Command line
-
-The same program runs without a window (on Linux, pass the same arguments to the AppImage):
-
-```
-bb-recomp --pkgs <PKG folder> --out <output folder>                  # A
-bb-recomp --game <game folder or its eboot.bin> --out <output folder>  # B
-```
+A new phone does not need a new build when the ABI version is the same: copy the `aot` folder to it.
 
 ### If something goes wrong
 
-- **A PKG is reported damaged or incomplete:** that file was not copied or downloaded completely. Get that one file again and rebuild; nothing was unpacked.
-- **"This does not look like a Bloodborne game folder":** for B, choose the folder that directly holds `eboot.bin`, `sce_module` and `sce_sys` (the tool lists what is missing and suggests sub-folders that look right).
+- **The phone build stops with a message:** the dialog shows it. Out of memory (the phone's memory manager killed it): close other apps and **Retry**; the finished parts are kept. Too hot: let it cool, **Retry** later. Anything else: **Report a problem**; the report includes the build's log.
+- **A PKG is reported damaged or incomplete** (PC tool): that file was not copied or downloaded completely. Get that one file again and rebuild; nothing was unpacked.
+- **"This does not look like a Bloodborne game folder"** (PC tool, source B): choose the folder that directly holds `eboot.bin`, `sce_module` and `sce_sys`.
 - **"This game is not supported":** the game is not 1.09, the update is not merged in, or the `eboot.bin` is a patched one. Use the original 1.09 files.
-- **The game stops with "native code is missing an entry at +0x...":** the library does not cover a place the game jumped to. The app saved the address in `logs/aot-misses.log`. Send it with Menu → **Report a problem**, copy the file to the PC and rebuild once with `--extra-entries aot-misses.log` added to the command above. Every logged address becomes an entry of the new library.
-- **The app says the library is "not for this game" or has "another ABI version":** build again from the game files you play, with a tool release that matches your app. Builds are also needed again after an app release that changes the ABI version (the app says so).
-- **Out of memory, or the PC freezes while building:** close other programs, or use the command line with `--jobs 4 --mem-fraction 0.4`.
-
-The tool's own [README](https://github.com/ducvd89/Bloodborne-android-rebuild-tool#readme) has the full reference with every message. A new phone does not need a new build: copy the same folder to it.
+- **The app says the library is "not for this game" or has "another ABI version":** build again (on the phone, or on a PC with Rebuild Tool 1.2.0) from the game files you play.
+- **The game stops with "the game stopped itself after an internal error (panic)":** no native code is missing: the game's own error check fired (the message after it is the game's text). Report it with the log.
+- **Out of memory, or the PC freezes while building on a PC:** close other programs, or use the command line with `--jobs 4 --mem-fraction 0.4`.
 
 ## Features
 
-- **Native ARM64 game code** (new in 2.0.0): no x86 emulator, no translation while you play (see the guide above).
+- **Native ARM64 game code** (2.0.0), **built on the phone** (new in 2.1.0): no x86 emulator, no translation while you play (see the guide above).
 - **Snapdragon GSR 2 upscaling** (default since 0.11.0): Qualcomm's upscaler made for Adreno, about 1.1 ms per frame on the Thor. FSR 3.1 is also available.
 - **Bloodframe frame generation**: Lossless Scaling frame generation (2x to 4x) with FP16 and low input lag. Needs your own `Lossless.dll`. It pauses by itself while a movie plays.
 - **Any screen shape and resolution**: aspect ratio Auto, 4:3 to 32:9, and output from 360p up to your screen's own size.
@@ -135,16 +108,14 @@ The tool's own [README](https://github.com/ducvd89/Bloodborne-android-rebuild-to
 | AYN Thor | Snapdragon 8 Gen 2 | Adreno 740 |
 | Oppo Find N5 | Snapdragon 8 Elite | Adreno 830 |
 
-Other Adreno 6xx/7xx/8xx devices are untested. **Mali is not supported** (PanVK is included for testing only; please don't report Mali bugs). Needs Android 9+; tested with 16 GB RAM. **2.0.0 Beta 1 is a beta:** the native code was tested on the AYN Thor (Snapdragon 8 Gen 2).
+Other Adreno 6xx/7xx/8xx devices are untested. **Mali is not supported** (PanVK is included for testing only; please don't report Mali bugs). Needs Android 9+; tested with 16 GB RAM. **2.1.0 Beta 1 is a beta:** the native code and the phone build were measured on the AYN Thor (Snapdragon 8 Gen 2); other phones may build more slowly.
 
 ## Install and update
 
 1. Install the APK from [Releases](https://github.com/ducvd89/Bloodborne-Android/releases/latest).
-2. Build the game once on a PC with the Rebuild Tool and copy the folder to the phone ([guide above](#how-to-get-the-game-running-200)), then pick it in the app.
+2. Put the game on the phone and build its native code ([how to get the game running](#how-to-get-the-game-running)).
 
-Already have an extracted 1.09 game, or installed it on the phone with **Install from PKG**? Build only the native code from that folder (way **B** in the guide) and copy the `aot` folder next to `eboot.bin`. The app does not start the game without the native code.
-
-Use the original 1.09 `eboot.bin`: pre-patched 60 FPS ones crash in the gestures menu. Updating keeps your saves, settings, mods and game folder; after updating from 1.2.0 or earlier you still need the native code before the game starts. Update checks in the menu only offer final releases, so install a Beta by hand.
+Updating keeps your saves, settings, mods and game folder. **Updating from 2.0.x to 2.1.0 needs the native code built again once** (ABI 2): the app asks when you start the game. Update checks in the menu only offer final releases, so install a Beta by hand.
 
 On ColorOS / OxygenOS a "Security warning" may appear at launch: tap **Got it**.
 
@@ -152,22 +123,17 @@ On ColorOS / OxygenOS a "Security warning" may appear at launch: tap **Got it**.
 
 Swipe in from the left edge or press Back.
 
-- **Game**: Back to game, **Pause game** / Play game, Game settings (game language, skip intros and the online screen, free camera, debug menu), Cheats, Mods, **Hunter's Atlas** (map on/off, second screen or floating mini map, opacity, size, footprint size), **Online** (server, account, connection test), **Native CPU** (status of the native code, import it, link to the Rebuild Tool).
+- **Game**: Back to game, **Pause game** / Play game, Game settings (game language, skip intros and the online screen, free camera, debug menu), Cheats, Mods, **Hunter's Atlas** (map on/off, second screen or floating mini map, opacity, size, footprint size), **Online** (server, account, connection test), **Native CPU** (status of the native code, **Rebuild on this phone**, import it, link to the Rebuild Tool for PC).
 - **Graphics**: aspect ratio, resolution, upscaler, FPS limit, effects; **Bloodframe**; GPU driver.
 - **Controls**: on-screen controller and its layout (also moves and resizes the mini map), **Remap buttons** for gamepads, controller vibration on/off. Drag outside the buttons to turn the camera.
 - **Storage**: game folder, back up and restore saves.
 - **App**: Report a problem, Check for updates, Debug options (turn off unified memory if you see new glitches or crashes).
 
-## Native code (required)
+## About the native code
 
-Since 2.0.0 the app has no x86 translator: the game's code runs only as ahead-of-time compiled ARM64 code, in the file `libbbaot.so` (with `libbbaot.json`, which says which game build it was made from). It is made from **your** game, so it cannot be downloaded or shared: you build it once, on a PC, with the [Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool) as described in the [guide at the top](#how-to-get-the-game-running-200). A phone-only install cannot produce it.
-
-- **Without a matching `libbbaot.so` the game does not start.** The app shows a full-screen message with the steps, a button to the tool's page, and **Choose game folder** / **Import libbbaot.so…**. The same page is in the menu under **Native CPU**, which shows what is installed and whether it fits your game.
-- **Choosing the folder the tool made** imports `aot/libbbaot.so` and `aot/libbbaot.json` automatically (the app copies them into its own storage). You can also import the two files by hand.
-- The library has to be built from the **same game build** (the original 1.09 `eboot.bin`) and by a tool version that matches the app (ABI version 1). The app checks both and the file's checksum before the game starts.
-- **Installing PKGs on the phone** (**Install from PKG**) still extracts the game, but it cannot make the native code. Build it on the PC from the same game files (way A from the PKGs, or way B from the extracted folder) and add the `aot` folder.
-- If the game stops with *"native code is missing an entry"*, send the `logs/aot-misses.log` (Menu → **Report a problem**): the tool can close the gap from that log and you rebuild once.
-- If it stops with *"the game stopped itself after an internal error (panic)"*, no native code is missing: the game's own error check fired (the message after it is the game's text); report it with the log instead.
+- **Without a matching `libbbaot.so` the game does not start.** The app checks at every start: the installed library is used when it fits the game (game build, ABI version 2, checksum); else the `aot/` folder in the game folder is imported when it fits; else the **Native code needed** dialog opens (once per game folder; close it and a full-screen message with a **Rebuild native code** button stays). Menu → **Native CPU** shows what is installed and whether it fits.
+- **Installing PKGs on the phone** (**Install from PKG**) extracts the game; the native code comes next, from the dialog.
+- Details of the tool's phone build and its file formats: the [Rebuild Tool's documentation](https://github.com/ducvd89/Bloodborne-android-rebuild-tool/blob/master/docs/NATIVE_CPU.md).
 
 ## Settings and performance
 
@@ -201,7 +167,7 @@ Menu → **Report a problem** saves a logs zip (device, settings, logs; no saves
 
 ## How it works
 
-The game's own `eboot.bin` runs on the phone as native ARM64 code: the Rebuild Tool compiled its x86-64 code ahead of time (`libbbaot.so`), and nothing is translated while you play. Its calls to PS4 system libraries go to native replacements, and its GPU commands and shaders are translated to Vulkan by shadPS4's renderer as [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) tailored it. Everything is a plain Android (NDK) program: no Linux system, Wine or Box64.
+The game's own `eboot.bin` runs on the phone as native ARM64 code: the Rebuild Tool compiled its x86-64 code ahead of time (`libbbaot.so`), once, on the phone inside the app or on a PC, and nothing is translated while you play. Its calls to PS4 system libraries go to native replacements, and its GPU commands and shaders are translated to Vulkan by shadPS4's renderer as [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc) tailored it. Everything is a plain Android (NDK) program: no Linux system, Wine or Box64.
 
 ```mermaid
 flowchart LR
@@ -210,6 +176,7 @@ flowchart LR
     eboot["eboot.bin (x86-64)<br>as native ARM64 (libbbaot.so)"] --> rt["PS4 libraries<br>(native)"] --> gpu["Renderer → Vulkan<br>GSR 2 / FSR 3.1, Bloodframe"] --> drv["Turnip driver"]
   end
   gpu -- "frames" --> app
+  files["Your game files (1.09)"] --> tool["Rebuild Tool, once<br>(in the app, or on a PC)"] --> eboot
 ```
 
 ## Build
@@ -221,6 +188,8 @@ bash tools/android/build_bionic_deps.sh      # once: NDK and native libraries
 bash tools/android/build_bionic.sh           # the game process and tools
 bash tools/android/build_release_apk.sh      # the APK
 ```
+
+The APK carries the Rebuild Tool's Android package (`libbbrecomp.so` and its files, pinned by sha256 in `tools/android/fetch_recomp_android.sh`, which the build runs).
 
 More in [docs/ANDROID_THOR.md](docs/ANDROID_THOR.md). The Linux PC build: [bbport's README](https://github.com/deadinside28/bloodborne_pc).
 
