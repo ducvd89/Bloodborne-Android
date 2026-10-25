@@ -133,7 +133,7 @@ Swipe in from the left edge or press Back.
 
 - **Without a matching `libbbaot.so` the game does not start.** The app checks at every start: the installed library is used when it fits the game (game build, ABI version 2, checksum); else the `aot/` folder in the game folder is imported when it fits; else the **Native code needed** dialog opens (once per game folder; close it and a full-screen message with a **Rebuild native code** button stays). Menu → **Native CPU** shows what is installed and whether it fits.
 - **Installing PKGs on the phone** (**Install from PKG**) extracts the game; the native code comes next, from the dialog.
-- Details of the tool's phone build and its file formats: the [Rebuild Tool's documentation](https://github.com/ducvd89/Bloodborne-android-rebuild-tool/blob/master/docs/NATIVE_CPU.md).
+- Details of the tool's phone build and its file formats: the [Rebuild Tool's documentation](https://github.com/ducvd89/Bloodborne-android-rebuild-tool/blob/main/docs/NATIVE_CPU.md).
 
 ## Settings and performance
 
