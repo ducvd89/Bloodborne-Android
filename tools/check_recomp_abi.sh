@@ -3,8 +3,8 @@
 # Checks that this runtime and the Rebuild Tool (the tools/recomp submodule, https://github.com/ducvd89/Bloodborne-android-rebuild-tool) agree on the
 # contract of libbbaot.so (docs/RECOMP_ABI.md). The runtime compiles without the submodule; this check needs it (git submodule update --init tools/recomp)
 # and says so when it is not there. Checked:
-#   1. the ABI version: cpu/guest_cpu_aot.cpp (BbrAbiVersion), the app's NativeCpu.ABI_VERSION, the tool's bbr_abi_version (compile.cpp) and
-#      kAbiVersion (player.cpp) are the same number;
+#   1. the ABI version: cpu/guest_cpu_aot.cpp (BbrAbiVersion), the app's NativeCpu.ABI_VERSION and the tool's kBbrAbiVersion (src/version.h, which the
+#      compiler, the json writer and the player all use) are the same number;
 #   2. the GuestState offsets the tool's lowering has hand-written (the x87 control word FCW and the x87 invalid-operation flag in lower_vector.cpp)
 #      are the ones of cpu/guest_state.h;
 #   3. with BB_FEX_DIR=<FEX source tree> (the tool's out/recomp-fex): tests/guest_state_check.cpp compares GuestState with FEX's CPUState field by field.
@@ -18,8 +18,9 @@ fi
 fail=0
 runtime=$(sed -n 's/.*BbrAbiVersion = \([0-9]*\);.*/\1/p' cpu/guest_cpu_aot.cpp | head -1)
 app=$(sed -n 's/.*ABI_VERSION = \([0-9]*\);.*/\1/p' tools/android/frontend/src/ro/cobrabm/fexdroid/NativeCpu.java | head -1)
-emitted=$(sed -n 's/.*ConstantInt::get(i32, \([0-9]*\)), "bbr_abi_version".*/\1/p' $tool/src/compile.cpp | head -1)
-player=$(sed -n 's/.*kAbiVersion = \([0-9]*\);.*/\1/p' $tool/src/player.cpp | head -1)
+# tool 1.2.0 and newer: one constant (src/version.h), used by the compiler (the table object), the json writer and the player
+emitted=$(sed -n 's/.*kBbrAbiVersion = \([0-9]*\);.*/\1/p' $tool/src/version.h | head -1)
+player=$(grep -c 'abiVersion != kBbrAbiVersion' $tool/src/player.cpp >/dev/null && echo "$emitted")
 echo "ABI version: runtime $runtime, app $app, tool emits $emitted, tool's player expects $player"
 [[ -n $runtime && $runtime == "$app" && $runtime == "$emitted" && $runtime == "$player" ]] || { echo "ABI version mismatch" >&2; fail=1; }
 # 2. offsets

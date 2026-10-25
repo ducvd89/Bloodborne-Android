@@ -56,7 +56,7 @@ struct UnitEntry {
     UnitFn fn;
 };
 
-constexpr uint32_t BbrAbiVersion = 1;            // bbr_abi_version of the library (docs/RECOMP_ABI.md); the app's NativeCpu.ABI_VERSION and the tool's kAbiVersion say the same
+constexpr uint32_t BbrAbiVersion = 2;            // bbr_abi_version of the library (docs/RECOMP_ABI.md); the app's NativeCpu.ABI_VERSION and the tool's kAbiVersion say the same
 constexpr uint64_t TrapUnsupported = 1ull << 63;
 constexpr uint64_t TrapUnliftable = 1ull << 62;
 constexpr size_t DefaultStack = 4u << 20;        // guest stack of a thread nobody gave one to
