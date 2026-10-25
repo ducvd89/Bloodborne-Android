@@ -57,20 +57,41 @@ int main(int argc,char **argv) {
     assert((uint32_t)param(0,NULL)==0x80d90002);
     unsigned char entries[48]; memset(entries,0xaa,sizeof(entries));
     struct { uint32_t hits,canary; } h={99,0xabcdef};
+    uint32_t status;
+    /* BB_DLC=0 and no add-on folders: nothing installed. */
+    setenv("BB_DLC","0",1);
     assert(list(0,NULL,0,&h.hits)==0 && h.hits==0 && h.canary==0xabcdef);
     assert(list(0,entries,2,&h.hits)==0 && h.hits==0);
     for (unsigned i=0;i<sizeof(entries);++i) assert(entries[i]==0xaa);
     assert((uint32_t)list(0,NULL,0,NULL)==0x80d90002);
-    /* <user>/addcont/<title>/<label>: reported installed (The Old Hunters' entitlement). */
+    /* Default: The Old Hunters' entitlement is reported installed without a folder. */
+    unsetenv("BB_DLC");
+    assert(list(0,NULL,0,&h.hits)==0 && h.hits==1);
+    assert(list(0,entries,2,&h.hits)==0 && h.hits==1);
+    assert(!strcmp((const char *)entries,"SPEXPANSIONDLC03"));
+    memcpy(&status,entries+20,4); assert(status==4);
+    for (unsigned i=24;i<sizeof(entries);++i) assert(entries[i]==0xaa);
+    /* <user>/addcont/<title>/<label>: reported installed; The Old Hunters' folder is not listed twice. */
     char path[160];
     snprintf(path,sizeof(path),"%s/addcont",user_dir); assert(!mkdir(path,0755));
     snprintf(path,sizeof(path),"%s/addcont/CUSA00900",user_dir); assert(!mkdir(path,0755));
     snprintf(path,sizeof(path),"%s/addcont/CUSA00900/SPEXPANSIONDLC03",user_dir); assert(!mkdir(path,0755));
     assert(list(0,NULL,0,&h.hits)==0 && h.hits==1);
+    setenv("BB_DLC","0",1);
     memset(entries,0xaa,sizeof(entries));
     assert(list(0,entries,2,&h.hits)==0 && h.hits==1);
     assert(!strcmp((const char *)entries,"SPEXPANSIONDLC03"));
-    uint32_t status; memcpy(&status,entries+20,4); assert(status==4);
+    memcpy(&status,entries+20,4); assert(status==4);
+    for (unsigned i=24;i<sizeof(entries);++i) assert(entries[i]==0xaa);
+    unsetenv("BB_DLC");
+    rmdir(path);
+    /* Another label next to the built-in one; capacity 1 writes only the first entry. */
+    snprintf(path,sizeof(path),"%s/addcont/CUSA00900/OTHERADDON",user_dir); assert(!mkdir(path,0755));
+    memset(entries,0xaa,sizeof(entries));
+    assert(list(0,entries,2,&h.hits)==0 && h.hits==2);
+    assert(!strcmp((const char *)entries,"SPEXPANSIONDLC03") && !strcmp((const char *)entries+24,"OTHERADDON"));
+    memset(entries,0xaa,sizeof(entries));
+    assert(list(0,entries,1,&h.hits)==0 && h.hits==1);
     for (unsigned i=24;i<sizeof(entries);++i) assert(entries[i]==0xaa);
     rmdir(path);
     snprintf(path,sizeof(path),"%s/addcont/CUSA00900",user_dir); rmdir(path);

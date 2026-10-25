@@ -1,6 +1,6 @@
 /* Offline AppContent provider for the configured base-game profile.
- * No package/DLC mounting, downloads, entitlement or license emulation; add-on folders in
- * <user>/addcont are reported as installed (see addon_list). */
+ * No package/DLC mounting, downloads, entitlement or license emulation; The Old Hunters and
+ * add-on folders in <user>/addcont are reported as installed (see addon_list). */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -81,17 +81,30 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
 #define LABEL_SIZE 17
 #define ADDON_INSTALLED 4u
 typedef struct { char label[LABEL_SIZE]; char padding[3]; uint32_t status; } AddonInfo;
-/* Add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout),
- * each reported as installed. No add-on data is mounted: Bloodborne: The Old Hunters
- * (SPEXPANSIONDLC03) needs only the entitlement, its data ships with patch 1.09. Without a list
- * the count is returned, with one at most capacity entries are written. Never touch unused list
- * slots. */
+/* The Old Hunters (SPEXPANSIONDLC03) is always reported installed (BB_DLC=0 turns it off): no
+ * add-on data is mounted, it needs only the entitlement, its data ships with patch 1.09. Other
+ * add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout), each
+ * reported as installed. Without a list the count is returned, with one at most capacity entries
+ * are written. Never touch unused list slots. */
+#define OLD_HUNTERS "SPEXPANSIONDLC03"
+static void addon_add(void *list,uint32_t capacity,uint32_t *count,const char *label) {
+    if (list && capacity) {
+        if (*count>=capacity) return;
+        AddonInfo info;
+        memset(&info,'\0',sizeof(info)); memcpy(info.label,label,strlen(label));
+        info.status=ADDON_INSTALLED;
+        memcpy((unsigned char *)list+(size_t)*count*sizeof(info),&info,sizeof(info));
+    }
+    ++*count;
+}
 static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
     require_initialized();
     if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
     if ((!capacity || !list) && !hits) return PARAMETER;
-    int fill=list && capacity;
+    const char *dlc=getenv("BB_DLC");
+    int builtin=!dlc || strcmp(dlc,"0");
     uint32_t count=0;
+    if (builtin) addon_add(list,capacity,&count,OLD_HUNTERS);
     char root[4096];
     snprintf(root,sizeof(root),"%s/addcont",runtime_file_user_dir());
     DIR *titles=opendir(root);
@@ -102,22 +115,15 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
         if (!labels && title>=0) close(title);
         for (struct dirent *l; labels && (l=readdir(labels));) {
             struct stat entry;
-            size_t n=strlen(l->d_name);
-            if (l->d_name[0]=='.' || n>=LABEL_SIZE || fstatat(dirfd(labels),l->d_name,&entry,0) ||
-                !S_ISDIR(entry.st_mode) || (fill && count>=capacity)) continue;
-            if (fill) {
-                AddonInfo info;
-                memset(&info,'\0',sizeof(info)); memcpy(info.label,l->d_name,n);
-                info.status=ADDON_INSTALLED;
-                memcpy((unsigned char *)list+(size_t)count*sizeof(info),&info,sizeof(info));
-            }
-            ++count;
+            if (l->d_name[0]=='.' || strlen(l->d_name)>=LABEL_SIZE || (builtin && !strcmp(l->d_name,OLD_HUNTERS)) ||
+                fstatat(dirfd(labels),l->d_name,&entry,0) || !S_ISDIR(entry.st_mode)) continue;
+            addon_add(list,capacity,&count,l->d_name);
         }
         if (labels) closedir(labels);
     }
     if (titles) closedir(titles);
     if (hits) *hits=count;
-    if (count) printf("Runtime: AppContent add-ons reported installed (%s): %u\n",root,(unsigned)count);
+    if (count) printf("Runtime: AppContent add-ons reported installed (%s%s): %u\n",builtin ? "The Old Hunters, " : "",root,(unsigned)count);
     ++lists; return 0;
 }
 uintptr_t runtime_content_resolve(const char *name) {
