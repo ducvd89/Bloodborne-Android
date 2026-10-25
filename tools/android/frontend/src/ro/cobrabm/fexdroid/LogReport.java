@@ -78,6 +78,8 @@ final class LogReport {
             String logcatNote=logcat(zip,removed);
             tail(zip,new File(base,"logs/android-game.log"),"android-game.log",LOG_CAP,removed);
             tail(zip,new File(base,"logs/android-game.prev.log"),"android-game.prev.log",LOG_CAP,removed);
+            tail(zip,new File(base,"logs/aot-build.log"),"aot-build.log",LOG_CAP,removed); // building the native code on the phone (AotBuildService)
+            tail(zip,new File(base,"logs/aot-compile.txt"),"aot-compile.txt",LOG_CAP,removed); // the tool's compile.txt of the last run
             tail(zip,AtlasDoorLog.file(base),"atlas-doors.log",LOG_CAP,removed); // the map's door-flag calibration log (Atlas, Debug), when it was on
             String settings=settings(zip,new File(base,"bbport.ini"));
             String shaders=shaders(zip,new File(base,"logs/failed-shaders"));
@@ -137,6 +139,11 @@ final class LogReport {
         line(s,"GPU",chip.describe());
         line(s,"GPU driver",f.driverLine);
         line(s,"Game folder",f.gameFolder==null ? "not chosen" : f.gameFolder+(f.ebootFound ? " (eboot.bin found)" : " (no eboot.bin)"));
+        try { // the installed native code: the app's ABI and the library's tool, ABI and time (the file names no folder)
+            NativeCpu.State st=NativeCpu.state(base,NativeCpu.deviceImageHash(base,false),null,null);
+            line(s,"Native code","app ABI "+NativeCpu.ABI_VERSION+"; "+(st.info!=null ? st.info.tool+", ABI "+st.info.abiVersion+", made "+st.info.created
+                : st.installed ? "installed but unusable ("+st.problem+")" : "not installed"));
+        } catch (Exception e) { line(s,"Native code","unknown"); }
         line(s,"Mods",f.modsLine);
         line(s,"Lossless.dll",f.losslessDll ? "present" : "not present");
         try { line(s,"Online",new OnlineSettings(a).summary()); } // the pool only: never the account, password or token

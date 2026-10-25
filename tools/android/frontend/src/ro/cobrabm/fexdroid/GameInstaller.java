@@ -231,8 +231,8 @@ final class GameInstaller {
     private void finished(PkgInstaller.GameResult o) {
         String where=o.gameDir==null ? "" : o.gameDir;
         if (o.ready && !where.isEmpty()) {
-            // Without native code that fits, the game start shows the "Native code needed" dialog (NativeNeededDialog): it explains the
-            // Rebuild Tool and links to it, so the install says only where the game went.
+            // Without native code that fits, the game start shows the "Native code needed" dialog (RebuildDialog): it leads to
+            // building it on the phone or on a PC, so the install says only where the game went.
             if (!host.nativeReady()) host.toast("Game installed in "+where+".");
             closed=true; host.useGame(new File(where));
             return;

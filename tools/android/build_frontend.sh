@@ -56,6 +56,24 @@ steam_libs=$PWD/.local-deps/android/steam-libs
 [[ -f $steam_libs/jars.txt ]] || bash tools/android/fetch_steam_libs.sh
 mapfile -t lib_jars < <(sed "s|^|$steam_libs/jars/|" "$steam_libs/jars.txt")
 mkdir -p "$out/lib/arm64-v8a" && cp "$steam_libs"/jni/*.so "$out/lib/arm64-v8a/"
+# The Rebuild Tool's Android package (fetch_recomp_android.sh, pinned): libbbrecomp.so, the static AArch64 program that builds the game's native code on the
+# phone (AotBuildService runs it from the native library folder: it is extracted, extractNativeLibs is true), and its bundle/ and variants/ files (assets/recomp,
+# copied out to files by RecompAssets) with its licenses appended to the notices. BB_SKIP_RECOMP=1: a development build without it (the app then only
+# imports native code built on a PC).
+if [[ ${BB_SKIP_RECOMP:-} != 1 ]]; then
+    bash tools/android/fetch_recomp_android.sh >/dev/null \
+        || { echo "The Rebuild Tool package is missing or does not match its sha256: bash tools/android/fetch_recomp_android.sh (BB_RECOMP_ANDROID_TARBALL=<file> uses a local one; BB_SKIP_RECOMP=1 builds without it)" >&2; exit 1; }
+    recomp=$PWD/.local-deps/android/recomp/android
+    cp "$recomp/libbbrecomp.so" "$out/lib/arm64-v8a/"
+    mkdir -p "$out/assets/recomp" && cp -r "$recomp/bundle" "$recomp/variants" "$recomp/VERSION" "$out/assets/recomp/"
+    { printf '\n--------------------------------------------------------------------------------\nBloodborne Android Rebuild Tool (libbbrecomp.so), GPL-3.0-or-later; what it links in\n--------------------------------------------------------------------------------\n\n'
+      cat "$recomp/licenses/NOTICES.txt" "$recomp/licenses/ADDITIONAL_TERMS.md"
+      for f in LLVM-Apache-2.0-with-LLVM-exception.txt FEX-MIT.txt x87-helpers-NOTICE.txt; do
+          printf '\n--------------------------------------------------------------------------------\n%s\n--------------------------------------------------------------------------------\n\n' "$f"
+          cat "$recomp/licenses/$f"
+      done
+    } >> "$out/assets/THIRD_PARTY_LICENSES.txt"
+fi
 # libbbpresent.so: the Bionic game's frame path (AHardwareBuffers -> ASurfaceControl), built with the
 # NDK at minSdk 28 (the API 29 calls are looked up at run time). NEEDED: libandroid, liblog,
 # libnativewindow and libc/libm/libdl only.

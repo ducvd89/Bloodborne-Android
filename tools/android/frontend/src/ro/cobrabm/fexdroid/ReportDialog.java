@@ -44,6 +44,7 @@ final class ReportDialog {
                 +"• the app settings (bbport.ini, without anything that looks like a password or key)\n"
                 +"• whether online play is on and with which pool, and the online connection's last state (never the online account, password or token)\n"
                 +"• the game's log of this run and of the run before, and this app's system log\n"
+                +"• the log and statistics of building the native code on this phone, if you did\n"
                 +"• the shaders the driver rejected, if any\n"
                 +"• the map's door log (door flag changes with your position), if Log door flags was on\n\n"
                 +"It does not hold your saves, game files, Lossless.dll or Steam account data. The logs can show folder "

@@ -91,11 +91,14 @@ public final class MainActivity extends Activity {
     private AtlasScreen atlas;
     private AtlasDialog atlasDialog;
     private LinearLayout atlasItem;
-    /** Native CPU (the recompiled game code, required to play): its status/import page, its drawer row, and the full-screen message
-     *  shown instead of the game when the library is missing or does not fit. */
+    /** Native CPU (the recompiled game code, required to play): its status/import page, its drawer row, the rebuild dialog (RebuildDialog:
+     *  build it on the phone or on a PC) and the full-screen message shown instead of the game when the library is missing or does not fit. */
     private NativeCpuDialog nativeCpu;
-    private NativeNeededDialog nativeNeeded;
-    /** The game folders the "Native code needed" dialog was shown for since the app started (UI thread): once each, unless the player chooses
+    private RebuildDialog rebuild;
+    /** Why the game cannot start (the last check), for the full-screen message's button. */
+    private NativeCpu.Needed lastNeeded;
+    private boolean resumed;
+    /** The game folders the rebuild dialog was shown for since the app started (UI thread): once each, unless the player chooses
      *  the folder again or installs a game into it. */
     private final java.util.Set<String> neededShown=new java.util.HashSet<>();
     private LinearLayout nativeCpuItem;
@@ -142,11 +145,8 @@ public final class MainActivity extends Activity {
         GameInstaller.Host host=modsHost();
         mods=new ModsDialog(this,host); installer=new GameInstaller(this,host);
         nativeCpu=new NativeCpuDialog(this,nativeCpuHost());
-        nativeNeeded=new NativeNeededDialog(this,new NativeNeededDialog.Host() {
-            @Override public void openUrl(String url) { MainActivity.this.openUrl(url); }
-            @Override public void importFiles() { nativeCpu.show(); nativeCpu.importNow(); }
-            @Override public void closed() { if (!destroyed) immersive(); }
-        });
+        rebuild=new RebuildDialog(this,rebuildHost());
+        AotBuildService.listen(buildListener); // a build that ends while its dialog is closed: show how it ended
         updater=new AppUpdater(this,new AppUpdater.Host() {
             @Override public void stopGame() { MainActivity.this.stopGame(); }
             @Override public void restartGame() { if (!destroyed && displayReady) MainActivity.this.restartGame(); }
@@ -236,8 +236,7 @@ public final class MainActivity extends Activity {
         screen.addView(atlasFull,frame(-1,-1,Gravity.FILL));
         // Instead of the game when its native code is missing or does not fit: above the controller, below the handle and the drawer.
         nativeRequired=new NativeRequiredView(this,new NativeRequiredView.Actions() {
-            @Override public void openDownload() { openUrl(NativeCpu.DOWNLOAD_URL); }
-            @Override public void openGuide() { openUrl(NativeCpu.GUIDE_URL); }
+            @Override public void rebuild() { rebuild.show(lastNeeded!=null ? lastNeeded : new NativeCpu.Needed(NativeCpu.Need.MISSING,NativeCpu.NEEDED_MISSING)); }
             @Override public void chooseGameFolder() { askGameFolder(gameDir!=null); }
             @Override public void importFiles() { nativeCpu.show(); nativeCpu.importNow(); }
         });
@@ -715,10 +714,13 @@ public final class MainActivity extends Activity {
         if (pad!=null) pad.reset();
         synchronized (pauseLock) { backgrounded=true; }
         applyPause();
+        resumed=false;
         super.onPause();
     }
     @Override protected void onResume() {
         super.onResume();
+        resumed=true;
+        main.post(buildListener);
         synchronized (pauseLock) { backgrounded=false; }
         applyPause();
         if (updater!=null) updater.resumed(); // back from the "install unknown apps" setting
@@ -1013,12 +1015,20 @@ public final class MainActivity extends Activity {
         android.util.Log.w("Bloodborne","game pid unknown: "+text);
         return 0;
     }
+    /** The native code build ended (or the app came back after it ended) while its dialog is closed: the dialog opens at the end. */
+    private final Runnable buildListener=() -> {
+        AotBuildService.Status st=AotBuildService.status();
+        if (destroyed || !resumed || rebuild==null || rebuild.showing() || !st.ended() || st.acknowledged) return;
+        if (st.phase==AotBuildService.Phase.CANCELLED) { AotBuildService.acknowledge(); return; }
+        rebuild.showProgress();
+    };
     @Override protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         // Deterministic UI checks over ADB, using the same handlers as the actual controls.
         String action=intent.getStringExtra("ui_action");
         if ("open-menu".equals(action)) openDrawer();
         if ("close-menu".equals(action)) closeDrawer();
+        if ("aot-build".equals(action) && rebuild!=null) rebuild.showProgress(); // the build's notification
     }
 
     /** The game's launch script, run with Android's own shell. extra: NAME=value pairs added to the environment.
@@ -1404,6 +1414,10 @@ public final class MainActivity extends Activity {
             @Override public void toast(String message) { MainActivity.this.toast(message); }
             @Override public boolean gameRunning() { Process p=game; return p!=null && p.isAlive(); }
             @Override public void chooseGameFolder() { askGameFolder(gameDir!=null); }
+            @Override public void rebuildOnPhone() {
+                if (!hasGame()) { toast("Choose the game folder first."); askGameFolder(gameDir!=null); return; }
+                rebuild.showRebuild();
+            }
             @Override public void openUrl(String url) { MainActivity.this.openUrl(url); }
             @Override public void changed() { nativeCodeChanged(); }
             @Override public void closed() { if (!destroyed) immersive(); }
@@ -1412,6 +1426,40 @@ public final class MainActivity extends Activity {
     private void openUrl(String url) {
         try { startActivity(new Intent(Intent.ACTION_VIEW,android.net.Uri.parse(url))); }
         catch (Exception ex) { toast("No browser: "+url); }
+    }
+    /** The page in the phone's default browser app (a selector for it: no chooser, no app that merely handles the link), else a plain link. */
+    private void openInBrowser(String url) {
+        try {
+            Intent view=new Intent(Intent.ACTION_VIEW,android.net.Uri.parse(url)).addCategory(Intent.CATEGORY_BROWSABLE);
+            view.setSelector(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN,Intent.CATEGORY_APP_BROWSER));
+            startActivity(view);
+        } catch (Exception ex) {
+            android.util.Log.w("Bloodborne","default browser: "+ex);
+            openUrl(url);
+        }
+    }
+    private RebuildDialog.Host rebuildHost() {
+        return new RebuildDialog.Host() {
+            @Override public File base() { return new File(BASE); }
+            @Override public File gameDir() { return gameDir==null ? null : new File(gameDir); }
+            @Override public void openToolPage(String url) { openInBrowser(url); }
+            @Override public void toast(String message) { MainActivity.this.toast(message); }
+            @Override public boolean gameRunning() { Process p=game; return p!=null && p.isAlive(); }
+            @Override public void stopGame(Runnable after) { worker.execute(() -> { MainActivity.this.stopGame(); main.post(() -> { if (!destroyed) after.run(); }); }); }
+            @Override public void startGame() {
+                if (destroyed || !displayReady) return;
+                status.setText("Starting Bloodborne\u2026"); status.setVisibility(View.VISIBLE);
+                worker.execute(() -> { if (game!=null) MainActivity.this.stopGame(); MainActivity.this.startGame(); });
+            }
+            @Override public void recheck() {
+                if (destroyed || !displayReady || game!=null || !hasGame()) return;
+                status.setText("Checking the game folder\u2026"); status.setVisibility(View.VISIBLE);
+                worker.execute(() -> MainActivity.this.startGame());
+            }
+            @Override public void quit() { finish(); }
+            @Override public void report() { report.show(); }
+            @Override public void closed() { if (!destroyed) immersive(); }
+        };
     }
     /** The library was imported or removed in the Native CPU page: the game starts when it fits and nothing runs, else the message shows. */
     private void nativeCodeChanged() {
@@ -1756,22 +1804,31 @@ public final class MainActivity extends Activity {
     private void startGame() {
         if (destroyed) return;
         hadError=false;
-        final NativeCpu.Sync synced=syncNativeCpu(); // the game folder's aot/ (from the rebuild tool) into bbport/aot/
+        // A native code build is running (the app was opened again, or the display came up): the game cannot start meanwhile; its progress shows.
+        if (AotBuildService.active()) {
+            main.post(() -> { if (!destroyed) { status.setVisibility(View.GONE); nativeRequired.show("The native code is being built."); rebuild.showProgress(); } });
+            return;
+        }
+        // The trigger rule: the installed native code, else the game folder's aot/ (imported here), else the rebuild dialog.
+        final NativeCpu.Sync synced=syncNativeCpu(); // the game folder's aot/ (from the rebuild tool or an earlier build) into bbport/aot/
         // The game runs as native code only: without a library that fits, the message below stays instead of the game.
         final NativeCpu.State native_=nativeCpu.startState();
         final String blocker=native_.blocker();
         if (blocker!=null) {
             android.util.Log.w("Bloodborne","native code: "+blocker);
-            final String folder=gameDir, lead=NativeCpu.neededLead(folder==null ? null : new File(folder),synced,native_);
+            final String folder=gameDir;
+            final NativeCpu.Needed needed=NativeCpu.needed(folder==null ? null : new File(folder),synced,native_);
             main.post(() -> {
                 if (destroyed) return;
-                status.setVisibility(View.GONE); nativeRequired.show(blocker); if (drawerOpen) refreshDrawer();
-                // The dialog explains the way out once per folder; closing it leaves the message above, which blocks the start.
-                if (lead!=null && !nativeNeeded.showing() && neededShown.add(folder)) nativeNeeded.show(lead);
+                lastNeeded=needed!=null ? needed : new NativeCpu.Needed(NativeCpu.Need.OTHER,blocker);
+                status.setVisibility(View.GONE); nativeRequired.show(lastNeeded.reason); if (drawerOpen) refreshDrawer();
+                // The dialog leads the way out once per folder (and again when the player chooses "Check again"); closing it leaves the message
+                // above, which blocks the start and has the button for it.
+                if (needed!=null && (rebuild.showing() || neededShown.add(folder))) rebuild.show(needed);
             });
             return;
         }
-        main.post(() -> { if (!destroyed) nativeRequired.hide(); });
+        main.post(() -> { if (!destroyed) { nativeRequired.hide(); rebuild.dismissWhenReady(); } });
         releasePause(false);
         playing=false; gameState(true);
         pickRefreshRate();
@@ -1872,7 +1929,7 @@ public final class MainActivity extends Activity {
         if (p!=null) { p.destroyForcibly(); try { p.waitFor(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
     @Override protected void onDestroy() {
-        destroyed=true; if (nativeCpu!=null) nativeCpu.close(); if (nativeNeeded!=null) nativeNeeded.close(); if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); rumble.close(); audio.stop(); main.removeCallbacksAndMessages(null);
+        destroyed=true; if (nativeCpu!=null) nativeCpu.close(); if (rebuild!=null) rebuild.close(); AotBuildService.unlisten(buildListener); if (atlasDialog!=null) atlasDialog.close(); if (onlineDialog!=null) onlineDialog.close(); if (atlas!=null) atlas.destroy(); if (driverDownload!=null) driverDownload.close(); if (mods!=null) mods.close(); if (installer!=null) installer.close(); if (updater!=null) updater.close(); pad.reset(); rumble.close(); audio.stop(); main.removeCallbacksAndMessages(null);
         stopGame();
         worker.shutdownNow(); super.onDestroy();
     }

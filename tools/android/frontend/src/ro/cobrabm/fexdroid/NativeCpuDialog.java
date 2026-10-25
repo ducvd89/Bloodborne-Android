@@ -28,11 +28,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-/** Menu -> Native CPU: the status and import page of the game's native code, compiled ahead of time on the player's PC with the Rebuild
- *  Tool (NativeCpu.TOOL_URL) and imported here as libbbaot.so + libbbaot.json (NativeCpu). The game cannot run without it, so there is no
- *  switch: the page shows what is installed and whether it fits this game, imports a picked pair (the files are checked: ABI version,
- *  game, checksum), removes it, and leads to the tool and to the game folder choice. It cannot be downloaded: it is derived from the
- *  player's own game. Rows take the gamepad (D-pad, A, B) and touch. */
+/** Menu -> Native CPU: the status and import page of the game's native code, built from the player's own game: on the phone (Rebuild on this
+ *  phone: RebuildDialog) or on a PC with the Rebuild Tool (NativeCpu.TOOL_URL) and imported here as libbbaot.so + libbbaot.json (NativeCpu).
+ *  The game cannot run without it, so there is no switch: the page shows what is installed and whether it fits this game, imports a picked
+ *  pair (the files are checked: ABI version, game, checksum), removes it, rebuilds it, and leads to the tool and to the game folder choice.
+ *  It cannot be downloaded: it is derived from the player's own game. Rows take the gamepad (D-pad, A, B) and touch. */
 final class NativeCpuDialog {
     static final int REQUEST_FILES = 11;
     private static final int TEXT = 0xffe8dfc9, GOLD = 0xffc6ad76, WARN = 0xffe5a04b, GOOD = 0xff8fbf7f, DIM = 0xff8e9097;
@@ -46,6 +46,7 @@ final class NativeCpuDialog {
         void toast(String text);
         boolean gameRunning();
         void chooseGameFolder();                      // the activity's own folder choice (it imports the folder's aot/ by itself)
+        void rebuildOnPhone();                        // the rebuild dialog, from its confirmations
         void openUrl(String url);
         void changed();                               // the installed library changed (imported, removed): the activity checks again
         void closed();                                // the dialog went away (the activity returns to immersive mode)
@@ -78,11 +79,7 @@ final class NativeCpuDialog {
     /** The game's id and version from the chosen folder's param.sfo (null each when unknown). */
     private String[] gameIdentity() {
         String dir = host.gameDir();
-        if (dir == null) return new String[]{null, null};
-        try {
-            Map<String, Object> sfo = Sfo.parse(java.nio.file.Files.readAllBytes(new File(dir, "sce_sys/param.sfo").toPath()));
-            return new String[]{Sfo.text(sfo, "TITLE_ID"), Sfo.text(sfo, "APP_VER")};
-        } catch (IOException | Sfo.Invalid e) { return new String[]{null, null}; }
+        return NativeCpu.identity(dir == null ? null : new File(dir));
     }
 
     /** The state for the drawer row and the activity (cached image hash only: cheap). */
@@ -155,8 +152,14 @@ final class NativeCpuDialog {
     private void render(NativeCpu.State s) {
         if (box == null) return;
         box.removeAllViews();
-        box.addView(line(NativeCpu.NEEDED_TEXT, 13, TEXT, false));
-        box.addView(linkButton("Download the Rebuild Tool", NativeCpu.DOWNLOAD_URL, 8));
+        box.addView(line("Bloodborne runs as native ARM64 code that is built from your own game files. It cannot be downloaded. Build it on this phone "
+            + "(a few minutes, the phone gets hot), or on a PC with the Rebuild Tool and copy its aot folder into the game folder.", 13, TEXT, false));
+        Button rebuildButton = new Button(activity); rebuildButton.setText("Rebuild on this phone"); rebuildButton.setAllCaps(false);
+        rebuildButton.setEnabled(!busy);
+        rebuildButton.setOnClickListener(v -> { if (!busy) { dialog.dismiss(); host.rebuildOnPhone(); } });
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-2, -2); rlp.topMargin = dp(8);
+        box.addView(rebuildButton, rlp);
+        box.addView(linkButton("Rebuild Tool for PC", NativeCpu.DOWNLOAD_URL, 4));
         box.addView(linkButton("How to use it", NativeCpu.GUIDE_URL, 4));
 
         TextView heading = line("STATUS", 11, GOLD, true); heading.setLetterSpacing(0.15f); heading.setPadding(0, dp(14), 0, dp(2));
@@ -168,7 +171,7 @@ final class NativeCpuDialog {
         }
         if (!s.installed) {
             box.addView(line("Not installed: the game cannot start", 16, WARN, true));
-            box.addView(line("Choose the game folder the tool made, or import libbbaot.so and libbbaot.json from the PC.", 13, DIM, false));
+            box.addView(line("Rebuild it on this phone, choose a game folder that has an aot folder, or import libbbaot.so and libbbaot.json from a PC.", 13, DIM, false));
         } else if (s.problem != null || s.info == null) {
             box.addView(line("Installed, but it cannot be used", 16, WARN, true));
             box.addView(line(s.problem, 13, WARN, false));

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.ducvd89.bloodborne" android:versionCode="36" android:versionName="2.0.1-beta1">
+    package="com.ducvd89.bloodborne" android:versionCode="37" android:versionName="2.1.0-beta1">
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="28" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -13,6 +13,11 @@
     <!-- The game folder in shared storage (targetSdk 28: file paths, as the game process reads them). -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <!-- Building the native code on the phone (AotBuildService): a foreground service with a partial wake lock while the build runs. The app targets
+         API 28, so there is no notification permission to ask for: on Android 13 and newer the system asks when the notification channel is
+         created; a refusal only hides the progress notification (the dialog still shows it). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- allowAudioPlaybackCapture: screen recorders may record the game's sound (targetSdk 28 apps
          are not capturable by default on Android 10+). -->
     <application android:label="Bloodborne" android:icon="@drawable/icon"
@@ -39,6 +44,8 @@
             android:launchMode="singleInstance" android:excludeFromRecents="true" android:resizeableActivity="true"
             android:noHistory="false" android:label="Hunter's Atlas"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation|uiMode" />
+        <!-- The native code build (AotBuildService): runs libbbrecomp.so, the Rebuild Tool, on the game image. -->
+        <service android:name="ro.cobrabm.fexdroid.AotBuildService" android:exported="false" />
         <!-- Serves the problem report's zip (files/reports) to the share sheet; see ReportProvider. -->
         <provider android:name="ro.cobrabm.fexdroid.ReportProvider" android:authorities="com.ducvd89.bloodborne.reports"
             android:exported="false" android:grantUriPermissions="true" />

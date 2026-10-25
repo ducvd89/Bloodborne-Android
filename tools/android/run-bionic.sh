@@ -461,7 +461,7 @@ if [ "${1:-game}" = game ]; then
 fi
 
 # The game's code runs as ahead-of-time recompiled native code and nothing else (docs/STATIC_RECOMPILE_PLAN.md): the Bloodborne Android
-# Rebuild Tool's libbbaot.so, copied to aot/libbbaot.so in the runtime's directory (bbport/aot, or bbport/bionic/aot) by the app (NativeCpu.java).
+# Rebuild Tool's libbbaot.so (built by the app on the phone, or on a PC), copied to aot/libbbaot.so in the runtime's directory (bbport/aot, or bbport/bionic/aot) by the app (NativeCpu.java).
 # BB_AOT=<path> by hand wins (bionic-local.sh, environment). Without the library the game cannot start: the app shows how to get it, and this script
 # stops here with the same message. A native-code miss is written to logs/aot-misses.log and stops the game (BB_AOT_STATS=1: counters).
 if [ "${BB_AOT:-0}" = 0 ]; then
@@ -471,7 +471,7 @@ if [ "${BB_AOT:-0}" = 0 ]; then
     done
 fi
 if [ -z "${BB_AOT:-}" ]; then
-    echo "STOP: AOT: libbbaot.so is missing: this version of the app runs Bloodborne as native code, which is built once on a PC from your own game files with the Bloodborne Android Rebuild Tool (https://github.com/ducvd89/Bloodborne-android-rebuild-tool)"
+    echo "STOP: AOT: libbbaot.so is missing: this version of the app runs Bloodborne as native code, which is built once from your own game files, on the phone (the app offers it) or on a PC with the Bloodborne Android Rebuild Tool (https://github.com/ducvd89/Bloodborne-android-rebuild-tool)"
     exit 3
 fi
 export BB_AOT; echo "AOT: $BB_AOT"

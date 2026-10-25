@@ -66,8 +66,10 @@ public final class NativeCpuTest {
         catch (NativeCpu.Problem p) { return p; }
     }
 
-    /** NativeCpu.neededLead as MainActivity.startGame gets it: sync the folder, then the start state (null: no dialog). */
-    static String needed(File phone, File game) {
+    /** NativeCpu.needed as MainActivity.startGame gets it: sync the folder, then the start state (null: no dialog). */
+    static String needed(File phone, File game) { NativeCpu.Needed n = neededFull(phone, game); return n == null ? null : n.reason; }
+    static NativeCpu.Need needKind(File phone, File game) { NativeCpu.Needed n = neededFull(phone, game); return n == null ? NativeCpu.Need.NONE : n.need; }
+    static NativeCpu.Needed neededFull(File phone, File game) {
         NativeCpu.Sync sync = NativeCpu.syncFromGame(phone, game, "CUSA00207", "01.09", null);
         String hash = NativeCpu.deviceImageHash(phone, true);
         NativeCpu.State state = NativeCpu.state(phone, hash, "CUSA00207", "01.09");
@@ -75,8 +77,10 @@ public final class NativeCpuTest {
             String bad = NativeCpu.checksumProblem(phone, state.info);
             if (bad != null) state.problem = bad;
         }
-        return NativeCpu.neededLead(game, sync, state);
+        return NativeCpu.needed(game, sync, state);
     }
+
+    static boolean Arrays_equal(byte[] a, byte[] b) { return java.util.Arrays.equals(a, b); }
 
     public static void main(String[] args) throws Exception {
         byte[] image = new byte[5000];
@@ -94,7 +98,7 @@ public final class NativeCpuTest {
 
         // a good pair
         byte[] good = so(183, 100000);
-        String goodJson = json("CUSA00207", "01.09", hash, good, 1, 1);
+        String goodJson = json("CUSA00207", "01.09", hash, good, 2, 1);
         check(tryInstall(base, goodJson, good, "CUSA00207", "01.09") == null, "good pair is installed");
         check(NativeCpu.so(base).length() == good.length && NativeCpu.json(base).isFile(), "files are in aot/");
         check(!new File(NativeCpu.dir(base), "libbbaot.so.part").exists(), "no .part left");
@@ -123,34 +127,35 @@ public final class NativeCpuTest {
             byte[] damaged = good.clone(); damaged[5000] ^= 1;
             Files.write(NativeCpu.so(b4).toPath(), damaged);
             check(NativeCpu.checksumProblem(b4, st4.info) != null && NativeCpu.checksumProblem(b4, st4.info).contains("checksum"), "a damaged library is caught by its checksum");
-            check(NativeCpu.NEEDED_TEXT.startsWith("Bloodborne on Android 2.0 runs as native ARM64 code that you build once on a PC (Windows or Linux)") && NativeCpu.NEEDED_TEXT.endsWith("then choose it here."), "the message text");
+            check(NativeCpu.NEEDED_TEXT.startsWith("Bloodborne runs as native ARM64 code made from your own game files.") && NativeCpu.NEEDED_TEXT.contains("saves are not touched"), "the message text");
+            check(NativeCpu.ABI_VERSION == 2, "this app takes ABI 2 (Rebuild Tool 1.2.0)");
             check("https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/latest".equals(NativeCpu.DOWNLOAD_URL) && "https://github.com/ducvd89/Bloodborne-android-rebuild-tool#how-to-use-it".equals(NativeCpu.GUIDE_URL), "the two links");
         }
 
         // refusals (each leaves the installed pair alone)
         File b2 = temp(); bootFile(b2, image);
-        refuses("ABI 2", "ABI version 2", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 2, 1), good, "CUSA00207", "01.09"));
-        refuses("format 2", "format 2", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 1, 2), good, "CUSA00207", "01.09"));
+        refuses("ABI 1", "ABI version 1", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA00207", "01.09"));
+        refuses("format 2", "format 2", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 2, 2), good, "CUSA00207", "01.09"));
         refuses("not json", "not readable", tryInstall(b2, "hello", good, null, null));
         refuses("not a bb-recomp file", "not a bb-recomp", tryInstall(b2, "{\"a\": 1}", good, null, null));
         // (b2 has its game image: the hash decides, whatever the ids say; without an image the version and the title id are compared)
-        check(tryInstall(temp(), json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA03173", "01.09") == null, "another region of the same 1.09, game not prepared: accepted");
+        check(tryInstall(temp(), json("CUSA00207", "01.09", hash, good, 2, 1), good, "CUSA03173", "01.09") == null, "another region of the same 1.09, game not prepared: accepted");
         File b2b = temp(); bootFile(b2b, image);
-        check(tryInstall(b2b, json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA03173", "01.09") == null, "same image, another title id: accepted");
-        refuses("other title", "not a Bloodborne", tryInstall(temp(), json("CUSA12345", "01.09", hash, good, 1, 1), good, null, null));
-        refuses("library from 1.08", "version 01.08", tryInstall(temp(), json("CUSA00207", "01.08", hash, good, 1, 1), good, null, null));
-        refuses("another version on the phone", "version 01.08", tryInstall(temp(), json("CUSA00207", "01.09", hash, good, 1, 1), good, "CUSA00207", "01.08"));
-        refuses("another image", "another build", tryInstall(b2, json("CUSA00207", "01.09", "ffffffffffffffff", good, 1, 1), good, "CUSA00207", "01.09"));
+        check(tryInstall(b2b, json("CUSA00207", "01.09", hash, good, 2, 1), good, "CUSA03173", "01.09") == null, "same image, another title id: accepted");
+        refuses("other title", "not a Bloodborne", tryInstall(temp(), json("CUSA12345", "01.09", hash, good, 2, 1), good, null, null));
+        refuses("library from 1.08", "version 01.08", tryInstall(temp(), json("CUSA00207", "01.08", hash, good, 2, 1), good, null, null));
+        refuses("another version on the phone", "version 01.08", tryInstall(temp(), json("CUSA00207", "01.09", hash, good, 2, 1), good, "CUSA00207", "01.08"));
+        refuses("another image", "another build", tryInstall(b2, json("CUSA00207", "01.09", "ffffffffffffffff", good, 2, 1), good, "CUSA00207", "01.09"));
         byte[] x86 = so(62, 100000);
-        refuses("x86 library", "not for ARM64", tryInstall(b2, json("CUSA00207", "01.09", hash, x86, 1, 1), x86, "CUSA00207", "01.09"));
+        refuses("x86 library", "not for ARM64", tryInstall(b2, json("CUSA00207", "01.09", hash, x86, 2, 1), x86, "CUSA00207", "01.09"));
         byte[] text = new byte[100000]; java.util.Arrays.fill(text, (byte) 'x');
-        refuses("not ELF", "not an ELF", tryInstall(b2, json("CUSA00207", "01.09", hash, text, 1, 1), text, "CUSA00207", "01.09"));
+        refuses("not ELF", "not an ELF", tryInstall(b2, json("CUSA00207", "01.09", hash, text, 2, 1), text, "CUSA00207", "01.09"));
         byte[] shortSo = java.util.Arrays.copyOf(good, 99000);
-        refuses("truncated", "99000 bytes", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 1, 1), shortSo, "CUSA00207", "01.09"));
+        refuses("truncated", "99000 bytes", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 2, 1), shortSo, "CUSA00207", "01.09"));
         byte[] flipped = good.clone(); flipped[5000] ^= 1;
-        refuses("flipped byte", "checksum", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 1, 1), flipped, "CUSA00207", "01.09"));
+        refuses("flipped byte", "checksum", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 2, 1), flipped, "CUSA00207", "01.09"));
         byte[] longer = java.util.Arrays.copyOf(good, 100500);
-        refuses("larger than json", "larger", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 1, 1), longer, "CUSA00207", "01.09"));
+        refuses("larger than json", "larger", tryInstall(b2, json("CUSA00207", "01.09", hash, good, 2, 1), longer, "CUSA00207", "01.09"));
         check(!NativeCpu.so(b2).exists() && !NativeCpu.json(b2).exists() && !new File(NativeCpu.dir(b2), "libbbaot.so.part").exists(), "nothing installed after refusals");
 
         // game not prepared yet and no game folder: accepted, the check happens later
@@ -159,7 +164,7 @@ public final class NativeCpuTest {
 
         // a second import replaces the pair; a wrong json size marks the files as not belonging together
         byte[] other = so(183, 120000);
-        check(tryInstall(b3, json("CUSA00207", "01.09", hash, other, 1, 1), other, null, null) == null && NativeCpu.so(b3).length() == 120000, "re-import replaces");
+        check(tryInstall(b3, json("CUSA00207", "01.09", hash, other, 2, 1), other, null, null) == null && NativeCpu.so(b3).length() == 120000, "re-import replaces");
         Files.write(NativeCpu.json(b3).toPath(), goodJson.getBytes(StandardCharsets.UTF_8));
         s = NativeCpu.state(b3, null, null, null);
         check(s.problem != null && s.problem.contains("not the one libbbaot.json describes") && !s.ready() && s.blocker() != null, "so and json of different builds");
@@ -180,14 +185,14 @@ public final class NativeCpuTest {
         check(sy.kind == NativeCpu.SyncKind.IMPORTED && NativeCpu.so(phone).length() == good.length && sy.info.unitCount == 185934, "imported from the game folder");
         long stamp = NativeCpu.so(phone).lastModified(); Thread.sleep(20);
         check(NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null).kind == NativeCpu.SyncKind.UNCHANGED && NativeCpu.so(phone).lastModified() == stamp, "not copied again");
-        Files.write(new File(aot, "libbbaot.so").toPath(), other); Files.write(new File(aot, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, other, 1, 1).getBytes(StandardCharsets.UTF_8));
+        Files.write(new File(aot, "libbbaot.so").toPath(), other); Files.write(new File(aot, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, other, 2, 1).getBytes(StandardCharsets.UTF_8));
         check(NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null).kind == NativeCpu.SyncKind.IMPORTED && NativeCpu.so(phone).length() == 120000, "copied again when it changed");
         Files.write(new File(aot, "libbbaot.so").toPath(), flipped);
         sy = NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null);
         check(sy.kind == NativeCpu.SyncKind.FAILED && NativeCpu.so(phone).length() == 120000, "a damaged pair is reported and the installed one stays");
-        Files.write(new File(aot, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 2, 1).getBytes(StandardCharsets.UTF_8));
+        Files.write(new File(aot, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 1, 1).getBytes(StandardCharsets.UTF_8));
         sy = NativeCpu.syncFromGame(phone, game, "CUSA03173", "01.09", null);
-        check(sy.kind == NativeCpu.SyncKind.FAILED && sy.problem.contains("ABI version 2"), "ABI mismatch in the game folder is reported");
+        check(sy.kind == NativeCpu.SyncKind.FAILED && sy.problem.contains("ABI version 1") && sy.need == NativeCpu.Need.ABI, "ABI mismatch in the game folder is reported");
 
         // the "Native code needed" dialog: when it is due and what it leads with (what MainActivity.startGame does with a game folder)
         File p1 = temp(); bootFile(p1, image);
@@ -205,18 +210,18 @@ public final class NativeCpuTest {
         check(needed(p1, g1) == null, "good aot/, imported already: no dialog");
         File g2 = temp(); // no aot/ at all, but the library was imported earlier: fine
         check(needed(p1, g2) == null, "folder without aot/, library installed in the app and fitting: no dialog");
-        Files.write(new File(a1, "libbbaot.json").toPath(), json("CUSA00207", "01.09", "0123456789abcdef", good, 1, 1).getBytes(StandardCharsets.UTF_8));
+        Files.write(new File(a1, "libbbaot.json").toPath(), json("CUSA00207", "01.09", "0123456789abcdef", good, 2, 1).getBytes(StandardCharsets.UTF_8));
         check(needed(p1, g1) == null, "bad aot/ but a fitting library installed: no dialog");
 
         File p2 = temp(); bootFile(p2, image);
         File g3 = temp(), a3 = new File(g3, "aot"); a3.mkdirs();
         Files.write(new File(a3, "libbbaot.so").toPath(), good);
-        Files.write(new File(a3, "libbbaot.json").toPath(), json("CUSA00207", "01.09", "0123456789abcdef", good, 1, 1).getBytes(StandardCharsets.UTF_8));
+        Files.write(new File(a3, "libbbaot.json").toPath(), json("CUSA00207", "01.09", "0123456789abcdef", good, 2, 1).getBytes(StandardCharsets.UTF_8));
         String lead = needed(p2, g3);
         check(lead != null && lead.contains("not used") && lead.contains("another build of the game's code"), "aot/ built from another game build: that reason");
-        Files.write(new File(a3, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 2, 1).getBytes(StandardCharsets.UTF_8));
+        Files.write(new File(a3, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 1, 1).getBytes(StandardCharsets.UTF_8));
         lead = needed(p2, g3);
-        check(lead != null && lead.contains("ABI version 2"), "aot/ with another ABI version: that reason");
+        check(lead != null && lead.contains("ABI version 1"), "aot/ with another ABI version: that reason");
         Files.write(new File(a3, "libbbaot.json").toPath(), goodJson.getBytes(StandardCharsets.UTF_8));
         Files.write(new File(a3, "libbbaot.so").toPath(), flipped);
         lead = needed(p2, g3);
@@ -233,6 +238,53 @@ public final class NativeCpuTest {
         check(lead != null && lead.contains("does not match this game"), "installed library for another build, folder without aot/: that reason");
         Files.write(new File(p3, "bionic-local.sh").toPath(), "export BB_AOT=/x/libbbaot.so\n".getBytes(StandardCharsets.UTF_8));
         check(needed(p3, temp()) == null, "BB_AOT set by hand: no dialog");
+
+        // the trigger rule and the kind of the need (what the rebuild dialog leads with)
+        {
+            File q = temp(); bootFile(q, image);
+            check(needKind(q, temp()) == NativeCpu.Need.MISSING, "nothing anywhere: missing");
+            File gq = temp(), aq = new File(gq, "aot"); aq.mkdirs();
+            Files.write(new File(aq, "libbbaot.so").toPath(), good);
+            Files.write(new File(aq, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 1, 1).getBytes(StandardCharsets.UTF_8));
+            check(needKind(q, gq) == NativeCpu.Need.ABI && needed(q, gq).contains("another app version"), "a library of tool 1.1.0 (ABI 1) in the folder: ABI");
+            Files.write(new File(aq, "libbbaot.json").toPath(), json("CUSA00207", "01.09", "0123456789abcdef", good, 2, 1).getBytes(StandardCharsets.UTF_8));
+            check(needKind(q, gq) == NativeCpu.Need.GAME, "a library of another game build in the folder: GAME");
+            Files.write(new File(aq, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 2, 1).getBytes(StandardCharsets.UTF_8));
+            check(needKind(q, gq) == NativeCpu.Need.NONE && NativeCpu.state(q, hash, null, null).ready(), "ABI 2 in the folder: imported, start");
+            // the installed pair is checked first: a valid one starts the game whatever the folder says
+            Files.write(new File(aq, "libbbaot.json").toPath(), json("CUSA00207", "01.09", hash, good, 1, 1).getBytes(StandardCharsets.UTF_8));
+            check(needKind(q, gq) == NativeCpu.Need.NONE, "installed ABI 2 pair fits, the folder's old pair is refused: start");
+            // an installed ABI 1 pair (a 2.0.x install that was updated) is "different ABI"
+            File q1 = temp(); bootFile(q1, image);
+            NativeCpu.dir(q1).mkdirs();
+            Files.write(NativeCpu.so(q1).toPath(), good); Files.write(NativeCpu.json(q1).toPath(), json("CUSA00207", "01.09", hash, good, 1, 1).getBytes(StandardCharsets.UTF_8));
+            NativeCpu.State st1 = NativeCpu.state(q1, hash, null, null);
+            check(!st1.ready() && st1.need() == NativeCpu.Need.ABI && needKind(q1, temp()) == NativeCpu.Need.ABI, "installed ABI 1: different ABI, rebuild");
+            // an installed pair for another game build
+            File q2 = temp(); bootFile(q2, image); tryInstall(q2, goodJson, good, null, null);
+            File boot2 = NativeCpu.bootImage(q2); byte[] o2 = image.clone(); o2[7] ^= 1; bootFile(q2, o2); boot2.setLastModified(boot2.lastModified() + 5000);
+            check(needKind(q2, temp()) == NativeCpu.Need.GAME, "installed for another game build: GAME");
+            check(NativeCpu.state(temp(), null, null, null).need() == NativeCpu.Need.MISSING, "state without files: MISSING");
+            // a half pair in the folder is its own reason (kind OTHER)
+            File q3 = temp(), g3b = temp(); bootFile(q3, image); new File(g3b, "aot").mkdirs();
+            Files.write(new File(g3b, "aot/libbbaot.so").toPath(), good);
+            check(needKind(q3, g3b) == NativeCpu.Need.OTHER, "one file of the pair: OTHER");
+        }
+
+        // identity and the copy into the game folder (what the build service does with a built pair)
+        {
+            File gi = temp();
+            check(NativeCpu.identity(gi)[0] == null && NativeCpu.identity(null)[1] == null, "no param.sfo: unknown");
+            File work = temp(), gdir = temp();
+            Files.write(new File(work, "libbbaot.so").toPath(), good); Files.write(new File(work, "libbbaot.json").toPath(), goodJson.getBytes(StandardCharsets.UTF_8));
+            check(NativeCpu.copyToGame(gdir, new File(work, "libbbaot.so"), new File(work, "libbbaot.json")) == null, "copied into aot/");
+            check(Arrays_equal(Files.readAllBytes(new File(gdir, "aot/libbbaot.so").toPath()), good) && goodJson.equals(new String(Files.readAllBytes(new File(gdir, "aot/libbbaot.json").toPath()), StandardCharsets.UTF_8)), "the copy is the pair");
+            check(!new File(gdir, "aot/libbbaot.so.part").exists() && !new File(gdir, "aot/libbbaot.json.part").exists(), "no .part left");
+            // the start-up sync leaves what is installed alone when the folder's pair is the same one
+            File ph = temp(); bootFile(ph, image);
+            check(tryInstall(ph, goodJson, good, null, null) == null && NativeCpu.syncFromGame(ph, gdir, null, null, null).kind == NativeCpu.SyncKind.UNCHANGED, "folder copy = installed pair: nothing copied again");
+            check(NativeCpu.copyToGame(null, null, null) != null, "no folder: reported");
+        }
 
         System.out.println(checks + " checks, " + failed + " failed");
         if (failed != 0) System.exit(1);

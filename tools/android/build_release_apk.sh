@@ -2,7 +2,8 @@
 # The release APK: the app (build_frontend.sh) with the runtime archive (build_release_runtime.py) inside.
 # Prerequisites: build_bionic.sh (the game process, bb-prepare), build_pkg_tool.sh android (ps4-pkg-tool),
 # out/eboot.elf (for the patch files; not packaged) and the user-owned game icon (see build_frontend.sh).
-# Also needs the pinned GPU drivers (fetch_bundled_drivers.sh, run here).
+# Also needs the pinned GPU drivers (fetch_bundled_drivers.sh, run here) and the Rebuild Tool's Android package (fetch_recomp_android.sh, run by
+# build_frontend.sh; BB_RECOMP_ANDROID_TARBALL=<file> takes a local tarball of it, e.g. before the tool's release exists).
 # BB_APK_NAME=<name>: the file name (without .apk) in out/release/, default Bloodborne-<versionName>.
 # BB_TEST_BUILD=1: a test build of the current commit: versionName "<manifest version>-test.<short commit>" (for example 2.0.0-test.a1b2c3d), which
 # the in-app update checker reads as the manifest version (text after the leading number is ignored: never a downgrade offer), same versionCode.
