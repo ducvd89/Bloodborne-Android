@@ -37,7 +37,7 @@ The game's x86-64 code is translated to ARM64 ahead of time, once, into a file `
 
 ### On the phone (default)
 
-Menu → **Native CPU** → **Rebuild on this phone**, or the **Build on this phone** choice of the **Native code needed** dialog. The app runs the same compiler as the PC tool (Rebuild Tool 1.2.0, built into the app) on the game image it already made, and writes the same `libbbaot.so` a PC would.
+Menu → **Native CPU** → **Rebuild on this phone**, or the **Build on this phone** choice of the **Native code needed** dialog. The app runs the same compiler as the PC tool (Rebuild Tool 1.2.1, built into the app; it writes the same code as the PC tool 1.2.0) on the game image it already made, and writes the same `libbbaot.so` a PC would.
 
 | | |
 |---|---|
