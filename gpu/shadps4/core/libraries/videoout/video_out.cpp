@@ -351,6 +351,11 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    // bbport: count the flip as in flight before the GPU can write the buffer label.
+    if (buf_id < MaxDisplayBuffers) {
+        port->flips_in_flight[buf_id].fetch_add(1);
+    }
+
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <functional>
 
@@ -36,6 +37,10 @@ struct VideoOutPort {
     std::condition_variable vblank_cv;
     int flip_rate = 0;
     int prev_index = -1;
+    // bbport: flips submitted but not yet processed by the present thread, per buffer. The flip
+    // label of a buffer may only be reset while no newer flip of that buffer is in flight,
+    // otherwise (A,B,A) resets the label the GPU already wrote for the second A flip.
+    std::array<std::atomic<u32>, MaxDisplayBuffers> flips_in_flight{};
     bool is_open = false;
     bool is_hdr = false;
 

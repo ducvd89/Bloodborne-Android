@@ -144,6 +144,9 @@ void VideoOutDriver::Close(s32 handle) {
     main_port.is_open = false;
     main_port.flip_rate = 0;
     main_port.prev_index = -1;
+    for (auto& n : main_port.flips_in_flight) {
+        n.store(0);
+    }
 
     // Clear port information
     std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
@@ -246,6 +249,7 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
 
         // Reset flip label also when registering buffer
         port->buffer_labels[startIndex + i] = 0;
+        port->flips_in_flight[startIndex + i].store(0);
         port->SignalVoLabel();
 
         presenter->RegisterVideoOutSurface(group, address);
@@ -1092,8 +1096,15 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
 
+    // bbport: this flip is processed, no longer in flight.
+    if (req.index != -1) {
+        port->flips_in_flight[req.index].fetch_sub(1);
+    }
+
     // Reset prev flip label
-    if (port->prev_index != -1) {
+    // bbport: only if no newer flip of that buffer is in flight: its GPU label write (=1) may
+    // already have happened and the flip IRQ still has to see it.
+    if (port->prev_index != -1 && port->flips_in_flight[port->prev_index].load() == 0) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -1128,6 +1139,9 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
         if (is_eop) {
             ++port->flip_status.gc_queue_num;
+        } else if (index != -1) {
+            // bbport: EOP flips were counted in sceVideoOutSubmitEopFlip.
+            port->flips_in_flight[index].fetch_add(1);
         }
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
