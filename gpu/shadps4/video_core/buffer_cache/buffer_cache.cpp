@@ -547,7 +547,18 @@ bool Detail::ComputeGuestInPlace() {
 }
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
-static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+/// The stream ring: 128 MiB, 32 on Android (a frame streams about 0.4 MiB; a request waits for
+/// the GPU to pass the region it would overwrite, StreamBuffer::WaitPendingOperations);
+/// BB_STREAM_BUFFER_MB another size.
+static size_t StreamBufferSize() {
+    const char* env = std::getenv("BB_STREAM_BUFFER_MB");
+    const u64 mb = env ? std::strtoull(env, nullptr, 10) : 0;
+#ifdef __ANDROID__
+    return (mb ? mb : 32ull) << 20;
+#else
+    return (mb ? mb : 128ull) << 20;
+#endif
+}
 
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
@@ -589,7 +600,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)}, page_manager{tracker},
-      stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
+      stream_buffer{instance, scheduler, MemoryType::Stream, StreamBufferSize()},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
     integrated_gpu = instance.IsIntegrated();

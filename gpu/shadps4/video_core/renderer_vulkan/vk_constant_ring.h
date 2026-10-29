@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 
 #include "common/assert.h"
 #include "common/types.h"
@@ -19,10 +20,22 @@ namespace Vulkan {
 
 class ConstantRing {
 public:
-    static constexpr u64 Capacity = 32ull << 20;
+    /// 32 MiB, 16 on Android (a full ring only sends a binding to stage B; the ring is reused
+    /// only once the GPU has passed it, so a smaller one cannot overwrite data in flight);
+    /// BB_CONSTANT_RING_MB another size.
+    static u64 CapacityFor() {
+        const char* env = std::getenv("BB_CONSTANT_RING_MB");
+        const u64 mb = env ? std::strtoull(env, nullptr, 10) : 0;
+#ifdef __ANDROID__
+        return (mb ? mb : 16ull) << 20;
+#else
+        return (mb ? mb : 32ull) << 20;
+#endif
+    }
+    const u64 Capacity;
 
     ConstantRing(const Instance& instance, Scheduler& scheduler_)
-        : scheduler{scheduler_},
+        : Capacity{CapacityFor()}, scheduler{scheduler_},
           buffer{instance, 0, Capacity, VideoCore::MemoryType::Stream, "bbport constant ring"} {
         ASSERT(!buffer.mapped_data.empty());
     }
