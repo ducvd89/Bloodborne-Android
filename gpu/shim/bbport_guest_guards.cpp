@@ -29,6 +29,11 @@
 //   colour (0, 0, 0, 1) a WRITE_DATA of zeros is submitted to the graphics queue in order, without
 //   touching the game's context; anything else (another layout, colour or thread) calls the game's
 //   function as before. BB_FX_INIT_CLEAR=0: not installed.
+// - GX occlusion queries without a handle (#336, upstream 0.7): a query whose creation failed (the
+//   device's heap full late in a long session) has a null handle, and the render command that
+//   begins it reads the handle: a guest fault at 0x2169edc on GXRenderThread. Described at
+//   GxQuery below. Only as native hook slots (three sites that tool 1.2.x libraries have no slot
+//   for: without them the guard is off, one line says so). BB_GX_QUERY_GUARD=0: not installed.
 #include "common/types.h"
 #include "bbport_guest_guards.h"
 #include "bbport_guest_code.h"
@@ -39,8 +44,10 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,7 +68,7 @@ u64 image_base = 0;
 u8* stub_page = nullptr;
 std::size_t stub_used = 0;
 
-bool clamp_on = false, gx_guard_on = false, fx_clear_on = false;
+bool clamp_on = false, gx_guard_on = false, fx_clear_on = false, gx_query_on = false;
 std::atomic<u64> clamps{0}, gx_null_nodes{0}, fx_clears{0};
 
 /// Rate-limited logging: the first five and then every power of two.
@@ -352,6 +359,183 @@ bool InstallFxInitClear() {
     }
     return true;
 }
+// ---- GX occlusion queries without a handle ----
+// A query (0x30 bytes, made by its pool, 0xec6820 and 0xec68d0, with 0x2288d00) gets its handle, its
+// first field, from 0xe2f080(this, 1) -> 0x21674f0, which allocates a 0x18-byte handle (the device's
+// allocator at +0xdc10) and its data (+0xdc18). On a failure it returns 8 or 9 and the handle stays
+// null; the pool does not look. The render command 0x2285e10 then begins the query (0xe2f130: inner
+// state [this + 8] 0 -> 2, then 0x2169ec0(device, device + 0xb730, handle), which reads the handle:
+// the fault) and ends it (0xe2f160: state 1, 0x216a070, which reads it too). The guard: at the
+// begin, a query whose creation failed (GxQueryCreated keeps their addresses) is created again; one
+// still without a handle is not begun, and its end is skipped. Its state stays 0, so the result
+// getter (0xe2f190) gives its stored result, 0 (nothing visible). A null handle the creation did not
+// leave (a query released while the render thread holds it) is only skipped: creating one would
+// write into a freed object. The pool creates on the main thread, the retry runs on GXRenderThread:
+// both allocators (0x1fc5f30, 0x1fc5ed0) hold their lock (+0x468) around the game's TLSF heap
+// (0x2085a60), and the rest of the creation touches only the query. The cause is a guess; the
+// observer logs each failed creation once a minute.
+// BB_RE_GX_QUERY=1: the first creations and guard events are logged with their thread.
+// BB_GX_QUERY_FAIL=N (diagnostics): every N-th creation (retries too) fails as with a full heap
+// (the game's release 0xe2f020 takes the new handle back), so the guard's paths run in any
+// session. The pool makes 8192 at startup and hands out the last made first: N = 2 reaches a scene.
+constexpr u64 GxQueryBeginSite = 0xe2f134; // cmp dword [rdi + 8], 0; jne 0xe2f157 (begun already)
+constexpr u64 GxQueryReturn = 0xe2f157;    // mov al, 1; pop rbp; ret
+constexpr std::array<u8, 6> GxQueryBeginCode = {0x83, 0x7f, 0x08, 0x00, 0x75, 0x1d};
+constexpr u64 GxQueryEndSite = 0xe2f164;   // mov dword [rdi + 8], 1
+constexpr u64 GxQueryEndReturn = 0xe2f181; // mov al, 1; pop rbp; ret
+constexpr std::array<u8, 7> GxQueryEndCode = {0xc7, 0x47, 0x08, 0x01, 0x00, 0x00, 0x00};
+constexpr u64 GxQueryCreate = 0xe2f080;
+constexpr u64 GxQueryRelease = 0xe2f020;
+/// The creation's common exit (`mov rcx, [r15]; cmp rcx, [rbp - 0x20]`, the stack check): eax the
+/// result, r14 where the handle goes (the query), rbx null when the handle's allocation failed.
+constexpr u64 GxQueryCreateExit = 0x21675b0;
+constexpr std::array<u8, 7> GxQueryCreateExitCode = {0x49, 0x8b, 0x0f, 0x48, 0x3b, 0x4d, 0xe0};
+std::array<std::atomic<u64>, 256> gx_query_failed{}; ///< queries whose creation failed (0: free)
+std::atomic<u64> gx_query_failures{0}, gx_query_recreated{0}, gx_query_skipped{0};
+std::atomic<long long> gx_query_failure_told{0}, gx_query_guard_told{0};
+
+/// True the first time and then at most once a minute (`last`: steady clock, ms).
+bool OncePerMinute(std::atomic<long long>& last) {
+    const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count();
+    long long seen = last.load(std::memory_order_relaxed);
+    return (seen == 0 || now - seen >= 60000) && last.compare_exchange_strong(seen, now);
+}
+
+std::array<char, 32> ThreadName() {
+    std::array<char, 32> name{};
+    if (pthread_getname_np(pthread_self(), name.data(), name.size()) != 0 || !name[0]) name = {"?"};
+    return name;
+}
+
+/// BB_RE_GX_QUERY=1: true for the first 16 events counted in `traced`.
+bool GxQueryTrace(std::atomic<int>& traced) {
+    static const bool trace = [] {
+        const char* env = std::getenv("BB_RE_GX_QUERY");
+        return env && env[0] == '1';
+    }();
+    return trace && traced.fetch_add(1) < 16;
+}
+
+/// The creation's exit as a native hook slot (observer: the game's instructions run next): rax the result, r14 the query.
+std::uint32_t GxQueryCreatedSlot(void*, GuestRegsEx* r) {
+    auto status = std::uint32_t(r->gpr[GUEST_RAX]);
+    const u64 query = r->gpr[GUEST_R14];
+    static const long fail_every = [] {
+        const char* env = std::getenv("BB_GX_QUERY_FAIL");
+        return env ? std::strtol(env, nullptr, 10) : 0l;
+    }();
+    static std::atomic<u64> creations{0};
+    const bool simulated = status == 0 && fail_every > 0 &&
+                           (creations.fetch_add(1) + 1) % u64(fail_every) == 0;
+    if (simulated) {
+        const u64 args[1] = {query};
+        guest_cpu_call(uintptr_t(image_base + GxQueryRelease), 1, args);
+        r->gpr[GUEST_RAX] = status = 9;
+    }
+    static std::atomic<int> traced{0};
+    if (GxQueryTrace(traced)) {
+        std::printf("Guest guards: GX query %#llx created, result %u%s (thread %s)\n",
+                    static_cast<unsigned long long>(query), status, simulated ? " (BB_GX_QUERY_FAIL)" : "",
+                    ThreadName().data());
+    }
+    if (status == 0) {
+        for (auto& slot : gx_query_failed) {
+            u64 expected = query;
+            if (slot.load(std::memory_order_relaxed) == query) slot.compare_exchange_strong(expected, 0);
+        }
+        return GUEST_HOOK_CONTINUE;
+    }
+    bool known = false;
+    for (const auto& slot : gx_query_failed) known = known || slot.load(std::memory_order_relaxed) == query;
+    for (auto& slot : gx_query_failed) {
+        u64 expected = 0;
+        if (known || slot.compare_exchange_strong(expected, query)) break;
+    }
+    const u64 n = gx_query_failures.fetch_add(1) + 1;
+    if (!OncePerMinute(gx_query_failure_told)) return GUEST_HOOK_CONTINUE;
+    std::printf("Guest guards: a GX occlusion query could not be created (error %u: %s), %llu so far "
+                "(thread %s); the query guard creates it again before it begins\n", status,
+                simulated     ? "BB_GX_QUERY_FAIL"
+                : status == 9 ? (r->gpr[GUEST_RBX] ? "no memory for its data" : "no memory for its handle")
+                              : "the device or its data not ready",
+                static_cast<unsigned long long>(n), ThreadName().data());
+    return GUEST_HOOK_CONTINUE;
+}
+
+/// Called for a query without a handle at its begin. A query whose creation failed is created again
+/// (the game's own 0xe2f080, as the pool does); the caller then looks again.
+void GxQueryWithoutHandle(u64 query) {
+    bool failed = false;
+    for (const auto& slot : gx_query_failed) failed = failed || slot.load(std::memory_order_relaxed) == query;
+    if (failed) {
+        const u64 args[2] = {query, 1};
+        guest_cpu_call(uintptr_t(image_base + GxQueryCreate), 2, args); // GxQueryCreatedSlot keeps or forgets it
+    }
+    const bool created = *reinterpret_cast<const volatile u64*>(query) != 0;
+    const u64 recreated = gx_query_recreated.fetch_add(created) + created;
+    const u64 skipped = gx_query_skipped.fetch_add(!created) + !created;
+    static std::atomic<int> traced{0};
+    if (!OncePerMinute(gx_query_guard_told) && !GxQueryTrace(traced)) return;
+    std::printf("Guest guards: GX occlusion query %#llx had no handle at its begin (%s): %llu created "
+                "again, %llu not begun (no fault; nothing visible) so far (thread %s)\n",
+                static_cast<unsigned long long>(query),
+                failed ? "its creation had failed" : "no failed creation seen: released?",
+                static_cast<unsigned long long>(recreated), static_cast<unsigned long long>(skipped),
+                ThreadName().data());
+}
+
+/// The begin (instead of `cmp dword [rdi + 8], 0; jne done`): the game's state check, then the handle's:
+/// begun or ended already, or not begun without a handle (the state stays 0): to the return; else the body.
+std::uint32_t GxQueryBeginSlot(void*, GuestRegsEx* r) {
+    const u64 query = r->gpr[GUEST_RDI];
+    const bool done = *reinterpret_cast<const volatile std::uint32_t*>(query + 8) != 0;
+    bool handle = done || *reinterpret_cast<const volatile u64*>(query) != 0;
+    if (!handle) {
+        GxQueryWithoutHandle(query);
+        handle = *reinterpret_cast<const volatile u64*>(query) != 0;
+    }
+    r->rip = image_base + (!done && handle ? GxQueryBeginSite + GxQueryBeginCode.size() : GxQueryReturn);
+    return GUEST_HOOK_JUMP;
+}
+
+/// The end (instead of `mov dword [rdi + 8], 1`): only a query with a handle (begun) is ended.
+std::uint32_t GxQueryEndSlot(void*, GuestRegsEx* r) {
+    const u64 query = r->gpr[GUEST_RDI];
+    if (*reinterpret_cast<const volatile u64*>(query) != 0) {
+        const std::uint32_t ended = 1;
+        std::memcpy(reinterpret_cast<u8*>(query) + 8, &ended, sizeof(ended)); // mov dword [rdi + 8], 1
+        r->rip = image_base + GxQueryEndSite + GxQueryEndCode.size();
+    } else {
+        r->rip = image_base + GxQueryEndReturn; // not ended, the state stays 0
+    }
+    return GUEST_HOOK_JUMP;
+}
+
+bool InstallGxQueryGuard() {
+    if (const char* env = std::getenv("BB_GX_QUERY_GUARD"); env && env[0] == '0') {
+        std::printf("Guest guards: GX occlusion query guard off (BB_GX_QUERY_GUARD=0)\n");
+        return false;
+    }
+    if (!Expect(GxQueryBeginSite, GxQueryBeginCode.data(), GxQueryBeginCode.size(), "GX occlusion query guard") ||
+        !Expect(GxQueryEndSite, GxQueryEndCode.data(), GxQueryEndCode.size(), "GX occlusion query guard") ||
+        !Expect(GxQueryCreateExit, GxQueryCreateExitCode.data(), GxQueryCreateExitCode.size(), "GX occlusion query guard")) {
+        return false;
+    }
+    // Slots only: a libbbaot.so built before these sites were in the catalog (Rebuild Tool 1.2.x) has none, and runs as before.
+    if (!BbHookSites::Available(image_base + GxQueryBeginSite) || !BbHookSites::Available(image_base + GxQueryEndSite) ||
+        !BbHookSites::Available(image_base + GxQueryCreateExit)) {
+        std::printf("Guest guards: GX occlusion query guard inactive: the libbbaot.so has no hook slots there "
+                    "(rebuild it with a newer Rebuild Tool)\n");
+        return false;
+    }
+    // The creation observer first: without it a query without a handle is only skipped.
+    return BbHookSites::Slot(image_base + GxQueryCreateExit, image_base, GxQueryCreateExitCode.size(), GxQueryCreatedSlot, nullptr) &&
+           BbHookSites::Slot(image_base + GxQueryBeginSite, image_base, GxQueryBeginCode.size(), GxQueryBeginSlot, nullptr,
+                             {image_base + GxQueryBeginSite + GxQueryBeginCode.size(), image_base + GxQueryReturn}) &&
+           BbHookSites::Slot(image_base + GxQueryEndSite, image_base, GxQueryEndCode.size(), GxQueryEndSlot, nullptr,
+                             {image_base + GxQueryEndSite + GxQueryEndCode.size(), image_base + GxQueryEndReturn});
+}
 } // namespace
 
 void PatchImage(unsigned char* image, std::uint64_t size) {
@@ -362,6 +546,7 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
     clamp_on = InstallKernelClamp();
     gx_guard_on = InstallGxNodeGuard();
     fx_clear_on = InstallFxInitClear();
+    gx_query_on = InstallGxQueryGuard();
     if (stub_page && stub_used == 0) {
         munmap(stub_page, PageSize);
         stub_page = nullptr;
@@ -371,19 +556,22 @@ void PatchImage(unsigned char* image, std::uint64_t size) {
         guest_cpu_code(reinterpret_cast<uintptr_t>(stub_page), PageSize);
         mprotect(stub_page, PageSize, PROT_READ | PROT_EXEC);
     }
-    if (!clamp_on && !gx_guard_on && !fx_clear_on) return;
+    if (!clamp_on && !gx_guard_on && !fx_clear_on && !gx_query_on) return;
     std::printf("Guest guards: blur-kernel sample clamp %s, GX command node guard %s, effect "
-                "initialization by the port %s\n",
-                clamp_on ? "on" : "off", gx_guard_on ? "on" : "off", fx_clear_on ? "on" : "off");
+                "initialization by the port %s, GX query guard %s\n",
+                clamp_on ? "on" : "off", gx_guard_on ? "on" : "off", fx_clear_on ? "on" : "off",
+                gx_query_on ? "on" : "off");
 }
 
 void Report() {
-    if (clamp_on || gx_guard_on || fx_clear_on) {
+    if (clamp_on || gx_guard_on || fx_clear_on || gx_query_on) {
         std::printf("Guest guards: %llu blur-kernel clamps, %llu GX commands without a node, %llu "
-                    "effect targets cleared by the port\n",
+                    "effect targets cleared by the port, %llu GX queries recreated, %llu not begun\n",
                     static_cast<unsigned long long>(clamps.load(std::memory_order_relaxed)),
                     static_cast<unsigned long long>(gx_null_nodes.load(std::memory_order_relaxed)),
-                    static_cast<unsigned long long>(fx_clears.load(std::memory_order_relaxed)));
+                    static_cast<unsigned long long>(fx_clears.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(gx_query_recreated.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(gx_query_skipped.load(std::memory_order_relaxed)));
     }
 }
 } // namespace BbGuestGuards
