@@ -15,6 +15,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/buffer_cache/page_generation.h"
 #include "video_core/renderer_vulkan/vk_copy_filter.h"
 
 namespace Vulkan {
@@ -134,33 +135,25 @@ void CopyFilter::Check(Job& job) {
     const auto& entries = job.entries;
     job.control.clear();
     job.skipped_sources.clear();
-    page_hashes.clear();
+    job.skipped_destinations.clear();
+    job.skipped_signatures.clear();
     spans.clear();
+    dst_spans.clear();
     u32 kept = 0;
-    // The pages of a destination (one or two for a copy): hashed once a job.
-    const auto pages_of = [&](const CopyEntry& e) {
-        const u64 first = e.dst / PageSize, end = (e.dst + e.size - 1) / PageSize;
-        u64 signature = 0;
-        for (u64 page = first; page <= end; ++page) {
-            auto [it, fresh] = page_hashes.try_emplace(page, 0);
-            if (fresh) {
-                it->second = HashGuest(page * PageSize, PageSize);
-            }
-            signature = signature * 0x9E3779B97F4A7C15ull + it->second;
-        }
-        return signature;
-    };
     // In list order against the history as it stands: a copy into a destination overlapping a
     // later one takes that one's note away, and the later one runs.
     for (u32 i = 0; i < entries.size(); ++i) {
         const auto& e = entries[i];
         const u64 hash = HashGuest(e.src, e.size);
-        const u64 pages = pages_of(e);
+        const u64 pages = VideoCore::PageGeneration::Signature(e.dst, e.size);
         const auto it = last.find(e.dst);
         if (it != last.end() && it->second.size == e.size && it->second.hash == hash &&
             it->second.pages == pages) {
             spans.emplace_back(e.src / PageSize * PageSize,
                                (e.src + e.size + PageSize - 1) / PageSize * PageSize);
+            dst_spans.emplace_back(e.dst / PageSize * PageSize,
+                                   (e.dst + e.size + PageSize - 1) / PageSize * PageSize);
+            job.skipped_signatures.push_back({e.dst, e.size, pages});
             continue; // nothing changes
         }
         ++kept;
@@ -194,19 +187,27 @@ void CopyFilter::Check(Job& job) {
     if (kept == entries.size()) {
         job.control.clear(); // all kept: the call's own list
     }
-    // The sources of the copies left out, merged.
-    std::sort(spans.begin(), spans.end());
-    size_t merged = 0;
-    for (size_t i = 1; i < spans.size(); ++i) {
-        if (spans[i].first <= spans[merged].second) {
-            spans[merged].second = std::max(spans[merged].second, spans[i].second);
-        } else {
-            spans[++merged] = spans[i];
+    // The sources and destinations of the copies left out, merged.
+    const auto merge = [](std::vector<std::pair<u64, u64>>& list,
+                          std::vector<std::pair<u64, u64>>& out) {
+        std::sort(list.begin(), list.end());
+        size_t merged = 0;
+        for (size_t i = 1; i < list.size(); ++i) {
+            if (list[i].first <= list[merged].second) {
+                list[merged].second = std::max(list[merged].second, list[i].second);
+            } else {
+                list[++merged] = list[i];
+            }
         }
-    }
-    spans.resize(spans.empty() ? 0 : merged + 1);
-    for (const auto& span : spans) {
-        job.skipped_sources.emplace_back(span.first, span.second - span.first);
+        list.resize(list.empty() ? 0 : merged + 1);
+        for (const auto& span : list) {
+            out.emplace_back(span.first, span.second - span.first);
+        }
+    };
+    merge(spans, job.skipped_sources);
+    merge(dst_spans, job.skipped_destinations);
+    if (kept == 0) {
+        ++skipped_calls;
     }
     if (last.size() > 200000) {
         Invalidate();
@@ -215,15 +216,17 @@ void CopyFilter::Check(Job& job) {
     if (now - printed >= 5) {
         static const bool where = std::getenv("BB_COPY_WHERE") != nullptr;
         if (printed != 0 && where) {
-            std::printf("Copy filter (5 s): %llu of %llu copies left out in %llu calls; history "
-                        "restarted %llu times; %llu calls ran unchecked\n",
+            std::printf("Copy filter (5 s): %llu of %llu copies left out in %llu calls (%llu "
+                        "not recorded at all); history restarted %llu times; %llu calls ran "
+                        "unchecked\n",
                         (unsigned long long)left_out, (unsigned long long)total,
-                        (unsigned long long)calls, (unsigned long long)(now_epoch - printed_epoch),
+                        (unsigned long long)calls, (unsigned long long)skipped_calls,
+                        (unsigned long long)(now_epoch - printed_epoch),
                         (unsigned long long)unchecked_calls.exchange(0));
         }
         printed = now;
         printed_epoch = now_epoch;
-        total = left_out = calls = 0;
+        total = left_out = calls = skipped_calls = 0;
     }
 }
 

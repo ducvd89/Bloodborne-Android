@@ -24,6 +24,7 @@
 #include "common/spin_lock.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "video_core/buffer_cache/page_generation.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 
@@ -185,6 +186,10 @@ public:
         }
 
         for (const auto& [start, end] : mask) {
+            if constexpr (type == Type::CPU && clear) {
+                PageGeneration::Bump(cpu_addr + start * TRACKER_BYTES_PER_PAGE,
+                                     (end - start) * TRACKER_BYTES_PER_PAGE);
+            }
             func(cpu_addr + start * TRACKER_BYTES_PER_PAGE, (end - start) * TRACKER_BYTES_PER_PAGE);
         }
     }

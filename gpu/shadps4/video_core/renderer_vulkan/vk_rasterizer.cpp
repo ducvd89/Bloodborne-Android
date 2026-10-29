@@ -27,6 +27,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/page_generation.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -2123,7 +2124,25 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
                         break;
                     }
                 }
-                if (sources_modified) {
+                // And their destinations to hold the last copy's result: nothing uploaded over
+                // them or waiting to be (an upload after the check, or a CPU write the next
+                // binding uploads).
+                bool destinations_changed = false;
+                if (!sources_modified) {
+                    for (const auto& s : job->skipped_signatures) {
+                        if (VideoCore::PageGeneration::Signature(s.dst, s.size) != s.signature) {
+                            destinations_changed = true;
+                            break;
+                        }
+                    }
+                    for (const auto& [address, size] : job->skipped_destinations) {
+                        if (destinations_changed) {
+                            break;
+                        }
+                        destinations_changed = buffer_cache.IsRegionCpuModified(address, size);
+                    }
+                }
+                if (sources_modified || destinations_changed) {
                     filter.Invalidate(); // runs whole
                 } else if (job->kept == 0) {
                     filter.Release();
