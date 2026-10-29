@@ -1197,11 +1197,22 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     Common::AccurateTimer timer{vblank_period};
 
     // bbport: frame limit (see EmulatorSettings::GetFrameLimit). A request waits in the queue
-    // until its slot; slots advance by one period (no drift) but never lag behind by more.
+    // until its slot; a late flip moves the slots (BB_PACE_CATCHUP=1: they advance by one
+    // period and may lag one behind, so a late frame was followed by an early one: a saw in the
+    // frame time at 30 FPS).
+    static const bool catch_up = [] {
+        const char* env = std::getenv("BB_PACE_CATCHUP");
+        return env && env[0] == '1';
+    }();
     const u32 frame_limit = EmulatorSettings.GetFrameLimit();
     const auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
                                           : std::chrono::nanoseconds(0);
     auto next_flip = std::chrono::steady_clock::now();
+    const auto next_slot = [&](std::chrono::steady_clock::time_point slot,
+                               std::chrono::steady_clock::time_point at) {
+        return catch_up ? std::max(slot + frame_period, at - frame_period)
+                        : std::max(slot, at) + frame_period;
+    };
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
                 EmulatorSettings.GetVblankFrequency(), frame_limit);
 
@@ -1237,7 +1248,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (request && frame_limit) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                next_flip = next_slot(next_flip, now);
             }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -1298,7 +1309,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const auto now = std::chrono::steady_clock::now();
             const auto request = receive_request();
             if (request) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
+                next_flip = next_slot(next_flip, now);
                 Flip(request);
                 FRAME_END;
             }
