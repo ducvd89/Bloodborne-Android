@@ -112,6 +112,20 @@ public:
         return stream_buffer;
     }
 
+    /// bbport: the ring for `size` bytes of LDS emulation memory (shared memory x workgroups, up to
+    /// 128 MiB): the stream ring when it can hold them (32 MiB on Android), else a 128 MiB ring of
+    /// its own, made on first use.
+    StreamBuffer& GetLdsBuffer(u64 size) {
+        if (size <= stream_buffer.SizeBytes()) {
+            return stream_buffer;
+        }
+        if (!lds_buffer) {
+            lds_buffer = std::make_unique<StreamBuffer>(instance, scheduler, MemoryType::Stream,
+                                                        128ull << 20);
+        }
+        return *lds_buffer;
+    }
+
     /// Returns minimum granularity of a sparse memory bind.
     u32 GetSparsePageShift() const noexcept {
         return block_shift;
@@ -607,6 +621,7 @@ private:
     PageManager& page_manager;
 
     StreamBuffer stream_buffer;
+    std::unique_ptr<StreamBuffer> lds_buffer; ///< see GetLdsBuffer
     Buffer gds_buffer;
     /// Several threads (LockedRangeSet): the recording thread adds, the GPU command thread and
     /// the write-fault handler read and subtract.

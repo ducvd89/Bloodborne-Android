@@ -3314,10 +3314,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
                 hoist_notes.push_back({fault_buffer, 0, fault_buffer->SizeBytes(), true});
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
-                auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = CsRegs();
-                const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
+                const u64 lds_size = u64(cs_program.SharedMemSize()) * cs_program.NumWorkgroups();
+                auto& lds_buffer = buffer_cache.GetLdsBuffer(lds_size);
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
+                ASSERT_MSG(data, "LDS emulation memory of {} bytes does not fit", lds_size);
                 std::memset(data, 0, lds_size);
                 lds_buffer.Commit();
                 buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
