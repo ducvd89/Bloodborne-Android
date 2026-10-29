@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 
 #include "video_core/host_shaders/gsr2_convert_comp.h"
@@ -32,7 +33,7 @@ struct Params {
     float min_lerp_contribution;
     u32 same_camera;
     u32 reset;
-    u32 pad;
+    u32 history_filter; ///< gsr2_upscale.comp only: 1 = Catmull-Rom history, 0 = bilinear
 };
 static_assert(sizeof(Params) == 64);
 
@@ -77,6 +78,12 @@ struct GsrUpscaler::Impl {
     const float min_lerp = [] {
         const char* env = std::getenv("BB_GSR2_MIN_LERP");
         return env && env[0] ? std::clamp(float(std::atof(env)), 0.0f, 1.0f) : 0.25f;
+    }();
+    // BB_GSR2_HISTORY=bilinear (or 0): upstream's single bilinear history fetch (default: a
+    // Catmull-Rom filter, which does not blur the history a little more every frame).
+    const bool history_catmull_rom = [] {
+        const char* env = std::getenv("BB_GSR2_HISTORY");
+        return !(env && (std::strcmp(env, "bilinear") == 0 || std::strcmp(env, "0") == 0));
     }();
     vk::UniqueQueryPool pool;
     double period_ns = 1.0;
@@ -210,6 +217,9 @@ struct GsrUpscaler::Impl {
         current = 0;
         fresh = true;
         std::printf("Upscaler: GSR 2 %ux%u -> %ux%u\n", rw, rh, ow, oh);
+        std::printf(history_catmull_rom
+                        ? "Upscaler: GSR 2 history Catmull-Rom (BB_GSR2_HISTORY=bilinear: upstream's bilinear)\n"
+                        : "Upscaler: GSR 2 history bilinear (upstream's; default: Catmull-Rom)\n");
     }
 
     void CollectProfile(u32 slice) {
@@ -337,6 +347,7 @@ struct GsrUpscaler::Impl {
         params.min_lerp_contribution = min_lerp;
         params.same_camera = frame.camera_still || force_nine_tap ? 1u : 0u;
         params.reset = clear ? 1u : 0u;
+        params.history_filter = history_catmull_rom ? 1u : 0u;
 
         const auto image = [](vk::Sampler sampler, vk::ImageView view) {
             return vk::DescriptorImageInfo{.sampler = sampler, .imageView = view,
