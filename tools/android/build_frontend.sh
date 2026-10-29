@@ -67,6 +67,11 @@ if [[ ${BB_SKIP_RECOMP:-} != 1 ]]; then
     cp "$recomp/libbbrecomp.so" "$out/lib/arm64-v8a/"
     mkdir -p "$out/assets/recomp" && cp -r "$recomp/bundle" "$recomp/variants" "$recomp/VERSION" "$out/assets/recomp/"
     [[ -d $recomp/manifest ]] && cp -r "$recomp/manifest" "$out/assets/recomp/" # optional: the PC-made shard manifest
+    # BB_RECOMP_MANIFEST=<file>: the PC-made shard manifest (bb-recomp --manifest-out) for a test build, bundled as manifest/<name>.json (RecompAssets picks the first *.json)
+    if [[ -n ${BB_RECOMP_MANIFEST:-} ]]; then
+        [[ -f $BB_RECOMP_MANIFEST ]] || { echo "BB_RECOMP_MANIFEST: no such file: $BB_RECOMP_MANIFEST" >&2; exit 1; }
+        mkdir -p "$out/assets/recomp/manifest" && cp "$BB_RECOMP_MANIFEST" "$out/assets/recomp/manifest/$(basename "${BB_RECOMP_MANIFEST%.*}").json"
+    fi
     { printf '\n--------------------------------------------------------------------------------\nBloodborne Android Rebuild Tool (libbbrecomp.so), GPL-3.0-or-later; what it links in\n--------------------------------------------------------------------------------\n\n'
       cat "$recomp/licenses/NOTICES.txt" "$recomp/licenses/ADDITIONAL_TERMS.md"
       for f in LLVM-Apache-2.0-with-LLVM-exception.txt FEX-MIT.txt x87-helpers-NOTICE.txt; do
