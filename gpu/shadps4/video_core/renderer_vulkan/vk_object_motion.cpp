@@ -139,11 +139,11 @@ void ObjectMotion::OnFrameStart() {
     });
 }
 
-u32 ObjectMotion::PrepareDraw(const DrawInfo& draw) {
+u32 ObjectMotion::PrepareDraw(const DrawInfo& draw, Motion::Anchor anchor) {
     if (!enabled || BbToggle::Disabled(1u << 29) || params_used >= ParamsPerFrame) {
         return 0;
     }
-    const auto allocation = history.Prepare(draw);
+    const auto allocation = history.Prepare(draw, anchor);
     u32 flags = (allocation.store ? Shader::MotionVectors::FlagStore : 0) |
                 (allocation.load ? Shader::MotionVectors::FlagLoad : 0);
     if (!flags) {

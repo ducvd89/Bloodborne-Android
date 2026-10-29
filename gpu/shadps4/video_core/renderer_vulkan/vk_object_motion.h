@@ -30,10 +30,10 @@ public:
     }
 
     using DrawInfo = Motion::Draw;
-    u32 PrepareDraw(const DrawInfo& draw);
+    u32 PrepareDraw(const DrawInfo& draw, Motion::Anchor anchor = {});
     /// Small skeletons: whether the bone palette changed (Motion::History::Moving).
-    bool Moving(const Motion::History::GateKey& key, u64 palette) {
-        return history.Moving(key, palette);
+    bool Moving(const Motion::History::GateKey& key, u64 palette, Motion::Anchor anchor = {}) {
+        return history.Moving(key, palette, anchor);
     }
     /// Index range and topology hash of an indexed draw, reused across frames.
     template <class Scan>

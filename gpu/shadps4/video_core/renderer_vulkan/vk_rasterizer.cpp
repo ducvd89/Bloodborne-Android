@@ -1787,24 +1787,45 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             const char* value = std::getenv("BB_OBJECT_MOTION_ALL");
             return value && value[0] == '1';
         }();
+        // Instanced draws (foliage) hash their per-instance matrices into the draw's identity and
+        // every draw anchors its object by the first bone's translation (Motion::Draw, Anchor).
+        // BB_MOTION_INSTANCE_HASH=0 (diagnostics): neither, the matching of before.
+        static const bool instance_hash = [] {
+            const char* value = std::getenv("BB_MOTION_INSTANCE_HASH");
+            return !value || value[0] != '0';
+        }();
+        const u32 instances = regs.num_instances.NumInstances();
         bool gated = !all_motion;
-        u64 palette = 0;
+        u64 palette = 0, instance_data = 0;
+        Motion::Anchor anchor{};
         for (const auto& resource : vs.buffers) {
             if (resource.IsSpecial()) continue;
             const auto buffer = resource.GetSharp(vs);
             const u32 size = buffer.GetSize();
             if (!buffer.Valid() || buffer.GetStride() != 16) continue;
             const auto role = Motion::ClassifyBuffer(size);
+            if (role == Motion::BufferRole::Other) continue;
+            const VAddr address = buffer.base_address;
+            if (!memory->IsValidGpuMapping(address, 0) ||
+                memory->ClampRangeSize(address, size) != size) {
+                gated &= role != Motion::BufferRole::Skeleton;
+                continue;
+            }
+            const void* data = reinterpret_cast<const void*>(address);
+            if (instance_hash && !anchor.valid) {
+                const float* bone = static_cast<const float*>(data);
+                anchor = {bone[3], bone[7], bone[11], true};
+            }
+            // The instances' 3x4 world matrices (a 48-byte stride buffer) up to the instance count;
+            // past them and in the other buffers the game leaves per-frame data.
+            if (instance_hash && instances > 1 && size % 48 == 0) {
+                instance_data = XXH3_64bits_withSeed(data, std::min<u64>(size, u64(instances) * 48),
+                                                     instance_data | 1);
+            }
             if (role == Motion::BufferRole::Skeleton) {
                 gated = false;
-                break;
-            }
-            const VAddr address = buffer.base_address;
-            if (role == Motion::BufferRole::SmallSkeleton &&
-                memory->IsValidGpuMapping(address, 0) &&
-                memory->ClampRangeSize(address, size) == size) {
-                palette = XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size,
-                                               palette);
+            } else if (gated) {
+                palette = XXH3_64bits_withSeed(data, size, palette);
             }
         }
         push_data.motion_param = 0;
@@ -1812,9 +1833,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                                              .geometry = motion_geometry,
                                              .indices = index_address,
                                              .index_count = regs.num_indices,
-                                             .instances = regs.num_instances.NumInstances(),
+                                             .instances = instances,
                                              .first_instance = first_instance},
-                                            palette)) {
+                                            palette, anchor)) {
             Motion::VertexRange range{base_vertex, regs.num_indices};
             u64 topology = 0;
             if (is_indexed) {
@@ -1847,11 +1868,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 .geometry = motion_geometry,
                 .indices = index_address,
                 .topology = topology,
+                .instance_data = instance_data,
                 .index_count = regs.num_indices,
-                .instances = regs.num_instances.NumInstances(),
+                .instances = instances,
                 .first_instance = first_instance,
                 .vertices = range,
-            });
+            }, anchor);
         }
     }
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted

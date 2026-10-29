@@ -211,11 +211,31 @@ inline uint32_t JitterPhases(uint32_t render_width, uint32_t output_width) {
     return uint32_t(std::clamp(std::ceil(8.0 * ratio * ratio), 8.0, 256.0));
 }
 
+// Instanced draws (the game's foliage: up to 64 bushes or flowers per draw) also carry a hash of
+// their per-instance matrices: culling changes which objects the instances are as the camera
+// turns, often at the same instance count, and instance i then read another bush's positions
+// (frame generation drew bushes where there are none, 2026-10-20).
 struct Draw {
-    uint64_t shader{}, geometry{}, indices{}, topology{};
+    uint64_t shader{}, geometry{}, indices{}, topology{}, instance_data{};
     uint32_t index_count{}, instances{}, first_instance{};
     VertexRange vertices;
     bool operator==(const Draw& rhs) const = default;
+};
+
+// Where a draw's object is (its first bone's translation, world space). Repeated draws of one
+// mesh are matched by their order; a match whose object jumped further than MaxStep since last
+// frame is another object (an earlier one was culled) and gets camera vectors instead.
+struct Anchor {
+    float x{}, y{}, z{};
+    bool valid{};
+    static constexpr float MaxStep = 0.5f;
+    bool Near(const Anchor& other) const {
+        if (!valid || !other.valid) {
+            return true;
+        }
+        const float dx = x - other.x, dy = y - other.y, dz = z - other.z;
+        return dx * dx + dy * dy + dz * dz <= MaxStep * MaxStep;
+    }
 };
 
 // CPU bookkeeping shared with the regression test. Draw identity includes topology and
@@ -228,7 +248,7 @@ public:
         uint32_t store{}, load{}, vertices{}, instances{}, first_vertex{}, first_instance{};
     };
     struct Stats {
-        uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{};
+        uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{}, jumped{};
     } stats;
 
     // A small skeleton (weapon, prop; most are static world pieces) only needs history
@@ -240,12 +260,12 @@ public:
         uint32_t index_count{}, instances{}, first_instance{}, occurrence{};
         bool operator==(const GateKey&) const = default;
     };
-    bool Moving(GateKey key, uint64_t palette) {
+    bool Moving(GateKey key, uint64_t palette, Anchor anchor = {}) {
         key.occurrence = 0;
         key.occurrence = gate_occurrences[key]++;
         const auto* prev = gate_previous.find(key);
-        const bool moving = prev && *prev != palette;
-        gate_current.emplace(key, palette);
+        const bool moving = prev && prev->palette != palette && prev->anchor.Near(anchor);
+        gate_current.emplace(key, {palette, anchor});
         stats.still += moving ? 0 : 1;
         return moving;
     }
@@ -261,7 +281,7 @@ public:
         used = 0;
     }
 
-    Allocation Prepare(const Draw& draw) {
+    Allocation Prepare(const Draw& draw, Anchor anchor = {}) {
         ++stats.draws;
         Key key{draw, 0};
         key.occurrence = occurrences[key]++;
@@ -274,8 +294,12 @@ public:
         const auto* prev = previous.find(key);
         Allocation result{0, 0, draw.vertices.count, draw.instances,
                           draw.vertices.first, draw.first_instance};
+        if (prev && !prev->anchor.Near(anchor)) {
+            ++stats.jumped;
+            prev = nullptr;
+        }
         if (prev) {
-            result.load = *prev;
+            result.load = prev->store;
             ++stats.loaded;
         } else {
             ++stats.unmatched;
@@ -283,7 +307,7 @@ public:
         if (count <= capacity - used) {
             result.store = 1 + uint32_t(frame & 1) * capacity + used;
             used += uint32_t(count);
-            current.emplace(key, result.store);
+            current.emplace(key, {result.store, anchor});
             ++stats.stored;
         } else {
             ++stats.exhausted;
@@ -304,7 +328,7 @@ private:
             uint64_t h = 0;
             const auto mix = [&](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
             const auto& d = key.draw;
-            mix(d.shader); mix(d.geometry); mix(d.indices); mix(d.topology);
+            mix(d.shader); mix(d.geometry); mix(d.indices); mix(d.topology); mix(d.instance_data);
             mix(d.index_count); mix(d.instances); mix(d.first_instance);
             mix(d.vertices.first); mix(d.vertices.count); mix(key.occurrence);
             return size_t(h);
@@ -312,7 +336,12 @@ private:
     };
     uint32_t capacity{}, used{};
     uint64_t frame{};
-    FlatMap<Key, uint32_t, Hash> previous, current, occurrences;
+    struct Stored {
+        uint32_t store{};
+        Anchor anchor;
+    };
+    FlatMap<Key, Stored, Hash> previous, current;
+    FlatMap<Key, uint32_t, Hash> occurrences;
     struct GateHash {
         size_t operator()(const GateKey& key) const {
             uint64_t h = 0;
@@ -322,7 +351,11 @@ private:
             return size_t(h);
         }
     };
-    FlatMap<GateKey, uint64_t, GateHash> gate_previous, gate_current;
+    struct Gate {
+        uint64_t palette{};
+        Anchor anchor;
+    };
+    FlatMap<GateKey, Gate, GateHash> gate_previous, gate_current;
     FlatMap<GateKey, uint32_t, GateHash> gate_occurrences;
 };
 
