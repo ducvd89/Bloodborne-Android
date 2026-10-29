@@ -49,6 +49,8 @@ public:
             u64 dst, size, signature;
         };
         std::vector<Signature> skipped_signatures;
+        /// Stage B found the job unchecked: the call ran whole, the check must not count.
+        std::atomic<bool> abandoned{false};
     };
 
     /// BB_COPY_SKIP_SAME (default on) and the copy shader runs as HLE.

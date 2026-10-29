@@ -72,6 +72,7 @@ void CopyFilter::Post(u64 packet, std::vector<CopyEntry>& entries) {
     }
     auto& job = jobs[at % jobs.size()];
     job.packet = packet;
+    job.abandoned.store(false, std::memory_order_relaxed);
     job.entries.swap(entries);
     head.store(at + 1, std::memory_order_release);
     head.notify_one();
@@ -89,6 +90,10 @@ CopyFilter::Job* CopyFilter::Take(u64 packet, bool& unchecked) {
         if (job.packet == packet) {
             if (processed.load(std::memory_order_acquire) <= at) {
                 unchecked = true;
+                // The call runs whole; the check, still to come or running, must not record
+                // what it finds in memory from now on.
+                job.abandoned.store(true, std::memory_order_release);
+                Invalidate();
                 tail.store(at + 1, std::memory_order_release);
                 ++unchecked_calls;
                 return nullptr;
@@ -209,8 +214,8 @@ void CopyFilter::Check(Job& job) {
     if (kept == 0) {
         ++skipped_calls;
     }
-    if (last.size() > 200000) {
-        Invalidate();
+    if (last.size() > 200000 || job.abandoned.load(std::memory_order_acquire)) {
+        Invalidate(); // (abandoned: the call ran whole, whichever came first)
     }
     const u32 now = BbStats::coarse_second.load(std::memory_order_relaxed);
     if (now - printed >= 5) {
