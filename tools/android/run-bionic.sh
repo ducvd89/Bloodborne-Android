@@ -258,6 +258,20 @@ export BB_VRAM_IDLE_SECONDS=${BB_VRAM_IDLE_SECONDS:-20}
 # (BB_PRESENT_MODE) while frame generation runs, so BB_VSYNC is the setting alone. BB_VSYNC=0/1 in
 # bionic-local.sh overrides.
 if [ "$(setting vsync)" = 1 ]; then export BB_VSYNC=1; else export BB_VSYNC=0; fi
+# Texture quality (texture_quality: full, half, quarter, auto; auto when missing): big mipmapped textures leave out
+# their top levels (half: one, quarter: two), which saves memory and bandwidth. Auto is half on a phone with 12 GB of
+# RAM or less, else full (libbbgpu resolves auto the same way when BB_TEXTURE_QUALITY is not set). BB_TEXTURE_QUALITY
+# in bionic-local.sh overrides.
+if [ -z "${BB_TEXTURE_QUALITY:-}" ]; then
+    case $(setting texture_quality) in
+        full|half|quarter) BB_TEXTURE_QUALITY=$(setting texture_quality) ;;
+        *)
+            mem_kb=$(sed -n 's/^MemTotal:[^0-9]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null | head -n 1)
+            # 12 GB phones report ~11.2 GiB, 16 GB ones ~15 GiB.
+            if [ -n "$mem_kb" ] && [ "$mem_kb" -le $((12 * 1024 * 1024)) ]; then BB_TEXTURE_QUALITY=half; else BB_TEXTURE_QUALITY=full; fi ;;
+    esac
+fi
+export BB_TEXTURE_QUALITY
 # The game's language (language: a PS4 system language id, 1 English US when missing or unknown; the game reads
 # it at start). BB_LANGUAGE in bionic-local.sh overrides.
 if [ -z "${BB_LANGUAGE:-}" ]; then
@@ -276,20 +290,6 @@ export BB_LANGUAGE
 # adrenotools-style Turnip / PanVK for Android), loaded directly. Empty, "auto", or an id whose folder is
 # gone: the automatic choice, the driver the app resolved for this GPU and named in BB_GPU_DRIVER (it installs
 # the one bundled in the APK; AutoDriver.java; BB_GPU_DRIVER_WHY is its log line), else the stock driver.
-# Texture quality (texture_quality: full, half, quarter, auto; auto when missing): big mipmapped textures leave out
-# their top levels (half: one, quarter: two), which saves memory and bandwidth. Auto is half on a phone with 12 GB of
-# RAM or less, else full (libbbgpu resolves auto the same way when BB_TEXTURE_QUALITY is not set). BB_TEXTURE_QUALITY
-# in bionic-local.sh overrides.
-if [ -z "${BB_TEXTURE_QUALITY:-}" ]; then
-    case $(setting texture_quality) in
-        full|half|quarter) BB_TEXTURE_QUALITY=$(setting texture_quality) ;;
-        *)
-            mem_kb=$(sed -n 's/^MemTotal:[^0-9]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null | head -n 1)
-            # 12 GB phones report ~11.2 GiB, 16 GB ones ~15 GiB.
-            if [ -n "$mem_kb" ] && [ "$mem_kb" -le $((12 * 1024 * 1024)) ]; then BB_TEXTURE_QUALITY=half; else BB_TEXTURE_QUALITY=full; fi ;;
-    esac
-fi
-export BB_TEXTURE_QUALITY
 gpu_driver=$(setting gpu_driver)
 gpu_auto=0
 case $gpu_driver in
