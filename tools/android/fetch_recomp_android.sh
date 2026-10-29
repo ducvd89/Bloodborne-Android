@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # The Rebuild Tool's Android package (the command line build of the tool, run on the phone by AotBuildService): libbbrecomp.so (an Android NDK
 # executable on the phone's bionic), bundle/, variants/, licenses/, VERSION, README-ANDROID.md. build_frontend.sh puts libbbrecomp.so in lib/arm64-v8a and the rest in assets/recomp.
-# Pinned: the tarball is checked against its sha256 on every run. Source: the tool's release (tag v1.2.1, bb-recomp-android-aarch64.tar.xz), or
+# Pinned: the tarball is checked against its sha256 on every run. Source: the tool's release (tag v1.3.0, bb-recomp-android-aarch64.tar.xz), or
 # BB_RECOMP_ANDROID_TARBALL=<file> (a local build of the tool: arm64/package-android.sh, out/dist/; the sha256 must be the pinned one, or
 # BB_RECOMP_ANDROID_SHA256=<sha256> for a test build of an unreleased tool).
 # Output: .local-deps/android/recomp/android/ (libbbrecomp.so, bundle/, variants/, licenses/, VERSION).
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
-sha=${BB_RECOMP_ANDROID_SHA256:-7d1a9f075b538aa922b7e40bafeb6908dde9f436124f472b154c1164763f9b87}
-url=https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/download/v1.2.1/bb-recomp-android-aarch64.tar.xz
+sha=${BB_RECOMP_ANDROID_SHA256:-e0598aebe5b148419d06484e2f02aa19a2a2743915cfdd87a45da814f34d0681}
+url=https://github.com/ducvd89/Bloodborne-android-rebuild-tool/releases/download/v1.3.0/bb-recomp-android-aarch64.tar.xz
 out=$PWD/.local-deps/android/recomp
 mkdir -p "$out"
 tarball=$out/bb-recomp-android-aarch64.tar.xz
