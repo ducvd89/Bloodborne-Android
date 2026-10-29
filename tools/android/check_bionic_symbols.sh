@@ -20,9 +20,9 @@ fail=0
 allowed='^(libc\.so|libm\.so|libdl\.so|liblog\.so|libandroid\.so|libnativewindow\.so|libc\+\+_shared\.so|libbbgpu\.so|libbbcpu\.so|libSDL3\.so)$'
 defined() { "$llvm/llvm-nm" -D --defined-only "$@" 2>/dev/null | awk 'NF>=3{print $3}' | sed 's/@.*//'; }
 provided=$(mktemp); trap 'rm -f "$provided"' EXIT
-{ defined "$out/bin/bb-probe" "$out/bin/bb-prepare" "$out/lib/libbbgpu.so" "$out/lib/libbbcpu.so" "$out/lib/libbloodframe.so" "$out/lib/libc++_shared.so"
+{ defined "$out/bin/bb-probe" "$out/bin/bb-prepare" "$out/bin/bb-texpack" "$out/lib/libbbgpu.so" "$out/lib/libbbcpu.so" "$out/lib/libbloodframe.so" "$out/lib/libc++_shared.so"
   for lib in libc.so libm.so libdl.so liblog.so libandroid.so libnativewindow.so; do defined "$sysroot_libs/$lib"; done; } | sort -u > "$provided"
-for f in "$out/bin/bb-probe" "$out/bin/kgsl-chip-id" "$out/bin/bb-prepare" "$out/lib/libbbgpu.so" "$out/lib/libbbcpu.so" "$out/lib/libbloodframe.so" "$out/lib/libbbnet20.so"; do
+for f in "$out/bin/bb-probe" "$out/bin/kgsl-chip-id" "$out/bin/bb-prepare" "$out/bin/bb-texpack" "$out/lib/libbbgpu.so" "$out/lib/libbbcpu.so" "$out/lib/libbloodframe.so" "$out/lib/libbbnet20.so"; do
     echo "== $f"
     "$llvm/llvm-readelf" -d "$f" | grep -E 'NEEDED|SONAME|RUNPATH' | sed 's/^ *0x[0-9a-f]* *//'
     for lib in $("$llvm/llvm-readelf" -d "$f" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p'); do
@@ -97,7 +97,7 @@ done
 # No FEX anywhere: the game runs as ahead-of-time native code (libbbaot.so), the runtime has no FEXCore. No symbol (dynamic or, when not stripped, static)
 # and no string of an output may name FEX, except the two constants the CPUID model presents to the game (the hypervisor vendor "FEXIFEXIEMU" and its
 # version leaf "FEX-2609.1": cpu/guest_cpu_cpuid.h, pinned by tests/test_aot_native.cpp).
-for f in "$out/bin/bb-probe" "$out/bin/bb-prepare" "$out/bin/ps4-pkg-tool" "$out/lib/libbbgpu.so" "$out/lib/libbbcpu.so" "$out/lib/libbloodframe.so" "$out/lib/libbbnet20.so"; do
+for f in "$out/bin/bb-probe" "$out/bin/bb-prepare" "$out/bin/bb-texpack" "$out/bin/ps4-pkg-tool" "$out/lib/libbbgpu.so" "$out/lib/libbbcpu.so" "$out/lib/libbloodframe.so" "$out/lib/libbbnet20.so"; do
     hits=$({ "$llvm/llvm-nm" "$f" 2>/dev/null | awk '{print $NF}'; "$llvm/llvm-nm" -D "$f" 2>/dev/null | awk '{print $NF}'; strings -a "$f"; } \
         | grep -E 'FEX|fextl|[Jj]emalloc' | grep -E 'FEXCore|FEX-Emu|FEXInterpreter|fextl|FEX::|FEX_|[Jj]emalloc' | grep -vxE 'FEXIFEXIEMU|FEX-2609\.1' | sort -u | head -5 || true)
     if [[ -n $hits ]]; then echo "== $f names FEX/jemalloc:"; echo "$hits" | sed 's/^/    /'; fail=1; fi

@@ -111,6 +111,24 @@ if [ "$render" = 1920x1080 ]; then render=; preset=0; fi
 dmem_mb=5056; big_scene=0
 if [ $((scene_w * scene_h)) -gt $((1920 * 1080)) ]; then big_scene=1; dmem_mb=${BB_DMEM_MB_HIGH:-9152}; fi
 echo "Scene ${render:-1920x1080} for $output at preset $preset$([ "$big_scene" = 1 ] && echo "; larger than 1080p: $dmem_mb MB direct memory")"
+# Texture packs (upscaled map textures, in the game folder or from the mods folder) fill the game's graphics heaps
+# where the retail game fits: its GPU allocations fail, textures flicker, then it crashes (#240). They get the larger
+# heaps and direct memory whatever the scene's size. bb-texpack finds a map texture larger than the retail game's
+# (once, kept in texture-pack.cache); BB_LARGE_HEAPS=1/0 forces it on or off.
+large_heaps=${BB_LARGE_HEAPS:-}
+if [ "$large_heaps" != 0 ] && [ "$large_heaps" != 1 ]; then
+    large_heaps=0; pack=
+    if [ "${1:-game}" = game ] && [ -x "$bionic/bin/bb-texpack" ]; then
+        pack=$("$bionic/bin/bb-texpack" "${BB_APP0_DIR:-${BB_GAME_DIR:-$base/game}}" "$base/texture-pack.cache" 2>&1 | tail -n 1) || pack=
+        case $pack in "1 "*) large_heaps=1 ;; esac
+    fi
+else
+    pack="BB_LARGE_HEAPS=$large_heaps"
+fi
+if [ "$large_heaps" = 1 ]; then
+    big_scene=1; dmem_mb=${BB_DMEM_MB_HIGH:-9152}
+    echo "Graphics heaps: larger (${pack#1 }), $dmem_mb MB direct memory (BB_LARGE_HEAPS=0: the game's own sizes)"
+fi
 export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
 [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
@@ -437,6 +455,9 @@ if [ "${1:-game}" = game ]; then
         # The patch holds a 1280x720 scene: libbbgpu writes the real size (BB_RENDER_RES) into it at load.
         patch_args="--patches $parts/res-scene.bin"
         [ "$big_scene" = 1 ] && [ -f "$parts/graphics-heap.bin" ] && patch_args="$patch_args --patches $parts/graphics-heap.bin"
+    elif [ "$large_heaps" = 1 ] && [ -f "$parts/graphics-heap.bin" ]; then
+        # A texture pack at the game's own 1080p scene: the heaps without the scene patch.
+        patch_args="$patch_args --patches $parts/graphics-heap.bin"
     fi
     for key in effect_chromatic_aberration effect_dof effect_motion_blur effect_ssao \
                effect_game_aa effect_dynamic_shadows effect_ssr skip_intro debug_camera debug_menu model_lod; do

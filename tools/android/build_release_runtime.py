@@ -6,7 +6,7 @@ bb-prepare, kgsl-chip-id), the Bionic PKG tool (build_pkg_tool.sh android), the 
 (build_patch_parts.py) and the launch script. No Linux rootfs, no glibc libraries, no Python.
 
 Archive layout (everything under bbport/, extracted into the app's files directory):
-  bbport/bionic/bin/   bb-probe bb-prepare kgsl-chip-id ps4-pkg-tool   (stripped, executable)
+  bbport/bionic/bin/   bb-probe bb-prepare bb-texpack kgsl-chip-id ps4-pkg-tool   (stripped, executable)
   bbport/bionic/lib/   libbbgpu.so libbbcpu.so libbloodframe.so libbbnet20.so libc++_shared.so   (libbloodframe.so: Lossless
                        Scaling frame generation, loaded by libbbgpu only when it is on; needs the player's own Lossless.dll.
                        libbbnet20.so: online play, loaded by bb-probe only with BB_ONLINE=1)
@@ -33,7 +33,7 @@ EBOOT = ROOT / 'out/eboot.elf'  # the patch compiler reads the 1.09 code from it
 NDK_STRIP = next(iter(sorted((ROOT / '.local-deps/android/sdk/ndk').glob(
     '*/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip'))), None)
 OUT = ROOT / 'out/release'
-PROGRAMS = ('bb-probe', 'bb-prepare', 'kgsl-chip-id', 'ps4-pkg-tool')
+PROGRAMS = ('bb-probe', 'bb-prepare', 'bb-texpack', 'kgsl-chip-id', 'ps4-pkg-tool')
 LIBRARIES = ('libbbgpu.so', 'libbbcpu.so', 'libbloodframe.so', 'libbbnet20.so', 'libc++_shared.so')
 # build_bionic.sh (+ build_bionic_deps.sh): the online module's CA bundle and the licences of its static libraries.
 CA_BUNDLE = 'cacert.pem'

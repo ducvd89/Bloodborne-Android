@@ -37,6 +37,11 @@ if [[ $what == android || $what == all ]]; then
         -fuse-ld=lld -pie -static-libstdc++ -Wl,-z,max-page-size=16384 -Wl,--gc-sections -Wl,-s \
         "$llvm/sysroot/usr/lib/aarch64-linux-android/libz.a"
     echo "Built out/bionic/bin/bb-prepare (Bionic, API $api)"
+    # bb-texpack: finds a texture pack in the game folder (run-bionic.sh: the larger graphics heaps).
+    run "$llvm/bin/aarch64-linux-android$api-clang++" "${flags[@]}" -fPIE tools/android/texpack/texpack.cpp \
+        -fuse-ld=lld -pie -static-libstdc++ -Wl,-z,max-page-size=16384 -Wl,--gc-sections -Wl,-s \
+        "$llvm/sysroot/usr/lib/aarch64-linux-android/libz.a" -o out/bionic/bin/bb-texpack
+    echo "Built out/bionic/bin/bb-texpack (Bionic, API $api)"
 fi
 if [[ $what == host || $what == all ]]; then
     cflags=()
