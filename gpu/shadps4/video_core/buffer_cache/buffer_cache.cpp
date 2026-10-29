@@ -26,6 +26,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/page_generation.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -4262,6 +4263,7 @@ void BufferCache::ProcessLateWrites() {
         }
         const auto* arena = GetArena(first, last);
         runtime.UpdateBuffer(arena, arena->Offset(addr), bytes);
+        PageGeneration::Bump(addr, size);
         BbStats::late_vram_writes.fetch_add(1, std::memory_order_relaxed);
     }
     // CPU bytes next to GPU data in VRAM: copied by the GPU from the game's memory, block by
@@ -4281,6 +4283,7 @@ void BufferCache::ProcessLateWrites() {
                 const auto* arena = GetArena(block, block);
                 const vk::BufferCopy copy{phys - chunk->phys, at - arena->cpu_addr, to - at};
                 runtime.CopyFromGuestChunk(chunk->buffer, arena, std::span{&copy, 1});
+                PageGeneration::Bump(at, to - at);
                 BbStats::late_vram_writes.fetch_add(1, std::memory_order_relaxed);
             }
             at = to;
@@ -4347,6 +4350,7 @@ bool BufferCache::UpdateGpuWritten(VAddr addr, std::span<const u8> data) {
     }
     const auto* arena = GetArena(first, last);
     runtime.UpdateBuffer(arena, arena->Offset(addr), data);
+    PageGeneration::Bump(addr, size);
     BbStats::gpu_data_updates.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
