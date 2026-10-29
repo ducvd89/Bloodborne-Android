@@ -19,6 +19,8 @@
 #include "bbport_hook_sites.h"
 #include "../../src/guest_cpu.h"
 
+#include <sys/mman.h>
+
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -67,7 +69,35 @@ struct alignas(16) ScratchArray {
     void* data;
     std::int32_t size;
     std::int32_t capacity;
+    u8 hit[96]; ///< the one hit the array holds
 };
+static_assert(sizeof(ScratchArray) == 0x90);
+
+/// This thread's scratch array, in guest memory (a page below the image, like the other shims'
+/// near mappings): the game's code reads and writes it, host thread-local memory is not where it
+/// expects its data. One per thread for the thread's life; null when the pages are used up.
+ScratchArray* ThreadScratch() {
+    constexpr u64 Pages = 16, SlotsPerPage = 4096 / sizeof(ScratchArray);
+    static u8* pool = [] {
+        for (u64 k = 1; k <= 64; ++k) {
+            const u64 hint = image_base - (192 + k * Pages) * (4ull << 20); // away from the other shims'
+            void* p = mmap(reinterpret_cast<void*>(hint), Pages * 4096, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) return static_cast<u8*>(p);
+        }
+        return static_cast<u8*>(nullptr);
+    }();
+    static std::atomic<u64> used{0};
+    thread_local ScratchArray* mine = nullptr;
+    if (!mine && pool) {
+        const u64 slot = used.fetch_add(1, std::memory_order_relaxed);
+        if (slot < Pages * SlotsPerPage) {
+            mine = reinterpret_cast<ScratchArray*>(pool + slot / SlotsPerPage * 4096 +
+                                                   slot % SlotsPerPage * sizeof(ScratchArray));
+        }
+    }
+    return mine;
+}
 /// At the entry of the push_back: a full collector gets this thread's one-hit scratch array instead.
 std::uint32_t HitPushBackSlot(void*, GuestRegsEx* r) {
     static const std::int32_t cap = [] {
@@ -82,12 +112,12 @@ std::uint32_t HitPushBackSlot(void*, GuestRegsEx* r) {
     std::memcpy(&size, array + 0x28, sizeof(size));
     std::memcpy(&data, array + 0x20, sizeof(data));
     if (size < cap && (data || size == 0)) return GUEST_HOOK_CONTINUE;
-    alignas(16) thread_local std::array<u8, 96> hit{};
-    thread_local ScratchArray scratch{};
-    scratch.data = hit.data();
-    scratch.size = 0;
-    scratch.capacity = 1;
-    r->gpr[GUEST_RDI] = reinterpret_cast<u64>(&scratch);
+    ScratchArray* scratch = ThreadScratch();
+    if (!scratch) return GUEST_HOOK_CONTINUE;
+    scratch->data = scratch->hit;
+    scratch->size = 0;
+    scratch->capacity = 1;
+    r->gpr[GUEST_RDI] = reinterpret_cast<u64>(scratch);
     if (hits_dropped.fetch_add(1, std::memory_order_relaxed) == 0) {
         std::printf("Engine fixes: a hit collector reached %d hits: further hits dropped\n", int(size));
     }
