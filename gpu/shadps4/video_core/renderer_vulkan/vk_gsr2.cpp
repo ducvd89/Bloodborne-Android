@@ -67,11 +67,11 @@ struct GsrUpscaler::Impl {
         const char* env = std::getenv("BB_GSR2_PROFILE");
         return env && env[0] == '1';
     }();
-    // BB_GSR2_NINE_TAP=1: the 9-sample kernel always (default: when the camera stands still, as
-    // upstream's bSameCamera).
+    // The 9-sample kernel always (sharper while the camera moves: the 5-sample one softens a
+    // 3x upscale). BB_GSR2_NINE_TAP=0: only when the camera stands still, as upstream's bSameCamera.
     const bool force_nine_tap = [] {
         const char* env = std::getenv("BB_GSR2_NINE_TAP");
-        return env && env[0] == '1';
+        return !(env && env[0] == '0');
     }();
     // BB_GSR2_MIN_LERP=<0..1>: upstream's minLerpContribution (history kept when it leaves the
     // color box); the sample framework uses 0.25.
@@ -220,6 +220,9 @@ struct GsrUpscaler::Impl {
         std::printf(history_catmull_rom
                         ? "Upscaler: GSR 2 history Catmull-Rom (BB_GSR2_HISTORY=bilinear: upstream's bilinear)\n"
                         : "Upscaler: GSR 2 history bilinear (upstream's; default: Catmull-Rom)\n");
+        std::printf(force_nine_tap
+                        ? "Upscaler: GSR 2 9-sample kernel always (BB_GSR2_NINE_TAP=0: only with the camera still)\n"
+                        : "Upscaler: GSR 2 9-sample kernel only with the camera still (upstream's)\n");
     }
 
     void CollectProfile(u32 slice) {
