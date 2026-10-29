@@ -28,6 +28,7 @@
 #include "bbport_guest_code.h"
 #include "bbport_hook_sites.h"
 #include "bbport_patch_notes.h"
+#include "bbport_toggles.h"
 #include "../../src/guest_cpu.h"
 
 #include <sys/mman.h>
@@ -83,6 +84,7 @@ struct alignas(64) Live {
     float cloth = 1.0f;               ///< cloth constraints' stiffness
 };
 Live* live = nullptr;
+bool cloth_hooked = false; ///< ClothStiffnessFactor replaces Havok's factor (the slot at 0x1167a80)
 
 /// The pacer at the main loop's step (rdi: it): this frame's values. `frames` below is the frame's
 /// length in the game's 30 FPS frames: up to 30 * longest_frame (1.5 with a 20 FPS bound).
@@ -111,16 +113,18 @@ void PS4_SYSV_ABI FrameStep(u64 pacer) {
     live->step_down = -0.1f * frames;
     live->step_up = 0.1f * frames;
     live->decay08 = std::pow(0.8f, frames);
-    // Cloth is stiffer the more often it is solved: the game's 1.0 at 30 FPS, 0.5 from 60 FPS up
-    // (the value the community's 60 FPS patches settled on). It is the upper bound the cloth
-    // setups clamp their Stiffness, Rigid Factor and Allowed Compression to when they load. Below
-    // 30 FPS (frames > 1) it stays at the game's own 1.0: never stiffer than the game made it.
+    // The cloth setups' range checks of Stiffness, Rigid Factor and Allowed Compression (0x80d800
+    // only warns) and a few uses of 1.0 next to them. With the stiffness factor hook (cloth_hooked,
+    // ClothStiffnessFactor) the cloth follows the frame rate there and these stay the game's 1.0.
+    // Without it (a libbbaot.so without that hook site) they are as they were: 0.5 from 60 FPS up
+    // (the value the community's 60 FPS patches settled on), which changes nothing the cloth shows.
+    // Below 30 FPS (frames > 1) it stays at the game's own 1.0: never stiffer than the game made it.
     // BB_CLOTH_STIFFNESS=value (diagnostics): that bound at any frame rate.
     static const float cloth_override = [] {
         const char* env = std::getenv("BB_CLOTH_STIFFNESS");
         return env && *env ? std::strtof(env, nullptr) : -1.0f;
     }();
-    live->cloth = cloth_override > 0.0f ? cloth_override : std::clamp(frames, 0.5f, 1.0f);
+    live->cloth = cloth_override > 0.0f ? cloth_override : cloth_hooked ? 1.0f : std::clamp(frames, 0.5f, 1.0f);
 }
 
 // ---- Redirected constants: instruction (its RIP-relative operand), the constant, the value ----
@@ -432,6 +436,89 @@ std::uint32_t FixedStepSlot(void* offset, GuestRegsEx* r) {
     return GUEST_HOOK_JUMP;
 }
 
+// ---- Cloth: the constraints' stiffness factor per substep ----
+/// The game's exponent of Havok's stiffness adaptation (0x48d7bbc: -1.725), read at start.
+float cloth_exponent = -1.725f;
+std::atomic<u64> cloth_calls{0}, cloth_modes{0}, cloth_types{0};
+
+/// Havok's stiffness factor of a constraint set for one substep (0x1167a80, replaced): `mode` 2
+/// adapts the constraints' stiffness to how often they are solved, (substeps x a x b)^-1.725
+/// (a, b the instance's scales at +0x1d0/+0x1d4), for a set of type 8 the iteration's share
+/// instead and for types 5 and 10 only the last substep. The substeps are per frame: at 191 FPS
+/// the cloth is solved 6.4 times as often as at 30 FPS by the same factor, and stiffer by as much
+/// (it flutters, #58). The factor here is the game's x frames (the frame's length in 30 FPS
+/// frames): the cloth is pulled as far per second as at 30 FPS, whether or not it adapts to its
+/// own substeps. At 30 FPS it is the game's.
+/// Experiment bit 65536 (BB_TOGGLE_FILE): the game's factor (A/B).
+float ClothStiffnessFactor(const u8* set, int mode, int iteration, int substeps, float a, float b) {
+    const std::uint32_t type = *reinterpret_cast<const std::uint32_t*>(set + 0x18);
+    const u64 n = cloth_calls.fetch_add(1, std::memory_order_relaxed);
+    cloth_modes.fetch_or(u64(1) << (unsigned(mode) & 63), std::memory_order_relaxed);
+    cloth_types.fetch_or(u64(1) << (type & 63), std::memory_order_relaxed);
+    if (n == 20000) {
+        std::printf("Frame rate: cloth stiffness factor: modes %#llx, constraint types %#llx, "
+                    "%.0f FPS: factor x%.3f\n",
+                    (unsigned long long)cloth_modes.load(), (unsigned long long)cloth_types.load(),
+                    1.0f / live->dt, live->dt * 30.0f);
+    }
+    const bool adapts = mode == 2 && !(substeps == 1 && a == 1.0f && b == 1.0f);
+    if (adapts && type == 8) {
+        return float(iteration + 1) / float(substeps);
+    }
+    if (adapts && (type == 5 || type == 10)) {
+        return substeps - 1 == iteration ? 1.0f : 0.0f;
+    }
+    if (type == 5 || type == 8 || type == 10 || BbToggle::Experiment(65536)) {
+        return adapts ? std::pow(float(substeps) * a * b, cloth_exponent) : 1.0f;
+    }
+    const float frames = live->dt * 30.0f;
+    const float game = adapts ? std::pow(float(substeps) * a * b, cloth_exponent) : 1.0f;
+    // A constraint solved with stiffness k pulls its particles k of the way per solve: at 30 FPS
+    // k a frame, at any frame rate 1 - (1 - k)^frames a frame, ~k x frames (the per-frame factors'
+    // rule above). x0.5 at 60 FPS, the community's 60 FPS value.
+    return game * frames;
+}
+
+/// The function's entry as a native hook slot (`push rbp; mov rbp, rsp; push r15` is not run): the arguments are in
+/// rdi, esi, edx, ecx, xmm0 and xmm1, the factor goes to xmm0 and the unit returns.
+std::uint32_t ClothStiffnessSlot(void*, GuestRegsEx* r) {
+    float a = 0.0f, b = 0.0f;
+    std::memcpy(&a, r->ymm[0], sizeof(a));
+    std::memcpy(&b, r->ymm[1], sizeof(b));
+    const float factor = ClothStiffnessFactor(reinterpret_cast<const u8*>(r->gpr[GUEST_RDI]), int(r->gpr[GUEST_RSI]), int(r->gpr[GUEST_RDX]),
+                                              int(r->gpr[GUEST_RCX]), a, b);
+    std::memcpy(r->ymm[0], &factor, sizeof(factor));
+    return GUEST_HOOK_RETURN;
+}
+
+/// Havok's stiffness factor (0x1167a80) by ClothStiffnessFactor. Not part of InstallAllSlots: a libbbaot.so built before
+/// this site was in the catalog (Rebuild Tool 1.2.x) has no slot there, and the cloth then stays as it was (one line, in
+/// PatchImage). BB_CLOTH_FACTOR=0: not installed.
+bool HookClothStiffness(const char*& why) {
+    constexpr u64 site = 0x1167a80;
+    constexpr u8 code[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    if (const char* env = std::getenv("BB_CLOTH_FACTOR"); env && env[0] == '0') {
+        why = "off (BB_CLOTH_FACTOR=0)";
+        return false;
+    }
+    float exponent = 0.0f;
+    std::memcpy(&exponent, reinterpret_cast<const void*>(image_base + 0x48d7bbc), sizeof(float));
+    if (std::memcmp(reinterpret_cast<const void*>(image_base + site), code, sizeof(code)) != 0 || !(exponent < 0.0f && exponent > -4.0f)) {
+        why = "per frame (not the expected code)";
+        return false;
+    }
+    if (!BbHookSites::Available(image_base + site)) {
+        why = "per frame (the libbbaot.so has no hook slot there: rebuild it with a newer Rebuild Tool)";
+        return false;
+    }
+    cloth_exponent = exponent;
+    if (!BbHookSites::Slot(image_base + site, image_base, sizeof(code), ClothStiffnessSlot, nullptr)) {
+        why = "per frame (the hook slot was refused)";
+        return false;
+    }
+    return true;
+}
+
 /// `size` bytes at `site` are `expected`: they become `bytes` (checked in the first pass, written in the second).
 bool PatchBytes(u64 site, const u8* expected, const u8* bytes, std::size_t size) {
     u8* code = reinterpret_cast<u8*>(image_base + site);
@@ -602,9 +689,13 @@ void PatchImage(unsigned char* image, std::uint64_t image_size) {
     }
     if (stub_page) mprotect(stub_page, StubPageSize, PROT_READ | PROT_EXEC);
     unlocked = true;
-    std::printf("Frame rate: hooks on (%d redirects, %d detours%s), step 1/%.0f..1/%.0f s%s\n",
+    // The cloth's stiffness factor (a slot, slot mode only): per second instead of per frame.
+    const char* cloth_why = "per frame (no native hook slots)";
+    if (slot_mode && !(slot_test & 32)) cloth_hooked = HookClothStiffness(cloth_why);
+    std::printf("Frame rate: hooks on (%d redirects, %d detours%s), step 1/%.0f..1/%.0f s%s, the cloth's stiffness %s\n",
                 counts.redirects, counts.detours, slot_mode ? ", native hook slots" : "", 1.0f / live->shortest, 1.0f / longest_frame,
-                counts.run == 2 ? "; the run's wall check was fixed by a Sprint Fix patch already" : "");
+                counts.run == 2 ? "; the run's wall check was fixed by a Sprint Fix patch already" : "",
+                cloth_hooked ? "by solves per second" : cloth_why);
 }
 
 bool Unlocked() {
