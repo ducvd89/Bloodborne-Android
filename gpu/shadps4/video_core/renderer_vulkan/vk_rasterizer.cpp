@@ -2150,9 +2150,8 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
                 } else {
                     copy_control = job->control;
                 }
-            } else if (!unchecked) {
-                filter.Invalidate(); // run whole after a check against an older history
             }
+            // (Against an older history: runs whole, which is consistent with any history.)
             if (job) {
                 filter.Release();
             }
