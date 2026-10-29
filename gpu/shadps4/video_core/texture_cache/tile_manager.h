@@ -54,8 +54,11 @@ public:
                    const VideoCore::Buffer* out_buffer, u64 out_offset,
                    std::optional<u32> linear_fill = std::nullopt);
 
+    /// From `first_level` on only (texture quality's reduced images): the staging buffer then
+    /// starts at that level (its linear offset is info.mips_layout[first].offset), and the GPU
+    /// reads only those levels' bytes of the game's memory.
     std::pair<const Buffer*, u64> DetileImage(const VideoCore::Buffer* in_buffer, u64 in_offset,
-                                              const ImageInfo& info);
+                                              const ImageInfo& info, u32 first_level = 0);
 
 private:
     void RecordTilingDispatch(vk::Pipeline pipeline, const vk::DescriptorBufferInfo& tiled,

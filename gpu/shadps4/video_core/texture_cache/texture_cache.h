@@ -209,6 +209,11 @@ public:
     /// Creates a new image with provided image info and copies subresources from image_id
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
+    /// bbport texture quality: the guest levels a new texture of `desc` leaves out (0, 1 or 2).
+    u32 SkipLevelsFor(const ImageDesc& desc);
+    /// A view of the guest's levels as the levels of an image that left some out.
+    static void AdjustView(const Image& image, ImageViewInfo& view);
+
     /// Reuploads image contents.
     void RefreshImage(Image& image);
     void WatchImage(const Image& image, const char* what);
@@ -538,6 +543,9 @@ private:
         int view_slice = -1;
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
+    /// bbport texture quality: addresses whose textures are made whole from now on (one was bound
+    /// as more than a sampled texture, or met by another image).
+    std::unordered_set<VAddr> whole_textures;
     std::atomic<u64> registry_generation{0};
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;

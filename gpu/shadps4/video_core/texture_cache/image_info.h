@@ -57,6 +57,9 @@ struct ImageInfo {
 
     bool IsCompatible(const ImageInfo& info) const;
     void UpdateSize();
+    /// bbport texture quality: the image without its `skip` largest levels; level 0 is level `skip`
+    /// of the guest's. The guest address and size stay (the detiler takes the full description).
+    ImageInfo Reduced(u32 skip) const;
 
     struct {
         VAddr cmask_addr;
@@ -87,6 +90,7 @@ struct ImageInfo {
     u32 guest_size{};
     u8 bank_swizzle{};
     bool alt_tile{};
+    u8 skip_levels{}; ///< bbport: Reduced: the guest's levels left out
     /// bbport (BB_TEX_HOME_LOG diagnostics): the T#'s data and number formats (0 for targets).
     u8 guest_data_format{};
     u8 guest_number_format{};

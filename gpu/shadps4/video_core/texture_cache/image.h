@@ -188,6 +188,8 @@ public:
     u64 image_uid{};
 
     ImageInfo info;
+    /// bbport: the guest's description of it (`info` without the levels texture quality left out).
+    ImageInfo guest_info;
     Vulkan::Runtime* runtime;
     Common::SlotVector<ImageView>* slot_image_views;
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;

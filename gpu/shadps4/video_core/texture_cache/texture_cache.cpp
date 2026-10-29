@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string_view>
 #include <thread>
+#ifdef __ANDROID__
+#include <sys/sysinfo.h>
+#endif
 #include <xxhash.h>
 
 #include "bbport_toggles.h"
@@ -627,6 +631,73 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+/// bbport texture quality (BB_TEXTURE_QUALITY: full, half, quarter or auto; the Android app sets it
+/// from texture_quality in bbport.ini, resolving auto there): the levels skipped, 0, 1 or 2. Auto:
+/// half on an Android device with 12 GiB of RAM or less, else full.
+static u32 WantedSkipLevels() {
+    static const u32 wanted = [] {
+        const char* env = std::getenv("BB_TEXTURE_QUALITY");
+        const std::string_view quality = env ? env : "";
+        u32 skip = 0;
+        if (quality == "half") {
+            skip = 1;
+        } else if (quality == "quarter") {
+            skip = 2;
+        } else if (quality != "full") {
+#ifdef __ANDROID__
+            struct sysinfo si {};
+            if (sysinfo(&si) == 0 && u64(si.totalram) * si.mem_unit <= (u64{12} << 30)) {
+                skip = 1;
+            }
+#endif
+        }
+        std::printf("Texture quality: %s (%s; BB_TEXTURE_QUALITY=full|half|quarter|auto)\n",
+                    skip == 2 ? "quarter" : skip == 1 ? "half" : "full",
+                    quality.empty() || quality == "auto" ? "auto" : "set");
+        return skip;
+    }();
+    return wanted;
+}
+
+u32 TextureCache::SkipLevelsFor(const ImageDesc& desc) {
+    const u32 wanted = WantedSkipLevels();
+    const ImageInfo& info = desc.info;
+    // Sampled, block-compressed, mipmapped 2D textures the CPU wrote (the materials): not render
+    // targets, storage, depth or lookup tables (whose texel sizes shaders may rely on). Not with
+    // BB_TEX_HOME, which tiles an image back from the host image as it is.
+    if (wanted == 0 || desc.type != BindingType::Texture || desc.view_info.is_storage ||
+        !info.props.is_block || info.props.is_depth || info.props.is_volume ||
+        info.num_samples != 1 || info.resources.levels < 3 || BbTexHome::Enabled() ||
+        whole_textures.contains(info.guest_address)) {
+        return 0;
+    }
+    u32 skip = 0;
+    while (skip < wanted && info.resources.levels - skip >= 3 &&
+           std::min(info.size.width, info.size.height) >> skip >= 512) {
+        ++skip;
+    }
+    if (skip != 0 && buffer_cache.IsRegionGpuModified(info.guest_address, info.guest_size)) {
+        return 0; // the GPU wrote it: a render to texture
+    }
+    return skip;
+}
+
+void TextureCache::AdjustView(const Image& image, ImageViewInfo& view) {
+    const u32 skip = image.info.skip_levels;
+    if (skip == 0) {
+        return;
+    }
+    // Guest levels [first, last] -> the image's: those it left out become its level 0.
+    const u32 first = view.range.base.level;
+    const u32 last = first + std::max(view.range.extent.levels, 1u) - 1;
+    const u32 levels = image.info.resources.levels;
+    const u32 new_first = std::min(first > skip ? first - skip : 0u, levels - 1);
+    const u32 new_last = std::min(last > skip ? last - skip : 0u, levels - 1);
+    view.range.base.level = new_first;
+    view.range.extent.levels = std::max(new_last, new_first) - new_first + 1;
+    view.min_lod = view.min_lod > skip * 256 ? view.min_lod - skip * 256 : 0;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
@@ -648,9 +719,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
         const Image& image = slot_images[cached.image_id];
         return True(image.flags & ImageFlagBits::Registered) &&
-               image.info.guest_address == info.guest_address &&
-               image.info.guest_size == info.guest_size && image.info.size == info.size &&
-               image.info.pixel_format == info.pixel_format;
+               image.guest_info.guest_address == info.guest_address &&
+               image.guest_info.guest_size == info.guest_size &&
+               image.guest_info.size == info.size &&
+               image.guest_info.pixel_format == info.pixel_format;
     };
     if ((cached.generation == registry_generation.load(std::memory_order_relaxed) || still_exact()) &&
         cached.address == info.guest_address &&
@@ -668,32 +740,58 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (cached.view_slice > 0) {
             desc.view_info.range.base.layer = cached.view_slice;
         }
+        AdjustView(image, desc.view_info);
         return cached.image_id;
     }
 
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    // A texture without its largest levels (texture quality) serves only the sampled binding of
+    // that very texture: bound otherwise, or met by another image over it, it goes (made again
+    // whole) and its address keeps its textures whole from then on.
+    for (auto it = image_ids.begin(); it != image_ids.end();) {
+        const Image& reduced = slot_images[*it];
+        if (reduced.info.skip_levels == 0) {
+            ++it;
+            continue;
+        }
+        const ImageInfo& whole = reduced.guest_info;
+        const bool same = desc.type == BindingType::Texture &&
+                          whole.guest_address == info.guest_address &&
+                          whole.guest_size == info.guest_size && whole.size == info.size &&
+                          whole.type == info.type && whole.resources == info.resources &&
+                          IsVulkanFormatCompatible(whole.pixel_format, info.pixel_format);
+        if (same) {
+            ++it;
+            continue;
+        }
+        whole_textures.insert(whole.guest_address);
+        const ImageId id = *it;
+        it = image_ids.erase(it);
+        FreeImage(id);
+    }
 
     ImageId image_id{};
 
     // Check for a perfect match first
     for (const auto& cache_id : image_ids) {
         auto& cache_image = slot_images[cache_id];
-        if (cache_image.info.guest_address != info.guest_address) {
+        const ImageInfo& cached_info = cache_image.guest_info;
+        if (cached_info.guest_address != info.guest_address) {
             continue;
         }
-        if (cache_image.info.guest_size != info.guest_size) {
+        if (cached_info.guest_size != info.guest_size) {
             continue;
         }
-        if (cache_image.info.size != info.size) {
+        if (cached_info.size != info.size) {
             continue;
         }
-        if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
-            (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+        if (!IsVulkanFormatCompatible(cached_info.pixel_format, info.pixel_format) ||
+            (cached_info.type != info.type && info.size != Extent3D{1, 1, 1})) {
             continue;
         }
-        if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
+        if (exact_fmt && info.pixel_format != cached_info.pixel_format) {
             continue;
         }
         image_id = cache_id;
@@ -732,7 +830,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        if (const u32 skip = SkipLevelsFor(desc)) {
+            image_id = slot_images.insert(instance, runtime, slot_image_views, info.Reduced(skip));
+            slot_images[image_id].guest_info = info;
+        } else {
+            image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        }
         RegisterImage(image_id);
     }
 
@@ -747,6 +850,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     if (view_slice > 0) {
         desc.view_info.range.base.layer = view_slice;
     }
+    AdjustView(image, desc.view_info);
 
     cached = FindImageCacheEntry{
         .address = info.guest_address,
@@ -771,7 +875,7 @@ ImageId TextureCache::FindImageLayer(VAddr address, size_t size, u32& layer) {
     ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
         const auto& info = image.info;
         const u32 layers = info.resources.layers;
-        if (found || info.resources.levels != 1 || layers < 2 ||
+        if (found || info.skip_levels != 0 || info.resources.levels != 1 || layers < 2 ||
             info.guest_size % layers != 0 || address < info.guest_address) {
             return;
         }
@@ -790,6 +894,9 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
             return;
+        }
+        if (image.info.skip_levels != 0) {
+            return; // a texture without its largest levels (the game's memory holds them all)
         }
         if (ensure_valid && !image.SafeToDownload()) {
             return;
@@ -1063,9 +1170,22 @@ void TextureCache::RefreshImage(Image& image) {
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
-    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    // The guest's whole description (texture quality: `info` may leave its largest levels out):
+    // those levels are not detiled, nor read over the bus (BB_DETILE_SKIPPED=1: they are). The
+    // staging copy then starts at the first level detiled.
+    static const bool detile_skipped = [] {
+        const char* env = std::getenv("BB_DETILE_SKIPPED");
+        return env && env[0] == '1';
+    }();
+    const u32 guest_first = detile_skipped ? 0u : u32(image.info.skip_levels);
+    const auto [buffer, offset] =
+        tile_manager.DetileImage(in_buffer, in_offset, image.guest_info, guest_first);
+    const u64 skipped = image.guest_info.props.is_tiled && guest_first != 0
+                            ? image.guest_info.mips_layout[guest_first].offset
+                            : 0;
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
+        copy.bufferOffset -= skipped;
     }
 
     runtime.UploadImage(&image, buffer, image_copies);

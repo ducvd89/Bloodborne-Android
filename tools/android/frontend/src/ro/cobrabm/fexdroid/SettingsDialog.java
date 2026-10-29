@@ -135,6 +135,10 @@ final class SettingsDialog {
     }
     private static final String[] LOD_VALUES={"-2","0","1","2"};
     private static final String[] LOD_NAMES={"Highest","Game default","Lower","Lowest"};
+    /** texture_quality: big mipmapped textures leave out their top levels (half: one, quarter: two); auto (the default) is half on a
+     *  phone with 12 GB of RAM or less. run-bionic.sh turns it into BB_TEXTURE_QUALITY; it applies at the next start. */
+    private static final String[] TEXTURE_VALUES={"auto","full","half","quarter"};
+    private static final String[] TEXTURE_NAMES={"Auto (half up to 12 GB of RAM)","Full","Half","Quarter"};
 
     private final Activity activity;
     private final File file;
@@ -397,6 +401,13 @@ final class SettingsDialog {
         for (int i=0;i<LOD_VALUES.length;++i) if (LOD_VALUES[i].equals(get("model_lod","0"))) lod=i;
         final RadioGroup lods=choices(box,LOD_NAMES,lod);
 
+        heading(box,"Texture quality");
+        final RadioGroup textures=choices(box,TEXTURE_NAMES,indexOf(TEXTURE_VALUES,get("texture_quality","auto"),0));
+        TextView textureNote=new TextView(activity); textureNote.setTextSize(13); textureNote.setAlpha(0.7f);
+        textureNote.setText("Large textures leave out their biggest detail level: less memory and bandwidth, a little less sharpness up close. "
+            +"Auto picks Half on phones with 12 GB of RAM or less.");
+        box.addView(textureNote);
+
         ScrollView scroll=new ScrollView(activity); scroll.addView(box);
         new AlertDialog.Builder(activity).setTitle("Graphics settings").setView(scroll)
             .setNegativeButton("Cancel",null)
@@ -417,6 +428,7 @@ final class SettingsDialog {
                 changed.put("show_fps",fps.isChecked() ? "1" : "0");
                 for (int i=0;i<EFFECTS.length;++i) changed.put(EFFECTS[i][0],effects[i].isChecked() ? "1" : "0");
                 changed.put("model_lod",LOD_VALUES[Math.max(0,checkedIndex(lods))]);
+                changed.put("texture_quality",TEXTURE_VALUES[Math.max(0,checkedIndex(textures))]);
                 apply(changed);
             }).show();
     }
