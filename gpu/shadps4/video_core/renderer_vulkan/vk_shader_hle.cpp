@@ -135,8 +135,15 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     return true;
 }
 
+struct CopyControl {
+    u32 dst_idx;
+    u32 src_idx;
+    u32 end;
+};
+static_assert(sizeof(CopyControl) == 12);
+
 static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
-                                 Rasterizer& rasterizer) {
+                                 Rasterizer& rasterizer, std::span<const u8> control) {
     auto& runtime = rasterizer.GetRuntime();
     auto& buffer_cache = rasterizer.GetBufferCache();
 
@@ -147,18 +154,17 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     const auto buf_stride = src_buf_sharp.GetStride();
     ASSERT(buf_stride == dst_buf_sharp.GetStride());
 
-    struct CopyShaderControl {
-        u32 dst_idx;
-        u32 src_idx;
-        u32 end;
-    };
-    static_assert(sizeof(CopyShaderControl) == 12);
-    ASSERT(ctl_buf_sharp.GetStride() == sizeof(CopyShaderControl));
-    const auto ctl_buf = reinterpret_cast<const CopyShaderControl*>(ctl_buf_sharp.base_address);
+    ASSERT(ctl_buf_sharp.GetStride() == sizeof(CopyControl));
+    // The filtered list (CopyFilter: the copies that change something) when given; the groups
+    // are then its entries.
+    const auto ctl_buf = control.empty()
+                             ? reinterpret_cast<const CopyControl*>(ctl_buf_sharp.base_address)
+                             : reinterpret_cast<const CopyControl*>(control.data());
+    const u32 groups = control.empty() ? cs_program.dim_x : u32(control.size() / sizeof(CopyControl));
 
     static std::vector<vk::BufferCopy> copies;
     copies.clear();
-    copies.reserve(cs_program.dim_x);
+    copies.reserve(groups);
     // bbport BB_COPY_SHADER_TRACE=1 (diagnostics): the copy shader's buffers, every 2 s.
     static const bool trace = std::getenv("BB_COPY_SHADER_TRACE") != nullptr;
     if (trace) {
@@ -168,7 +174,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         if (std::chrono::steady_clock::now() - last > std::chrono::seconds(2)) {
             last = std::chrono::steady_clock::now();
             u64 bytes = 0, lo = ~0ull, hi = 0;
-            for (u32 i = 0; i < cs_program.dim_x; ++i) {
+            for (u32 i = 0; i < groups; ++i) {
                 bytes += u64(ctl_buf[i].end + 1) * buf_stride;
                 lo = std::min<u64>(lo, u64(ctl_buf[i].dst_idx) * buf_stride);
                 hi = std::max<u64>(hi, u64(ctl_buf[i].dst_idx + ctl_buf[i].end + 1) * buf_stride);
@@ -176,7 +182,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             std::printf("Copy shader: %u calls; this one %u ranges %llu bytes; ctl %#llx size %u; "
                         "src %#llx size %u stride %u fmt %u/%u; dst %#llx size %u stride %u fmt "
                         "%u/%u; dst touched %#llx..%#llx; threads %u x %u, user data %u regs\n",
-                        calls, cs_program.dim_x, (unsigned long long)bytes,
+                        calls, groups, (unsigned long long)bytes,
                         (unsigned long long)ctl_buf_sharp.base_address, u32(ctl_buf_sharp.GetSize()),
                         (unsigned long long)src_buf_sharp.base_address, u32(src_buf_sharp.GetSize()),
                         u32(buf_stride), u32(src_buf_sharp.GetDataFmt()),
@@ -190,7 +196,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         }
     }
 
-    for (u32 i = 0; i < cs_program.dim_x; i++) {
+    for (u32 i = 0; i < groups; i++) {
         const auto& [dst_idx, src_idx, end] = ctl_buf[i];
         const u32 local_dst_offset = dst_idx * buf_stride;
         const u32 local_src_offset = src_idx * buf_stride;
@@ -264,8 +270,49 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     return true;
 }
 
+bool CopyShaderIsHle() {
+    static const bool native_env = [] {
+        const char* env = std::getenv("BB_COPY_SHADER_NATIVE");
+        return !env || env[0] != '0';
+    }();
+    return !(VideoCore::GuestInPlace() && native_env != BbToggle::Experiment(2));
+}
+
+bool CopyShaderEntries(const Shader::Info& info, u32 groups, std::vector<CopyEntry>& out) {
+    const u64 copy_shader = Game::BufferCopyShader();
+    if (copy_shader == 0 || info.pgm_hash != copy_shader || info.buffers.size() < 3 || groups == 0) {
+        return false;
+    }
+    const auto ctl_sharp = info.buffers[0].GetSharp(info);
+    const auto src_sharp = info.buffers[1].GetSharp(info);
+    const auto dst_sharp = info.buffers[2].GetSharp(info);
+    const u64 stride = src_sharp.GetStride();
+    if (ctl_sharp.GetStride() != sizeof(CopyControl) || stride == 0 ||
+        stride != dst_sharp.GetStride() || ctl_sharp.base_address == 0 ||
+        u64(groups) * sizeof(CopyControl) > ctl_sharp.GetSize()) {
+        return false;
+    }
+    const auto* ctl = reinterpret_cast<const CopyControl*>(ctl_sharp.base_address);
+    const size_t first = out.size();
+    for (u32 i = 0; i < groups; ++i) {
+        const CopyControl c = ctl[i];
+        const u64 size = (u64(c.end) + 1) * stride;
+        // Read on another thread: nothing past the bound buffers.
+        if (u64(c.src_idx) * stride + size > src_sharp.GetSize() ||
+            u64(c.dst_idx) * stride + size > dst_sharp.GetSize()) {
+            out.resize(first);
+            return false;
+        }
+        out.push_back({src_sharp.base_address + u64(c.src_idx) * stride,
+                       dst_sharp.base_address + u64(c.dst_idx) * stride, size,
+                       {c.dst_idx, c.src_idx, c.end}});
+    }
+    return true;
+}
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
-                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer,
+                      std::span<const u8> copy_control) {
     // The game's buffer copy shader, from its profile (games/); nothing else is replaced.
     const u64 copy_shader = Game::BufferCopyShader();
     if (copy_shader != 0 && info.pgm_hash == copy_shader) {
@@ -292,7 +339,7 @@ bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
         // Rasterizer::DispatchRecord): our translator reads what it copies there on the CPU.
         auto& buffer_cache = rasterizer.GetBufferCache();
         buffer_cache.force_writes_in_place = true;
-        const bool done = ExecuteCopyShaderHLE(info, cs_program, rasterizer);
+        const bool done = ExecuteCopyShaderHLE(info, cs_program, rasterizer, copy_control);
         buffer_cache.force_writes_in_place = false;
         return done;
     }

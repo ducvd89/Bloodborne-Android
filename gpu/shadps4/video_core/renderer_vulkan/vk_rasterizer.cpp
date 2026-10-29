@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/vk_copy_filter.h"
 #include "video_core/renderer_vulkan/vk_gpu_labels.h"
 #include "video_core/renderer_vulkan/vk_indirect_guard.h"
 #include "video_core/renderer_vulkan/vk_occlusion.h"
@@ -1187,6 +1188,15 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     if (cs) {
         size += AlignPacket(sizeof(AmdGpu::ComputeProgram));
+        if (Game::BufferCopyShader() != 0 && !stages.empty() && stages[0] &&
+            stages[0]->pgm_hash == Game::BufferCopyShader() && CopyFilter::On()) {
+            // BB_COPY_SKIP_SAME: its copies are checked on the filter thread, in packet order.
+            thread_local std::vector<CopyEntry> entries;
+            entries.clear();
+            if (CopyShaderEntries(*stages[0], cs->dim_x, entries)) {
+                CopyFilter::Get().Post(draw_pipe->NextPacket(), entries);
+            }
+        }
     }
     if (indirect) {
         size += AlignPacket(sizeof(IndirectDraw));
@@ -2094,10 +2104,47 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (upscaler->Enabled()) {
         upscaler->OnDispatch(cs.pgm_hash);
     }
+    // BB_COPY_SKIP_SAME: the game's copy shader runs the copies that change something (checked by
+    // bb:CopyFilter, vk_copy_filter.h); a call with none is left out, before anything is bound or
+    // the render pass ended. Never waits for the check: an unchecked call runs whole.
+    thread_local std::vector<u8> copy_control;
+    copy_control.clear();
+    if (Game::BufferCopyShader() != 0 && cs.pgm_hash == Game::BufferCopyShader()) {
+        if (draw_pipe && DrawPipe::OnStageB() && CopyFilter::On()) {
+            auto& filter = CopyFilter::Get();
+            bool unchecked = false;
+            auto* job = filter.Take(draw_pipe->RunningPacket(), unchecked);
+            if (job && job->epoch == filter.Epoch()) {
+                // Left-out copies rely on their sources being the game's data (not GPU-written).
+                bool sources_modified = false;
+                for (const auto& [address, size] : job->skipped_sources) {
+                    if (buffer_cache.IsRegionGpuModified(address, size)) {
+                        sources_modified = true;
+                        break;
+                    }
+                }
+                if (sources_modified) {
+                    filter.Invalidate(); // runs whole
+                } else if (job->kept == 0) {
+                    filter.Release();
+                    return;
+                } else {
+                    copy_control = job->control;
+                }
+            } else if (!unchecked) {
+                filter.Invalidate(); // run whole after a check against an older history
+            }
+            if (job) {
+                filter.Release();
+            }
+        } else if (CopyFilter::Started()) {
+            CopyFilter::Get().Invalidate(); // its copies run unchecked from here
+        }
+    }
     bool hle;
     {
         BB_SECTION(ShaderHle);
-        hle = ExecuteShaderHLE(cs, Regs(), cs_program, *this);
+        hle = ExecuteShaderHLE(cs, Regs(), cs_program, *this, copy_control);
     }
     if (hle) {
         return;

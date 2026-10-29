@@ -146,6 +146,10 @@ public:
     [[nodiscard]] u64 NextPacket() const noexcept {
         return packets + 1;
     }
+    /// Stage B: the number (NextPacket's) of the packet it is running.
+    [[nodiscard]] u64 RunningPacket() const noexcept {
+        return consumed_packets.load(std::memory_order_acquire) + 1;
+    }
     [[nodiscard]] bool ReachedPacket(u64 number) const noexcept {
         return consumed_packets.load(std::memory_order_acquire) >= number;
     }
