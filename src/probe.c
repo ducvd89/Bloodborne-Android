@@ -143,6 +143,7 @@ static void protect(void *p, size_t size, unsigned flags) {
 #else
     int mode = ((flags & 4) ? PROT_READ : 0) | ((flags & 2) ? PROT_WRITE : 0) | ((flags & 1) ? PROT_EXEC : 0);
     if (mprotect(p, size, mode)) fail("mprotect failed");
+    runtime_low_protect((uintptr_t)p, size, mode);
 #endif
 }
 static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argument) {
