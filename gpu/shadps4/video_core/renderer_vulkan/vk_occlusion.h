@@ -6,8 +6,8 @@
 // game issues one event before the draws it measures and one after, and takes the difference
 // (Bloodborne: ~60 events a frame).
 //
-// Here the samples are counted by a chain of Vulkan occlusion query segments: one is active at
-// all times once the game has used them, and a segment ends at every event and at every boundary
+// Here the samples are counted by a chain of Vulkan occlusion query segments: one is active
+// while any of the game's queries is open (begin event seen, its end not yet), and a segment ends at every event and at every boundary
 // a query may not span (a render pass beginning or ending, a command buffer: Scheduler::
 // CarriedScope). An event remembers how many segments ended before it. Where no render pass is
 // open (the next boundary), the segments' results are copied and one dispatch
@@ -18,6 +18,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -89,6 +90,11 @@ private:
 
     void BeginSegment(bool inside_render_pass);
     void EndSegment();
+    /// Whether samples are counted now: while one of the game's queries is open (or always, when
+    /// its events do not pair up as begin and end).
+    bool Counting() const;
+    /// An event opens (its begin counters) or closes (the end counters 8 bytes on) a query.
+    void NoteInterval(VAddr address);
     /// Outside a render pass: the ended segments added up, the pending events written.
     void Resolve();
     /// Outside a render pass: query slots reset ahead of the segments that will use them.
@@ -110,6 +116,14 @@ private:
     u64 reset_until = 0; ///< slots below it (absolute) are reset and unused
     bool active = false;
     bool started = false; ///< the game has used occlusion queries
+    /// Segments only while a query is open: the samples outside every query are in no difference
+    /// the game takes, and each segment costs its share of the results' copy (~150 us a resolve
+    /// with segments across all render passes). BB_OCCLUSION_INTERVALS=0: always.
+    bool intervals = [] {
+        const char* env = std::getenv("BB_OCCLUSION_INTERVALS");
+        return !env || env[0] != '0';
+    }();
+    std::vector<VAddr> open; ///< begin addresses of the open queries
     bool total_cleared = false;
     u64 events = 0;
     u64 starved = 0; ///< segments not begun in a render pass for want of a reset slot

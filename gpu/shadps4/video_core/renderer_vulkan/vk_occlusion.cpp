@@ -231,7 +231,9 @@ void OcclusionQueries::WriteBeforeLabel() {
     }
     Resolve();
     ResetAhead();
-    BeginSegment(false);
+    if (Counting()) {
+        BeginSegment(false);
+    }
 }
 
 void OcclusionQueries::Suspend(bool inside_render_pass) {
@@ -250,9 +252,34 @@ void OcclusionQueries::Suspend(bool inside_render_pass) {
 
 void OcclusionQueries::Resume(bool inside_render_pass) {
     std::scoped_lock lk{mutex};
-    if (started && !active) {
+    if (started && !active && Counting()) {
         BeginSegment(inside_render_pass);
     }
+}
+
+bool OcclusionQueries::Counting() const {
+    return !intervals || !open.empty();
+}
+
+void OcclusionQueries::NoteInterval(VAddr address) {
+    if (!intervals) {
+        return;
+    }
+    // A query's begin counters at 16-byte steps, its end counters 8 bytes after them.
+    if (address % 16 == 0 && open.size() < 256) {
+        open.push_back(address);
+        return;
+    }
+    if (const auto it = std::ranges::find(open, address - 8); address % 16 == 8 && it != open.end()) {
+        open.erase(it);
+        return;
+    }
+    // Another layout: segments everywhere again, as before (any interval counts all its samples).
+    intervals = false;
+    open.clear();
+    std::printf("Occlusion queries: event at %#llx is no begin or end of an open query: samples "
+                "counted all the time\n",
+                (unsigned long long)address);
 }
 
 void OcclusionQueries::Event(VAddr address, u32 pairs) {
@@ -312,7 +339,10 @@ void OcclusionQueries::Event(VAddr address, u32 pairs) {
     if (ReadTrace()) {
         WatchReads(address, events + 1);
     }
-    BeginSegment(scheduler.IsRendering());
+    NoteInterval(address);
+    if (Counting()) {
+        BeginSegment(scheduler.IsRendering());
+    }
     ++events;
     if (!scheduler.IsRendering() && pending.size() >= 64) {
         if (active) {
@@ -320,7 +350,9 @@ void OcclusionQueries::Event(VAddr address, u32 pairs) {
         }
         Resolve();
         ResetAhead();
-        BeginSegment(false);
+        if (Counting()) {
+            BeginSegment(false);
+        }
     }
     // BB_FRAME_STATS: how often the game measures (every 5 s).
     static auto last_report = std::chrono::steady_clock::now();
