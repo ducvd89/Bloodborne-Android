@@ -421,10 +421,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         const bool pow2_padding_only =
             image_info.props.is_pow2 != cache_image.info.props.is_pow2 &&
             image_info.tile_mode == cache_image.info.tile_mode &&
-            image_info.size == cache_image.info.size &&
-            image_info.pitch == cache_image.info.pitch && image_info.resources.levels == 1 &&
-            cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
-            cache_image.info.resources.layers == 1;
+            image_info.size == cache_image.guest_info.size &&
+            image_info.pitch == cache_image.guest_info.pitch && image_info.resources.levels == 1 &&
+            cache_image.guest_info.resources.levels == 1 && image_info.resources.layers == 1 &&
+            cache_image.guest_info.resources.layers == 1;
 
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
@@ -438,7 +438,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Size and resources are greater, expand the image.
         if (image_info.type == cache_image.info.type &&
-            image_info.resources > cache_image.info.resources) {
+            image_info.resources > cache_image.guest_info.resources) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -818,10 +818,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     if (image_id) {
         Image& image_resolved = slot_images[image_id];
-        if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
+        if (exact_fmt && info.pixel_format != image_resolved.guest_info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
-        } else if (image_resolved.info.resources < info.resources) {
+        } else if (image_resolved.guest_info.resources < info.resources) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
