@@ -56,6 +56,7 @@ final class RebuildDialog {
     private Step step = Step.CHECKING;
     private NativeCpu.Needed needed;
     private AotBuild.Plan plan;
+    private boolean full, update, quickKept; // full: delete the kept files at the start; update: opened from the update prompt; quickKept: a finished build's files are there
     private int resumePercent = -1;            // an unfinished work folder of this tool and game: how far it is (-1: none)
     private boolean pcOpened, understood, noCharger, checkedAgain;
     private String recheckNote;
@@ -64,6 +65,7 @@ final class RebuildDialog {
     // step 2 (live charger line) and step 3 (updated in place)
     private TextView chargerLine; private CheckBox noChargerBox; private Button startButton; private CheckBox heatBox;
     private android.content.BroadcastReceiver batteryReceiver;
+    private TextView reusedText;
     private TextView stageText, percentText, etaText, elapsedText, tempText, chargerText, memText, noteText;
     private ProgressBar bar;
     private final Runnable statusListener = this::onStatus;
@@ -84,7 +86,7 @@ final class RebuildDialog {
     /** The game cannot start without native code that fits: step 1 with the reason (while a build runs: its progress). Shown again in place
      *  when it is up already (the reason is refreshed: "Check again"). */
     void show(NativeCpu.Needed why) {
-        needed = why;
+        needed = why; full = false; update = false;
         if (showing()) {
             if (step == Step.CHOOSE) { checkedAgain = pcOpened; recheckNote = pcOpened ? "Checked again: " + why.reason : null; render(); }
             return;
@@ -96,9 +98,13 @@ final class RebuildDialog {
     }
 
     /** Menu > Native CPU > Rebuild on this phone: from step 2 when the phone can build. */
-    void showRebuild() {
+    void showRebuild() { showRebuild(false, false); }
+
+    /** `full`: the kept build files are deleted when the build starts (a full rebuild); `update`: from the "update available" prompt. */
+    void showRebuild(boolean full, boolean update) {
         needed = null;
         if (showing()) return;
+        this.full = full; this.update = update;
         open();
         AotBuildService.Status st = AotBuildService.status();
         if (st.active() || (st.ended() && !st.acknowledged)) { onStatus(); return; }
@@ -114,11 +120,11 @@ final class RebuildDialog {
     }
 
     private void open() {
-        closed = false; step = Step.CHECKING; pcOpened = understood = noCharger = checkedAgain = false; recheckNote = null; plan = null; resumePercent = -1;
+        closed = false; step = Step.CHECKING; pcOpened = understood = noCharger = checkedAgain = false; recheckNote = null; plan = null; resumePercent = -1; quickKept = false;
         box = new LinearLayout(activity); box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(dp(24), dp(4), dp(24), dp(8));
         ScrollView scroll = new ScrollView(activity); scroll.addView(box);
-        dialog = new AlertDialog.Builder(activity).setTitle(NativeCpu.NEEDED_TITLE).setView(scroll).create();
+        dialog = new AlertDialog.Builder(activity).setTitle(update ? "Native code update" : NativeCpu.NEEDED_TITLE).setView(scroll).create();
         dialog.setCanceledOnTouchOutside(false);
         dialog.setOnKeyListener((d, code, e) -> { // B goes back or closes, A taps the focused control, like the other dialogs
             if (code == KeyEvent.KEYCODE_BUTTON_B || e.getScanCode() == 305) {
@@ -171,15 +177,19 @@ final class RebuildDialog {
             arm64 &= RecompAssets.program(activity) != null;
             String toolVersion = RecompAssets.version(RecompAssets.versionText(activity));
             String hash = NativeCpu.deviceImageHash(base, true);
-            int shards = 0;
-            if (toolVersion != null && hash != null) shards = AotBuild.shardsDone(new File(new File(base, "aot-build"), AotBuild.workName(toolVersion, hash)));
+            int shards = 0; boolean finished = false;
+            if (hash != null && !full) {
+                File work = new File(AotBuild.workRoot(base), AotBuild.workName(hash));
+                shards = AotBuild.shardsDone(work); finished = shards > 0 && AotBuild.built(work);
+            }
+            final boolean quick = finished;
             AotBuild.Plan p = AotBuild.plan(arm64, AotBuild.memAvailableKb(new File("/proc/meminfo")), activity.getFilesDir().getUsableSpace(),
                 AotBuild.maxFreqs(new File("/sys/devices/system/cpu")), shards > 0);
             if (toolVersion == null) p.blocker = "This APK has no build program.";
-            final int pct = shards > 0 ? Math.max(1, AotBuild.percentDone(shards)) : -1;
+            final int pct = shards > 0 && !quick ? Math.max(1, AotBuild.percentDone(shards)) : -1; // -1 also for a finished build's files: a quick update, not a continued build
             main.post(() -> {
                 if (closed || gen != generation) return;
-                plan = p; resumePercent = pct;
+                plan = p; resumePercent = pct; quickKept = quick;
                 step = toConfirm && p.blocker == null ? Step.CONFIRM : Step.CHOOSE;
                 if (toConfirm && p.blocker == null) startBattery();
                 render();
@@ -193,7 +203,7 @@ final class RebuildDialog {
     private void render() {
         if (box == null) return;
         box.removeAllViews();
-        chargerLine = null; noChargerBox = null; startButton = null; heatBox = null; stageText = percentText = etaText = elapsedText = tempText = chargerText = memText = noteText = null; bar = null;
+        chargerLine = null; noChargerBox = null; startButton = null; heatBox = null; reusedText = stageText = percentText = etaText = elapsedText = tempText = chargerText = memText = noteText = null; bar = null;
         View focus = null;
         switch (step) {
             case CHECKING: box.addView(line("Checking this phone…", 15, DIM, false)); break;
@@ -243,10 +253,11 @@ final class RebuildDialog {
         box.addView(line("The game's code has to be rebuilt for this phone, once. Your saves are not touched.", 14, TEXT, false));
         View first = null;
         String sub; int subColor = DIM; boolean ok = plan != null && plan.blocker == null;
-        String title = resumePercent >= 0 ? "Continue the build (" + resumePercent + " % done)" : "Build on this phone";
+        String title = resumePercent >= 0 ? "Continue the build (" + resumePercent + " % done)" : quickKept ? "Quick rebuild on this phone" : "Build on this phone";
         if (plan == null) sub = "";
         else if (!ok) { sub = plan.blocker; subColor = WARN; }
-        else sub = (resumePercent >= 0 ? "The finished parts are kept. " : "") + AotBuild.about(plan.etaSeconds * (resumePercent >= 0 ? 1 - resumePercent / 100.0 : 1)) + " with the charger · needs about "
+        else sub = (resumePercent >= 0 ? "The finished parts are kept. " : quickKept ? "Reuses the files of the last build: only what changed is built again. " : "")
+            + (quickKept ? "about a minute" : AotBuild.about(plan.etaSeconds * (resumePercent >= 0 ? 1 - resumePercent / 100.0 : 1))) + " with the charger · needs about "
             + String.format(Locale.ROOT, "%.0f", Math.ceil(AotBuild.ramNeededGb(plan.jobs))) + " GB of free memory and "
             + String.format(Locale.ROOT, "%.1f", plan.storageNeed / 1073741824.0) + " GB of free storage";
         View build = row(title, sub, subColor, ok, () -> { step = Step.CONFIRM; understood = noCharger = false; startBattery(); render(); });
@@ -269,8 +280,11 @@ final class RebuildDialog {
     private View renderConfirm() {
         TextView title = line("Before you build", 18, GOLD, true);
         box.addView(title);
-        box.addView(line("For several minutes the phone runs its fast cores at full speed and gets hot: the CPU reaches about 95 °C. Take it out of a case and "
-            + "do not hold it on your lap.", 14, WARN, false));
+        box.addView(line(quickKept ? "The update reuses the files of the last build, so it takes only a few minutes at most. The phone runs its fast cores at full "
+            + "speed and gets warm meanwhile."
+            : "For several minutes the phone runs its fast cores at full speed and gets hot: the CPU reaches about 95 °C. Take it out of a case and "
+            + "do not hold it on your lap."
+            + (update ? " There are no kept build files yet, so this is a full rebuild, once: later updates are quick." : ""), 14, WARN, false));
         chargerLine = line("", 14, TEXT, false); box.addView(chargerLine);
         if (host.gameRunning()) box.addView(line("The game is running: it is closed when the build starts.", 13, WARN, false));
         box.addView(line("You can switch to other apps while it builds, but do not close Bloodborne from the recent apps. If the build stops, it goes on "
@@ -324,8 +338,9 @@ final class RebuildDialog {
         Runnable go = () -> {
             // Read again at this moment: the game that was running has let go of its memory by now.
             AotBuild.Plan q = AotBuild.plan(true, AotBuild.memAvailableKb(new File("/proc/meminfo")), activity.getFilesDir().getUsableSpace(),
-                AotBuild.maxFreqs(new File("/sys/devices/system/cpu")), resumePercent >= 0);
+                AotBuild.maxFreqs(new File("/sys/devices/system/cpu")), resumePercent >= 0 || quickKept);
             if (q.blocker != null) { plan = q; step = Step.CHOOSE; if (needed == null) needed = new NativeCpu.Needed(NativeCpu.Need.OTHER, q.blocker); render(); return; }
+            if (full) { AotBuild.deleteWorkFiles(host.base()); full = false; quickKept = false; resumePercent = -1; } // a full rebuild: nothing is reused
             AotBuildService.start(activity, gameDir.getPath(), q.jobs);
             step = Step.BUILDING; render();
         };
@@ -339,6 +354,7 @@ final class RebuildDialog {
         box.addView(bar, new LinearLayout.LayoutParams(-1, -2));
         percentText = line("", 15, TEXT, true); box.addView(percentText);
         etaText = line("", 14, TEXT, false); box.addView(etaText);
+        reusedText = line("", 13, GOOD, false); box.addView(reusedText);
         elapsedText = line("", 13, DIM, false); box.addView(elapsedText);
         tempText = line("", 13, DIM, false); box.addView(tempText);
         chargerText = line("", 13, DIM, false); box.addView(chargerText);
@@ -360,6 +376,8 @@ final class RebuildDialog {
             percentText.setText(s.percent() + " %");
             etaText.setText(AotBuild.left(s.etaSeconds));
         }
+        if (s.reused >= 0 && s.reusedOf > 0) { reusedText.setVisibility(View.VISIBLE); reusedText.setText("Reused " + s.reused + " of " + s.reusedOf + " parts from the last build"); }
+        else reusedText.setVisibility(View.GONE);
         elapsedText.setText(s.phase == AotBuildService.Phase.PREPARING ? "" : "Elapsed " + AotBuild.clock(s.elapsedMs) + (s.jobs > 0 ? " · " + s.jobs + (s.jobs == 1 ? " job" : " jobs") : ""));
         if (Double.isNaN(s.tempC)) tempText.setVisibility(View.GONE);
         else { tempText.setVisibility(View.VISIBLE); tempText.setText(String.format(Locale.ROOT, "CPU temperature %.0f °C", s.tempC)); tempText.setTextColor(s.tempC >= 95 ? WARN : DIM); }
@@ -370,6 +388,27 @@ final class RebuildDialog {
         if (s.veryHot) note.append("The CPU has stayed at 95 °C or more. The phone slows itself down to cool off, so the build takes longer. If you can, take it out of a case or put it somewhere cool.\n");
         if (s.notificationsOff) note.append("Notifications are off for this app, so the progress shows only here. You can turn them on in the phone's settings.");
         noteText.setText(note.toString().trim()); noteText.setVisibility(note.length() == 0 ? View.GONE : View.VISIBLE);
+    }
+
+    // ---------------------------------------------------------------- the update prompt
+
+    /** A library that works but was built with older catalogs: not blocking. "Later" is remembered per catalog hash (the prompt comes back when the
+     *  app ships newer catalogs). `quick`: kept build files from a finished build exist. */
+    static final String LATER_KEY = "native_update_later";
+    void offerUpdate(String catalogHash, boolean quick) {
+        if (showing()) return;
+        String msg = "New fixes need a quick rebuild of the native code. "
+            + (quick ? "It reuses the files of the last build and takes about a minute."
+                     : "This time it is a full rebuild (several minutes, the phone gets hot), once: later updates are quick.")
+            + " Until then the game runs as before, without the new fixes. Your saves are not touched.";
+        Runnable later = () -> activity.getSharedPreferences("bloodborne", Context.MODE_PRIVATE).edit().putString(LATER_KEY, catalogHash).apply();
+        AlertDialog d = new AlertDialog.Builder(activity).setTitle("Native code update available").setMessage(msg)
+            .setPositiveButton("Update now", (x, w) -> showRebuild(false, true))
+            .setNegativeButton("Later", (x, w) -> later.run())
+            .setOnCancelListener(x -> later.run())
+            .setOnDismissListener(x -> { if (!showing()) host.closed(); })
+            .create();
+        d.show();
     }
 
     // step 4

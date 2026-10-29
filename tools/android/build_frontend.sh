@@ -66,6 +66,7 @@ if [[ ${BB_SKIP_RECOMP:-} != 1 ]]; then
     recomp=$PWD/.local-deps/android/recomp/android
     cp "$recomp/libbbrecomp.so" "$out/lib/arm64-v8a/"
     mkdir -p "$out/assets/recomp" && cp -r "$recomp/bundle" "$recomp/variants" "$recomp/VERSION" "$out/assets/recomp/"
+    [[ -d $recomp/manifest ]] && cp -r "$recomp/manifest" "$out/assets/recomp/" # optional: the PC-made shard manifest
     { printf '\n--------------------------------------------------------------------------------\nBloodborne Android Rebuild Tool (libbbrecomp.so), GPL-3.0-or-later; what it links in\n--------------------------------------------------------------------------------\n\n'
       cat "$recomp/licenses/NOTICES.txt" "$recomp/licenses/ADDITIONAL_TERMS.md"
       for f in LLVM-Apache-2.0-with-LLVM-exception.txt FEX-MIT.txt x87-helpers-NOTICE.txt; do

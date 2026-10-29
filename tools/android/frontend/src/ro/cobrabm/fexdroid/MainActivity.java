@@ -100,6 +100,7 @@ public final class MainActivity extends Activity {
     private boolean resumed;
     /** The game folders the rebuild dialog was shown for since the app started (UI thread): once each, unless the player chooses
      *  the folder again or installs a game into it. */
+    private volatile boolean nativeUpdateOffered;
     private final java.util.Set<String> neededShown=new java.util.HashSet<>();
     private LinearLayout nativeCpuItem;
     private NativeRequiredView nativeRequired;
@@ -511,7 +512,11 @@ public final class MainActivity extends Activity {
         if ("1".equals(setting("cheat_items"))) cheats.add("infinite items");
         setDetail(cheatsItem,online.playingOnline() ? "Off while playing online" : cheats.isEmpty() ? "Off" : String.join(" · ",cheats));
         setDetail(onlineItem,onlineDetail());
-        setDetail(nativeCpuItem,NativeCpu.summary(nativeCpu.quickState()));
+        {
+            NativeCpu.State ns=nativeCpu.quickState();
+            boolean upd=ns.ready() && !ns.manualOverride && NativeCpu.outdated(ns.info,RecompAssets.catalogHash(this));
+            setDetail(nativeCpuItem,NativeCpu.summary(ns)+(upd ? " · update available" : ""));
+        }
         mods.summary(text -> setDetail(modsItem,text));
         setDetail(atlasItem,AtlasDialog.summary(atlas));
         String upscaler="off".equals(setting("upscaler")) ? "No upscaling"
@@ -1414,9 +1419,9 @@ public final class MainActivity extends Activity {
             @Override public void toast(String message) { MainActivity.this.toast(message); }
             @Override public boolean gameRunning() { Process p=game; return p!=null && p.isAlive(); }
             @Override public void chooseGameFolder() { askGameFolder(gameDir!=null); }
-            @Override public void rebuildOnPhone() {
+            @Override public void rebuildOnPhone(boolean full) {
                 if (!hasGame()) { toast("Choose the game folder first."); askGameFolder(gameDir!=null); return; }
-                rebuild.showRebuild();
+                rebuild.showRebuild(full,false);
             }
             @Override public void openUrl(String url) { MainActivity.this.openUrl(url); }
             @Override public void changed() { nativeCodeChanged(); }
@@ -1828,7 +1833,13 @@ public final class MainActivity extends Activity {
             });
             return;
         }
-        main.post(() -> { if (!destroyed) { nativeRequired.hide(); rebuild.dismissWhenReady(); } });
+        // A library that works but was built with older catalogs: a non-blocking offer, once per run, not again after "Later" for the same catalogs.
+        final String bundledCatalog=RecompAssets.catalogHash(this);
+        final boolean offerUpdate=!nativeUpdateOffered && !native_.manualOverride && native_.info!=null && NativeCpu.outdated(native_.info.catalogHash,bundledCatalog)
+            && !bundledCatalog.equals(getSharedPreferences("bloodborne",MODE_PRIVATE).getString(RebuildDialog.LATER_KEY,null));
+        final boolean offerQuick=offerUpdate && AotBuild.keptShards(new File(BASE))>0;
+        if (offerUpdate) nativeUpdateOffered=true;
+        main.post(() -> { if (!destroyed) { nativeRequired.hide(); rebuild.dismissWhenReady(); if (offerUpdate) rebuild.offerUpdate(bundledCatalog,offerQuick); } });
         releasePause(false);
         playing=false; gameState(true);
         pickRefreshRate();

@@ -47,7 +47,7 @@ final class NativeCpu {
 
     /** libbbaot.json. */
     static final class Info {
-        String gameId, gameVersion, gameTitle, imageHash, tool, created, soSha256;
+        String gameId, gameVersion, gameTitle, imageHash, tool, created, soSha256, catalogHash, compilerVersion;
         long unitCount, functionCount, soSize, abiVersion, abiFlags;
     }
 
@@ -110,6 +110,7 @@ final class NativeCpu {
                 + "). It has to be built again: on the phone in the app, or with Rebuild Tool " + TOOL_VERSION_TEXT + " or newer (" + TOOL_URL + ").", Need.ABI);
         info.gameId = str(m, "game_id"); info.gameVersion = str(m, "game_version"); info.gameTitle = str(m, "game_title");
         info.imageHash = str(m, "image_hash"); info.tool = str(m, "tool"); info.created = str(m, "created"); info.soSha256 = str(m, "so_sha256");
+        info.catalogHash = str(m, "catalog_hash"); info.compilerVersion = str(m, "compiler_version"); // null: made by a tool before delta rebuilds
         info.unitCount = num(m, "unit_count", 0); info.functionCount = num(m, "function_count", 0); info.soSize = num(m, "so_size", 0);
         info.abiFlags = num(m, "abi_flags", 0);
         if (info.imageHash == null || info.imageHash.length() != 16 || info.soSha256 == null || info.soSha256.length() != 64 || info.soSize <= 0 || info.unitCount <= 0)
@@ -419,6 +420,11 @@ final class NativeCpu {
     // ---------------------------------------------------------------- text
 
     static String megabytes(long bytes) { return String.format(Locale.ROOT, "%.0f MB", bytes / 1048576.0); }
+
+    /** The library works but its hook/variant catalogs are not the ones this app ships (libbbaot.json has another catalog_hash, or none: an older tool):
+     *  the newest fixes are inactive. `bundled` is variants/CATALOG_HASH of the APK (null: none, never outdated). */
+    static boolean outdated(Info info, String bundled) { return info != null && AotBuild.outdated(info.catalogHash, bundled); }
+    static boolean outdated(String libraryCatalogHash, String bundled) { return AotBuild.outdated(libraryCatalogHash, bundled); }
 
     /** The drawer row's second line (no hashing: the cached image hash only). */
     static String summary(State s) {

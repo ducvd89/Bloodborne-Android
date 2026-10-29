@@ -33,7 +33,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *  folder, AotBuild.command) on the game image the app made and installs the result through NativeCpu.install. A foreground service,
  *  so the build goes on when the app is in the background (a partial wake lock keeps the CPU on). One build at a time; its state is a
  *  static {@link Status} that the rebuild dialog (RebuildDialog) and the notification both show. Stopping (cancel, a kill, a crash of the
- *  app) leaves the finished shards in the work folder (files/bbport/aot-build/<tool version>-<image hash>/): the next start resumes. */
+ *  app) leaves the finished shards in the work folder (files/bbport/aot-build/<image hash>/: app-private, kept after a finished build too, so that a
+ *  catalog update rebuilds only the shards that changed): the next start resumes or updates. */
 public final class AotBuildService extends Service {
     static final String ACTION_CANCEL = "ro.cobrabm.fexdroid.AOT_CANCEL", EXTRA_GAME = "game_dir", EXTRA_JOBS = "jobs";
     static final String CHANNEL = "aot_build";
@@ -57,11 +58,12 @@ public final class AotBuildService extends Service {
         long builtMs;                 // DONE: the run's length
         boolean notificationsOff;
         boolean acknowledged;         // the player has seen the end (DONE, FAILED, CANCELLED)
+        int reused = -1, reusedOf;    // shards taken from the kept files (-1: not reported)
         Status copy() {
             Status s = new Status();
             s.phase = phase; s.label = label; s.fraction = fraction; s.startMs = startMs; s.elapsedMs = elapsedMs; s.etaSeconds = etaSeconds;
             s.tempC = tempC; s.veryHot = veryHot; s.charging = charging; s.batteryPercent = batteryPercent; s.rssKb = rssKb; s.jobs = jobs;
-            s.error = error; s.builtMs = builtMs; s.notificationsOff = notificationsOff; s.acknowledged = acknowledged;
+            s.error = error; s.builtMs = builtMs; s.notificationsOff = notificationsOff; s.acknowledged = acknowledged; s.reused = reused; s.reusedOf = reusedOf;
             return s;
         }
         boolean active() { return phase == Phase.PREPARING || phase == Phase.RUNNING || phase == Phase.INSTALLING; }
@@ -251,12 +253,15 @@ public final class AotBuildService extends Service {
         String hash = NativeCpu.deviceImageHash(base, true);
         if (hash == null) { fail("The game image could not be read after it was prepared."); return; }
 
-        // The work folder: the same tool and the same game resume; anything else is deleted.
-        File root = new File(base, "aot-build"), work = new File(root, AotBuild.workName(toolVersion, hash));
+        // The work folder of this game image (kept across builds and tool versions: the tool reuses what did not change); other images' are deleted.
+        File root = AotBuild.workRoot(base), work = new File(root, AotBuild.workName(hash));
         String[] others = root.list();
         if (others != null) for (String n : others) if (!n.equals(work.getName())) FsUtil.deleteTree(new File(root, n));
         if (!work.isDirectory() && !work.mkdirs()) { fail("Cannot create " + work); return; }
         boolean resuming = AotBuild.shardsDone(work) > 0;
+        final boolean keepWork = AotBuild.keepWork(files.getUsableSpace(), resuming);
+        if (!keepWork) say(log, "short of free storage (" + (files.getUsableSpace() >> 20) + " MB): the build files are not kept, they are cleaned after the build");
+        new File(work, AotBuild.BUILT).delete(); // a new build is under way: the files are not those of a finished one until it is installed
         if (files.getUsableSpace() < (resuming ? AotBuild.STORAGE_NEED_RESUME : AotBuild.STORAGE_NEED)) {
             fail(String.format(java.util.Locale.ROOT, "Not enough free storage: %d MB free, about %d MB are needed.", files.getUsableSpace() >> 20,
                 (resuming ? AotBuild.STORAGE_NEED_RESUME : AotBuild.STORAGE_NEED) >> 20));
@@ -271,7 +276,8 @@ public final class AotBuildService extends Service {
         if (cancelRequested) { update(s -> s.phase = Phase.CANCELLED); return; }
 
         List<String> cmd = AotBuild.command(program.getPath(), NativeCpu.bootImage(base).getPath(), gameCopy.getPath(),
-            new File(recomp, "bundle").getPath(), new File(recomp, "variants").getPath(), work.getPath(), jobs);
+            new File(recomp, "bundle").getPath(), new File(recomp, "variants").getPath(), work.getPath(), jobs, keepWork,
+            RecompAssets.manifest(recomp) == null ? null : RecompAssets.manifest(recomp).getPath());
         say(log, String.join(" ", cmd) + (resuming ? "  (resuming: " + AotBuild.shardsDone(work) + " shards)" : ""));
         ProcessBuilder pb = new ProcessBuilder(cmd).directory(work).redirectErrorStream(true);
         Map<String, String> env = pb.environment(); env.clear();
@@ -308,7 +314,7 @@ public final class AotBuildService extends Service {
         say(log, "exit " + rc + ", BBR-DONE " + (tracker.exit == AotBuild.NO_EXIT ? "none" : tracker.exit) + ", " + AotBuild.clock(ms) + ", " + AotBuild.percentDone(AotBuild.shardsDone(work)) + "% of shards kept");
         saveStats(base, work);
 
-        if (tracker.succeeded() && rc == 0) { install(base, gameDir, work, ms, log); return; }
+        if (tracker.succeeded() && rc == 0) { install(base, gameDir, work, ms, log, keepWork); return; }
         if (cancelRequested || rc == 143 || rc == 130 || tracker.exit == 143 || tracker.exit == 130) {
             update(s -> { s.phase = Phase.CANCELLED; s.elapsedMs = ms; });
             return;
@@ -361,7 +367,7 @@ public final class AotBuildService extends Service {
     }
 
     /** BBR-DONE 0: the pair goes through the same checks as a pair from a PC, into bbport/aot, and a copy into the game folder's aot/. */
-    private void install(File base, File gameDir, File work, long ms, PrintWriter log) {
+    private void install(File base, File gameDir, File work, long ms, PrintWriter log, boolean keepWork) {
         update(s -> { s.phase = Phase.INSTALLING; s.label = "Checking and installing"; s.fraction = 1; s.elapsedMs = ms; s.etaSeconds = 0; });
         notifyNow();
         File so = new File(work, NativeCpu.SO), json = new File(work, NativeCpu.JSON);
@@ -374,7 +380,10 @@ public final class AotBuildService extends Service {
             say(log, copy == null ? "copied libbbaot.so and libbbaot.json into " + new File(gameDir, "aot") : "could not copy them into the game folder's aot/ (" + copy + "); the app's own copy is installed");
         } catch (NativeCpu.Problem p) { fail("The built library was refused: " + p.getMessage()); return; }
         catch (IOException | RuntimeException e) { fail("The built library could not be installed: " + e); return; }
-        FsUtil.deleteTree(work);
+        if (keepWork) { // the shard objects and .stat files (and the tool's own state) stay for the next, delta build
+            try { SafeWrite.write(new File(work, AotBuild.BUILT), "built " + System.currentTimeMillis() + "\n"); } catch (IOException e) { say(log, "could not mark the build files: " + e); }
+            say(log, "build files kept: " + AotBuild.treeSize(work) / (1 << 20) + " MB in " + work);
+        } else FsUtil.deleteTree(work);
         update(s -> { s.phase = Phase.DONE; s.builtMs = ms; s.fraction = 1; s.label = "Native code ready"; });
     }
 
@@ -396,10 +405,11 @@ public final class AotBuildService extends Service {
         void stop() { stop = true; thread.interrupt(); }
         synchronized void changed() {
             long now = System.currentTimeMillis();
-            final String stage; final double fraction; final boolean compile;
-            synchronized (tracker) { stage = tracker.stage; fraction = tracker.fraction; compile = tracker.compileSeen; }
+            final String stage; final double fraction; final boolean compile; final int ru, ruOf;
+            synchronized (tracker) { ru = tracker.reused; ruOf = tracker.reusedOf; stage = tracker.stage; fraction = tracker.fraction; compile = tracker.compileSeen; }
             if (now - lastPublish < 200) return;
             lastPublish = now;
+            eta.reused(ru, ruOf);
             eta.update(now, fraction, compile);
             double temp = AotBuild.hottestCpuC(new File("/sys/class/thermal"));
             if (!Double.isNaN(temp) && temp >= 95) { if (hotSince < 0) hotSince = now; } else hotSince = -1;
@@ -417,6 +427,7 @@ public final class AotBuildService extends Service {
             final boolean notificationsOff = !((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).areNotificationsEnabled();
             update(s -> {
                 if (s.phase != Phase.RUNNING) return;
+                s.reused = ru; s.reusedOf = ruOf;
                 s.label = AotBuild.stageLabel(stage); s.fraction = fraction; s.elapsedMs = now - t0; s.etaSeconds = remaining;
                 s.tempC = temp; s.veryHot = hot; s.charging = ch; s.batteryPercent = bp; s.rssKb = rss; s.notificationsOff = notificationsOff;
             });

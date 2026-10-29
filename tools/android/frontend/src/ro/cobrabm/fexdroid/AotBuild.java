@@ -38,17 +38,54 @@ final class AotBuild {
     // ---------------------------------------------------------------- the command line
 
     /** The tool's command line for the phone (paths absolute, without spaces: the tool splits some internal commands on spaces). */
-    static List<String> command(String recomp, String boot, String gameDir, String bundleDir, String variantsDir, String work, int jobs) {
+    static List<String> command(String recomp, String boot, String gameDir, String bundleDir, String variantsDir, String work, int jobs,
+                                boolean keepWork, String manifest) {
         List<String> c = new ArrayList<>();
         c.add(recomp);
         c.addAll(Arrays.asList("--boot", boot, "--game-dir", gameDir, "--bundle-dir", bundleDir, "--variants", variantsDir,
             "--so", work + "/libbbaot.so", "--stats", work + "/compile.txt", "--jobs", String.valueOf(jobs),
-            "--shards", String.valueOf(SHARDS), "-O1", "--no-nice", "--progress", "--resume", "--clean-work"));
+            "--shards", String.valueOf(SHARDS), "-O1", "--no-nice", "--progress", "--resume"));
+        if (manifest != null) c.addAll(Arrays.asList("--manifest", manifest)); // optional: from the PC, the tool ignores one that does not fit
+        if (!keepWork) c.add("--clean-work"); // short of space: the old behaviour, the tool cleans after a success
         return c;
     }
 
-    /** The work folder of a tool version and a game image: a different one starts fresh, the same one resumes. */
-    static String workName(String toolVersion, String imageHash) { return toolVersion + "-" + imageHash; }
+    /** The work folder of a game image: it is kept across builds and app updates (files/bbport/aot-build/<image hash>/, app-private, not cache/);
+     *  the tool itself decides per shard what it can reuse (inputs, catalogs, compiler version). */
+    static String workName(String imageHash) { return imageHash; }
+    static File workRoot(File base) { return new File(base, "aot-build"); }
+    /** Free space left over after a build that the work files may stay: the need of the build plus this. Else the old behaviour (clean after success). */
+    static final long KEEP_MARGIN = 1L << 30;
+    static boolean keepWork(long freeBytes, boolean resuming) { return freeBytes >= (resuming ? STORAGE_NEED_RESUME : STORAGE_NEED) + KEEP_MARGIN; }
+    /** Marker the app writes into a work folder after its build was installed: the files are those of a finished build (a quick update can use them). */
+    static final String BUILT = ".built";
+    static boolean built(File work) { return new File(work, BUILT).isFile(); }
+    /** Kept files of a finished build: the most finished shards of any work folder under the root that has the marker (0: none). */
+    static int keptShards(File base) {
+        File[] dirs = workRoot(base).listFiles(File::isDirectory);
+        int best = 0;
+        if (dirs != null) for (File d : dirs) if (built(d)) best = Math.max(best, shardsDone(d));
+        return best;
+    }
+    /** Deletes every kept work folder (the next build is a full one). */
+    static void deleteWorkFiles(File base) { FsUtil.deleteTree(workRoot(base)); }
+    static long treeSize(File f) {
+        if (f == null || Files.isSymbolicLink(f.toPath())) return 0;
+        if (f.isFile()) return f.length();
+        File[] kids = f.listFiles();
+        long n = 0;
+        if (kids != null) for (File k : kids) n += treeSize(k);
+        return n;
+    }
+
+    // ---------------------------------------------------------------- a library that is behind the app's catalogs
+
+    /** The library is usable but was made with other hook/variant catalogs than the app ships (or by a tool that wrote no catalog_hash): its newest
+     *  fixes are inactive. `bundled` is variants/CATALOG_HASH of the APK (null: the APK has none, never outdated). */
+    static boolean outdated(String libraryCatalogHash, String bundled) {
+        if (bundled == null || bundled.trim().isEmpty()) return false;
+        return libraryCatalogHash == null || !libraryCatalogHash.trim().equalsIgnoreCase(bundled.trim());
+    }
 
     // ---------------------------------------------------------------- the tool's lines
 
@@ -84,6 +121,18 @@ final class AotBuild {
         try { return Integer.parseInt(m.group(1)); } catch (NumberFormatException e) { return NO_EXIT; }
     }
 
+    private static final Pattern REUSED = Pattern.compile("(?i)reused\\s+(\\d+)\\s+(?:of|/)\\s+(\\d+)\\s+shards?");
+    /** {reused, of} from a line like "reused 58 of 64 shards" (anywhere in the line, any case), or null. */
+    static int[] parseReused(String line) {
+        if (line == null) return null;
+        Matcher m = REUSED.matcher(line);
+        if (!m.find()) return null;
+        try {
+            int a = Integer.parseInt(m.group(1)), b = Integer.parseInt(m.group(2));
+            return b > 0 && a >= 0 && a <= b ? new int[]{a, b} : null;
+        } catch (NumberFormatException e) { return null; }
+    }
+
     /** The name of a stage for the player. */
     static String stageLabel(String stage) {
         switch (stage == null ? "" : stage) {
@@ -104,11 +153,17 @@ final class AotBuild {
         String error;              // the last BBR-ERROR
         int exit = NO_EXIT;        // BBR-DONE
         boolean compileSeen;
+        int reused = -1, reusedOf;  // "reused N of 64 shards" (-1: not reported)
 
         /** Feeds one line; returns whether anything changed. */
         boolean feed(String line) {
+            int[] ru = parseReused(line);
+            if (ru != null) { reused = ru[0]; reusedOf = ru[1]; return true; }
             Progress p = parseProgress(line);
             if (p != null) {
+                // Progress that counts only the shards compiled now (reused ones left out): add the reused ones, the bar covers the whole compile.
+                if (p.stage.equals("compile") && reused > 0 && reusedOf > 0 && p.total + reused == reusedOf)
+                    p = new Progress(p.stage, p.done + reused, reusedOf);
                 double f = fractionOf(p);
                 stage = p.stage;
                 if (p.stage.equals("compile")) compileSeen = true;
@@ -145,6 +200,9 @@ final class AotBuild {
         private final double initialSeconds;
         private long refMs = -1, lastMs; private double refFraction, smoothed = -1;
 
+        private double reusedShare;
+        /** Shards taken from the kept files ("reused N of M shards"): the estimate before the pace is known counts them as done work. */
+        void reused(int n, int of) { if (of > 0 && n >= 0) reusedShare = Math.min(1.0, (double) n / of); }
         Eta(double initialSeconds) { this.initialSeconds = initialSeconds; }
 
         /** `compile`: whether the compile stage has started (the analysis before it has a different pace). */
@@ -166,7 +224,8 @@ final class AotBuild {
         /** Seconds left, or -1 when nothing is known. */
         double remaining(double fraction) {
             if (smoothed >= 0) return Math.max(0, smoothed);
-            return initialSeconds > 0 ? initialSeconds * Math.max(0, 1 - fraction) : -1;
+            double done = Math.max(fraction, reusedShare > 0 ? 0.05 + WEIGHTS[3] / 100.0 * reusedShare : 0);
+            return initialSeconds > 0 ? initialSeconds * Math.max(0, 1 - done) : -1;
         }
     }
 

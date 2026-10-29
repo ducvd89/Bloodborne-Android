@@ -30,6 +30,23 @@ final class RecompAssets {
         }
         return null;
     }
+    /** variants/CATALOG_HASH of the APK (the catalog hash of the catalogs it ships, one hex line), or null when this APK has none. */
+    static String catalogHash(Context c) {
+        try (InputStream in = c.getAssets().open(ASSET + "/variants/CATALOG_HASH")) {
+            String t = new String(readAll(in), StandardCharsets.UTF_8).trim();
+            int nl = t.indexOf('\n');
+            if (nl >= 0) t = t.substring(0, nl).trim();
+            return t.matches("[0-9A-Fa-f]+") ? t.toLowerCase(java.util.Locale.ROOT) : null;
+        } catch (IOException e) { return null; }
+    }
+    /** The optional shard manifest the APK carries (recomp/manifest/*.json, made on a PC), copied out next to bundle/: its path, or null. */
+    static File manifest(File recompRoot) {
+        File[] f = new File(recompRoot, "manifest").listFiles((d, n) -> n.endsWith(".json"));
+        if (f == null || f.length == 0) return null;
+        java.util.Arrays.sort(f);
+        return f[0];
+    }
+
     /** The program: the APK's extracted native library. Null when it is not there (no arm64 build). */
     static File program(Context c) {
         File f = new File(c.getApplicationInfo().nativeLibraryDir, PROGRAM);
@@ -50,6 +67,12 @@ final class RecompAssets {
             File out = new File(root, dir);
             if (!out.isDirectory() && !out.mkdirs()) throw new IOException("Cannot create " + out);
             for (String name : names) copy(am, ASSET + "/" + dir + "/" + name, new File(out, name));
+        }
+        String[] manifests = am.list(ASSET + "/manifest"); // optional
+        if (manifests != null && manifests.length > 0) {
+            File out = new File(root, "manifest");
+            if (!out.isDirectory() && !out.mkdirs()) throw new IOException("Cannot create " + out);
+            for (String name : manifests) copy(am, ASSET + "/manifest/" + name, new File(out, name));
         }
         SafeWrite.write(marker, text);
         return root;

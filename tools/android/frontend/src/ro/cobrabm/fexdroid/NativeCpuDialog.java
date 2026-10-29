@@ -46,7 +46,7 @@ final class NativeCpuDialog {
         void toast(String text);
         boolean gameRunning();
         void chooseGameFolder();                      // the activity's own folder choice (it imports the folder's aot/ by itself)
-        void rebuildOnPhone();                        // the rebuild dialog, from its confirmations
+        void rebuildOnPhone(boolean full);            // the rebuild dialog, from its confirmations (full: the kept build files are deleted first)
         void openUrl(String url);
         void changed();                               // the installed library changed (imported, removed): the activity checks again
         void closed();                                // the dialog went away (the activity returns to immersive mode)
@@ -59,6 +59,7 @@ final class NativeCpuDialog {
     private LinearLayout box;
     private Button importButton, removeButton, folderButton;
     private boolean busy, restartNote;
+    private boolean updateAvailable, quickUpdate; private long buildFilesBytes; // of the last refresh (off the UI thread)
     /** The first file of a pair, kept while the player picks the other one. */
     private Uri pendingSo, pendingJson;
     private String pendingJsonText;
@@ -144,7 +145,11 @@ final class NativeCpuDialog {
         Thread t = new Thread(() -> {
             String hash = NativeCpu.deviceImageHash(host.base(), true);
             NativeCpu.State s = NativeCpu.state(host.base(), hash, id[0], id[1]);
-            main.post(() -> { if (!closed) render(s); });
+            boolean upd = s.installed && s.info != null && s.problem == null && !s.manualOverride && s.match != NativeCpu.Match.MISMATCH
+                && NativeCpu.outdated(s.info, RecompAssets.catalogHash(activity));
+            boolean quick = AotBuild.keptShards(host.base()) > 0;
+            long bytes = AotBuild.treeSize(AotBuild.workRoot(host.base()));
+            main.post(() -> { if (!closed) { updateAvailable = upd; quickUpdate = quick; buildFilesBytes = bytes; render(s); } });
         }, "NativeCpu-state");
         t.setDaemon(true); t.start();
     }
@@ -156,9 +161,27 @@ final class NativeCpuDialog {
             + "(a few minutes, the phone gets hot), or on a PC with the Rebuild Tool and copy its aot folder into the game folder.", 13, TEXT, false));
         Button rebuildButton = new Button(activity); rebuildButton.setText("Rebuild on this phone"); rebuildButton.setAllCaps(false);
         rebuildButton.setEnabled(!busy);
-        rebuildButton.setOnClickListener(v -> { if (!busy) { dialog.dismiss(); host.rebuildOnPhone(); } });
+        rebuildButton.setOnClickListener(v -> { if (!busy) { dialog.dismiss(); host.rebuildOnPhone(false); } });
         LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-2, -2); rlp.topMargin = dp(8);
         box.addView(rebuildButton, rlp);
+        if (s != null && updateAvailable) {
+            box.addView(line("Native code update available: new fixes need a " + (quickUpdate ? "quick rebuild (about a minute, it reuses the last build's files)."
+                : "rebuild. There are no kept build files yet, so this one is a full rebuild; later updates are quick."), 13, WARN, false));
+        }
+        Button fullButton = new Button(activity); fullButton.setText("Full rebuild"); fullButton.setAllCaps(false); fullButton.setEnabled(!busy);
+        fullButton.setOnClickListener(v -> { if (!busy) { dialog.dismiss(); host.rebuildOnPhone(true); } });
+        LinearLayout.LayoutParams flp = new LinearLayout.LayoutParams(-2, -2); flp.topMargin = dp(4);
+        box.addView(fullButton, flp);
+        Button filesButton = new Button(activity); filesButton.setText("Delete build files (" + NativeCpu.megabytes(buildFilesBytes) + ")"); filesButton.setAllCaps(false);
+        filesButton.setEnabled(!busy && buildFilesBytes > 0 && !AotBuildService.active());
+        filesButton.setOnClickListener(v -> new AlertDialog.Builder(activity).setTitle("Delete the build files?")
+            .setMessage("Frees " + NativeCpu.megabytes(buildFilesBytes) + ". The game keeps working; the next rebuild has to be a full one (several minutes) instead of a quick update.")
+            .setNegativeButton("Cancel", null).setPositiveButton("Delete", (d, w) -> {
+                if (AotBuildService.active()) return;
+                AotBuild.deleteWorkFiles(host.base()); host.toast("Build files deleted"); refresh();
+            }).show());
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(-2, -2); dlp.topMargin = dp(4);
+        box.addView(filesButton, dlp);
         box.addView(linkButton("Rebuild Tool for PC", NativeCpu.DOWNLOAD_URL, 4));
         box.addView(linkButton("How to use it", NativeCpu.GUIDE_URL, 4));
 

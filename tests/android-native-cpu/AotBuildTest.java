@@ -15,10 +15,17 @@ public final class AotBuildTest {
 
     public static void main(String[] args) throws Exception {
         // ---- the command line
-        List<String> c = AotBuild.command("/lib/libbbrecomp.so", "/f/bbport/data/boot-linked.bin", "/w/game", "/f/recomp/1.2.0/bundle", "/f/recomp/1.2.0/variants", "/w", 4);
+        List<String> c = AotBuild.command("/lib/libbbrecomp.so", "/f/bbport/data/boot-linked.bin", "/w/game", "/f/recomp/1.2.0/bundle", "/f/recomp/1.2.0/variants", "/w", 4, false, null);
         check(String.join(" ", c).equals("/lib/libbbrecomp.so --boot /f/bbport/data/boot-linked.bin --game-dir /w/game --bundle-dir /f/recomp/1.2.0/bundle "
             + "--variants /f/recomp/1.2.0/variants --so /w/libbbaot.so --stats /w/compile.txt --jobs 4 --shards 64 -O1 --no-nice --progress --resume --clean-work"), "the command line is the tool's contract");
-        check(AotBuild.workName("1.2.0", "0123456789abcdef").equals("1.2.0-0123456789abcdef"), "work folder name");
+        check(AotBuild.workName("0123456789abcdef").equals("0123456789abcdef"), "work folder name");
+        check(String.join(" ", AotBuild.command("/r", "/b", "/g", "/bu", "/v", "/w", 2, true, "/m.json")).endsWith("--resume --manifest /m.json"), "kept work files: no --clean-work, manifest passed");
+        check(AotBuild.keepWork(3L << 30, false) && !AotBuild.keepWork(2L << 30, false) && AotBuild.keepWork(2L << 30, true), "keep the work files only with room to spare");
+        check(AotBuild.outdated(null, "ab12") && AotBuild.outdated("cd", "ab12") && !AotBuild.outdated("AB12", "ab12") && !AotBuild.outdated(null, null), "outdated library detection");
+        int[] ru = AotBuild.parseReused("bb-recomp: Reused 58 of 64 shards (6 to build)");
+        check(ru != null && ru[0] == 58 && ru[1] == 64 && AotBuild.parseReused("compile done") == null, "reused shards line");
+        AotBuild.Tracker rt = new AotBuild.Tracker(); rt.feed("reused 60 of 64 shards"); rt.feed("BBR-PROGRESS compile 2 4");
+        check(rt.fraction > 0.9, "progress that counts only the rebuilt shards includes the reused ones");
 
         // ---- the tool's lines
         AotBuild.Progress p = AotBuild.parseProgress("BBR-PROGRESS compile 123 4567");
