@@ -14,7 +14,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 BLOODFRAME_REPO=https://github.com/ducvd89/bloodframe.git
-BLOODFRAME_COMMIT=c29027555cfa8c9fc73c20f03816230becb9f469
+BLOODFRAME_COMMIT=50d1e312f8af62f787b138ca8ff398b07d6245a1
 root=$PWD/.local-deps/android
 src=$root/src/bloodframe
 ndk=${BB_NDK:-$root/sdk/ndk/29.0.14206865}
@@ -30,6 +30,12 @@ if [[ ! -d $src/.git ]]; then
 fi
 git -C "$src" cat-file -e "$BLOODFRAME_COMMIT^{commit}" 2>/dev/null ||
     git -C "$src" fetch -q origin main
+# dxbc was a submodule before Bloodframe 50d1e31 vendored it (its upstream repository was deleted): a tree that
+# still has the submodule checked out blocks the checkout, and the commit brings the same files back.
+if [[ -e $src/thirdparty/dxbc/.git ]]; then
+    git -C "$src" submodule deinit -q -f thirdparty/dxbc 2>/dev/null || true
+    rm -rf "$src/thirdparty/dxbc"
+fi
 git -C "$src" -c advice.detachedHead=false checkout -q "$BLOODFRAME_COMMIT"
 [[ $(git -C "$src" rev-parse HEAD) == "$BLOODFRAME_COMMIT" ]] ||
     { echo "$src is not at $BLOODFRAME_COMMIT" >&2; exit 1; }
