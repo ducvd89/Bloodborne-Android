@@ -67,6 +67,13 @@ static char title_id[16]="UNKNOWN";
 static struct { int used; char host[700], meta[700]; } slots[SLOTS];
 static char memory_path[720];
 static uint64_t memory_size;
+/* The save root: BB_SAVEDATA_DIR when set (a folder the player chose), else <user dir>/savedata. */
+static const char *savedata_root(char *buf, size_t size) {
+    const char *env=getenv("BB_SAVEDATA_DIR");
+    if (env && env[0]) return env;
+    snprintf(buf,size,"%s/savedata",runtime_file_user_dir());
+    return buf;
+}
 static size_t mounts_done, memory_writes;
 
 /* Bloodborne "sound hack" (rainvmaker, from the Diegolix29 shadPS4 fork): the game data
@@ -80,8 +87,8 @@ static void bloodborne_sound_hack(void) {
     int bloodborne=0;
     for (size_t i=0;i<sizeof(ids)/sizeof(*ids);++i) if (!strcmp(title_id,ids[i])) bloodborne=1;
     if (!bloodborne) return;
-    char users[700];
-    snprintf(users,sizeof(users),"%s/savedata",runtime_file_user_dir());
+    char usersbuf[700];
+    const char *users=savedata_root(usersbuf,sizeof(usersbuf));
     DIR *dir=opendir(users);
     if (!dir) return;
     for (struct dirent *e; (e=readdir(dir));) {
@@ -111,7 +118,8 @@ static int make_dirs(const char *path) {
     return mkdir(buffer,0755) && errno!=EEXIST ? -1 : 0;
 }
 static void root(int32_t user, const char *title, char *out, size_t size) {
-    snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,title && *title ? title : title_id);
+    char base[700];
+    snprintf(out,size,"%s/%d/%s",savedata_root(base,sizeof(base)),user,title && *title ? title : title_id);
 }
 static int valid_name(const char *name, size_t max) {
     size_t n=strnlen(name,max);

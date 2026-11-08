@@ -14,8 +14,8 @@ import android.widget.TextView;
 /** The full-screen message shown instead of the game when libbbaot.so is missing or does not fit (wrong game, ABI, checksum): this app
  *  runs Bloodborne as native code only, which is built once from the player's game files, on the phone or on a PC. It leads back to the rebuild
  *  dialog (RebuildDialog, which opens by itself once per game folder and can be closed) and has the other ways to bring the result here:
- *  the game folder with its aot/, or the library itself. Sits above the game surface and the touch controller, below the menu handle
- *  and the drawer. */
+ *  the game folder with its aot/, or the library itself. Sits above the game surface and the touch controller, below the
+ *  drawer. */
 final class NativeRequiredView extends ScrollView {
     private static final int TEXT = 0xffe8dfc9, WARN = 0xffe5a04b;
 

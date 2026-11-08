@@ -42,20 +42,20 @@ public final class MainActivity extends Activity {
     private String FILES, BASE;
     /** The game (e.g. CUSA03173, with eboot.bin) in shared storage, chosen by the player. */
     private String gameDir;
-    private static final int REQUEST_FOLDER=1, REQUEST_STORAGE=2, REQUEST_DRIVER=3, REQUEST_SAVES=9, REQUEST_DLL=10; // 4-6: ModsDialog, 7-8: GameInstaller, 11: NativeCpuDialog
+    private static final int REQUEST_FOLDER=1, REQUEST_STORAGE=2, REQUEST_DRIVER=3, REQUEST_SAVES=9, REQUEST_DLL=10, REQUEST_SAVE_LOCATION=12; // 4-6: ModsDialog, 7-8: GameInstaller, 11: NativeCpuDialog
     private SurfaceHolder pendingHolder;
     private final Handler main=new Handler(Looper.getMainLooper());
     private final ExecutorService worker=Executors.newSingleThreadExecutor();
     private FrameLayout screen;
     private SurfaceView surface;
-    private View scrim, handle;
+    private View scrim;
     private LinearLayout drawer;
     private LinearLayout drawerItems;
     private TextView status;
     private View resume;
     private LinearLayout pauseItem;
     private TextView pausedChip;
-    private LinearLayout vibrationItem, gameSettingsItem, cheatsItem, modsItem, graphicsItem, frameGenItem, driverItem, controllerItem, remapItem, folderItem;
+    private LinearLayout vibrationItem, gameSettingsItem, cheatsItem, modsItem, graphicsItem, frameGenItem, driverItem, controllerItem, remapItem, folderItem, saveLocationItem;
     private TouchControllerOverlay controllerOverlay;
     private PadBridge pad;
     private AudioBridge audio;
@@ -101,6 +101,8 @@ public final class MainActivity extends Activity {
     /** The game folders the rebuild dialog was shown for since the app started (UI thread): once each, unless the player chooses
      *  the folder again or installs a game into it. */
     private volatile boolean nativeUpdateOffered;
+    /** The low-spec / Mali notice: shown once per run at the game start, never again after "Don't show again". */
+    private volatile boolean deviceWarned;
     private final java.util.Set<String> neededShown=new java.util.HashSet<>();
     private LinearLayout nativeCpuItem;
     private NativeRequiredView nativeRequired;
@@ -227,15 +229,15 @@ public final class MainActivity extends Activity {
         // invisible view takes no touch.
         controllerOverlay.setVisibility(controllerEnabled() ? View.VISIBLE : View.INVISIBLE);
         // Hunter's Atlas' floating mini map: above the game (and the status text), below the touch controller, the
-        // handle, the scrim and the drawer. It is not clickable (AtlasView mini), so touches go to what is under it.
+        // notices, the scrim and the drawer. It is not clickable (AtlasView mini), so touches go to what is under it.
         atlasMini=atlas.createMini(this);
         screen.addView(atlasMini,frame(dp(120),dp(120),Gravity.TOP|Gravity.LEFT));
         screen.addView(controllerOverlay,frame(-1,-1,Gravity.CENTER));
-        // The full-screen map: above the controller and the mini map, below the handle, the notices, the scrim and the drawer.
+        // The full-screen map: above the controller and the mini map, below the notices, the scrim and the drawer.
         atlasFull=atlas.createFull(this);
         atlasFull.setCloseHandler(this::closeFullMap);
         screen.addView(atlasFull,frame(-1,-1,Gravity.FILL));
-        // Instead of the game when its native code is missing or does not fit: above the controller, below the handle and the drawer.
+        // Instead of the game when its native code is missing or does not fit: above the controller, below the drawer.
         nativeRequired=new NativeRequiredView(this,new NativeRequiredView.Actions() {
             @Override public void rebuild() { rebuild.show(lastNeeded!=null ? lastNeeded : new NativeCpu.Needed(NativeCpu.Need.MISSING,NativeCpu.NEEDED_MISSING)); }
             @Override public void chooseGameFolder() { askGameFolder(gameDir!=null); }
@@ -250,11 +252,7 @@ public final class MainActivity extends Activity {
         atlas.setConfigListener(() -> { controllerOverlay.setMiniMap(atlas.floatOn()); if (!atlas.floatOn()) closeFullMap(); });
         controllerOverlay.setMiniMap(atlas.floatOn());
 
-        handle=new View(this);
-        GradientDrawable grip=new GradientDrawable(); grip.setColor(0x80c6ad76); grip.setCornerRadius(dp(4));
-        handle.setBackground(grip); handle.setContentDescription("Open game menu");
-        screen.addView(handle,frame(dp(4),dp(44),Gravity.LEFT|Gravity.CENTER_VERTICAL));
-        handle.setOnClickListener(v -> openDrawer());
+        // No on-screen menu handle: Back (button, gesture or the controller's Mode/Home) opens the menu.
 
         // Shown at the top while the player has paused the game (and the menu is closed); a tap plays on.
         pausedChip=text("Paused \u00b7 tap to play",13,0xffe8dfc9); pausedChip.setPadding(dp(14),dp(7),dp(14),dp(7));
@@ -386,6 +384,7 @@ public final class MainActivity extends Activity {
         folderItem=menuItem("ic_folder","Game folder","",() -> { closeDrawer(); askGameFolder(true); });
         menuItem("ic_download","Back up saves","Copy them to the Download folder",() -> { closeDrawer(); backupSaves(); });
         menuItem("ic_restore","Restore saves","From a backup folder",() -> { closeDrawer(); askRestoreSaves(); });
+        saveLocationItem=menuItem("ic_folder","Save location","",() -> { closeDrawer(); askSaveLocation(); });
         menuItem("ic_exit","Quit game",null,() -> new AlertDialog.Builder(this)
             .setTitle("Quit Bloodborne?").setMessage("Any unsaved progress will be lost.")
             .setNegativeButton("Cancel",null).setPositiveButton("Quit",(dialog,which) -> finish()).show());
@@ -537,6 +536,7 @@ public final class MainActivity extends Activity {
         setDetail(controllerItem,controllerEnabled() ? "On" : "Off");
         setDetail(vibrationItem,vibrationEnabled() ? "On" : "Off");
         setDetail(remapItem,ButtonRemapDialog.summary(getSharedPreferences("bloodborne",MODE_PRIVATE)));
+        setDetail(saveLocationItem,customSaves()==null ? "App storage" : customSaves());
         setDetail(folderItem,gameDir==null ? "Not chosen" : gameDir);
         updatePauseUi();
     }
@@ -546,7 +546,6 @@ public final class MainActivity extends Activity {
         drawerOpen=true; controllerOverlay.release(); pad.reset(); rumble.setDrawer(true);
         refreshDrawer();
         applyOverlayVisibility();
-        handle.setVisibility(View.GONE);
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.setAlpha(0); scrim.setVisibility(View.VISIBLE); scrim.animate().alpha(1).setDuration(200).start();
         drawer.setTranslationX(-dp(320)); drawer.setVisibility(View.VISIBLE);
@@ -559,7 +558,7 @@ public final class MainActivity extends Activity {
         scrim.animate().cancel(); drawer.animate().cancel();
         scrim.animate().alpha(0).setDuration(180).withEndAction(() -> scrim.setVisibility(View.GONE)).start();
         drawer.animate().translationX(-dp(320)).setDuration(200)
-            .withEndAction(() -> { drawer.setVisibility(View.GONE); handle.setVisibility(View.VISIBLE); surface.requestFocus(); }).start();
+            .withEndAction(() -> { drawer.setVisibility(View.GONE); surface.requestFocus(); }).start();
         immersive();
     }
 
@@ -1046,6 +1045,15 @@ public final class MainActivity extends Activity {
         env.put("TMPDIR",FILES+"/tmp");
         env.put("FXD_FILES",FILES); env.put("BB_ANDROID_INPUT","1");
         if (gameDir!=null) env.put("BB_GAME_DIR",gameDir);
+        String custom=customSaves();
+        if (custom!=null) {
+            File dir=new File(custom);
+            if (dir.isDirectory() && dir.canWrite()) env.put("BB_SAVEDATA_DIR",custom);
+            else if (!saveFolderWarned) { saveFolderWarned=true; main.post(() -> { if (!destroyed) new AlertDialog.Builder(this).setTitle("Save folder missing")
+                .setMessage(custom+" cannot be used (missing or not writable), so the game uses the app's own save folder for now. "
+                    +"Saves made now are not in your chosen folder. Fix the folder, or choose another in Save location.")
+                .setPositiveButton("OK",null).setOnDismissListener(d -> immersive()).show(); }); }
+        }
         for (String pair:extra) { int eq=pair.indexOf('='); env.put(pair.substring(0,eq),pair.substring(eq+1)); }
         return b.start();
     }
@@ -1147,6 +1155,11 @@ public final class MainActivity extends Activity {
             else immersive();
             return;
         }
+        if (code==REQUEST_SAVE_LOCATION) {
+            if (result==RESULT_OK && data!=null && data.getData()!=null) moveSaves(folderOf(data.getData()),false);
+            else immersive();
+            return;
+        }
         if (code==GameInstaller.REQUEST_PKG || code==GameInstaller.REQUEST_DEST) { installer.onResult(code,result,data); return; }
         if (code!=REQUEST_FOLDER) return;
         if (result!=RESULT_OK || data==null || data.getData()==null) { if (!hasGame()) askGameFolder(false); return; }
@@ -1237,7 +1250,71 @@ public final class MainActivity extends Activity {
         } catch (Exception ex) { return false; }
     }
     // ---- Save data backup and restore (SaveBackup) ----
-    private File savesDir() { return SaveBackup.saves(new File(BASE)); }
+    private File defaultSaves() { return SaveBackup.saves(new File(BASE)); }
+    /** The chosen save folder (pref saves_dir), or null for the app's own. */
+    private String customSaves() { String s=getSharedPreferences("bloodborne",MODE_PRIVATE).getString("saves_dir",null); return s==null || s.isEmpty() ? null : s; }
+    private File savesDir() { String c=customSaves(); return c==null ? defaultSaves() : new File(c); }
+    private boolean saveFolderWarned;
+    private void askSaveLocation() {
+        String c=customSaves();
+        AlertDialog.Builder b=new AlertDialog.Builder(this).setTitle("Save location")
+            .setMessage("Your saves are in\n"+(c==null ? "the app's own storage (removed when the app is uninstalled)" : c)
+                +"\n\nChoosing another folder moves them there.")
+            .setNegativeButton("Cancel",null)
+            .setPositiveButton("Choose folder",(d,w) -> {
+                if (!saveStorage()) return;
+                try { startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE),REQUEST_SAVE_LOCATION); }
+                catch (Exception ex) { toast("No folder picker: "+ex); }
+            }).setOnDismissListener(d -> immersive());
+        if (c!=null) b.setNeutralButton("Use app storage",(d,w) -> moveSaves(defaultSaves(),true));
+        b.show();
+    }
+    private void failDialog(String title,String text) {
+        new AlertDialog.Builder(this).setTitle(title).setMessage(text).setPositiveButton("OK",null).setOnDismissListener(d -> immersive()).show();
+    }
+    /** Moves the saves to a picked folder (or back to the default one, dest given directly). */
+    private void moveSaves(File picked,boolean toDefault) {
+        if (picked==null) { failDialog("Cannot use that folder","That location is not a folder in shared storage."); return; }
+        File dest=toDefault ? picked : SaveBackup.destinationFor(picked), cur=savesDir();
+        try {
+            if (SaveBackup.isInside(dest,cur) || SaveBackup.isInside(cur,dest)) { failDialog("Cannot use that folder","That is the current save folder, or contains it or lies inside it."); return; }
+            if (!toDefault && (SaveBackup.isInside(dest,new File(FILES)) || dest.getCanonicalPath().startsWith("/data/"))) {
+                failDialog("Cannot use that folder","Choose a folder in shared storage (not the app's own storage)."); return; }
+        } catch (java.io.IOException ex) { failDialog("Cannot use that folder",ex.toString()); return; }
+        if (SaveBackup.hasSaves(dest)) {
+            new AlertDialog.Builder(this).setTitle("Saves already there")
+                .setMessage(dest.getPath()+" already holds saves. They will be used instead; your current saves are backed up to the Download folder "
+                    +"and also stay where they are."+(gameRunning() ? STOP_NOTE : ""))
+                .setNegativeButton("Cancel",null)
+                .setPositiveButton("Use the saves there",(d,w) -> runMove(dest,toDefault,true)).setOnDismissListener(d -> immersive()).show();
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("Move saves?")
+            .setMessage("Moves your saves to\n"+dest.getPath()+(gameRunning() ? STOP_NOTE : ""))
+            .setNegativeButton("Cancel",null)
+            .setPositiveButton("Move",(d,w) -> runMove(dest,toDefault,false)).setOnDismissListener(d -> immersive()).show();
+    }
+    private void runMove(File dest,boolean toDefault,boolean useExisting) {
+        saveJob("Moving saves…","Move failed",true,() -> {
+            File cur=savesDir(); String note="";
+            boolean have=SaveBackup.hasSaves(cur);
+            if (useExisting) {
+                if (have) { if (!saveStorage(false)) throw new java.io.IOException("Allow storage access first, to back up the current saves.");
+                    note="\n\nYour previous saves are in\n"+SaveBackup.backup(cur,downloads(),new java.util.Date()).getPath()+"\nand still in\n"+cur.getPath(); }
+            } else if (have) SaveBackup.copyInto(cur,dest);
+            else if (!dest.isDirectory() && !dest.mkdirs()) throw new java.io.IOException("Cannot create "+dest);
+            if (!dest.isDirectory() || !dest.canWrite()) throw new java.io.IOException(dest+" is not writable.");
+            android.content.SharedPreferences.Editor e=getSharedPreferences("bloodborne",MODE_PRIVATE).edit();
+            if (toDefault) e.remove("saves_dir"); else e.putString("saves_dir",dest.getPath());
+            if (!e.commit()) throw new java.io.IOException("Cannot store the setting; nothing was changed.");
+            saveFolderWarned=false;
+            if (!useExisting && have) { // moved already: a leftover old copy is only a note
+                try { SaveBackup.deleteTree(cur); } catch (Exception ex) { note="\n\nThe old copy could not be removed: "+cur.getPath(); }
+                if (cur.exists() && note.isEmpty()) note="\n\nThe old copy could not be fully removed: "+cur.getPath(); }
+            main.post(this::refreshDrawer);
+            return "Saves are now in\n"+dest.getPath()+note;
+        });
+    }
     private boolean gameRunning() { Process p=game; return p!=null && p.isAlive(); }
     private boolean saveStorage() { return saveStorage(true); }
     private boolean saveStorage(boolean explain) {
@@ -1689,6 +1766,32 @@ public final class MainActivity extends Activity {
         });
         driverDownload.show();
     }
+    /** Worker thread (gpu() blocks). Warns, without holding the start, on a Mali GPU, an Adreno 6xx (chip id 0x06...), or under
+     *  10 GiB of RAM (the reported total, below the size sold: 12 GB phones report about 10.9-11.5 GiB), unless the player chose "Don't show again". */
+    private void warnDevice() {
+        if (deviceWarned || getSharedPreferences("bloodborne",MODE_PRIVATE).getBoolean("device_warning_off",false)) return;
+        deviceWarned=true;
+        GpuFamily g=gpu();
+        android.app.ActivityManager.MemoryInfo mem=new android.app.ActivityManager.MemoryInfo();
+        ((android.app.ActivityManager)getSystemService(ACTIVITY_SERVICE)).getMemoryInfo(mem);
+        double gib=mem.totalMem/(1024.0*1024*1024);
+        java.util.List<String> why=new java.util.ArrayList<>();
+        if (GpuFamily.MALI.equals(g.family)) why.add("Mali GPU: not supported. Do not expect the game to run on this phone.");
+        else if (g.chip!=null && g.chip.startsWith("0x06")) why.add("Adreno 6xx GPU: older than the phones the game is tuned for. Expect low frame rates.");
+        if (mem.totalMem>0 && gib<10.0) why.add(String.format(java.util.Locale.ROOT,"%.1f GB of RAM: 12 GB or more is recommended. The game may run out of memory and close.",gib));
+        if (why.isEmpty()) return;
+        final boolean mali=GpuFamily.MALI.equals(g.family);
+        String text=(mali ? "This phone cannot run the game:" : "This phone is below what the game needs to run well:")
+            +"\n\n\u2022 "+android.text.TextUtils.join("\n\u2022 ",why)
+            +(mali ? "\n\nThe game is made for Adreno GPUs (Snapdragon phones)." : "\n\nYou can keep playing; lower the output resolution in Graphics settings if it runs slowly.");
+        main.post(() -> {
+            if (destroyed) return;
+            new AlertDialog.Builder(this).setTitle(mali ? "GPU not supported" : "Low-spec device").setMessage(text)
+                .setPositiveButton(mali ? "OK" : "Play anyway",null)
+                .setNeutralButton("Don't show again",(d,w) -> getSharedPreferences("bloodborne",MODE_PRIVATE).edit().putBoolean("device_warning_off",true).apply())
+                .setOnDismissListener(d -> immersive()).show();
+        });
+    }
     /** The GPU family (GpuFamily): "gen8", "main", "mali", or null when unknown. The download list marks the
      *  builds for it. Blocks. */
     private String gpuVariant() { return gpu().family; }
@@ -1833,6 +1936,7 @@ public final class MainActivity extends Activity {
             });
             return;
         }
+        warnDevice();
         // A library that works but was built with older catalogs: a non-blocking offer, once per run, not again after "Later" for the same catalogs.
         final String bundledCatalog=RecompAssets.catalogHash(this);
         final boolean offerUpdate=!nativeUpdateOffered && !native_.manualOverride && native_.info!=null && NativeCpu.outdated(native_.info.catalogHash,bundledCatalog)

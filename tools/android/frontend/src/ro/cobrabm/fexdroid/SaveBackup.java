@@ -68,6 +68,29 @@ final class SaveBackup {
         deleteTree(old);
     }
 
+    /** Where saves go for a picked folder: the folder itself when it is (or is named) savedata, else its "savedata" subfolder. */
+    static File destinationFor(File picked) {
+        return picked.getName().equals("savedata") || looksLikeSavedata(picked) ? picked : new File(picked,"savedata");
+    }
+    /** Whether a is b or inside b (canonical paths). */
+    static boolean isInside(File a,File b) throws IOException {
+        String x=a.getCanonicalPath(), y=b.getCanonicalPath();
+        return x.equals(y) || x.startsWith(y.endsWith("/") ? y : y+"/");
+    }
+    /** Copies src into dst (merging) and checks that every file arrived with its size. */
+    static void copyInto(File src,File dst) throws IOException {
+        copyTree(src,dst);
+        long[] a=count(src), b=count(dst);
+        if (a[0]!=b[0] || a[1]!=b[1]) throw new IOException("The copy does not match the original ("+b[0]+" of "+a[0]+" files); nothing was changed.");
+    }
+    /** {files, bytes} under f. */
+    static long[] count(File f) {
+        long[] n={0,0};
+        File[] children=f.isDirectory() ? f.listFiles() : null;
+        if (children!=null) for (File c : children) { long[] m=count(c); n[0]+=m[0]; n[1]+=m[1]; }
+        else if (f.isFile()) { n[0]=1; n[1]=f.length(); }
+        return n;
+    }
     static void copyTree(File from,File to) throws IOException {
         if (from.isDirectory()) {
             if (!to.isDirectory() && !to.mkdirs()) throw new IOException("Cannot create "+to);
