@@ -11,8 +11,8 @@ jdk="$root/.local-deps/android/jdk/usr/lib/jvm/java-27-openjdk"
 [[ -x $jdk/bin/javac ]] || jdk=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
 out=${BB_TEST_OUT:-$root/out/android-native-cpu-test}
 rm -rf "$out"; mkdir -p "$out/classes"
-src=tools/android/frontend/src/ro/cobrabm/fexdroid
+src=tools/android/frontend/src/com/ducvd89/bloodborne
 "$jdk/bin/javac" --release 8 -Xlint:-options -d "$out/classes" $src/FsUtil.java $src/SafeWrite.java $src/MiniJson.java $src/Sfo.java $src/GameCheck.java $src/NativeCpu.java $src/AotBuild.java
 "$jdk/bin/javac" --release 17 -cp "$out/classes" -d "$out/classes" tests/android-native-cpu/NativeCpuTest.java tests/android-native-cpu/AotBuildTest.java
-"$jdk/bin/java" -cp "$out/classes" ro.cobrabm.fexdroid.NativeCpuTest
-"$jdk/bin/java" -cp "$out/classes" ro.cobrabm.fexdroid.AotBuildTest
+"$jdk/bin/java" -cp "$out/classes" com.ducvd89.bloodborne.NativeCpuTest
+"$jdk/bin/java" -cp "$out/classes" com.ducvd89.bloodborne.AotBuildTest

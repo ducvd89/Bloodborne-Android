@@ -1,6 +1,6 @@
-package ro.cobrabm.fexdroid;
+package com.ducvd89.bloodborne;
 
-import static ro.cobrabm.fexdroid.T.*;
+import static com.ducvd89.bloodborne.T.*;
 
 import java.io.File;
 import java.nio.file.Files;

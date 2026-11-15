@@ -29,7 +29,7 @@ def run_py(*args):
 
 
 def run_java(*args):
-    r = subprocess.run([JAVA, '-cp', CLASSES, 'ro.cobrabm.fexdroid.ParityCli', *map(str, args)], capture_output=True, text=True)
+    r = subprocess.run([JAVA, '-cp', CLASSES, 'com.ducvd89.bloodborne.ParityCli', *map(str, args)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     return r.stdout, r.stderr
 

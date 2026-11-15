@@ -10,7 +10,7 @@ jdk="$root/.local-deps/android/jdk/usr/lib/jvm/java-27-openjdk"
 [[ -x $jdk/bin/javac ]] || jdk=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
 out=${BB_TEST_OUT:-$root/out/android-nav-test}
 rm -rf "$out"; mkdir -p "$out/classes"
-src=tools/android/frontend/src/ro/cobrabm/fexdroid
+src=tools/android/frontend/src/com/ducvd89/bloodborne
 "$jdk/bin/javac" --release 8 -Xlint:-options -d "$out/classes" $src/MiniJson.java $src/NavGate.java $src/NavData.java
 "$jdk/bin/javac" --release 17 -cp "$out/classes" -d "$out/classes" tests/android-nav/NavTest.java
-exec "$jdk/bin/java" -cp "$out/classes" ro.cobrabm.fexdroid.NavTest "$@"
+exec "$jdk/bin/java" -cp "$out/classes" com.ducvd89.bloodborne.NavTest "$@"

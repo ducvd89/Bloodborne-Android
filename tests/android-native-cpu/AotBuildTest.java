@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-package ro.cobrabm.fexdroid;
+package com.ducvd89.bloodborne;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;

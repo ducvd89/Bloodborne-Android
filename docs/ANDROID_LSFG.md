@@ -10,6 +10,38 @@ The game runs as a native Android (Bionic) process, so Lossless Scaling's frame 
 
 It replaces FSR 3.1 frame generation (FSR 3.1 frame generation stays in Graphics settings, which needs a restart; the two menus lock each other while one is on). It sees only finished frames, without the game's motion vectors, so expect more artifacts around fast motion and the HUD than with FSR 3.1 frame generation. Messages are in `files/bbport/logs/android-game.log` (`LSFG: ...` for the state, `Bloodframe: ...` for the engine); `BB_LSFG_STATS=1` in `bbport/bionic-local.sh` logs real and generated frames a second, with the shader set in use (`FP16`, `FP32` or `FP32-DXBC`).
 
+## MAKO-FG (experimental, Bloodframe 2.0)
+
+The Bloodframe page has a **Model** choice: Lossless Scaling, or **MAKO-FG (experimental)**. MAKO-FG needs no `Lossless.dll`:
+
+1. **The APK carries the model:** `LICENSE` and `model/{weights.bin,transport.spv,ops.spv,mixture.spv}` (about 100 KB), unchanged, in `assets/mako-fg/`.
+   - At build time, `tools/android/fetch_mako_model.sh` downloads them from the model's Hugging Face release at a pinned revision and checks each against the SHA-256 of Bloodframe's `mako/release.json`. `build_frontend.sh` packs them; `BB_SKIP_MAKO=1` builds without them.
+   - At start, the app copies them into `bbport/mako-fg/` and checks them again (`MakoModel.java`).
+2. **The licence:** **MAKO FG by Eugenio Segala**, CC BY-NC 4.0, non-commercial use only, plus its training data's non-commercial research-and-education condition, which passes to every user. It is shown on the Bloodframe page, and its full text is appended to the app's `THIRD_PARTY_LICENSES.txt`.
+3. **Apply:** like Lossless Scaling, it switches live. `lsfg.state` gains `model=lsfg|mako`, and bbport.ini gains `lsfg_model`.
+
+libbbgpu calls `bb_lsfg_init_v2` with `BB_LSFG_BACKEND_MAKO_EXPERIMENTAL` and the model folder (`BbLsfgState::FindMakoModel`: `BB_MAKO_MODEL` when it holds `weights.bin`, else `bbport/mako-fg/model`). The shared images are RGBA8, since MAKO-FG is SDR only. The log says `Bloodframe: MAKO-FG (experimental) x2, …` and `Bloodframe: MAKO-FG V1.24 blend, Bloodframe motion (…)`, and the stats line names the set `MAKO-FG`. A `libbloodframe.so` older than 2.0 has no `bb_lsfg_init_v2`, so frame generation stays off with a log line saying so.
+
+What it is: Bloodframe's own runtime runs the released MAKO-FG blend with Bloodframe's own motion estimation. Its parts are:
+- a luma pyramid, a coarse-to-fine search and a median filter;
+- a divergence-based visibility prior;
+- a static-HUD mask.
+
+It is not the official MAKO-FG runtime, which is published only as x64/x86 Linux binaries. MAKO-FG's own motion search, thin-object stage, scene-cut logic and motion-reuse modes are not implemented.
+
+- **Performance mode** narrows Bloodframe's motion search.
+- **FP16** runs that search in half precision; the MAKO-FG blend has no half-precision mode and stays FP32.
+- **Sync:** with sync files (Turnip), nothing waits on the CPU.
+- `BB_MAKO_SYNC=host` forces the blocking path and `BB_MAKO_HUD=0` turns the HUD mask off. Both are test switches, read by Bloodframe.
+
+Measured on the AYN Thor (Adreno 740, Turnip Gen8 V39) with a test build of the same backend, 1920×1080, 2×, flow 0.75, performance mode:
+- 33–34 real + 33–34 generated frames/s, against 42 real without frame generation;
+- about 4 ms of GPU time per real frame;
+- 0.2 ms in the framegen call on the CPU;
+- real frames ready about 29 ms after the flip.
+
+Fast turns, repeating textures and scene cuts can show artifacts.
+
 ## Half precision (FP16) and the shader sets
 
 A recent Lossless.dll carries every frame generation shader three times, as resources of its RCDATA: the DXBC set (resource id N), a half-precision SPIR-V set (N + 49) and a full-precision SPIR-V set (N + 98). Bloodframe runs the dll's own SPIR-V whenever it can and translates the DXBC set (the fork's DXBC to SPIR-V translation) only as the last resort. The three sets, in the order they are tried:

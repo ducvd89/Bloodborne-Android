@@ -23,6 +23,8 @@
 
 A port of Bloodborne (PS4, **v1.09**), not an emulator. Experimental. You need your own copy of the game.
 
+> **New in 2.3.0: Bloodframe 2.0 with MAKO-FG, and a new signing key.** Bloodframe can now run MAKO-FG, a frame generation model included with the app that needs no `Lossless.dll` (Menu → Bloodframe → Model). The bundled Adreno driver is now Turnip Gen8 V39. **2.3.0 is signed with a new key: uninstall the old app and install this one** (back up your saves first with Menu → Back up saves); see the release notes.
+
 > **New in 2.1.0 (Beta 1): the app builds the game's native code on the phone.** Since 2.0.0 the game runs as native ARM64 code made from **your own game files**. Until now that needed a PC. Now the app does it itself: when the native code is missing, the app asks, and a few minutes later the game starts. Building on a PC with the free [Bloodborne Android Rebuild Tool](https://github.com/ducvd89/Bloodborne-android-rebuild-tool) still works.
 
 ## How to get the game running
@@ -87,7 +89,7 @@ A new phone does not need a new build when the ABI version is the same: copy the
 
 - **Native ARM64 game code** (2.0.0), **built on the phone** (new in 2.1.0): no x86 emulator, no translation while you play (see the guide above).
 - **Snapdragon GSR 2 upscaling** (default since 0.11.0): Qualcomm's upscaler made for Adreno, about 1.1 ms per frame on the Thor. FSR 3.1 is also available.
-- **Bloodframe frame generation**: Lossless Scaling frame generation (2x to 4x) with FP16 and low input lag. Needs your own `Lossless.dll`. It pauses by itself while a movie plays.
+- **Bloodframe frame generation**: 2x to 4x with FP16 and low input lag, with Lossless Scaling (needs your own `Lossless.dll`) or the experimental MAKO-FG model (a free download in the app). It pauses by itself while a movie plays.
 - **Any screen shape and resolution**: aspect ratio Auto, 4:3 to 32:9, and output from 360p up to your screen's own size.
 - **Real game speed** down to 20 FPS, instead of slow motion below 30.
 - **GPU driver included**: Turnip for Adreno 6xx/7xx and 8xx, picked for you.
@@ -146,7 +148,10 @@ The defaults are tuned on the AYN Thor: **GSR 2 Performance** at 1080p output (a
 
 ## Bloodframe
 
-Bloodframe is this port's frame generation engine ([ducvd89/bloodframe](https://github.com/ducvd89/bloodframe), based on lsfg-vk 1.0, MIT). It runs Lossless Scaling's LSFG 3.1 with the shaders from your own `Lossless.dll`; the Bloodframe page can download it through Steam sign-in.
+Bloodframe is this port's frame generation engine ([ducvd89/bloodframe](https://github.com/ducvd89/bloodframe), based on lsfg-vk 1.0, MIT). The Bloodframe page picks the model:
+
+- **Lossless Scaling (LSFG 3.1)**, with the shaders from your own `Lossless.dll`; the page can download it through Steam sign-in.
+- **MAKO-FG (experimental, Bloodframe 2.0)**: no `Lossless.dll`. The app includes the MAKO-FG V1.24 model files, unchanged (about 100 KB, checked against fixed SHA-256 checksums): **MAKO FG by Eugenio Segala**, [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/), non-commercial use only. Bloodframe runs the released MAKO-FG blend with its own motion estimation, not the official MAKO-FG runtime. On the AYN Thor: 2× at about 34 real + 34 generated frames/s, about 4 ms of GPU time.
 
 Recommended: **2×, performance mode on, FP16 on** (the defaults). Works best at 30 FPS or more. It works with any upscaler, and changes apply while you play. Details: [docs/ANDROID_LSFG.md](docs/ANDROID_LSFG.md).
 
@@ -156,7 +161,7 @@ On **Automatic** the app uses its bundled driver for your GPU:
 
 | GPU | Driver |
 |---|---|
-| Adreno 6xx / 7xx / 8xx | Turnip Gen8 V37 by StevenMXZ |
+| Adreno 6xx / 7xx / 8xx | Turnip Gen8 V39 by StevenMXZ |
 | Mali G610+ (Android 15+) | PanVK V3.2, **testing only** |
 
 The phone's own Adreno driver does not run the game yet (black screen). You can also download other drivers (our Turnip 26.3.0, StevenMXZ's 26.3.0-R6 and R6 One UI) or install any adrenotools driver zip from the menu.

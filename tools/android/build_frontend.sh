@@ -40,8 +40,8 @@ if [[ ${BB_SKIP_DRIVERS:-} != 1 ]]; then
     bash tools/android/fetch_bundled_drivers.sh >/dev/null \
         || { echo "The bundled GPU drivers are missing or do not match their sha256: bash tools/android/fetch_bundled_drivers.sh (BB_SKIP_DRIVERS=1 builds without them)" >&2; exit 1; }
     mkdir -p "$out/assets/drivers"
-    cp "$drivers"/Turnip_Gen8_V37.zip "$drivers"/PanVK-android-v3.2-universal-2a9358a.zip "$out/assets/drivers/"
-    # Our Turnip 26.3.0 zip is not packed (V37 is the Adreno driver); it gives the Mesa license text.
+    cp "$drivers"/Turnip_Gen8_V39.zip "$drivers"/PanVK-android-v3.2-universal-2a9358a.zip "$out/assets/drivers/"
+    # Our Turnip 26.3.0 zip is not packed (V39 is the Adreno driver); it gives the Mesa license text.
     { cat tools/android/frontend/THIRD_PARTY_LICENSES.txt tools/android/frontend/DRIVERS_NOTICE.txt
       unzip -p "$drivers/Turnip-android-main-26.3.0-35b085c.zip" LICENSE-mesa.txt
       printf '\n--------------------------------------------------------------------------------\nGNU General Public License, version 3 (StevenMXZ/Adreno-Tools-Drivers)\n--------------------------------------------------------------------------------\n\n'
@@ -49,6 +49,21 @@ if [[ ${BB_SKIP_DRIVERS:-} != 1 ]]; then
     } > "$out/assets/THIRD_PARTY_LICENSES.txt"
 else
     cp tools/android/frontend/THIRD_PARTY_LICENSES.txt "$out/assets/"
+fi
+# The MAKO-FG model inside the APK (assets/mako-fg/, copied into bbport/mako-fg by MakoModel.java) for
+# Bloodframe 2.0's experimental MAKO-FG backend, unchanged, with its licence appended to THIRD_PARTY_LICENSES.txt.
+# fetch_mako_model.sh downloads and checks the pinned files (BB_SKIP_MAKO=1: a development build without them;
+# MAKO-FG then stays off).
+mako=$PWD/.local-deps/android/mako-fg
+if [[ ${BB_SKIP_MAKO:-} != 1 ]]; then
+    bash tools/android/fetch_mako_model.sh >/dev/null \
+        || { echo "The MAKO-FG model files are missing or do not match their sha256: bash tools/android/fetch_mako_model.sh (BB_SKIP_MAKO=1 builds without them)" >&2; exit 1; }
+    mkdir -p "$out/assets/mako-fg/model"
+    cp "$mako/LICENSE" "$out/assets/mako-fg/"
+    cp "$mako"/model/{weights.bin,transport.spv,ops.spv,mixture.spv} "$out/assets/mako-fg/model/"
+    { printf '\n--------------------------------------------------------------------------------\nMAKO FG by Eugenio Segala: the MAKO-FG V1.24 model files in assets/mako-fg (unchanged)\nCC BY-NC 4.0, https://creativecommons.org/licenses/by-nc/4.0/ (non-commercial use only)\nSource: https://huggingface.co/eugeniosegala/MAKO-FG\n--------------------------------------------------------------------------------\n\n'
+      cat "$mako/LICENSE"
+    } >> "$out/assets/THIRD_PARTY_LICENSES.txt"
 fi
 # The libraries of the Steam sign-in that downloads Lossless.dll (SteamDllDialog.java: JavaSteam and its
 # dependencies, ZXing, zstd-jni) and of the Mods menu (ModArchive.java: Commons Compress and xz).
@@ -87,9 +102,10 @@ fi
 # NDK at minSdk 28 (the API 29 calls are looked up at run time). NEEDED: libandroid, liblog,
 # libnativewindow and libc/libm/libdl only.
 ndk=${BB_NDK:-$PWD/.local-deps/android/sdk/ndk/29.0.14206865}
-[[ -x $ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang ]] \
+ndk_host=linux-x86_64; [[ -d $ndk/toolchains/llvm/prebuilt/$ndk_host ]] || ndk_host=darwin-x86_64 # the NDK's macOS build
+[[ -x $ndk/toolchains/llvm/prebuilt/$ndk_host/bin/aarch64-linux-android28-clang ]] \
     || { echo "No NDK: $ndk (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
-"$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang" -fuse-ld=lld -std=c11 -O2 -g \
+"$ndk/toolchains/llvm/prebuilt/$ndk_host/bin/aarch64-linux-android28-clang" -fuse-ld=lld -std=c11 -O2 -g \
     -Wall -Wextra -Werror -fPIC -shared -Wl,-soname,libbbpresent.so -Wl,-z,max-page-size=16384 \
     -Itools/android/present tools/android/frontend/jni/bbpresent/bbpresent.c \
     -landroid -llog -lnativewindow -o "$out/lib/arm64-v8a/libbbpresent.so"
@@ -116,12 +132,26 @@ with zipfile.ZipFile(out/'unsigned.apk','a',compression=zipfile.ZIP_DEFLATED) as
     for p in sorted((out/'lib').rglob('*.so')): z.write(p,str(p.relative_to(out)))
 PY
 "$build_tools/zipalign" -f 4 "$out/unsigned.apk" "$out/aligned.apk"
-key="$PWD/.local-deps/android/bloodborne-thor.keystore"
-if [[ ! -f $key ]]; then
-    keytool -genkeypair -keystore "$key" -storepass android -keypass android \
-        -alias thor -dname 'CN=Bloodborne Thor local build' -keyalg RSA -keysize 2048 -validity 10000
+# Signing. BB_KEYSTORE (+ BB_KEYSTORE_PASS_FILE, a file holding its password, and BB_KEY_ALIAS) is the release key:
+# every release must be signed with the same key, or Android refuses the update and players must reinstall.
+# Keep that keystore and its password backed up outside this machine. Without BB_KEYSTORE a development key is
+# made in .local-deps; a release build (BB_RUNTIME_ARCHIVE set) refuses that.
+if [[ -n ${BB_KEYSTORE:-} ]]; then
+    key=$BB_KEYSTORE
+    [[ -f $key ]] || { echo "BB_KEYSTORE: no such file: $key" >&2; exit 1; }
+    [[ -f ${BB_KEYSTORE_PASS_FILE:-} ]] || { echo "BB_KEYSTORE_PASS_FILE must name the file with the keystore's password" >&2; exit 1; }
+    # The key's password is the keystore's (PKCS12): apksigner uses --ks-pass for both. Naming the same file
+    # for --key-pass too would make it read a second line from it.
+    sign_args=(--ks "$key" --ks-pass "file:$BB_KEYSTORE_PASS_FILE" --ks-key-alias "${BB_KEY_ALIAS:-bloodborne}")
+else
+    [[ -z ${BB_RUNTIME_ARCHIVE:-} ]] || { echo "A release build needs the release key: set BB_KEYSTORE and BB_KEYSTORE_PASS_FILE" >&2; exit 1; }
+    key="$PWD/.local-deps/android/bloodborne-dev.keystore"
+    if [[ ! -f $key ]]; then
+        keytool -genkeypair -keystore "$key" -storepass android -keypass android \
+            -alias dev -dname 'CN=Bloodborne-Android development build' -keyalg RSA -keysize 2048 -validity 10000
+    fi
+    sign_args=(--ks "$key" --ks-pass pass:android --key-pass pass:android)
 fi
-"$build_tools/apksigner" sign --ks "$key" --ks-pass pass:android --key-pass pass:android \
-    --out "$out/Bloodborne-Thor.apk" "$out/aligned.apk"
+"$build_tools/apksigner" sign "${sign_args[@]}" --out "$out/Bloodborne-Thor.apk" "$out/aligned.apk"
 "$build_tools/apksigner" verify --verbose "$out/Bloodborne-Thor.apk"
 echo "Built $out/Bloodborne-Thor.apk"

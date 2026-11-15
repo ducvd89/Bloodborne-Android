@@ -544,7 +544,7 @@ static void* server_thread(void* unused) {
 
 /* ---- JNI ---- */
 
-JNIEXPORT jstring JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeStart(JNIEnv* env, jclass cls,
+JNIEXPORT jstring JNICALL Java_com_ducvd89_bloodborne_BbPresent_nativeStart(JNIEnv* env, jclass cls,
         jstring jpath) {
     (void)cls;
     const char* path = (*env)->GetStringUTFChars(env, jpath, NULL);
@@ -589,7 +589,7 @@ fail:
     return (*env)->NewStringUTF(env, msg);
 }
 
-JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeSetSurface(JNIEnv* env, jclass cls,
+JNIEXPORT void JNICALL Java_com_ducvd89_bloodborne_BbPresent_nativeSetSurface(JNIEnv* env, jclass cls,
         jobject surface) {
     (void)cls;
     pthread_mutex_lock(&S.lock);
@@ -604,7 +604,7 @@ JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeSetSurface(JNIEn
 
 /* Hold on: queued frames go back unseen and every frame that follows is released at once (paced), as if no surface
  * were there; hold off: frames show again. The socket stays served either way. */
-JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeSetHold(JNIEnv* env, jclass cls, jboolean hold) {
+JNIEXPORT void JNICALL Java_com_ducvd89_bloodborne_BbPresent_nativeSetHold(JNIEnv* env, jclass cls, jboolean hold) {
     (void)env; (void)cls;
     pthread_mutex_lock(&S.lock);
     S.hold = hold ? 1 : 0;
@@ -615,12 +615,12 @@ JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeSetHold(JNIEnv* 
     pthread_mutex_unlock(&S.lock);
 }
 
-JNIEXPORT jlong JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeFrames(JNIEnv* env, jclass cls) {
+JNIEXPORT jlong JNICALL Java_com_ducvd89_bloodborne_BbPresent_nativeFrames(JNIEnv* env, jclass cls) {
     (void)env; (void)cls;
     return (jlong)atomic_load(&S.frames);
 }
 
-JNIEXPORT void JNICALL Java_ro_cobrabm_fexdroid_BbPresent_nativeShutdown(JNIEnv* env, jclass cls) {
+JNIEXPORT void JNICALL Java_com_ducvd89_bloodborne_BbPresent_nativeShutdown(JNIEnv* env, jclass cls) {
     (void)env; (void)cls;
     pthread_mutex_lock(&S.lock);
     drop_surface_control();

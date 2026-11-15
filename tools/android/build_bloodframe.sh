@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Bloodframe, this port's Lossless Scaling frame generation engine for the Bionic game process:
+# Bloodframe, this port's frame generation engine for the Bionic game process (Lossless Scaling LSFG 3.1, and
+# from 2.0 the experimental MAKO-FG backend):
 # libbloodframe.so. It lives in its own repository, https://github.com/ducvd89/bloodframe (MIT; it carries
 # the history of GameNative's MIT lsfg-vk Android fork it is based on, lsfg-vk 1.0 by PancakeTAS), and is
 # built here at a pinned commit with that repository's build-android.sh. Not a Vulkan layer: a single shared
 # library with the small C API of bb_lsfg.h; libbbgpu dlopen()s it only when frame generation is on
 # (gpu/shadps4/video_core/renderer_vulkan/vk_lsfg.cpp).
-# Lossless Scaling's shaders come from the player's own Lossless.dll at run time, never the APK.
+# Lossless Scaling's shaders come from the player's own Lossless.dll at run time, never the APK; the MAKO-FG
+# model files are downloaded by the app when the player opts in (MakoModel.java), never the APK either.
 # Output: out/bionic/lib/libbloodframe.so and out/bionic/licenses/bloodframe-*.LICENSE*, bloodframe-source.txt;
 # build_bionic.sh runs this, build_release_runtime.py packages them.
 # tools/android/lsfg/bb_lsfg.h is the game's copy of the C API header (libbbgpu is built before this runs); this script fails when it differs from the
@@ -14,7 +16,7 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 BLOODFRAME_REPO=https://github.com/ducvd89/bloodframe.git
-BLOODFRAME_COMMIT=50d1e312f8af62f787b138ca8ff398b07d6245a1
+BLOODFRAME_COMMIT=f4ac713aef58d9403a136e179b3b0d163d85eb66
 root=$PWD/.local-deps/android
 src=$root/src/bloodframe
 ndk=${BB_NDK:-$root/sdk/ndk/29.0.14206865}
@@ -23,6 +25,8 @@ J=${BB_JOBS:-22}
 out=$PWD/out/bionic
 build=$out/bloodframe-build
 [[ -f $ndk/build/cmake/android.toolchain.cmake ]] || { echo "No NDK: $ndk (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
+# Bloodframe 2.0 compiles its MAKO-FG backend's shaders on the host (shell.nix has glslang).
+command -v glslangValidator >/dev/null || { echo "No glslangValidator on PATH (Bloodframe 2.0 needs it; nix-shell provides it)" >&2; exit 1; }
 if [[ ! -d $src/.git ]]; then
     mkdir -p "$root/src"
     git clone -q "$BLOODFRAME_REPO" "$src" ||

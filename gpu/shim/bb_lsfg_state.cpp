@@ -21,7 +21,33 @@ bool IsFile(const std::string& path) {
     return !path.empty() && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
 }
 
+bool ParseModel(const char* value, Model& model) {
+    if (std::strncmp(value, "mako", 4) == 0) {
+        model = Model::Mako;
+        return true;
+    }
+    if (std::strncmp(value, "lsfg", 4) == 0) {
+        model = Model::Lsfg;
+        return true;
+    }
+    return false;
+}
+
+std::string BesideStateFile(const char* name) {
+    const char* path = FilePath();
+    if (!path) {
+        return {};
+    }
+    std::string beside = path;
+    const size_t slash = beside.rfind('/');
+    return (slash == std::string::npos ? std::string{} : beside.substr(0, slash + 1)) + name;
+}
+
 } // namespace
+
+const char* ModelName(Model model) {
+    return model == Model::Mako ? "mako" : "lsfg";
+}
 
 const char* FilePath() {
     const char* path = std::getenv("BB_LSFG_STATE_FILE");
@@ -71,6 +97,8 @@ bool Read(const char* path, State& state) {
             if (stop != value) {
                 parsed.fp16 = h != 0;
             }
+        } else if (key == "model") {
+            ParseModel(value, parsed.model); // an unknown value keeps the last one
         }
     }
     if (!has_multiplier) {
@@ -98,6 +126,9 @@ State FromEnvironment() {
     if (const char* fp16 = std::getenv("BB_LSFG_FP16"); fp16 && *fp16) {
         state.fp16 = std::strtol(fp16, nullptr, 10) != 0;
     }
+    if (const char* model = std::getenv("BB_LSFG_MODEL"); model && *model) {
+        ParseModel(model, state.model);
+    }
     return state;
 }
 
@@ -113,16 +144,21 @@ std::string FindDll() {
     if (const char* env = std::getenv("BB_LSFG_DLL"); env && IsFile(env)) {
         return env;
     }
-    if (const char* path = FilePath()) {
-        std::string beside = path;
-        const size_t slash = beside.rfind('/');
-        beside = (slash == std::string::npos ? std::string{} : beside.substr(0, slash + 1)) + "Lossless.dll";
-        if (IsFile(beside)) {
-            return beside;
-        }
+    if (const std::string beside = BesideStateFile("Lossless.dll"); IsFile(beside)) {
+        return beside;
     }
     const std::string shared = "/storage/emulated/0/Bloodborne/Lossless.dll";
     return IsFile(shared) ? shared : std::string{};
+}
+
+std::string FindMakoModel() {
+    if (const char* env = std::getenv("BB_MAKO_MODEL"); env && *env && IsFile(std::string{env} + "/weights.bin")) {
+        return env;
+    }
+    if (const std::string beside = BesideStateFile("mako-fg/model"); IsFile(beside + "/weights.bin")) {
+        return beside;
+    }
+    return {};
 }
 
 bool Watcher::Poll(State& state) {

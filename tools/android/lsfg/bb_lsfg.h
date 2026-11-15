@@ -37,6 +37,19 @@ typedef struct BbLsfgConfig {
                                      ///< says which runs and why.
 } BbLsfgConfig;
 
+// Bloodframe 2.0 opt-in initialization. The original config layout and init symbol are unchanged.
+#define BB_LSFG_BACKEND_LSFG 0
+#define BB_LSFG_BACKEND_MAKO_EXPERIMENTAL 1
+#define BB_LSFG_CONFIG_VERSION 2
+typedef struct BbLsfgConfigV2 {
+    uint32_t struct_size;            ///< sizeof(BbLsfgConfigV2)
+    uint32_t version;                ///< BB_LSFG_CONFIG_VERSION
+    int32_t backend;                 ///< BB_LSFG_BACKEND_*
+    int32_t reserved;                ///< must be zero
+    BbLsfgConfig config;             ///< dll_path may be NULL for experimental MAKO-FG
+    const char* model_path;          ///< verified MAKO-FG V1.24 model/ directory
+} BbLsfgConfigV2;
+
 typedef struct BbLsfgInfo {
     uint64_t input_ahb_usage;  ///< AHARDWAREBUFFER_USAGE_* the input buffers must be allocated with
     uint64_t output_ahb_usage; ///< ... the output buffers
@@ -53,6 +66,13 @@ typedef struct BbLsfgPresent {
 
 /// Starts the runtime: the framegen instance and device, the shaders from the Lossless.dll.
 BB_LSFG_API int bb_lsfg_init(const BbLsfgConfig* config, BbLsfgInfo* info, char* err, size_t err_len);
+/// Experimental MAKO: independent motion estimator + released MAKO-FG blend; SDR RGBA8. Sync files
+/// when the device has them (sync_fd_ok), else blocking. performance selects a smaller motion search;
+/// fp16 runs Bloodframe's analysis passes in half precision (the released blend is always FP32).
+/// No Lossless.dll.
+BB_LSFG_API int bb_lsfg_init_v2(const BbLsfgConfigV2* config, BbLsfgInfo* info, char* err, size_t err_len);
+/// Active backend (BB_LSFG_BACKEND_*), or -1 before initialization.
+BB_LSFG_API int bb_lsfg_backend(void);
 
 /// Makes a context over two input buffers and `out_count` output buffers (the config's
 /// generation_count), all allocated with the usage bb_lsfg_init reported and `format`.
@@ -84,9 +104,11 @@ BB_LSFG_API int bb_lsfg_shader_set(char* reason, size_t len);
 #define BB_LSFG_SET_FP16_SPIRV 0 ///< the Lossless.dll's half-precision SPIR-V (needs shaderFloat16)
 #define BB_LSFG_SET_FP32_SPIRV 1 ///< the Lossless.dll's full-precision SPIR-V
 #define BB_LSFG_SET_FP32_DXBC 2  ///< the dll's DXBC translated to SPIR-V by the library (the last resort)
+#define BB_LSFG_SET_MAKO_EXPERIMENTAL 3 ///< released MAKO-FG blend with Bloodframe's independent motion estimation
 
 /// The precision the session runs: 1 half (FP16 SPIR-V), 0 full (either full-precision set); `reason`
 /// as for bb_lsfg_shader_set. Kept for hosts that only ask for the precision.
+/// Experimental MAKO: 1 when Bloodframe's analysis passes run FP16; its blend is FP32 either way.
 BB_LSFG_API int bb_lsfg_precision(char* reason, size_t len);
 
 /// One line about the backend (driver, AHB transport mode, sync path, capabilities) for the log.

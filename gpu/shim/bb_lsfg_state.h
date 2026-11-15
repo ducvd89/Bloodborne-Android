@@ -8,9 +8,11 @@
 //     flow=0.75         flow scale, 0.25 .. 1.0
 //     performance=1     1: the light model, 0: the quality model
 //     fp16=1            1 (default): half-precision shaders when Lossless.dll and the GPU have them
+//     model=lsfg        lsfg (default): Lossless Scaling from Lossless.dll; mako: the experimental MAKO-FG
+//                       backend of Bloodframe 2.0 (bbport/mako-fg/model, downloaded by the app)
 //
 // Without BB_LSFG_STATE_FILE (a harness, a desktop run) the same four settings come from the
-// environment once, at start: BB_LSFG_MULTIPLIER, BB_LSFG_FLOW_SCALE, BB_LSFG_PERFORMANCE, BB_LSFG_FP16.
+// environment once, at start: BB_LSFG_MULTIPLIER, BB_LSFG_FLOW_SCALE, BB_LSFG_PERFORMANCE, BB_LSFG_FP16, BB_LSFG_MODEL.
 #pragma once
 #ifdef __ANDROID__
 #include <chrono>
@@ -19,8 +21,17 @@
 
 namespace BbLsfgState {
 
+enum class Model : u32 {
+    Lsfg = 0, ///< Lossless Scaling frame generation 3.1, shaders from the player's Lossless.dll
+    Mako = 1, ///< Bloodframe 2.0's experimental MAKO-FG backend (bb_lsfg_init_v2), no Lossless.dll
+};
+
+/// "lsfg" or "mako".
+const char* ModelName(Model model);
+
 struct State {
     u32 multiplier = 0; ///< 0: off, else 2-4
+    Model model = Model::Lsfg;
     float flow = 0.75f;
     bool performance = true;
     bool fp16 = true; ///< half precision wanted (Bloodframe falls back to full precision when it cannot)
@@ -30,7 +41,7 @@ struct State {
     }
     bool operator==(const State& other) const {
         return multiplier == other.multiplier && flow == other.flow && performance == other.performance &&
-               fp16 == other.fp16;
+               fp16 == other.fp16 && model == other.model;
     }
 };
 
@@ -42,7 +53,8 @@ const char* FilePath();
 /// is ignored.
 bool Read(const char* path, State& state);
 
-/// The environment's settings (BB_LSFG_MULTIPLIER, BB_LSFG_FLOW_SCALE, BB_LSFG_PERFORMANCE, BB_LSFG_FP16).
+/// The environment's settings (BB_LSFG_MULTIPLIER, BB_LSFG_FLOW_SCALE, BB_LSFG_PERFORMANCE, BB_LSFG_FP16,
+/// BB_LSFG_MODEL).
 State FromEnvironment();
 
 /// The state at start: the file when there is one and it reads, else the environment.
@@ -52,6 +64,11 @@ State Initial();
 /// the state file, else Bloodborne/Lossless.dll of shared storage (the order run-bionic.sh uses).
 /// Empty when there is none.
 std::string FindDll();
+
+/// The MAKO-FG model directory (weights.bin, transport.spv, ...): BB_MAKO_MODEL when it holds weights.bin,
+/// else bbport/mako-fg/model next to the state file (where the app downloads it). Empty when there is none.
+/// Bloodframe checks the files' SHA-256 itself.
+std::string FindMakoModel();
 
 /// Follows the file cheaply: at most one stat() every 250 ms, a read only when it changed.
 class Watcher {

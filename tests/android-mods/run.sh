@@ -12,14 +12,14 @@ jdk="$root/.local-deps/android/jdk/usr/lib/jvm/java-27-openjdk"
 [[ -x $jdk/bin/javac ]] || jdk=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
 out=${BB_TEST_OUT:-$root/out/android-mods-test}
 rm -rf "$out"; mkdir -p "$out/classes"
-src=tools/android/frontend/src/ro/cobrabm/fexdroid
+src=tools/android/frontend/src/com/ducvd89/bloodborne
 # The core classes are plain Java 8, as the frontend's javac --release 8 builds them.
 "$jdk/bin/javac" --release 8 -Xlint:-options -d "$out/classes" \
     $src/FsUtil.java $src/SafeWrite.java $src/MiniJson.java $src/ModLoader.java $src/ModManager.java $src/Sfo.java \
     $src/GameCheck.java $src/PkgInstaller.java $src/PkgVerifier.java $src/PkgProgress.java $src/RuntimeCleanup.java
 "$jdk/bin/javac" --release 17 -cp "$out/classes" -d "$out/classes" tests/android-mods/T.java tests/android-mods/ModsTest.java \
     tests/android-mods/ParityCli.java tests/android-mods/CleanupTest.java tests/android-mods/SafeWriteTest.java
-"$jdk/bin/java" -cp "$out/classes" ro.cobrabm.fexdroid.ModsTest
-"$jdk/bin/java" -cp "$out/classes" ro.cobrabm.fexdroid.CleanupTest
-"$jdk/bin/java" -cp "$out/classes" ro.cobrabm.fexdroid.SafeWriteTest
+"$jdk/bin/java" -cp "$out/classes" com.ducvd89.bloodborne.ModsTest
+"$jdk/bin/java" -cp "$out/classes" com.ducvd89.bloodborne.CleanupTest
+"$jdk/bin/java" -cp "$out/classes" com.ducvd89.bloodborne.SafeWriteTest
 python3 -I tests/android-mods/parity.py "$jdk/bin/java" "$out/classes"

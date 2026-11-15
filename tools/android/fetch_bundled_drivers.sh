@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The GPU drivers the app carries in its APK (assets/drivers/, tools/android/build_frontend.sh), which its
 # "Automatic" GPU driver choice installs on the first start (AutoDriver.java, BundledDrivers.java):
-#   Adreno          Turnip Gen8 V37 by StevenMXZ for 6xx/7xx and 8xx alike (Mesa Turnip; the build repository
+#   Adreno          Turnip Gen8 V39 by StevenMXZ for 6xx/7xx and 8xx alike (Mesa Turnip; the build repository
 #                   is GPL-3.0); other Turnip builds are download options on this project's releases
 #   Mali            PanVK v3.2 (ours, a universal CSF build; Mesa, MIT; needs Android 15)
 # plus the GPL-3.0 text of the notices and our Turnip 26.3.0 zip, not packed: build_frontend.sh takes the
@@ -13,11 +13,11 @@ cd -- "$(dirname -- "$0")/../.."
 out=$PWD/.local-deps/android/drivers
 mkdir -p "$out"
 
-# name  sha256  url. Turnip_Gen8_V37.zip is StevenMXZ's build (https://github.com/StevenMXZ/Adreno-Tools-Drivers,
-# tag v37), mirrored byte for byte on this project's release.
+# name  sha256  url. Turnip_Gen8_V39.zip is StevenMXZ's build (https://github.com/StevenMXZ/Adreno-Tools-Drivers,
+# tag v39, the unpatched Gen8 zip), fetched from its release (not mirrored on this project's yet).
 files=(
 "Turnip-android-main-26.3.0-35b085c.zip 5d08fb35c4add918ff6e3c0e435ae0fcc7e9b848173db95377c3ff20b3e7709b https://github.com/ducvd89/Bloodborne-Android/releases/download/turnip-android-main-26.3.0-35b085c/Turnip-android-main-26.3.0-35b085c.zip"
-"Turnip_Gen8_V37.zip d0335542ec996fe33e83dfbec0d86aed301da95d22b671a88b40a4722d115b48 https://github.com/ducvd89/Bloodborne-Android/releases/download/turnip-android-gen8-26.3.0-9c7e022/Turnip_Gen8_V37.zip"
+"Turnip_Gen8_V39.zip 572e415c11b636ea2a4c4968c60a9b24e459302549c8ea38e814dbd07e40654d https://github.com/StevenMXZ/Adreno-Tools-Drivers/releases/download/v39/Turnip_Gen8_V39.zip"
 "PanVK-android-v3.2-universal-2a9358a.zip 68d4eccc1442cb0bef08228c90127388e68bf6087898abc492c717b9a06ca61f https://github.com/ducvd89/Bloodborne-Android/releases/download/panvk-android-v3.2-2a9358a/PanVK-android-v3.2-universal-2a9358a.zip"
 "GPL-3.0.txt 3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986 https://www.gnu.org/licenses/gpl-3.0.txt"
 )

@@ -56,6 +56,7 @@ vk::Format VkFormatOf(u32 vk_format) {
 struct Lsfg::Api {
     void* library{};
     decltype(&bb_lsfg_init) init{};
+    decltype(&bb_lsfg_init_v2) init_v2{}; ///< Bloodframe 2.0 and later: backend choice (null before 2.0)
     decltype(&bb_lsfg_create_context) create_context{};
     decltype(&bb_lsfg_present) present{};
     decltype(&bb_lsfg_wait) wait{};
@@ -177,9 +178,16 @@ bool Lsfg::Initialize() {
         std::fflush(stdout);
         return false;
     };
-    const std::string dll = BbLsfgState::FindDll();
-    if (dll.empty()) {
+    // Lossless Scaling reads its shaders from the player's Lossless.dll; MAKO-FG (Bloodframe 2.0) needs
+    // no dll but the model files the app downloads (bbport/mako-fg/model).
+    const bool mako = settings.model == BbLsfgState::Model::Mako;
+    const std::string dll = mako ? std::string{} : BbLsfgState::FindDll();
+    const std::string model_dir = mako ? BbLsfgState::FindMakoModel() : std::string{};
+    if (!mako && dll.empty()) {
         return fail("no Lossless.dll: bbport/Lossless.dll or Bloodborne/Lossless.dll of shared storage");
+    }
+    if (mako && model_dir.empty()) {
+        return fail("no MAKO-FG model: download it in the app's Bloodframe menu (bbport/mako-fg/model)");
     }
     const std::string lib_path = EnvString("BB_LSFG_LIB").empty() ? "libbloodframe.so" : EnvString("BB_LSFG_LIB");
     api->library = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -197,10 +205,14 @@ bool Lsfg::Initialize() {
         !load(api->diagnostics, "bb_lsfg_diagnostics")) {
         return fail(lib_path + " lacks the bb_lsfg API");
     }
+    load(api->init_v2, "bb_lsfg_init_v2"); // optional: Bloodframe 1.x has only bb_lsfg_init
+    if (mako && !api->init_v2) {
+        return fail(lib_path + " is older than Bloodframe 2.0 (no bb_lsfg_init_v2): MAKO-FG needs 2.0");
+    }
 
     BbLsfgConfig config{};
     config.vk_get_instance_proc_addr = reinterpret_cast<void*>(bb_vk_get_instance_proc_addr());
-    config.dll_path = dll.c_str();
+    config.dll_path = mako ? nullptr : dll.c_str();
     const auto props_chain = instance.GetPhysicalDevice()
                                  .getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceIDProperties>();
     const auto& ids = props_chain.get<vk::PhysicalDeviceIDProperties>();
@@ -210,7 +222,8 @@ bool Lsfg::Initialize() {
     config.performance = settings.performance ? 1 : 0;
     config.fp16 = settings.fp16 ? 1 : 0;
     config.generation_count = static_cast<int32_t>(multiplier - 1);
-    shared_format = EnvString("BB_LSFG_FORMAT") == "rgba8" ? FormatRgba8 : FormatRgba16f;
+    // MAKO-FG takes SDR RGBA8 only; Lossless Scaling RGBA16F unless BB_LSFG_FORMAT=rgba8.
+    shared_format = mako || EnvString("BB_LSFG_FORMAT") == "rgba8" ? FormatRgba8 : FormatRgba16f;
     config.shared_format = static_cast<int32_t>(shared_format);
     config.hdr = 0;
     pace = EnvFlag("BB_LSFG_PACE", true);
@@ -242,7 +255,19 @@ bool Lsfg::Initialize() {
 
     const auto start = std::chrono::steady_clock::now();
     char error[512] = {};
-    if (api->init(&config, &api->info, error, sizeof error) != 0) {
+    int started = -1;
+    if (mako) {
+        BbLsfgConfigV2 v2{};
+        v2.struct_size = sizeof v2;
+        v2.version = BB_LSFG_CONFIG_VERSION;
+        v2.backend = BB_LSFG_BACKEND_MAKO_EXPERIMENTAL;
+        v2.config = config;
+        v2.model_path = model_dir.c_str();
+        started = api->init_v2(&v2, &api->info, error, sizeof error);
+    } else {
+        started = api->init(&config, &api->info, error, sizeof error);
+    }
+    if (started != 0) {
         return fail(error[0] ? error : "the framegen could not start");
     }
     api->started = true;
@@ -252,8 +277,8 @@ bool Lsfg::Initialize() {
     }
     char diagnostics[768] = {};
     api->diagnostics(diagnostics, sizeof diagnostics);
-    std::printf("Bloodframe: x%u, flow scale %.2f, %s model, %s images, %s sync, started in %.0f ms; %s\n",
-                multiplier, static_cast<double>(config.flow_scale),
+    std::printf("Bloodframe: %s x%u, flow scale %.2f, %s model, %s images, %s sync, started in %.0f ms; %s\n",
+                mako ? "MAKO-FG (experimental)" : "Lossless Scaling", multiplier, static_cast<double>(config.flow_scale),
                 config.performance ? "performance" : "quality",
                 shared_format == FormatRgba8 ? "RGBA8" : "RGBA16F", sync_host ? "CPU" : "sync-file",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
@@ -316,6 +341,10 @@ void Lsfg::LogPrecision() {
     case BB_LSFG_SET_FP32_SPIRV:
         shader_set_name = "FP32";
         std::printf("Bloodframe: shaders FP32 SPIR-V (%s)\n", reason);
+        break;
+    case BB_LSFG_SET_MAKO_EXPERIMENTAL:
+        shader_set_name = "MAKO-FG";
+        std::printf("Bloodframe: MAKO-FG V1.24 blend, Bloodframe motion (%s)\n", reason);
         break;
     default:
         shader_set_name = "FP32-DXBC";

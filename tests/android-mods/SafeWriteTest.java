@@ -1,4 +1,4 @@
-package ro.cobrabm.fexdroid;
+package com.ducvd89.bloodborne;
 import java.io.File; import java.nio.file.*; import java.util.*;
 public class SafeWriteTest {
   static void check(boolean c,String m){ if(!c) throw new AssertionError(m); System.out.println("ok: "+m); }

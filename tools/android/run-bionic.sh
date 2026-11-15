@@ -140,8 +140,8 @@ export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
 # the app sets the display to FPS limit x multiplier (MainActivity.pickRefreshRate).
 # It is LIVE: the app's Frame generation menu rewrites bbport/lsfg.state (BB_LSFG_STATE_FILE) while the
 # game runs and libbbgpu follows it (turns it on, off, or to another multiplier / flow scale / model with
-# no restart). That file is the one source of truth for the four settings; here is only its start,
-# written from bbport.ini (like cheats.state), so no BB_LSFG_MULTIPLIER/FLOW_SCALE/PERFORMANCE/FP16 are exported.
+# no restart). That file is the one source of truth for the five settings; here is only its start,
+# written from bbport.ini (like cheats.state), so no BB_LSFG_MULTIPLIER/FLOW_SCALE/PERFORMANCE/FP16/MODEL are exported.
 # BB_LSFG_DLL is exported when a Lossless.dll is found; libbbgpu looks again when frame generation is
 # turned on (the player may sign in to Steam meanwhile).
 # What cannot follow it live is decided here, from the multiplier at start: that FSR 3.1 frame
@@ -164,10 +164,25 @@ flow=$(setting lsfg_flow_scale)
 case $flow in 0.25|0.[3-9]|0.[3-9]0|0.[3-9]5|1.00|1.0|1) ;; *) flow=0.75 ;; esac
 performance=1; [ "$(setting lsfg_performance)" = 0 ] && performance=0
 fp16=1; [ "$(setting lsfg_fp16)" = 0 ] && fp16=0
+# lsfg_model: lsfg (Lossless Scaling, the default) or mako (Bloodframe 2.0's experimental MAKO-FG backend,
+# no Lossless.dll: the model files the app downloads into bbport/mako-fg, MakoModel.java).
+lsfg_model=lsfg; [ "$(setting lsfg_model)" = mako ] && lsfg_model=mako
+unset BB_LSFG_MODEL
 export BB_LSFG_STATE_FILE="$base/lsfg.state"
-printf 'multiplier=%s\nflow=%s\nperformance=%s\nfp16=%s\n' "$lsfg_requested" "$flow" "$performance" "$fp16" \
-    > "$BB_LSFG_STATE_FILE.tmp" && mv "$BB_LSFG_STATE_FILE.tmp" "$BB_LSFG_STATE_FILE"
-if [ -n "$lsfg" ]; then
+printf 'multiplier=%s\nflow=%s\nperformance=%s\nfp16=%s\nmodel=%s\n' "$lsfg_requested" "$flow" "$performance" "$fp16" \
+    "$lsfg_model" > "$BB_LSFG_STATE_FILE.tmp" && mv "$BB_LSFG_STATE_FILE.tmp" "$BB_LSFG_STATE_FILE"
+if [ -n "$lsfg" ] && [ "$lsfg_model" = mako ]; then
+    if [ ! -f "$base/mako-fg/model/weights.bin" ] && [ ! -f "${BB_MAKO_MODEL:-/nonexistent}/weights.bin" ]; then
+        echo "MAKO-FG frame generation: no model ($base/mako-fg/model; the app's Bloodframe menu downloads it): off"
+        lsfg=
+    elif [ ! -f "$bionic/lib/libbloodframe.so" ]; then
+        echo "MAKO-FG frame generation: $bionic/lib/libbloodframe.so is missing: off"
+        lsfg=
+    else
+        unset BB_FRAME_GEN
+        echo "MAKO-FG frame generation (Bloodframe 2.0, experimental): x$lsfg, flow scale $flow, performance mode $performance, half precision $fp16 (live: $BB_LSFG_STATE_FILE)"
+    fi
+elif [ -n "$lsfg" ]; then
     if [ -z "$lsfg_dll" ]; then
         echo "Lossless Scaling frame generation: no Lossless.dll ($base/Lossless.dll or /storage/emulated/0/Bloodborne/Lossless.dll): off"
         lsfg=
