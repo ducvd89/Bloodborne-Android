@@ -205,8 +205,33 @@ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
     runtime_report();
     exit(status);
 }
+static const struct { const char *nid, *symbol; } import_names[]={
+#include "import_names.inc"
+#include "import_names_diva.inc"
+};
 uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!(capabilities & 1)) return 0;
+    /* Normalise a non-canonical library-version suffix. The same 11-char NID may
+     * be imported with a different "#x#y" signature across firmware/library
+     * revisions (e.g. DIVA/FTDX's 959qrazPIrg#m#I vs the canonical #p#J). The
+     * signature is not part of the NID, so rewrite it to the canonical one the
+     * exact-match branches below and import_names.inc use. */
+    char norm[160];
+    {
+        const char *hash=strchr(name,'#');
+        if (hash && hash!=name && (size_t)(hash-name)<sizeof(norm)-40) {
+            size_t stem=(size_t)(hash-name);
+            for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i) {
+                const char *t=import_names[i].nid;
+                if (!strncmp(t,name,stem) && t[stem]=='#' && strcmp(t+stem,hash)) {
+                    memcpy(norm,name,stem);
+                    snprintf(norm+stem,sizeof(norm)-stem,"%s",t+stem);
+                    name=norm;
+                    break;
+                }
+            }
+        }
+    }
     if (is_data) {
         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
         if (!strcmp(name, "f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
@@ -248,10 +273,14 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (memory) return memory;
     uintptr_t kernel = runtime_kernel_resolve(name);
     if (kernel) return kernel;
+    uintptr_t jpeg = runtime_jpeg_resolve(name);
+    if (jpeg) return jpeg;
     uintptr_t services = runtime_services_resolve(name);
     if (services) return services;
     uintptr_t ajm = runtime_ajm_resolve(name);
     if (ajm) return ajm;
+    uintptr_t ngs2 = runtime_ngs2_resolve(name);
+    if (ngs2) return ngs2;
     uintptr_t audio = runtime_audio_resolve(name);
     if (audio) return audio;
     uintptr_t pad = runtime_pad_resolve(name);
@@ -264,13 +293,24 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (file) return file;
     return bbgpu_resolve(name);
 }
-static const struct { const char *nid, *symbol; } import_names[]={
-#include "import_names.inc"
-};
-/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
+/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it.
+ * The trailing "#x#y" is a library-version signature, not part of the NID: the
+ * same 11-char NID can be imported with different signatures (e.g. #p#J vs #m#I
+ * across PS4 firmware/library revisions) and denotes the same function. When an
+ * exact match is missing, fall back to the NID stem so the table (which holds a
+ * single signature per NID) still resolves the DIVA/FTDX variants. */
 const char *runtime_symbol(const char *nid) {
     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
         if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
+    /* Strip a "#x#y" suffix and match on the NID stem only. */
+    const char *hash=strchr(nid,'#');
+    if (hash && hash-nid>0) {
+        size_t stem=(size_t)(hash-nid);
+        for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i) {
+            const char *t=import_names[i].nid;
+            if (!strncmp(nid,t,stem) && t[stem]=='#') return import_names[i].symbol;
+        }
+    }
     return NULL;
 }
 /* Same symbol name means same contract whether imported from libkernel or

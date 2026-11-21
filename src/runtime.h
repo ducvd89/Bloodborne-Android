@@ -228,6 +228,7 @@ int runtime_memory_low_info(uintptr_t address, int *prot, uintptr_t *end);
 uintptr_t runtime_ajm_resolve(const char *name);
 void runtime_ajm_report(void);
 uintptr_t runtime_audio_resolve(const char *name);
+uintptr_t runtime_ngs2_resolve(const char *name);
 void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
 void runtime_pad_report(void);
@@ -236,5 +237,6 @@ const char *runtime_file_user_dir(void);
 void runtime_savedata_configure(const char *title);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
+uintptr_t runtime_jpeg_resolve(const char *name);
 void runtime_thread_attach_host(const char *name);
 #endif
